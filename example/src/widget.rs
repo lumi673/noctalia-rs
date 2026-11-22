@@ -96,11 +96,9 @@ fn render(ctx: &Context) -> Result<Vec<Op>> {
     }
 
     let text = if show_text {
-        nearest
-            .map(|timer| {
-                duration::approx(timer.remaining_ms(now).div_ceil(1_000))
-            })
-            .unwrap_or_default()
+        nearest.map_or_default(|timer| {
+            duration::approx(timer.remaining_ms(now).div_ceil(1_000))
+        })
     } else {
         String::new()
     };

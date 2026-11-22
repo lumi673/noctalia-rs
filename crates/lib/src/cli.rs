@@ -140,7 +140,7 @@ impl<W: Write> Serve<'_, W> {
     }
 }
 
-#[must_use]
+#[must_use = "the exit code must be returned to the caller"]
 pub fn run(plugin: &Plugin) -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
 

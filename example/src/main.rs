@@ -292,7 +292,7 @@ fn build_plugin() -> Plugin {
     plugin
 }
 
-#[must_use]
+#[must_use = "the exit code must be returned to the caller"]
 pub fn run() -> ExitCode {
     run_cli(&build_plugin())
 }
