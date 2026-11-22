@@ -1,0 +1,225 @@
+name: Audit
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# Measurements run on pull request code. This workflow only publishes results
+# and records ceilings, so it always runs default branch code.
+jobs:
+  performance-report:
+    name: Publish performance report
+    if: >-
+      github.event.workflow_run.name == 'CI' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      checks: write
+      contents: read
+      pull-requests: write
+      statuses: write
+    concurrency:
+      group: performance-report-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: true
+    steps:
+      # Only load the publisher from the default branch and never execute PR code.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+
+      - id: resolve
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const run = context.payload.workflow_run
+            // workflow_run.pull_requests is empty for fork pull requests.
+            let pr = run.pull_requests[0]
+            if (!pr && run.head_repository) {
+              const { data: candidates } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                head: `${run.head_repository.owner.login}:${run.head_branch}`,
+                per_page: 100,
+              })
+              const matches = candidates.filter((candidate) => candidate.head.sha === run.head_sha)
+              if (matches.length === 1) pr = matches[0]
+            }
+            if (!pr) return core.notice('No pull request for this run.')
+            core.setOutput('publish', 'true')
+            core.setOutput('number', String(pr.number))
+            core.setOutput('head_sha', run.head_sha)
+            core.setOutput('run_id', String(run.id))
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id,
+              per_page: 100,
+            })
+            core.setOutput('artifact', String(data.artifacts.some((item) => item.name === 'performance' && !item.expired)))
+
+      - name: Download measurement
+        if: steps.resolve.outputs.publish == 'true' && steps.resolve.outputs.artifact == 'true'
+        uses: actions/download-artifact@v6
+        with:
+          name: performance
+          path: ${{ runner.temp }}/performance
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare measurement
+        if: steps.resolve.outputs.publish == 'true'
+        env:
+          ARTIFACT: ${{ steps.resolve.outputs.artifact }}
+          RESULT_DIR: ${{ runner.temp }}/performance
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULT_DIR"
+          if [ "$ARTIFACT" != "true" ]; then
+            printf '<!-- performance-report -->\n### Performance audit\n\nNo performance measurement was uploaded for this run.\n' > "$RESULT_DIR/comment.md"
+            printf 'fail\n' > "$RESULT_DIR/result.txt"
+            exit 0
+          fi
+          if ! node .github/scripts/performance.cjs report \
+            --dir "$RESULT_DIR" \
+            --floor "$RESULT_DIR/floor.json" \
+            --out "$RESULT_DIR/comment.md" \
+            --result "$RESULT_DIR/result.txt"; then
+            printf '<!-- performance-report -->\n### Performance audit\n\nThe comparison failed. Check the workflow logs.\n' > "$RESULT_DIR/comment.md"
+            printf 'fail\n' > "$RESULT_DIR/result.txt"
+            exit 1
+          fi
+
+      - name: Update comment
+        if: always() && steps.resolve.outputs.publish == 'true'
+        uses: actions/github-script@v8
+        env:
+          COMMENT_PATH: ${{ runner.temp }}/performance/comment.md
+        with:
+          script: |
+            const fs = require('node:fs')
+            if (!fs.existsSync(process.env.COMMENT_PATH)) return
+            const body = fs.readFileSync(process.env.COMMENT_PATH, 'utf8')
+            const { owner, repo } = context.repo
+            const issue_number = Number('${{ steps.resolve.outputs.number }}')
+            const marker = '<!-- performance-report -->'
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            })
+            const existing = comments.find(
+              (comment) => comment.body?.includes(marker) && comment.user?.type === 'Bot'
+            )
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body })
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body })
+            }
+
+      - name: Publish check
+        if: always() && steps.resolve.outputs.publish == 'true'
+        uses: actions/github-script@v8
+        env:
+          RESULT_PATH: ${{ runner.temp }}/performance/result.txt
+          COMMENT_PATH: ${{ runner.temp }}/performance/comment.md
+          HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        with:
+          script: |
+            const fs = require('node:fs')
+            const hasResult = fs.existsSync(process.env.RESULT_PATH)
+            const result = hasResult ? fs.readFileSync(process.env.RESULT_PATH, 'utf8').trim() : 'fail'
+            const summary = fs.existsSync(process.env.COMMENT_PATH)
+              ? fs.readFileSync(process.env.COMMENT_PATH, 'utf8')
+              : 'No performance report was produced.'
+            const failed = !hasResult || result === 'fail'
+            const title = failed ? 'Performance audit failed' : 'Performance within limits'
+            const conclusion = failed ? 'failure' : result === 'pass' ? 'success' : 'neutral'
+            const state = failed ? 'failure' : result === 'pass' ? 'success' : 'pending'
+            try {
+              await github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: process.env.HEAD_SHA,
+                state,
+                context: 'Performance audit',
+                description: title.slice(0, 140),
+                target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              })
+            } catch (error) {
+              core.warning(`Cannot publish the performance status: ${error.message}`)
+            }
+            try {
+              await github.rest.checks.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'Performance audit',
+                head_sha: process.env.HEAD_SHA,
+                status: 'completed',
+                conclusion,
+                output: { title, summary },
+              })
+            } catch (error) {
+              core.warning(`Cannot publish the performance check: ${error.message}`)
+            }
+
+  performance-floor:
+    name: Record performance ceiling
+    if: >-
+      github.event.workflow_run.name == 'CI' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: performance-floor
+      cancel-in-progress: false
+    steps:
+      # Scripts always come from the default branch, never from the measured commit.
+      - uses: actions/checkout@v5
+
+      - name: Download main measurement
+        uses: actions/download-artifact@v6
+        with:
+          name: performance
+          path: ${{ runner.temp }}/performance
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record ceiling
+        env:
+          RESULT_DIR: ${{ runner.temp }}/performance
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          worktree="$RUNNER_TEMP/ceiling"
+          if git fetch --depth=1 origin floors; then
+            git worktree add --detach "$worktree" FETCH_HEAD
+          else
+            git worktree add --detach "$worktree" origin/main
+          fi
+          floor="$worktree/.github/performance-floor.json"
+          node .github/scripts/performance.cjs floor \
+            --floor "$floor" \
+            --meta "$RESULT_DIR/meta.json" \
+            --dir "$RESULT_DIR" \
+            --out "$floor" \
+            --marker "$RUNNER_TEMP/ceiling-changed.txt"
+          if [ "$(cat "$RUNNER_TEMP/ceiling-changed.txt")" != "changed" ]; then
+            exit 0
+          fi
+          git -C "$worktree" add .github/performance-floor.json
+          git -C "$worktree" commit -m "ci: record performance ceiling"
+          git -C "$worktree" push origin "HEAD:refs/heads/floors"

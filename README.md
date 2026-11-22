@@ -150,3 +150,12 @@ incremental release build. It prints machine metadata and median, p95, and p99
 per surface. Use `--build-samples` and `--build-warmup` for the build surfaces,
 `--helper` for an existing helper binary, and `--help` for all options. It uses
 its own scratch files and never reads the Noctalia config.
+
+CI runs the same harness three times on every pull request and publishes a
+`Performance audit` check and comment. The check compares the best round with a
+ceiling re-measured in the same session from the `floors` branch, and with each
+workload's budget. A workload fails when its median, p95, or p99 is more than
+10% slower than the reference worst round, or by more than either side's spread
+between rounds, whichever is larger. It also fails when its median is more than
+10% over budget while the reference is within budget. Budgets only tighten. Pushes
+to main record a new ceiling. The benchmark scripts live in `.github/scripts`.

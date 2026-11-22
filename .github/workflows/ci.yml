@@ -37,3 +37,79 @@ jobs:
         with:
           tool: cargo-tarpaulin
       - run: cargo tarpaulin --fail-under 80
+
+  performance:
+    name: Performance
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      RUN_KIND: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
+    steps:
+      # pull_request checks out the merge commit, so base-only changes are
+      # included in the PR measurement.
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Ceilings live on their own branch so a PR cannot move them.
+      - name: Plan variants
+        run: |
+          mkdir -p performance/raw
+          floor="$RUNNER_TEMP/performance-floor.json"
+          if git fetch --depth=1 origin floors; then
+            git show FETCH_HEAD:.github/performance-floor.json > "$floor" || rm -f "$floor"
+          fi
+          node .github/scripts/performance.cjs plan \
+            --floor "$floor" \
+            --head "$(git rev-parse HEAD)" \
+            --base "$BASE_SHA" \
+            --kind "$RUN_KIND" \
+            --meta performance/meta.json > "$RUNNER_TEMP/variant-shas.txt"
+
+      - name: Prepare variants
+        run: |
+          set -euo pipefail
+          : > "$RUNNER_TEMP/variant-dirs.txt"
+          while read -r sha; do
+            [ -n "$sha" ] || continue
+            dir="$RUNNER_TEMP/variants/$sha"
+            git fetch --depth=1 origin "$sha"
+            git worktree add --detach "$dir" FETCH_HEAD
+            printf '%s %s\n' "$sha" "$dir" >> "$RUNNER_TEMP/variant-dirs.txt"
+          done < "$RUNNER_TEMP/variant-shas.txt"
+
+      # Every commit is measured in the same session, so runner speed cancels out.
+      - name: Measure
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          for run in 1 2 3; do
+            cargo run --release -p noctalia-bench -- \
+              --samples 60 --warmup 6 --build-samples 2 --build-warmup 1 \
+              --report "performance/raw/$head-$run.json"
+            while read -r sha dir; do
+              [ -n "$sha" ] || continue
+              (
+                cd "$dir"
+                CARGO_TARGET_DIR="$RUNNER_TEMP/target-$sha" \
+                  cargo run --release -p noctalia-bench -- \
+                    --samples 60 --warmup 6 --build-samples 2 --build-warmup 1 \
+                    --report "$GITHUB_WORKSPACE/performance/raw/$sha-$run.json"
+              )
+            done < "$RUNNER_TEMP/variant-dirs.txt"
+          done
+          node .github/scripts/performance-aggregate.cjs performance/raw performance 3
+          if [ "$RUN_KIND" = "pull_request" ]; then
+            cp "performance/$head.json" performance/pr.json
+            cp "performance/$BASE_SHA.json" performance/base.json
+          fi
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: performance
+          path: performance/*.json
+          retention-days: 30
