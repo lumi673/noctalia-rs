@@ -14,20 +14,20 @@ Please ensure your pull request meets the following criteria:
 
 ## Type of Change
 
-- \[ \] Bug fix
-- \[ \] New feature
-- \[ \] Documentation update
-- \[ \] Refactor
-- \[ \] Dependency update
-- \[ \] Other (please describe)
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Documentation update
+- [ ] Refactor
+- [ ] Dependency update
+- [ ] Other (please describe)
 
 ## Checklist
 
-- \[ \] The project builds and passes all checks: `nix flake check`
-- \[ \] Code follows the project's style (formatting, clippy, etc.)
-- \[ \] Tests have been added or updated for new functionality
-- \[ \] Documentation has been updated if necessary
-- \[ \] All pre-commit hooks pass
+- [ ] The project builds and passes all checks: `nix flake check`
+- [ ] Code follows the project's style (formatting, clippy, etc.)
+- [ ] Tests have been added or updated for new functionality
+- [ ] Documentation has been updated if necessary
+- [ ] All pre-commit hooks pass
 
 ## Additional Notes
 

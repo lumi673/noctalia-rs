@@ -135,8 +135,13 @@ local function materialize(value)
       M.call("host_callback", { id = name, args = { ... } })
     end
   end
-  if type(value.__noctalia_rs_bytes) == "string" then
-    return hexDecode(value.__noctalia_rs_bytes)
+  local marker = value.__noctalia_rs_bytes
+  if type(marker) == "string" then
+    local only = next(value)
+    if only == "__noctalia_rs_bytes" and next(value, only) == nil
+      and #marker % 2 == 0 and marker:match("^%x*$") ~= nil then
+      return hexDecode(marker)
+    end
   end
   local out = {}
   for key, item in pairs(value) do
@@ -286,13 +291,18 @@ local handlers = {
       response.error = nil
     end
     if not ok then
-      response.value = tostring(value)
+      response.value = nil
       response.error = tostring(value)
     end
     local encoded = noctalia.json.encode(encodeBytes(response))
     if encoded then
-      local written, write_err = noctalia.writeFile(op.response, encoded)
+      local temporary = op.response .. ".pending"
+      local written, write_err = noctalia.writeFile(temporary, encoded)
+      if written then
+        written, write_err = noctalia.renameFile(temporary, op.response)
+      end
       if not written then
+        noctalia.removeFile(temporary)
         noctalia.log("noctalia bridge: query response failed: " .. tostring(write_err))
       end
     end

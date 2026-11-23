@@ -49,7 +49,14 @@ impl<'a> Convert<'a> {
             LuaValue::Integer(value) => Ok(json!(value)),
             LuaValue::Number(value) => Ok(json!(value)),
             LuaValue::String(value) => {
-                Ok(JsonValue::String(value.to_string_lossy().to_string()))
+                let bytes = value.as_bytes();
+                match std::str::from_utf8(&bytes) {
+                    Ok(text) => Ok(JsonValue::String(text.to_owned())),
+                    Err(_) => Ok(json!({
+                        noctalia_rs::bytes::BYTES_KEY:
+                            noctalia_rs::bytes::encode_hex(&bytes),
+                    })),
+                }
             }
             LuaValue::Function(function) => Ok(self.marker(&function)?),
             LuaValue::Table(table) => {
@@ -213,13 +220,8 @@ pub fn from_json_with_bytes(
     lua: &Lua,
     value: &JsonValue,
 ) -> LuaResult<LuaValue> {
-    if let Some(hex) = value
-        .get(noctalia_rs::bytes::BYTES_KEY)
-        .and_then(JsonValue::as_str)
-    {
-        return Ok(LuaValue::String(
-            lua.create_string(noctalia_rs::bytes::decode_hex(hex))?,
-        ));
+    if let Some(bytes) = noctalia_rs::bytes::marker_bytes(value) {
+        return Ok(LuaValue::String(lua.create_string(bytes)?));
     }
     match value {
         JsonValue::Array(values) => {

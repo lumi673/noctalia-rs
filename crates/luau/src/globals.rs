@@ -2,7 +2,7 @@ use mlua::{
     Function, IntoLuaMulti, Lua, MultiValue, Result as LuaResult, Table,
     Value as LuaValue, Variadic,
 };
-use noctalia_rs::Op;
+use noctalia_rs::{ByteBuf, Op};
 use serde_json::{Value as JsonValue, json};
 use std::fs;
 use std::sync::Arc;
@@ -571,12 +571,23 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     set_fn!(lua, &table, "copyToClipboard", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
-        let text = string_arg(lua, &values, 0);
         let mime = string_arg(lua, &values, 1);
-        host.collector.emit(Op::copy_with_mime(
-            &text,
-            if mime.is_empty() { "text/plain" } else { &mime },
-        ));
+        let mime = if mime.is_empty() {
+            "text/plain".to_owned()
+        } else {
+            mime
+        };
+        let text = string_arg(lua, &values, 0);
+        match values.first().and_then(|value| match value {
+            LuaValue::String(text) => Some(text.as_bytes().to_vec()),
+            _ => None,
+        }) {
+            Some(bytes) if std::str::from_utf8(&bytes).is_err() => {
+                host.collector
+                    .emit(Op::copy_bytes(ByteBuf::new(bytes), &mime));
+            }
+            _ => host.collector.emit(Op::copy_with_mime(&text, &mime)),
+        }
         Ok(LuaValue::Boolean(true))
     })?;
     set_fn!(lua, &table, "openPath", |lua, args: Args| {

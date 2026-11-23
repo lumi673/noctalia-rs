@@ -2,10 +2,13 @@
 //!
 //! A Rust handler can keep the straight-line control flow of a Luau coroutine
 //! by calling [`yield_now`] inside a spawned [`Coroutine`]. The driver resumes
-//! suspended coroutines until a [`ClockBudget`] expires.
+//! suspended coroutines until a [`ClockBudget`] expires. Dropping a coroutine
+//! stops it at its next yield, the same way the shell discards a Luau
+//! coroutine it never resumes again.
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -41,7 +44,10 @@ pub fn yield_value<T: Send + 'static>(value: T) {
             return;
         };
         let _ = current.yielded.send(Signal::Yield(Box::new(value)));
-        let _ = current.resumed.recv();
+        assert!(
+            current.resumed.recv().is_ok(),
+            "coroutine stopped: driver dropped"
+        );
     });
 }
 
@@ -58,8 +64,8 @@ pub enum Poll {
 /// A resumable Luau-style coroutine running on its own thread.
 pub struct Coroutine<T> {
     signals: Receiver<Signal>,
-    resume: Sender<()>,
-    handle: Option<JoinHandle<T>>,
+    resume: Option<Sender<()>>,
+    handle: Option<JoinHandle<Option<T>>>,
 }
 
 impl<T: Send + 'static> Coroutine<T> {
@@ -79,7 +85,7 @@ impl<T: Send + 'static> Coroutine<T> {
             CURRENT.with(|cell| {
                 *cell.borrow_mut() = Some(Current { yielded, resumed });
             });
-            let value = body();
+            let value = panic::catch_unwind(AssertUnwindSafe(body)).ok();
             CURRENT.with(|cell| {
                 if let Some(current) = cell.borrow_mut().take() {
                     let _ = current.yielded.send(Signal::Done);
@@ -89,7 +95,7 @@ impl<T: Send + 'static> Coroutine<T> {
         });
         Self {
             signals,
-            resume,
+            resume: Some(resume),
             handle: Some(handle),
         }
     }
@@ -108,20 +114,25 @@ impl<T: Send + 'static> Coroutine<T> {
 
     /// Resumes a suspended coroutine.
     pub fn resume(&self) {
-        let _ = self.resume.send(());
+        if let Some(resume) = self.resume.as_ref() {
+            let _ = resume.send(());
+        }
     }
 
     /// Waits for the finished body's return value.
     #[must_use]
     pub fn join(mut self) -> Option<T> {
         let handle = self.handle.take()?;
-        handle.join().ok()
+        handle.join().ok().flatten()
     }
 }
 
 impl<T> Drop for Coroutine<T> {
     fn drop(&mut self) {
-        let _ = self.resume.send(());
+        drop(self.resume.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

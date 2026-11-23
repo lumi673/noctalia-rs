@@ -211,6 +211,7 @@ fn serve(plugin: &Plugin, data_dir: &Path, spool_dir: &Path) -> Result<()> {
     let boot = boot_id();
     let run_dir = spool_dir.join(&boot);
     fs::create_dir_all(&run_dir)?;
+    prune_query_dir(data_dir);
     let stale = request_files(&run_dir)?;
     let translations = plugin.translations_value();
     let mut server = Serve {
@@ -223,6 +224,16 @@ fn serve(plugin: &Plugin, data_dir: &Path, spool_dir: &Path) -> Result<()> {
         out: &mut out,
     };
     server.run()
+}
+
+fn prune_query_dir(data_dir: &Path) {
+    let dir = data_dir.join(".noctalia-rs").join("query");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let _ = fs::remove_file(entry.path());
+    }
 }
 
 fn boot_id() -> String {

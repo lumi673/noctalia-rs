@@ -39,13 +39,6 @@ impl ByteBuf {
     pub fn into_vec(self) -> Vec<u8> {
         self.0
     }
-
-    /// Interprets the bytes as UTF-8 text, replacing invalid sequences.
-    #[inline]
-    #[must_use]
-    pub fn to_text_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.0).into_owned()
-    }
 }
 
 impl From<Vec<u8>> for ByteBuf {
@@ -136,11 +129,31 @@ pub fn decode_hex(text: &str) -> Vec<u8> {
     result
 }
 
+/// Returns the bytes of a bridge marker object, if the value is one.
+///
+/// A marker is an object whose only key is [`BYTES_KEY`] and whose value is an
+/// even-length hex string. Requiring both keeps a plain object that happens to
+/// carry that key from changing type.
+#[must_use]
+pub fn marker_bytes(value: &Json) -> Option<Vec<u8>> {
+    let object = value.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let text = object.get(BYTES_KEY)?.as_str()?;
+    if text.len() % 2 != 0
+        || !text.bytes().all(|byte| hex_value(byte).is_some())
+    {
+        return None;
+    }
+    Some(decode_hex(text))
+}
+
 /// Extracts bytes from either a marker object or a JSON string.
 #[must_use]
 pub fn decode_json_bytes(value: &Json) -> Vec<u8> {
-    if let Some(text) = value.get(BYTES_KEY).and_then(Json::as_str) {
-        return decode_hex(text);
+    if let Some(bytes) = marker_bytes(value) {
+        return bytes;
     }
     value
         .as_str()

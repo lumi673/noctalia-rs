@@ -147,6 +147,62 @@ fn seeded_rng_matches_embedded_luau_vm() {
     assert_eq!(ported_ranges, ranges);
 }
 #[test]
+fn registered_member_kinds_drive_luau_dispatch() {
+    let value = api::find("noctalia", "appIconPath").expect("appIconPath");
+    assert_eq!(value.kind, api::MemberKind::Value);
+    let void =
+        api::find("noctalia", "setWallpaperEnabled").expect("void member");
+    assert_eq!(void.kind, api::MemberKind::Void);
+
+    let dir = QueryDir::new();
+    dir.respond("noctalia_rs_luau_1", json!("icon.png"));
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"
+assert(noctalia["appIconPath"]("app") == "icon.png")
+assert(noctalia["setWallpaperEnabled"]("DP-1", true) == nil)
+"#;
+    let values = dispatch(&ctx, &[("entry", source)])
+        .expect("dispatch")
+        .into_iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    assert!(
+        values.iter().any(|value| value["op"] == "query"
+            && value["path"] == json!(["appIconPath"])),
+        "value member did not query the host: {values:?}"
+    );
+    let calls = values
+        .iter()
+        .filter(|value| {
+            value["op"] == "host_call"
+                && value["path"] == json!(["setWallpaperEnabled"])
+        })
+        .count();
+    assert_eq!(calls, 1, "void member did not emit one host call");
+}
+
+#[test]
+fn binary_lua_strings_cross_as_byte_markers() {
+    let values =
+        run(r#"noctalia.copyToClipboard(string.char(255, 254), "image/png")"#);
+    let call = values
+        .iter()
+        .find(|value| value["op"] == "host_call")
+        .expect("host call");
+    assert_eq!(call["args"][0], json!({ "__noctalia_rs_bytes": "fffe" }));
+}
+
+#[test]
+fn ordinary_tables_that_carry_the_marker_key_stay_tables() {
+    let values = run(
+        r#"noctalia.log(json.encode({ __noctalia_rs_bytes = "zz", other = 1 }))"#,
+    );
+    let log = find(&values, "log");
+    let message = log["message"].as_str().expect("message");
+    assert!(message.contains("other"), "{message}");
+}
+
+#[test]
 fn json_encode_and_decode_round_trip() {
     let source = r#"
 local encoded = json.encode({ a = 1, b = { "x", "y" }, c = true })

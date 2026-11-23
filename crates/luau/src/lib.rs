@@ -16,7 +16,7 @@ use serde_json::Value as Json;
 
 use crate::callback::{callback_args, callback_for_event};
 use crate::host::Host;
-use crate::value::from_json;
+use crate::value::{from_json, from_json_with_bytes};
 
 type SharedRuntime = Arc<Mutex<Runtime>>;
 
@@ -96,7 +96,7 @@ impl Runtime {
             .cloned()
             .unwrap_or_default()
             .iter()
-            .map(|value| from_json(&self.lua, value))
+            .map(|value| from_json_with_bytes(&self.lua, value))
             .collect::<mlua::Result<Vec<_>>>()?;
         if let Err(error) =
             function.call::<MultiValue>(MultiValue::from_vec(args))

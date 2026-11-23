@@ -42,6 +42,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
+static QUERY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 pub struct Context {
     pub entry: String,
     pub event: String,
@@ -54,7 +56,6 @@ pub struct Context {
     translations: Value,
     op_sink: Mutex<Option<OpSink>>,
     pending_ops: Mutex<Vec<Op>>,
-    query_id: AtomicUsize,
     query_timeout: Duration,
 }
 
@@ -80,7 +81,6 @@ impl Context {
             translations,
             op_sink: Mutex::new(None),
             pending_ops: Mutex::new(Vec::new()),
-            query_id: AtomicUsize::new(0),
             query_timeout: QUERY_TIMEOUT,
         }
     }
@@ -147,6 +147,7 @@ impl Context {
     /// Drains ops produced by queries made without an op writer.
     #[doc(hidden)]
     #[must_use]
+    /// Drains ops buffered while no op sink is installed.
     pub fn take_pending_ops(&self) -> Vec<Op> {
         let mut pending = lock(&self.pending_ops);
         mem::take(&mut pending)
@@ -184,8 +185,7 @@ impl Context {
         path: &[&str],
         args: Vec<Value>,
     ) -> Option<Value> {
-        let sequence = self
-            .query_id
+        let sequence = QUERY_SEQUENCE
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let id = format!("noctalia_rs_{}_{sequence}", process::id());
@@ -671,16 +671,7 @@ impl Context {
             Some("UTC") => stamp.to_utc().format(pattern).to_string(),
             Some(name) => name
                 .strip_prefix("UTC")
-                .and_then(|offset| {
-                    let (sign, digits) = offset.split_at(1);
-                    let hours: i32 = digits.parse().ok()?;
-                    let seconds = match sign {
-                        "+" => hours.saturating_mul(3600),
-                        "-" => hours.saturating_neg().saturating_mul(3600),
-                        _ => return None,
-                    };
-                    chrono::FixedOffset::east_opt(seconds)
-                })
+                .and_then(parse_utc_offset)
                 .map_or_else(
                     || stamp.with_timezone(&Local).format(pattern).to_string(),
                     |offset| {
@@ -996,6 +987,22 @@ fn now_ms() -> i64 {
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
+/// Parses a `+H` or `-H` offset that follows `UTC`.
+fn parse_utc_offset(offset: &str) -> Option<chrono::FixedOffset> {
+    let (sign, digits) = offset.split_at_checked(1)?;
+    let hours: i32 = digits
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some(digits)
+        .and_then(|text| text.parse().ok())?;
+    let seconds = match sign {
+        "+" => hours.saturating_mul(3600),
+        "-" => hours.saturating_neg().saturating_mul(3600),
+        _ => return None,
+    };
+    chrono::FixedOffset::east_opt(seconds)
+}
+
 #[inline]
 fn object_get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.as_object()?.get(key)
@@ -1015,6 +1022,7 @@ fn lookup<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::RefCell;
 
     fn make_context() -> Context {
         let parts = Parts {
@@ -1148,6 +1156,48 @@ mod tests {
         );
         assert!(!context.command_exists("noctalia-missing-command-xyz"));
     }
+    #[test]
+    fn test_format_time_at_survives_a_malformed_timezone() {
+        let context = make_context();
+
+        for name in ["UTC\u{e9}", "UTC+", "UTC+ab", "UTC++2", "UT"] {
+            let text = context.format_time_at("{:%H}", Some(0), Some(name));
+            assert!(!text.is_empty(), "{name} produced no time");
+        }
+    }
+
+    #[test]
+    fn test_query_ids_do_not_repeat_across_contexts() {
+        let mut first = make_context();
+        let mut second = make_context();
+        first.set_op_sink(Arc::new(record_response));
+        second.set_op_sink(Arc::new(record_response));
+        assert!(
+            first
+                .query_value("noctalia", &["outputs"], Vec::new())
+                .is_none()
+        );
+        assert!(
+            second
+                .query_value("noctalia", &["outputs"], Vec::new())
+                .is_none()
+        );
+        let seen = IDS.with(|ids| ids.borrow().clone());
+        assert_eq!(seen.len(), 2, "expected two queries");
+        assert_ne!(seen[0], seen[1], "query ids repeated");
+    }
+
+    fn record_response(op: &crate::Op) {
+        let value = serde_json::to_value(op).expect("serialize");
+        if let Some(response) = value.get("response").and_then(Value::as_str) {
+            IDS.with(|ids| ids.borrow_mut().push(response.to_owned()));
+        }
+    }
+
+    thread_local! {
+        static IDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
     #[test]
     fn test_format_time_accepts_noctalia_brace_syntax() {
         let context = make_context();

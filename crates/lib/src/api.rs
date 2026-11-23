@@ -23,10 +23,14 @@ pub enum MemberKind {
     Node,
 }
 
+/// One host member: where it lives, its name, and how a call is delivered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Member {
+    /// Root namespace, such as `noctalia` or `noctalia.state`.
     pub root: &'static str,
+    /// Member name inside the root.
     pub name: &'static str,
+    /// How a Luau call to this member is delivered.
     pub kind: MemberKind,
 }
 

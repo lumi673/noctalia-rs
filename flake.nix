@@ -97,7 +97,11 @@
             forbid-new-submodules.enable = true;
             check-json.enable = true;
             lychee.enable = true;
-            comrak.enable = true;
+            comrak = {
+              enable = true;
+              # PR templates carry checkbox syntax the formatter escapes.
+              excludes = ["^\.forgejo/"];
+            };
             ripsecrets.enable = true;
             typos.enable = true;
             check-toml.enable = true;
