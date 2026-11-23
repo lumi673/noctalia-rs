@@ -497,7 +497,7 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let command = json_arg(lua, &values, 0)?;
         let id = callback_id(lua, &values, 1)?;
         host.collector.emit(Op::run_stream(command, &id));
-        Ok(LuaValue::Nil)
+        Ok(LuaValue::Boolean(true))
     })?;
     set_fn!(lua, &table, "writeFile", |lua, args: Args| {
         let host = host(lua)?;

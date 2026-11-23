@@ -193,6 +193,8 @@ local function writeRequest(request)
   local name = string.format("%012d", sequence)
   local temporary = REQUEST_DIR .. "/" .. name .. ".pending"
   local target = REQUEST_DIR .. "/" .. name .. ".json"
+  M.host = snapshot()
+  request.host = M.host
   local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(request))
   if ok then
     ok, err = noctalia.renameFile(temporary, target)
@@ -267,14 +269,12 @@ end
 
 function M.call(event, payload)
   if not boot then startStream() end
-  M.host = snapshot()
   table.insert(pending, {
     entry = M.entry,
     event = event,
     payload = payload or {},
     config = M.config,
     state = M.state,
-    host = M.host,
   })
   flushPending()
 end

@@ -118,6 +118,14 @@ layer.show("badge")
 }
 
 #[test]
+fn stream_start_reports_success() {
+    let values = run(r#"
+assert(noctalia.runStream("while true do end", "line") == true, "stream start")
+"#);
+    assert_eq!(find(&values, "host_call")["path"], json!(["runStream"]));
+}
+
+#[test]
 fn require_loads_registered_local_sources() {
     let ctx = context(empty_fixture("update"));
     let sources = [
