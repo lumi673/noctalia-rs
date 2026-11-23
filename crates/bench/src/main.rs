@@ -3,6 +3,7 @@ mod process;
 mod stats;
 
 use chrono::Utc;
+use noctalia_rs::{Context, Op, ui};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -55,6 +56,61 @@ function update()
   assert(noctalia.nowMs() == 1700000000, "now")
 end
 "##;
+const SCRIPT_STATE_OPS: &str = r#"
+function update()
+  assert(state.get("label") == "ready", "label")
+  assert(state.get("timers")[3] == 3, "timers")
+  assert(state.get("missing") == nil, "missing")
+  state.set("bench.a", { value = 1 })
+  state.set("bench.b", { value = 2 })
+  state.set("bench.c", { value = 3 })
+  state.set("bench.d", { value = 4 })
+  state.watch("bench.a", { __host_callback = "bench.callback" })
+end
+"#;
+const SCRIPT_UI_TREE: &str = r#"
+function update()
+  local tree = ui.column({ id = "root", gap = 4 }, {
+    ui.row({ id = "header" }, {
+      ui.label({ id = "title", text = "Status" }),
+      ui.label({ id = "value", text = "ready" })
+    }),
+    ui.scroll({ id = "list", height = 200 }, {
+      ui.button({ id = "save", label = "Save" }),
+      ui.input({ id = "filter", placeholder = "Filter" }),
+      ui.progress({ id = "progress", value = 0.75 })
+    })
+  })
+  panel.render(tree)
+end
+"#;
+const SCRIPT_CALLBACK: &str = r#"
+function update(base, count)
+  local total = 0
+  for i = 1, count do
+    total = total + base * i
+  end
+  state.set("callback.total", total)
+  noctalia.log(tostring(total))
+end
+"#;
+const SCRIPT_SERVICE_UPDATE: &str = r#"
+function update(prefix, threshold, rows)
+  local total = 0
+  local active = 0
+  for _, row in ipairs(rows) do
+    total = total + row.value
+    if row.value >= threshold then
+      active = active + 1
+    end
+  end
+  local status = prefix .. ":" .. noctalia.getConfig("name") .. ":" ..
+    tostring(total) .. ":" .. tostring(active)
+  state.set("service.status", status)
+  noctalia.log(status)
+  barWidget.setText(status)
+end
+"#;
 const FIXTURE_MANIFEST: &str = r#"
 id = "bench/fixture"
 name = "Bench Fixture"
@@ -80,6 +136,11 @@ const SOURCES_VM: &[(&str, &str)] = &[("entry", SCRIPT_VM)];
 const SOURCES_RUNTIME: &[(&str, &str)] = &[("entry", SCRIPT_RUNTIME)];
 const SOURCES_JSON: &[(&str, &str)] = &[("entry", SCRIPT_JSON)];
 const SOURCES_SNAPSHOT: &[(&str, &str)] = &[("entry", SCRIPT_SNAPSHOT)];
+const SOURCES_STATE_OPS: &[(&str, &str)] = &[("entry", SCRIPT_STATE_OPS)];
+const SOURCES_UI_TREE: &[(&str, &str)] = &[("entry", SCRIPT_UI_TREE)];
+const SOURCES_CALLBACK: &[(&str, &str)] = &[("entry", SCRIPT_CALLBACK)];
+const SOURCES_SERVICE_UPDATE: &[(&str, &str)] =
+    &[("entry", SCRIPT_SERVICE_UPDATE)];
 
 #[derive(Debug)]
 struct Options {
@@ -118,9 +179,41 @@ impl Options {
 }
 
 #[derive(Debug, Serialize)]
+struct Pair {
+    workload: &'static str,
+    rust: Summary,
+    luau: Summary,
+    speedup_median: f64,
+    speedup_p95: f64,
+    speedup_p99: f64,
+}
+
+impl Pair {
+    fn new(workload: &'static str, rust: Summary, luau: Summary) -> Self {
+        Self {
+            workload,
+            speedup_median: ratio(rust.median_us, luau.median_us),
+            speedup_p95: ratio(rust.p95_us, luau.p95_us),
+            speedup_p99: ratio(rust.p99_us, luau.p99_us),
+            rust,
+            luau,
+        }
+    }
+}
+
+fn ratio(rust_us: f64, luau_us: f64) -> f64 {
+    if rust_us > 0.0 {
+        luau_us / rust_us
+    } else {
+        0.0
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct Report {
     metadata: Metadata,
     results: Vec<Summary>,
+    pairs: Vec<Pair>,
 }
 
 fn main() -> ExitCode {
@@ -205,16 +298,26 @@ fn run() -> Result<()> {
         },
     )?);
 
-    let json_dir = scratch.path().join("json");
-    results.push(measure(
-        options.phase("json_roundtrip_luau", false),
-        || {
-            let ctx = context(("entry", "update"), &json_dir, payload("{}"));
-            let ops = noctalia_rs_luau::dispatch(&ctx, SOURCES_JSON)?;
+    let mut pairs = Vec::new();
+
+    let json_ctx = context(
+        ("entry", "update"),
+        &scratch.path().join("pair-json"),
+        payload("{}"),
+    );
+    let json_luau =
+        measure(options.phase("json_roundtrip_luau", false), || {
+            let ops = noctalia_rs_luau::dispatch(&json_ctx, SOURCES_JSON)?;
             std::hint::black_box(ops);
             Ok(())
-        },
-    )?);
+        })?;
+    results.push(json_luau);
+    let json_rust =
+        measure(options.phase("json_roundtrip_rust", false), || {
+            json_roundtrip_rust()
+        })?;
+    results.push(json_rust);
+    pairs.push(Pair::new("json_roundtrip", json_rust, json_luau));
 
     let bridge_source = bridge_snapshot_source();
     let bridge_sources = [("entry", bridge_source.as_str())];
@@ -242,34 +345,131 @@ fn run() -> Result<()> {
         Ok(())
     })?);
 
-    let snapshot_dir = scratch.path().join("snapshot-rust");
-    results.push(measure(
-        options.phase("snapshot_reads_rust", false),
-        || {
-            let ctx =
-                context(("entry", "update"), &snapshot_dir, payload("{}"));
-            std::hint::black_box(ctx.config_str("name"));
-            std::hint::black_box(ctx.config_bool("count", false));
-            std::hint::black_box(ctx.state.get("label"));
-            std::hint::black_box(ctx.host("stats.cpu"));
-            std::hint::black_box(ctx.setting("shell.font"));
-            std::hint::black_box(ctx.color("primary"));
-            std::hint::black_box(ctx.now_ms);
-            Ok(())
-        },
-    )?);
-
-    let snapshot_luau_dir = scratch.path().join("snapshot-luau");
-    results.push(measure(
-        options.phase("snapshot_reads_luau", false),
-        || {
-            let ctx =
-                context(("entry", "update"), &snapshot_luau_dir, payload("{}"));
-            let ops = noctalia_rs_luau::dispatch(&ctx, SOURCES_SNAPSHOT)?;
+    let snapshot_rust_ctx = context(
+        ("entry", "update"),
+        &scratch.path().join("snapshot-rust"),
+        payload("{}"),
+    );
+    let snapshot_rust =
+        measure(options.phase("snapshot_reads_rust", false), || {
+            snapshot_reads_rust(&snapshot_rust_ctx)
+        })?;
+    results.push(snapshot_rust);
+    let snapshot_luau_ctx = context(
+        ("entry", "update"),
+        &scratch.path().join("snapshot-luau"),
+        payload("{}"),
+    );
+    let snapshot_luau =
+        measure(options.phase("snapshot_reads_luau", false), || {
+            let ops = noctalia_rs_luau::dispatch(
+                &snapshot_luau_ctx,
+                SOURCES_SNAPSHOT,
+            )?;
             std::hint::black_box(ops);
             Ok(())
-        },
-    )?);
+        })?;
+    results.push(snapshot_luau);
+    pairs.push(Pair::new("snapshot_reads", snapshot_rust, snapshot_luau));
+
+    let state_ctx = context(
+        ("entry", "update"),
+        &scratch.path().join("pair-state"),
+        payload("{}"),
+    );
+    let state_luau = measure(options.phase("state_ops_luau", false), || {
+        let ops = noctalia_rs_luau::dispatch(&state_ctx, SOURCES_STATE_OPS)?;
+        std::hint::black_box(ops);
+        Ok(())
+    })?;
+    results.push(state_luau);
+    let state_rust = measure(options.phase("state_ops_rust", false), || {
+        let ops = state_ops_rust(&state_ctx)?;
+        std::hint::black_box(ops);
+        Ok(())
+    })?;
+    results.push(state_rust);
+    pairs.push(Pair::new("state_ops", state_rust, state_luau));
+
+    let ui_ctx = context(
+        ("entry", "update"),
+        &scratch.path().join("pair-ui"),
+        payload("{}"),
+    );
+    let ui_luau = measure(options.phase("ui_tree_luau", false), || {
+        let ops = noctalia_rs_luau::dispatch(&ui_ctx, SOURCES_UI_TREE)?;
+        std::hint::black_box(ops);
+        Ok(())
+    })?;
+    results.push(ui_luau);
+    let ui_rust = measure(options.phase("ui_tree_rust", false), || {
+        let ops = ui_tree_rust();
+        std::hint::black_box(ops);
+        Ok(())
+    })?;
+    results.push(ui_rust);
+    pairs.push(Pair::new("ui_tree", ui_rust, ui_luau));
+
+    let callback_ctx = context(
+        ("entry", "update"),
+        &scratch.path().join("pair-callback"),
+        json!({ "args": [3, 4] }),
+    );
+    let callback_luau =
+        measure(options.phase("callback_dispatch_luau", false), || {
+            let ops =
+                noctalia_rs_luau::dispatch(&callback_ctx, SOURCES_CALLBACK)?;
+            std::hint::black_box(ops);
+            Ok(())
+        })?;
+    results.push(callback_luau);
+    let callback_rust =
+        measure(options.phase("callback_dispatch_rust", false), || {
+            let ops = callback_dispatch_rust(&callback_ctx)?;
+            std::hint::black_box(ops);
+            Ok(())
+        })?;
+    results.push(callback_rust);
+    pairs.push(Pair::new("callback_dispatch", callback_rust, callback_luau));
+
+    let service_ctx = context(
+        ("entry", "update"),
+        &scratch.path().join("pair-service"),
+        json!({
+            "args": [
+                "bench",
+                5,
+                [
+                    { "name": "cpu", "value": 12 },
+                    { "name": "mem", "value": 64 },
+                    { "name": "disk", "value": 3 },
+                    { "name": "net", "value": 8 },
+                    { "name": "gpu", "value": 21 },
+                    { "name": "temp", "value": 7 },
+                    { "name": "load", "value": 15 },
+                    { "name": "io", "value": 2 }
+                ]
+            ]
+        }),
+    );
+    let service_luau =
+        measure(options.phase("service_update_luau", false), || {
+            let ops = noctalia_rs_luau::dispatch(
+                &service_ctx,
+                SOURCES_SERVICE_UPDATE,
+            )?;
+            std::hint::black_box(ops);
+            Ok(())
+        })?;
+    results.push(service_luau);
+    let service_rust =
+        measure(options.phase("service_update_rust", false), || {
+            let ops = service_update_rust(&service_ctx)?;
+            std::hint::black_box(ops);
+            Ok(())
+        })?;
+    results.push(service_rust);
+    pairs.push(Pair::new("service_update", service_rust, service_luau));
 
     let mut fixture = Fixture::new(&workspace, scratch.path())?;
     results.push(measure(options.phase("codegen_generate", true), || {
@@ -281,7 +481,11 @@ fn run() -> Result<()> {
         || fixture.rebuild(),
     )?);
 
-    let report = Report { metadata, results };
+    let report = Report {
+        metadata,
+        results,
+        pairs,
+    };
     print_report(&report);
     if let Some(path) = &options.report {
         fs::write(path, serde_json::to_string_pretty(&report)?)?;
@@ -322,6 +526,112 @@ fn context(
         },
         json!({ "greet": { "label": "Hello {name}" } }),
     )
+}
+fn json_roundtrip_rust() -> Result<()> {
+    let value = json!({
+        "id": 42, "name": "bench", "ok": true,
+        "rows": [1, 2, 3, 4, 5, 6, 7, 8]
+    });
+    let text = serde_json::to_string(&value)?;
+    let decoded: Value = serde_json::from_str(&text)?;
+    assert_eq!(decoded["id"], 42);
+    assert_eq!(decoded["name"], "bench");
+    assert_eq!(decoded["ok"], true);
+    assert_eq!(decoded["rows"][7], 8);
+    std::hint::black_box(decoded);
+    Ok(())
+}
+
+fn snapshot_reads_rust(ctx: &Context) -> Result<()> {
+    assert_eq!(ctx.config_str("name").as_deref(), Some("bench"));
+    assert_eq!(ctx.config_str("count").as_deref(), Some("3"));
+    assert_eq!(ctx.state_value::<String>("label")?, "ready");
+    assert_eq!(
+        ctx.setting("shell.font").and_then(Value::as_str),
+        Some("sans")
+    );
+    assert_eq!(ctx.color("primary").and_then(Value::as_str), Some("#fff"));
+    assert_eq!(ctx.host("stats.cpu").and_then(Value::as_i64), Some(12));
+    assert_eq!(ctx.now_ms, 1_700_000_000);
+    Ok(())
+}
+
+fn state_ops_rust(ctx: &Context) -> Result<Vec<Op>> {
+    assert_eq!(ctx.state_value::<String>("label")?, "ready");
+    let timers = ctx.state_value::<Vec<i64>>("timers")?;
+    assert_eq!(timers.get(2), Some(&3));
+    assert!(ctx.state.get("missing").is_none());
+
+    let ops = vec![
+        Op::state("bench.a", json!({ "value": 1 })),
+        Op::state("bench.b", json!({ "value": 2 })),
+        Op::state("bench.c", json!({ "value": 3 })),
+        Op::state("bench.d", json!({ "value": 4 })),
+        Op::state_watch("bench.a", "bench.callback"),
+    ];
+    std::hint::black_box(&ops);
+    Ok(ops)
+}
+
+fn ui_tree_rust() -> Vec<Op> {
+    let tree = ui::column(
+        json!({ "id": "root", "gap": 4 }),
+        vec![
+            ui::row(
+                json!({ "id": "header" }),
+                vec![
+                    ui::label(json!({ "id": "title", "text": "Status" })),
+                    ui::label(json!({ "id": "value", "text": "ready" })),
+                ],
+            ),
+            ui::scroll(
+                json!({ "id": "list", "height": 200 }),
+                vec![
+                    ui::button(json!({ "id": "save", "label": "Save" })),
+                    ui::input(
+                        json!({ "id": "filter", "placeholder": "Filter" }),
+                    ),
+                    ui::progress(json!({ "id": "progress", "value": 0.75 })),
+                ],
+            ),
+        ],
+    );
+    vec![Op::PanelRender { tree }]
+}
+
+fn callback_dispatch_rust(ctx: &Context) -> Result<Vec<Op>> {
+    let base = ctx.payload_arg(0).and_then(Value::as_i64).unwrap_or(0);
+    let count = ctx.payload_arg(1).and_then(Value::as_i64).unwrap_or(0);
+    let mut total = 0;
+    for index in 1..=count {
+        total += base * index;
+    }
+    Ok(vec![
+        Op::state("callback.total", json!(total)),
+        Op::log(total.to_string()),
+    ])
+}
+
+fn service_update_rust(ctx: &Context) -> Result<Vec<Op>> {
+    let prefix = ctx.payload_arg(0).and_then(Value::as_str).unwrap_or("");
+    let threshold = ctx.payload_arg(1).and_then(Value::as_i64).unwrap_or(0);
+    let rows = ctx.payload_arg(2).ok_or("service update has no rows")?;
+    let mut total = 0;
+    let mut active = 0;
+    for row in rows.as_array().ok_or("service rows are not an array")? {
+        let value = row.get("value").and_then(Value::as_i64).unwrap_or(0);
+        total += value;
+        if value >= threshold {
+            active += 1;
+        }
+    }
+    let name = ctx.config_str("name").unwrap_or_default();
+    let status = format!("{prefix}:{name}:{total}:{active}");
+    Ok(vec![
+        Op::state("service.status", json!(status)),
+        Op::log(status.clone()),
+        Op::BarText { text: status },
+    ])
 }
 
 fn bridge_snapshot_source() -> String {
@@ -648,6 +958,40 @@ fn print_report(report: &Report) {
             item.p99_us,
             item.min_us,
             item.max_us
+        );
+    }
+    println!();
+    println!(
+        "Matched Rust vs Luau workloads (speedup = Luau median / Rust median)"
+    );
+    println!(
+        "{:<20} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>7}",
+        "workload",
+        "rust_med",
+        "rust_p95",
+        "rust_p99",
+        "luau_med",
+        "luau_p95",
+        "luau_p99",
+        "speedup",
+        "3x"
+    );
+    for pair in &report.pairs {
+        println!(
+            "{:<20} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>9.2} {:>7}",
+            pair.workload,
+            pair.rust.median_us,
+            pair.rust.p95_us,
+            pair.rust.p99_us,
+            pair.luau.median_us,
+            pair.luau.p95_us,
+            pair.luau.p99_us,
+            pair.speedup_median,
+            if pair.speedup_median >= 3.0 {
+                "yes"
+            } else {
+                "no"
+            }
         );
     }
 }

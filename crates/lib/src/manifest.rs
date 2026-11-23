@@ -278,6 +278,12 @@ impl Default for MetaBuilder<NeedId> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExclusiveZone {
+    Value(i32),
+    Auto,
+}
+
 #[derive(Clone, Debug)]
 pub struct LayerConfig {
     pub layer: String,
@@ -286,7 +292,7 @@ pub struct LayerConfig {
     pub keyboard: String,
     pub output: String,
     pub click_through: Option<bool>,
-    pub exclusive_zone: Option<i32>,
+    pub exclusive_zone: Option<ExclusiveZone>,
     pub margins: BTreeMap<String, i32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -362,7 +368,14 @@ impl LayerConfig {
     #[inline]
     #[must_use]
     pub const fn exclusive_zone(mut self, value: i32) -> Self {
-        self.exclusive_zone = Some(value);
+        self.exclusive_zone = Some(ExclusiveZone::Value(value));
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn exclusive_zone_auto(mut self) -> Self {
+        self.exclusive_zone = Some(ExclusiveZone::Auto);
         self
     }
 
@@ -637,6 +650,7 @@ pub struct SettingExtras {
     pub visible_when: Option<(Text, Vec<String>)>,
     pub step: Option<f64>,
     pub advanced: Option<bool>,
+    pub secret: Option<bool>,
 }
 
 static DEFAULT_SETTING_EXTRAS: LazyLock<SettingExtras> =
@@ -834,6 +848,13 @@ impl Setting {
     #[must_use]
     pub fn advanced(mut self, value: bool) -> Self {
         self.advanced = Some(value);
+        self
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn secret(mut self, value: bool) -> Self {
+        self.secret = Some(value);
         self
     }
 

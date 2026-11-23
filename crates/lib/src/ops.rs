@@ -1,7 +1,7 @@
+use crate::bytes::ByteBuf;
 use crate::ui::{UiNode, callback};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
-
 #[derive(Clone, Copy, Debug)]
 pub struct SharedStr(&'static str);
 
@@ -34,6 +34,11 @@ pub fn parse_json_static(json: &'static str) -> Value {
     serde_json::from_str(json).unwrap_or_default()
 }
 
+#[inline]
+fn bytes_value(bytes: ByteBuf) -> Value {
+    serde_json::to_value(bytes).unwrap_or(Value::Null)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -47,10 +52,14 @@ pub enum Op {
     Notify {
         title: String,
         body: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        options: Option<Value>,
     },
     NotifyError {
         title: String,
         body: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        options: Option<Value>,
     },
     SetInterval {
         ms: u64,
@@ -120,6 +129,13 @@ pub enum Op {
         path: Vec<String>,
         args: Vec<Value>,
     },
+    Query {
+        id: String,
+        root: String,
+        path: Vec<String>,
+        args: Vec<Value>,
+        response: String,
+    },
 }
 
 impl Op {
@@ -171,6 +187,28 @@ impl Op {
     }
 
     #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one op carries the full query envelope"
+    )]
+    #[must_use]
+    pub fn query(
+        id: &str,
+        root: &str,
+        path: &[&str],
+        args: Vec<Value>,
+        response: String,
+    ) -> Self {
+        Self::Query {
+            id: id.to_owned(),
+            root: root.to_owned(),
+            path: path.iter().map(|item| (*item).to_owned()).collect(),
+            args,
+            response,
+        }
+    }
+
+    #[inline]
     #[must_use]
     pub fn http(request: Value, callback_id: Option<&str>) -> Self {
         let args = match callback_id {
@@ -182,11 +220,74 @@ impl Op {
 
     #[inline]
     #[must_use]
+    pub fn http_bytes(
+        request: Value,
+        bytes: ByteBuf,
+        callback_id: Option<&str>,
+    ) -> Self {
+        let mut request = request;
+        if let Some(object) = request.as_object_mut() {
+            object.insert("body".to_owned(), bytes_value(bytes));
+        }
+        Self::http(request, callback_id)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn copy_bytes(bytes: ByteBuf, mime_type: &str) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["copyToClipboard"],
+            vec![bytes_value(bytes), Value::String(mime_type.to_owned())],
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn write_file_bytes(path: &str, bytes: ByteBuf) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["writeFile"],
+            vec![Value::String(path.to_owned()), bytes_value(bytes)],
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn load_font(path: &str) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["loadFont"],
+            vec![Value::String(path.to_owned())],
+        )
+    }
+
+    #[inline]
+    #[must_use]
     pub fn run(command: Value, callback_id: Option<&str>) -> Self {
         let args = match callback_id {
             Some(id) => vec![command, callback(id)],
             None => vec![command],
         };
+        Self::host_call("noctalia", &["runAsync"], args)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn run_with_timeout(
+        command: Value,
+        callback_id: Option<&str>,
+        timeout_ms: Option<f64>,
+    ) -> Self {
+        let mut args = match callback_id {
+            Some(id) => vec![command, callback(id)],
+            None => vec![command, Value::Null],
+        };
+        args.push(
+            timeout_ms
+                .and_then(serde_json::Number::from_f64)
+                .map_or(Value::Null, Value::Number),
+        );
         Self::host_call("noctalia", &["runAsync"], args)
     }
     #[inline]
@@ -215,6 +316,21 @@ impl Op {
         Self::Notify {
             title: title.to_owned(),
             body: body.to_owned(),
+            options: None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn notify_with_options(
+        title: &str,
+        body: &str,
+        options: Option<Value>,
+    ) -> Self {
+        Self::Notify {
+            title: title.to_owned(),
+            body: body.to_owned(),
+            options,
         }
     }
 
@@ -224,6 +340,21 @@ impl Op {
         Self::NotifyError {
             title: title.to_owned(),
             body: body.to_owned(),
+            options: None,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn notify_error_with_options(
+        title: &str,
+        body: &str,
+        options: Option<Value>,
+    ) -> Self {
+        Self::NotifyError {
+            title: title.to_owned(),
+            body: body.to_owned(),
+            options,
         }
     }
 
@@ -240,6 +371,19 @@ impl Op {
             "noctalia",
             &["copyToClipboard"],
             vec![Value::String(text.to_owned())],
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn copy_with_mime(text: &str, mime_type: &str) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["copyToClipboard"],
+            vec![
+                Value::String(text.to_owned()),
+                Value::String(mime_type.to_owned()),
+            ],
         )
     }
 
@@ -273,6 +417,39 @@ impl Op {
             "noctalia",
             &["setWallpaper"],
             vec![Value::String(path.to_owned())],
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn set_wallpaper_on(connector: &str, path: &str) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["setWallpaper"],
+            vec![
+                Value::String(connector.to_owned()),
+                Value::String(path.to_owned()),
+            ],
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn reveal_path(path: &str) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["revealPath"],
+            vec![Value::String(path.to_owned())],
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn run_in_terminal(command: &str) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["runInTerminal"],
+            vec![Value::String(command.to_owned())],
         )
     }
 }

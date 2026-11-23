@@ -9,7 +9,7 @@ pub struct Phase {
     pub warmup: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct Summary {
     pub surface: &'static str,
     pub samples: usize,

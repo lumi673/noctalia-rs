@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -110,7 +111,14 @@ impl<W: Write> Serve<'_, W> {
             host: request.host,
             data_dir: self.data_dir.to_path_buf(),
         };
-        let context = Context::new(parts, self.translations.clone());
+        let mut context = Context::new(parts, self.translations.clone());
+        let stdout = io::stdout();
+        context.set_op_sink(Arc::new(move |op| {
+            let text = serde_json::to_string(op).unwrap_or_default();
+            let mut handle = stdout.lock();
+            let _ = writeln!(handle, "{text}");
+            let _ = handle.flush();
+        }));
         for op in self.plugin.dispatch(&context)? {
             self.emit_op(&op)?;
         }
@@ -199,7 +207,7 @@ fn serve(plugin: &Plugin, data_dir: &Path, spool_dir: &Path) -> Result<()> {
     fs::create_dir_all(data_dir)?;
     fs::create_dir_all(spool_dir)?;
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = stdout;
     let boot = boot_id();
     let run_dir = spool_dir.join(&boot);
     fs::create_dir_all(&run_dir)?;

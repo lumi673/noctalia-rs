@@ -607,6 +607,9 @@ fn setting_expression(
         let _ =
             write!(expression, ".advanced({})", bool_value(value, "advanced")?);
     }
+    if let Some(value) = item.get("secret") {
+        let _ = write!(expression, ".secret({})", bool_value(value, "secret")?);
+    }
     Ok(expression)
 }
 
@@ -849,11 +852,20 @@ fn layer_config(row: &toml::Table) -> Result<String, BoxError> {
         }
     }
     if let Some(value) = row.get("exclusive_zone") {
-        let _ = write!(
-            chain,
-            ".exclusive_zone({})",
-            integer(value, "exclusive_zone")?
-        );
+        if let Some(text) = value.as_str() {
+            if text != "auto" {
+                return Err(
+                    "exclusive_zone must be \"auto\" or an integer".into()
+                );
+            }
+            let _ = write!(chain, ".exclusive_zone_auto()");
+        } else {
+            let _ = write!(
+                chain,
+                ".exclusive_zone({})",
+                integer(value, "exclusive_zone")?
+            );
+        }
     }
     if let Some(value) = row.get("margins") {
         let map = table(value, "margins")?;

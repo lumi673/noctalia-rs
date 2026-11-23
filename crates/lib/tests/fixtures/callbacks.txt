@@ -1,0 +1,21 @@
+# Official global callbacks from the plugin API docs (event, function, arity).
+update update 0
+ipc onIpc 2
+click onClick 0
+right_click onRightClick 0
+middle_click onMiddleClick 0
+hover onHover 1
+scroll onScroll 3
+query onQuery 1
+activate onActivate 1
+frame onFrameTick 1
+audio_spectrum onAudioSpectrum 2
+open onOpen 1
+close onClose 0
+key onKey 3
+config_changed onConfigChanged 0
+enable onEnable 0
+outputs_changed onOutputsChanged 0
+exit onExit 2
+suspend onSuspend 0
+resume onResume 0

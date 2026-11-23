@@ -5,8 +5,8 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::bridge::SOURCE;
 use crate::manifest::{
-    Entry, EntryConfig, EntryKind, LayerConfig, NumberConfig, Plugin, Setting,
-    SettingKind,
+    Entry, EntryConfig, EntryKind, ExclusiveZone, LayerConfig, NumberConfig,
+    Plugin, Setting, SettingKind,
 };
 
 fn config(entry: &Entry) -> EntryConfig {
@@ -297,8 +297,12 @@ fn write_entry_config(out: &mut String, entry: &Entry) {
         if let Some(value) = layer.click_through {
             let _ = writeln!(out, "click_through = {value}");
         }
-        if let Some(value) = layer.exclusive_zone {
-            let _ = writeln!(out, "exclusive_zone = {value}");
+        if let Some(zone) = &layer.exclusive_zone {
+            let text = match zone {
+                ExclusiveZone::Value(number) => number.to_string(),
+                ExclusiveZone::Auto => "\"auto\"".to_owned(),
+            };
+            let _ = writeln!(out, "exclusive_zone = {text}");
         }
         if !layer.margins.is_empty() {
             let pairs = layer
@@ -358,6 +362,9 @@ fn write_setting(out: &mut String, setting: &Setting, table: &str) {
     }
     if let Some(value) = setting.advanced {
         let _ = writeln!(out, "advanced = {value}");
+    }
+    if let Some(value) = setting.secret {
+        let _ = writeln!(out, "secret = {value}");
     }
     if let Some((key, values)) = &setting.visible_when {
         let _ = writeln!(
@@ -504,8 +511,8 @@ pub const CALLBACKS: &[Callback] = &[
     Callback {
         event: "key",
         function: "onKey",
-        params: "key, pressed",
-        payload: "{ key = key, pressed = pressed }",
+        params: "chord, pressed, repeated",
+        payload: "{ chord = chord, pressed = pressed, repeated = repeated }",
     },
     Callback {
         event: "ipc",
@@ -516,8 +523,8 @@ pub const CALLBACKS: &[Callback] = &[
     Callback {
         event: "config_changed",
         function: "onConfigChanged",
-        params: "key, value",
-        payload: "{ key = key, value = value }",
+        params: "",
+        payload: "",
     },
     Callback {
         event: "outputs_changed",
@@ -544,6 +551,12 @@ pub const CALLBACKS: &[Callback] = &[
         payload: "{ signal = signal, reason = reason }",
     },
     Callback {
+        event: "audio_spectrum",
+        function: "onAudioSpectrum",
+        params: "valuesCsv, stateCsv",
+        payload: "{ values_csv = valuesCsv, state_csv = stateCsv }",
+    },
+    Callback {
         event: "suspend",
         function: "onSuspend",
         params: "",
@@ -564,8 +577,8 @@ pub const CALLBACKS: &[Callback] = &[
     Callback {
         event: "open",
         function: "onOpen",
-        params: "",
-        payload: "",
+        params: "context",
+        payload: "{ context = context }",
     },
     Callback {
         event: "close",
@@ -693,37 +706,40 @@ fn entry_script(
         | EntryKind::Panel { .. }
         | EntryKind::Layer { .. } => "render",
     };
-    let _ =
-        writeln!(out, "function update() bridge.call(\"{update_event}\") end");
+    let _ = writeln!(
+        out,
+        "function update() bridge.call(\"{update_event}\", {{ source = \"update\" }}) end"
+    );
 
     match &entry.kind {
         EntryKind::Service => {
-            out.push_str("bridge.call(\"init\")\n");
+            out.push_str("bridge.call(\"load\", { source = \"load\" })\n");
         }
         EntryKind::Shortcut => {
+            out.push_str("bridge.call(\"load\", { source = \"load\" })\n");
             out.push_str(
-                "bridge.watch_state(function() bridge.call(\"render\") end)\n",
+                "bridge.watch_state(function() bridge.call(\"render\", { source = \"state\" }) end)\n",
             );
         }
         EntryKind::LauncherProvider { .. } => {
             out.push_str(
-                "bridge.watch_state(function() bridge.rerender_query() end)\n",
+                "bridge.watch_state(function() bridge.rerender_query(\"state\") end)\n",
             );
         }
         EntryKind::Widget
         | EntryKind::DesktopWidget
         | EntryKind::Layer { .. } => {
             out.push_str(
-                "bridge.watch_state(function() bridge.call(\"render\") end)\n",
+                "bridge.watch_state(function() bridge.call(\"render\", { source = \"state\" }) end)\n",
             );
-            out.push_str("bridge.call(\"render\")\n");
+            out.push_str("bridge.call(\"render\", { source = \"load\" })\n");
         }
         EntryKind::Panel { .. } => {
             out.push_str(
-                "bridge.watch_state(function() bridge.call(\"render\") end)\n",
+                "bridge.watch_state(function() bridge.call(\"render\", { source = \"state\" }) end)\n",
             );
             out.push_str("panel.setWantsSecondTicks(true)\n");
-            out.push_str("bridge.call(\"render\")\n");
+            out.push_str("bridge.call(\"render\", { source = \"load\" })\n");
         }
     }
 
@@ -841,7 +857,9 @@ mod tests {
         let script = entry_script(&plugin.entries[0], &[], "widget");
 
         assert!(script.contains("onFrameTick"));
-        assert!(script.contains("bridge.call(\"render\")"));
+        assert!(
+            script.contains("bridge.call(\"render\", { source = \"load\" })")
+        );
     }
     #[test]
     fn test_manifest_includes_dependencies_and_deprecated() {
@@ -946,12 +964,14 @@ mod tests {
             .service("service", handler);
 
         assert!(
-            entry_script(&widget.entries[0], &[], "widget")
-                .contains("function update() bridge.call(\"render\") end")
+            entry_script(&widget.entries[0], &[], "widget").contains(
+                "function update() bridge.call(\"render\", { source = \"update\" }) end"
+            )
         );
         assert!(
-            entry_script(&service.entries[0], &[], "service")
-                .contains("function update() bridge.call(\"update\") end")
+            entry_script(&service.entries[0], &[], "service").contains(
+                "function update() bridge.call(\"update\", { source = \"update\" }) end"
+            )
         );
     }
 

@@ -23,12 +23,55 @@ local ROOTS = {
 
 local COLOR_ROLES = {
   "primary",
+  "on_primary",
+  "primary_container",
+  "on_primary_container",
   "secondary",
+  "on_secondary",
+  "secondary_container",
+  "on_secondary_container",
   "tertiary",
+  "on_tertiary",
+  "tertiary_container",
+  "on_tertiary_container",
   "error",
+  "on_error",
+  "error_container",
+  "on_error_container",
+  "surface",
   "on_surface",
   "on_surface_variant",
+  "surface_container_low",
+  "surface_container",
+  "surface_container_high",
+  "surface_container_highest",
   "outline_variant",
+  "shadow",
+  "scrim",
+  "hover",
+  "on_hover",
+  "surface_variant",
+  "outline",
+}
+
+local SETTING_PATHS = {
+  "shell.time_format",
+  "shell.date_format",
+  "shell.offline_mode",
+  "shell.lang",
+  "shell.language",
+  "shell.corner_radius_scale",
+  "shell.show_close_buttons",
+  "general.language",
+  "bar",
+  "bar.order",
+  "widget",
+  "desktop_widgets",
+  "desktop_widgets.widget",
+  "theme.source",
+  "theme.pure_black_dark",
+  "theme.wallpaper_scheme",
+  "system.monitor.network_poll_seconds",
 }
 
 M.entry = "unknown"
@@ -44,6 +87,37 @@ local boot = nil
 local sequence = 0
 local pending = {}
 local stream_started = false
+local handles = {}
+local function hexDecode(text)
+  return (string.gsub(text or "", "%x%x", function(pair)
+    return string.char(tonumber(pair, 16) or 0)
+  end))
+end
+
+local function hexEncode(value)
+  return (string.gsub(value, ".", function(byte)
+    return string.format("%02x", string.byte(byte))
+  end))
+end
+
+local function isBinary(value)
+  if type(value) ~= "string" then return false end
+  local ok, length = pcall(utf8.len, value)
+  return not ok or length == nil
+end
+
+local function encodeBytes(value)
+  if isBinary(value) then
+    return { __noctalia_rs_bytes = hexEncode(value) }
+  end
+  if type(value) ~= "table" then return value end
+  local out = {}
+  for key, item in pairs(value) do
+    out[key] = encodeBytes(item)
+  end
+  return out
+end
+
 
 local function materialize(value)
   if type(value) ~= "table" then
@@ -60,6 +134,9 @@ local function materialize(value)
     return function(...)
       M.call("host_callback", { id = name, args = { ... } })
     end
+  end
+  if type(value.__noctalia_rs_bytes) == "string" then
+    return hexDecode(value.__noctalia_rs_bytes)
   end
   local out = {}
   for key, item in pairs(value) do
@@ -109,18 +186,25 @@ local function snapshot()
     now_ms = invoke(noctalia, "nowMs") or 0,
     dark = invoke(noctalia, "isDarkMode"),
     outputs = invoke(noctalia, "outputs"),
+    focused_output_name = invoke(noctalia, "focusedOutputName"),
+    pluginDir = invoke(noctalia, "pluginDir"),
+    pluginDataDir = invoke(noctalia, "pluginDataDir"),
     clipboard = invoke(noctalia, "clipboardText"),
     calendar = invoke(noctalia, "calendarEvents"),
     media = invoke(noctalia, "mediaPlayer"),
     stats = invoke(noctalia, "systemStats"),
     nightlight = invoke(noctalia, "nightlight.state"),
-    compositor = invoke(noctalia, "compositor.name"),
+    compositor = { name = invoke(noctalia, "compositor.name") },
+    setting = {},
     bar = {
       vertical = invoke(barWidget, "isVertical"),
       output_name = invoke(barWidget, "outputName"),
     },
     colors = {},
   }
+  for _, path in ipairs(SETTING_PATHS) do
+    host.setting[path] = invoke(noctalia, "getSetting", path)
+  end
   for _, role in ipairs(COLOR_ROLES) do
     host.colors[role] = invoke(noctalia, "getColor", role)
   end
@@ -140,11 +224,23 @@ local function resolve(root, path)
   end
   return value
 end
+local function call_host(root, path, args)
+  local target = resolve(root, path)
+  if type(target) ~= "function" then
+    return false, "unknown host call: " .. tostring(root) .. "." .. table.concat(path or {}, ".")
+  end
+  local values = {}
+  for index, value in ipairs(args or {}) do
+    values[index] = materialize(value)
+  end
+  return pcall(target, table.unpack(values))
+end
+
 
 local handlers = {
   log = function(op) noctalia.log(op.message) end,
-  notify = function(op) noctalia.notify(op.title, op.body) end,
-  notify_error = function(op) noctalia.notifyError(op.title, op.body) end,
+  notify = function(op) noctalia.notify(op.title, op.body, op.options) end,
+  notify_error = function(op) noctalia.notifyError(op.title, op.body, op.options) end,
   set_interval = function(op) noctalia.setUpdateInterval(op.ms) end,
   state_set = function(op) noctalia.state.set(op.key, op.value) end,
   toggle_panel = function(op) noctalia.togglePanel(op.id) end,
@@ -164,22 +260,41 @@ local handlers = {
   launcher_results = function(op) launcher.setResults(op.text, op.rows) end,
   layer_show = function(op) noctalia.layer.show(op.id) end,
   layer_hide = function(op) noctalia.layer.hide(op.id) end,
-  layer_render = function(op) noctalia.layer.render(render_node(op.tree)) end,
+  layer_render = function(op) layer.render(render_node(op.tree)) end,
   layer_configure = function(op) noctalia.layer.configure(op.id, op.props) end,
   remove_file = function(op) noctalia.removeFile(op.path) end,
   host_call = function(op)
-    local target = resolve(op.root, op.path)
-    if type(target) ~= "function" then
-      noctalia.log("unknown host call: " .. tostring(op.root))
+    if op.root == "__noctalia_rs" and op.path[1] == "httpStreamStop" then
+      local handle = handles[op.args[1]]
+      if handle then
+        handles[op.args[1]] = nil
+        handle.stop()
+      end
       return
     end
-    local args = {}
-    for index, value in ipairs(op.args) do
-      args[index] = materialize(value)
-    end
-    local ok, err = pcall(target, table.unpack(args))
+    local ok, err = call_host(op.root, op.path, op.args)
     if not ok then
       noctalia.log(tostring(err))
+    end
+  end,
+  query = function(op)
+    local ok, value, err = call_host(op.root, op.path, op.args)
+    local response = { ok = ok, value = value, error = err }
+    if op.root == "noctalia" and op.path[1] == "httpStream" and ok then
+      handles[op.id] = value
+      response.value = op.id
+      response.error = nil
+    end
+    if not ok then
+      response.value = tostring(value)
+      response.error = tostring(value)
+    end
+    local encoded = noctalia.json.encode(encodeBytes(response))
+    if encoded then
+      local written, write_err = noctalia.writeFile(op.response, encoded)
+      if not written then
+        noctalia.log("noctalia bridge: query response failed: " .. tostring(write_err))
+      end
     end
   end,
 }
@@ -195,7 +310,7 @@ local function writeRequest(request)
   local target = REQUEST_DIR .. "/" .. name .. ".json"
   M.host = snapshot()
   request.host = M.host
-  local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(request))
+  local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(encodeBytes(request)))
   if ok then
     ok, err = noctalia.renameFile(temporary, target)
   end
@@ -303,9 +418,9 @@ function M.query(text)
   M.call("query", { text = text })
 end
 
-function M.rerender_query()
+function M.rerender_query(source)
   if M.last_query ~= nil then
-    M.call("query", { text = M.last_query })
+    M.call("query", { text = M.last_query, source = source or "state" })
   end
 end
 

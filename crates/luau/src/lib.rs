@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use mlua::{Function, Lua, MultiValue, Value as LuaValue};
 use noctalia_rs::{Context, Op, Result};
+use serde_json::Value as Json;
 
 use crate::callback::{callback_args, callback_for_event};
 use crate::host::Host;
@@ -55,6 +56,9 @@ impl Runtime {
     fn dispatch(&self, ctx: &Context) -> Result<Vec<Op>> {
         self.host.update(ctx);
         let _ = self.host.collector.take_ops();
+        if ctx.event == "host_callback" {
+            return self.dispatch_host_callback(ctx);
+        }
 
         if let Some(callback) = callback_for_event(&ctx.event)
             && let Ok(function) = self.lua.globals().get::<Function>(callback)
@@ -75,6 +79,35 @@ impl Runtime {
             }
         }
 
+        Ok(self.host.collector.take_ops())
+    }
+
+    fn dispatch_host_callback(&self, ctx: &Context) -> Result<Vec<Op>> {
+        let Some(id) = ctx.payload.get("id").and_then(Json::as_str) else {
+            return Ok(self.host.collector.take_ops());
+        };
+        let Some(function) = self.host.collector.function(id) else {
+            return Ok(self.host.collector.take_ops());
+        };
+        let args = ctx
+            .payload
+            .get("args")
+            .and_then(Json::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|value| from_json(&self.lua, value))
+            .collect::<mlua::Result<Vec<_>>>()?;
+        if let Err(error) =
+            function.call::<MultiValue>(MultiValue::from_vec(args))
+        {
+            return Err(format!(
+                "{} host callback {id}: {}",
+                self.entry,
+                traceback(&self.lua, &error)
+            )
+            .into());
+        }
         Ok(self.host.collector.take_ops())
     }
 }

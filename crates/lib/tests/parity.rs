@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use noctalia_rs::{
     Context, Entry, EntryConfig, EntryKind, LauncherCategory, LayerConfig,
-    Meta, Op, Plugin, Setting,
+    Meta, Op, Plugin, Setting, api, codegen,
 };
 use toml::Value;
 
@@ -76,7 +76,11 @@ default = true
 key = "string"
 type = "string"
 label_key = "settings.string.label"
+description_key = "settings.string.description"
 default = "value"
+secret = true
+advanced = true
+visible_when = { key = "bool", values = ["true"] }
 
 [[widget.setting]]
 key = "string_list"
@@ -97,6 +101,7 @@ label_key = "settings.int.label"
 default = 1
 min = 0
 max = 5
+step = 1.0
 
 [[widget.setting]]
 key = "double"
@@ -226,6 +231,11 @@ exclusive_zone = 0
 margins = { top = 12, right = 8 }
 width = 320
 height = 240
+
+[[layer]]
+id = "layer-auto"
+entry = "layer-auto.luau"
+exclusive_zone = "auto"
 "#;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -293,6 +303,7 @@ struct Field<'a> {
 struct ManifestFacts {
     entry_kinds: BTreeSet<String>,
     setting_types: BTreeSet<String>,
+    setting_fields: BTreeSet<String>,
     root_fields: BTreeSet<String>,
     entry_fields: BTreeMap<String, BTreeSet<Shape>>,
 }
@@ -380,6 +391,7 @@ impl ManifestFacts {
         for setting in as_array(value, label)? {
             let setting_label = format!("{label}.setting");
             let table = as_table(setting, &setting_label)?;
+            self.setting_fields.extend(table.keys().cloned());
             let kind = setting_kind(table, &setting_label)?;
             self.setting_types.insert(kind.to_owned());
         }
@@ -565,7 +577,11 @@ fn handler(ctx: &Context) -> noctalia_rs::Result<Vec<Op>> {
 fn settings() -> Vec<Setting> {
     vec![
         Setting::bool("bool", "settings.bool.label", true),
-        Setting::string("string", "settings.string.label", "value"),
+        Setting::string("string", "settings.string.label", "value")
+            .description("settings.string.description")
+            .secret(true)
+            .advanced(true)
+            .visible_when("bool", &["true"]),
         Setting::string_list(
             "string_list",
             "settings.string_list.label",
@@ -576,7 +592,8 @@ fn settings() -> Vec<Setting> {
             "settings.string_map.label",
             &[("a", "b")],
         ),
-        Setting::int("int", "settings.int.label", (1.0, Some(0.0), Some(5.0))),
+        Setting::int("int", "settings.int.label", (1.0, Some(0.0), Some(5.0)))
+            .step(1.0),
         Setting::double(
             "double",
             "settings.double.label",
@@ -698,6 +715,12 @@ fn maximal_plugin() -> Plugin {
             "layer",
             EntryKind::Layer {
                 config: Box::new(layer_config()),
+            },
+        ),
+        (
+            "layer-auto",
+            EntryKind::Layer {
+                config: Box::new(LayerConfig::new().exclusive_zone_auto()),
             },
         ),
     ];
@@ -919,16 +942,51 @@ fn entry_scripts_map_update_to_expected_event() -> StdResult<(), Box<dyn Error>>
     ] {
         let script =
             fs::read_to_string(output.path().join(format!("{id}.luau")))?;
-        let expected =
-            format!("function update() bridge.call(\"{event}\") end");
+        let expected = format!(
+            "function update() bridge.call(\"{event}\", {{ source = \"update\" }}) end"
+        );
         let other = if event == "render" {
             "update"
         } else {
             "render"
         };
-        let wrong = format!("function update() bridge.call(\"{other}\") end");
+        let wrong = format!(
+            "function update() bridge.call(\"{other}\", {{ source = \"update\" }}) end"
+        );
         assert!(script.contains(&expected), "{id}: missing {expected}");
         assert!(!script.contains(&wrong), "{id}: unexpected {wrong}");
+    }
+    Ok(())
+}
+
+#[test]
+fn generated_entries_distinguish_load_update_and_state_events()
+-> StdResult<(), Box<dyn Error>> {
+    let output = TempDir::new()?;
+    maximal_plugin().emit(output.path(), "helper")?;
+
+    for id in ["shortcut", "service"] {
+        let script =
+            fs::read_to_string(output.path().join(format!("{id}.luau")))?;
+        assert!(
+            script.contains("bridge.call(\"load\", { source = \"load\" })"),
+            "{id}: missing load event"
+        );
+    }
+    for id in ["widget", "desktop", "panel", "layer", "shortcut"] {
+        let script =
+            fs::read_to_string(output.path().join(format!("{id}.luau")))?;
+        assert!(
+            script.contains("bridge.call(\"render\", { source = \"state\" })"),
+            "{id}: missing state render source"
+        );
+        if id != "shortcut" {
+            assert!(
+                script
+                    .contains("bridge.call(\"render\", { source = \"load\" })"),
+                "{id}: missing load render source"
+            );
+        }
     }
     Ok(())
 }
@@ -950,5 +1008,232 @@ fn emit_rejects_reserved_asset_paths() -> StdResult<(), Box<dyn Error>> {
             "{path} was accepted"
         );
     }
+    Ok(())
+}
+
+const OFFICIAL_SURFACE: &str = include_str!("fixtures/noctalia.d.luau");
+const API_ADDITIONS: &str = include_str!("fixtures/api-57.txt");
+const OFFICIAL_CALLBACKS: &str = include_str!("fixtures/callbacks.txt");
+const OFFICIAL_MANIFEST: &str = include_str!("fixtures/manifest-fields.txt");
+
+/// Plugins are translated, not redesigned. This rule is part of the parity
+/// contract: the generated Luau/bridge/runtime may get faster, but a Rust
+/// handler must keep the original algorithm, including its complexity.
+const ALGORITHM_RULE: &str =
+    "gains come from the generated Luau, bridge, and runtime";
+
+fn declaration_block(header: &str) -> Option<String> {
+    let source = OFFICIAL_SURFACE;
+    let start = source.lines().position(|line| line.starts_with(header))?;
+    let mut block = String::new();
+    for line in source.lines().skip(start.saturating_add(1)) {
+        if line.starts_with('}') {
+            break;
+        }
+        block.push_str(line);
+        block.push('\n');
+    }
+    Some(block)
+}
+
+fn declared_names(block: &str) -> BTreeSet<String> {
+    block
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if !line.starts_with("  ")
+                || line.starts_with("    ")
+                || trimmed.is_empty()
+                || trimmed.starts_with("--")
+            {
+                return None;
+            }
+            let (name, _) = trimmed.split_once(':')?;
+            if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                Some(name.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn official_members() -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    let namespaces = [
+        ("Noctalia", "noctalia"),
+        ("NoctaliaState", "noctalia.state"),
+        ("NoctaliaJson", "noctalia.json"),
+        ("NoctaliaString", "noctalia.string"),
+        ("NoctaliaSound", "noctalia.sound"),
+        ("NoctaliaIdle", "noctalia.idle"),
+        ("NoctaliaNightLight", "noctalia.nightlight"),
+        ("NoctaliaUmbriel", "noctalia.umbriel"),
+        ("NoctaliaCompositor", "noctalia.compositor"),
+        ("NoctaliaLayer", "noctalia.layer"),
+        ("NoctaliaOsd", "noctalia.osd"),
+        ("ui", "ui"),
+        ("barWidget", "barWidget"),
+        ("shortcut", "shortcut"),
+        ("launcher", "launcher"),
+        ("desktopWidget", "desktopWidget"),
+        ("panel", "panel"),
+        ("layer", "layer"),
+    ];
+    for (declaration, root) in namespaces {
+        let header =
+            if declaration.chars().next().is_some_and(char::is_uppercase) {
+                format!("export type {declaration} = {{")
+            } else {
+                format!("declare {declaration}: {{")
+            };
+        let block = declaration_block(&header).unwrap_or_default();
+        assert!(!block.is_empty(), "missing {header}");
+        for name in declared_names(&block) {
+            paths.insert(format!("{root}.{name}"));
+        }
+    }
+    for line in API_ADDITIONS.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("member")
+            && let (Some(root), Some(name)) = (parts.next(), parts.next())
+        {
+            paths.insert(format!("{root}.{name}"));
+        }
+    }
+    paths
+}
+
+fn official_callbacks() -> Vec<(String, String, usize)> {
+    let mut result = Vec::new();
+    for line in OFFICIAL_CALLBACKS
+        .lines()
+        .chain(API_ADDITIONS.lines())
+        .filter(|line| !line.starts_with('#'))
+    {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        let (Some(event), Some(function), Some(count)) =
+            (parts.first(), parts.get(1), parts.get(2))
+        else {
+            continue;
+        };
+        let Ok(arity) = count.parse() else {
+            continue;
+        };
+        result.push(((*event).to_owned(), (*function).to_owned(), arity));
+    }
+    result
+}
+
+#[test]
+fn official_api_surface_is_registered() {
+    let official = official_members();
+    let registered: BTreeSet<String> = api::members()
+        .map(|member| format!("{}.{}", member.root, member.name))
+        .collect();
+    let missing: Vec<_> = official.difference(&registered).collect();
+    let extra: Vec<_> = registered.difference(&official).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "API parity gaps: missing {missing:?}, unlisted {extra:?}"
+    );
+}
+
+#[test]
+fn official_callbacks_are_generated() -> StdResult<(), Box<dyn Error>> {
+    let output = TempDir::new()?;
+    Plugin::new(Meta::new("me/parity", "Parity", "0.1.0"))
+        .widget("widget", (Vec::new(), handler))
+        .emit(output.path(), "helper")?;
+    let script = fs::read_to_string(output.path().join("widget.luau"))?;
+
+    for (event, function, arity) in official_callbacks() {
+        if function == "update" {
+            assert_eq!(event, "update");
+            assert_eq!(arity, 0);
+            assert!(script.contains("function update()"));
+            continue;
+        }
+        let callback = codegen::CALLBACKS
+            .iter()
+            .find(|callback| callback.function == function)
+            .unwrap_or_else(|| panic!("callback {function} is not generated"));
+        assert_eq!(callback.event, event, "{function} uses the wrong event");
+        let params = if callback.params.is_empty() {
+            0
+        } else {
+            callback.params.split(',').count()
+        };
+        assert_eq!(params, arity, "{function} has the wrong arity");
+        assert!(
+            script.contains(&format!("function {function}(")),
+            "generated entry is missing {function}"
+        );
+    }
+    Ok(())
+}
+
+fn fixture_shape(name: &str) -> StdResult<Shape, Box<dyn Error>> {
+    match name {
+        "array" => Ok(Shape::Array),
+        "boolean" => Ok(Shape::Boolean),
+        "integer" => Ok(Shape::Integer),
+        "string" => Ok(Shape::String),
+        "table" => Ok(Shape::Table),
+        other => Err(error(format!("unknown shape {other}"))),
+    }
+}
+
+#[test]
+fn official_manifest_fields_are_emittable() -> StdResult<(), Box<dyn Error>> {
+    let output = TempDir::new()?;
+    maximal_plugin().emit(output.path(), "helper")?;
+    let text = fs::read_to_string(output.path().join("plugin.toml"))?;
+    let value: Value = toml::from_str(&text)?;
+    let mut generated = ManifestFacts::default();
+    generated.observe(&value, "generated plugin.toml")?;
+
+    for line in OFFICIAL_MANIFEST
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        match parts.as_slice() {
+            ["root", key] => assert!(
+                generated.root_fields.contains(*key),
+                "root field {key} cannot be emitted"
+            ),
+            ["entry", kind, key, shape] => {
+                let field = format!("{kind}.{key}");
+                let available = generated.entry_fields.get(&field);
+                let wanted = fixture_shape(shape)?;
+                assert!(
+                    available.is_some_and(|shapes| shapes.contains(&wanted)),
+                    "entry field {field} ({shape}) cannot be emitted"
+                );
+            }
+            ["setting", key] => assert!(
+                generated.setting_fields.contains(*key),
+                "setting field {key} cannot be emitted"
+            ),
+            _ => {
+                return Err(error(format!(
+                    "invalid manifest fixture line {line}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn algorithm_preservation_is_documented() -> StdResult<(), Box<dyn Error>> {
+    let readme = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    )?;
+    assert!(
+        readme.contains(ALGORITHM_RULE),
+        "README must state the algorithm preservation rule"
+    );
     Ok(())
 }

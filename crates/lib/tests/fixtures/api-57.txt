@@ -1,0 +1,20 @@
+# Capabilities documented after the checked-in noctalia.d.luau snapshot.
+# Sources: plugin-api, runtime-api, manifest, entries and declarative-ui docs.
+member ui ring
+callback audio_spectrum onAudioSpectrum 2
+key onKey 3
+setting secret
+layer-exclusive-zone auto
+panel-layer follow
+notify-actions actions onAction context
+runtime compositor.subscribe compositor.unsubscribe
+runtime nightlight.watch nightlight.unwatch
+runtime idle.watch idle.unwatch
+runtime openColorPicker download appIconPath wallpaperDirectory wallpaperPath
+runtime fuzzyScore loadFont portalAvailable processMatches flatpakAppInstalled
+runtime diskMounts diskStats cpuCores setGpuMonitoring timeFormat dateFormat
+runtime isValidTimezone readFileAsync sound.load
+runtime httpStream.stop
+runtime file-info isDir mtime
+runtime file-results value err
+runtime revealPath runInTerminal

@@ -1,18 +1,16 @@
-use chrono::Local;
 use mlua::{
     Function, IntoLuaMulti, Lua, MultiValue, Result as LuaResult, Table,
     Value as LuaValue, Variadic,
 };
 use noctalia_rs::Op;
-use serde_json::Value as JsonValue;
-use std::env;
+use serde_json::{Value as JsonValue, json};
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::host::Host;
 use crate::value::{
-    Convert, FunctionRole, as_string, from_json, params, string_arg,
+    Convert, FunctionRole, as_string, from_json, from_json_with_bytes, params,
+    string_arg,
 };
 
 type Args = Variadic<LuaValue>;
@@ -64,12 +62,39 @@ fn fallback(lua: &Lua, table: &Table, spec: &Fallback) -> LuaResult<()> {
         lua.create_function(move |lua, (_, key): (LuaValue, LuaValue)| {
             let mut path = prefix.clone();
             path.push(as_string(lua, key));
+            let full = format!("{}.{}", root, path.join("."));
+            let member = full.rsplit_once('.').and_then(|(root, name)| {
+                noctalia_rs::api::find(root, name).copied()
+            });
+            if root == "layer" && member.is_none() {
+                return Ok(LuaValue::Nil);
+            }
             let call = function(lua, move |lua, args: Args| {
                 let host = host(lua)?;
-                let values = runtime(lua, &host).json_args(args.to_vec())?;
-                let path = path.iter().map(String::as_str).collect::<Vec<_>>();
-                host.collector.emit(Op::host_call(root, &path, values));
-                Ok(LuaValue::Nil)
+                let runtime = runtime(lua, &host);
+                let values = runtime.json_args(args.to_vec())?;
+                let parts = path.iter().map(String::as_str).collect::<Vec<_>>();
+                match member.map(|member| member.kind) {
+                    Some(noctalia_rs::api::MemberKind::Value)
+                    | Some(noctalia_rs::api::MemberKind::Pair) => {
+                        runtime.query(root, &parts, values)
+                    }
+                    Some(noctalia_rs::api::MemberKind::Bool) => {
+                        host.collector
+                            .emit(Op::host_call(root, &parts, values));
+                        Ok(MultiValue::from_vec(vec![LuaValue::Boolean(true)]))
+                    }
+                    Some(noctalia_rs::api::MemberKind::Void) => {
+                        host.collector
+                            .emit(Op::host_call(root, &parts, values));
+                        Ok(MultiValue::from_vec(vec![LuaValue::Nil]))
+                    }
+                    _ => {
+                        host.collector
+                            .emit(Op::host_call(root, &parts, values));
+                        Ok(MultiValue::from_vec(vec![LuaValue::Nil]))
+                    }
+                }
             })?;
             Ok(LuaValue::Function(call))
         })?;
@@ -89,6 +114,73 @@ impl Runtime<'_> {
         args.into_iter()
             .map(|value| host_converter(self.lua, self.host).to_json(value))
             .collect()
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call carries the full query envelope"
+    )]
+    fn query(
+        &self,
+        root: &str,
+        path: &[&str],
+        args: Vec<JsonValue>,
+    ) -> LuaResult<MultiValue> {
+        let spool = self
+            .host
+            .snapshot
+            .data_dir()
+            .join(".noctalia-rs")
+            .join("spool");
+        if !spool.is_dir() {
+            return Ok(MultiValue::from_vec(vec![LuaValue::Nil]));
+        }
+        let id = self.host.collector.callback_id();
+        let response = self.host.response_path(&id);
+        if let Some(parent) = response.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        self.host.collector.emit(Op::query(
+            &id,
+            root,
+            path,
+            args,
+            response.to_string_lossy().to_string(),
+        ));
+        let Some(value) = self.host.read_response(&response) else {
+            return Ok(MultiValue::from_vec(vec![LuaValue::Nil]));
+        };
+        let mut result = vec![from_json_with_bytes(
+            self.lua,
+            value.get("value").unwrap_or(&JsonValue::Null),
+        )?];
+        if let Some(error) = value.get("error")
+            && !error.is_null()
+        {
+            result.push(from_json(self.lua, error)?);
+        }
+        Ok(MultiValue::from_vec(result))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call carries the full query envelope"
+    )]
+    fn query_or_snapshot(
+        &self,
+        root: &str,
+        path: &[&str],
+        args: Vec<JsonValue>,
+        fallback: JsonValue,
+    ) -> LuaResult<MultiValue> {
+        let result = self.query(root, path, args)?;
+        let first = result.iter().next().cloned().unwrap_or(LuaValue::Nil);
+        if matches!(first, LuaValue::Nil) {
+            return Ok(MultiValue::from_vec(vec![from_json(
+                self.lua, &fallback,
+            )?]));
+        }
+        Ok(result)
     }
 
     fn json(&self, args: &[LuaValue], index: usize) -> LuaResult<JsonValue> {
@@ -161,15 +253,6 @@ fn bool_arg(args: &[LuaValue], index: usize, default: bool) -> bool {
         Some(LuaValue::Boolean(value)) => *value,
         Some(_) => true,
     }
-}
-
-fn expand_path(_host: &Host, path: &str) -> PathBuf {
-    if let (Some(rest), Some(home)) =
-        (path.strip_prefix("~/"), env::var_os("HOME"))
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(path)
 }
 
 fn json_arg(
@@ -265,7 +348,16 @@ fn make_state_table(lua: &Lua) -> LuaResult<Table> {
         let host = host(lua)?;
         let values = args.to_vec();
         let key = string_arg(lua, &values, 0);
-        from_json(lua, &host.snapshot.state(&key))
+        if host.snapshot.has_state(&key) {
+            return from_json(lua, &host.snapshot.state(&key));
+        }
+        let result = runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["state", "get"],
+            vec![JsonValue::String(key)],
+            JsonValue::Null,
+        )?;
+        Ok(result.into_iter().next().unwrap_or(LuaValue::Nil))
     })?;
     set_fn!(lua, &table, "set", |lua, args: Args| {
         let host = host(lua)?;
@@ -308,9 +400,8 @@ fn make_string_table(lua: &Lua) -> LuaResult<Table> {
     Ok(table)
 }
 
-fn make_layer_table(lua: &Lua, root: &'static str) -> LuaResult<Table> {
+fn make_noctalia_layer_table(lua: &Lua) -> LuaResult<Table> {
     let table = lua.create_table()?;
-    let prefix: &[&str] = if root == "noctalia" { &["layer"] } else { &[] };
     set_fn!(lua, &table, "show", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
@@ -335,6 +426,12 @@ fn make_layer_table(lua: &Lua, root: &'static str) -> LuaResult<Table> {
         host.collector.emit(Op::LayerConfigure { id, props });
         Ok(LuaValue::Nil)
     })?;
+    fallback!(lua, &table, "noctalia", &["layer"])?;
+    Ok(table)
+}
+
+fn make_global_layer_table(lua: &Lua) -> LuaResult<Table> {
+    let table = lua.create_table()?;
     set_fn!(lua, &table, "render", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
@@ -343,7 +440,7 @@ fn make_layer_table(lua: &Lua, root: &'static str) -> LuaResult<Table> {
         host.collector.emit(Op::LayerRender { tree });
         Ok(LuaValue::Nil)
     })?;
-    fallback!(lua, &table, root, prefix)?;
+    fallback!(lua, &table, "layer", &[])?;
     Ok(table)
 }
 
@@ -352,7 +449,7 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     let json = make_json_table(lua)?;
     let state = make_state_table(lua)?;
     let strings = make_string_table(lua)?;
-    let layer = make_layer_table(lua, "noctalia")?;
+    let layer = make_noctalia_layer_table(lua)?;
     table.set("json", json.clone())?;
     table.set("state", state.clone())?;
     table.set("string", strings)?;
@@ -360,6 +457,12 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     let sound = lua.create_table()?;
     fallback!(lua, &sound, "noctalia", &["sound"])?;
     table.set("sound", sound)?;
+    let idle = lua.create_table()?;
+    fallback!(lua, &idle, "noctalia", &["idle"])?;
+    table.set("idle", idle)?;
+    let umbriel = lua.create_table()?;
+    fallback!(lua, &umbriel, "noctalia", &["umbriel"])?;
+    table.set("umbriel", umbriel)?;
 
     let osd = lua.create_table()?;
     set_fn!(lua, &osd, "show", |lua, args: Args| {
@@ -384,12 +487,12 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     let compositor = lua.create_table()?;
     set_fn!(lua, &compositor, "name", |lua, _: Args| {
         let host = host(lua)?;
-        match host.snapshot.host_path("compositor.name") {
-            JsonValue::String(value) => {
-                Ok(LuaValue::String(lua.create_string(value)?))
-            }
-            _ => Ok(LuaValue::Nil),
-        }
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["compositor", "name"],
+            Vec::new(),
+            host.snapshot.host_path("compositor.name"),
+        )
     })?;
     fallback!(lua, &compositor, "noctalia", &["compositor"])?;
     table.set("compositor", compositor)?;
@@ -397,7 +500,12 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     let nightlight = lua.create_table()?;
     set_fn!(lua, &nightlight, "state", |lua, _: Args| {
         let host = host(lua)?;
-        from_json(lua, &host.snapshot.host_path("nightlight.state"))
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["nightlight", "state"],
+            Vec::new(),
+            host.snapshot.host_path("nightlight.state"),
+        )
     })?;
     fallback!(lua, &nightlight, "noctalia", &["nightlight"])?;
     table.set("nightlight", nightlight)?;
@@ -417,7 +525,13 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let values = args.to_vec();
         let title = string_arg(lua, &values, 0);
         let body = string_arg(lua, &values, 1);
-        host.collector.emit(Op::notify(&title, &body));
+        let options = if matches!(values.get(2), None | Some(LuaValue::Nil)) {
+            None
+        } else {
+            Some(json_arg(lua, &values, 2)?)
+        };
+        host.collector
+            .emit(Op::notify_with_options(&title, &body, options));
         Ok(LuaValue::Nil)
     })?;
     set_fn!(lua, &table, "notifyError", |lua, args: Args| {
@@ -425,7 +539,13 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let values = args.to_vec();
         let title = string_arg(lua, &values, 0);
         let body = string_arg(lua, &values, 1);
-        host.collector.emit(Op::notify_error(&title, &body));
+        let options = if matches!(values.get(2), None | Some(LuaValue::Nil)) {
+            None
+        } else {
+            Some(json_arg(lua, &values, 2)?)
+        };
+        host.collector
+            .emit(Op::notify_error_with_options(&title, &body, options));
         Ok(LuaValue::Nil)
     })?;
     set_fn!(lua, &table, "setUpdateInterval", |lua, args: Args| {
@@ -448,17 +568,15 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         host(lua)?.collector.emit(Op::OpenSettings);
         Ok(LuaValue::Nil)
     })?;
-    set_fn!(lua, &table, "removeFile", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = string_arg(lua, &values, 0);
-        host.collector.emit(Op::RemoveFile { path });
-        Ok(LuaValue::Boolean(true))
-    })?;
     set_fn!(lua, &table, "copyToClipboard", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
-        host.collector.emit(Op::copy(&string_arg(lua, &values, 0)));
+        let text = string_arg(lua, &values, 0);
+        let mime = string_arg(lua, &values, 1);
+        host.collector.emit(Op::copy_with_mime(
+            &text,
+            if mime.is_empty() { "text/plain" } else { &mime },
+        ));
         Ok(LuaValue::Boolean(true))
     })?;
     set_fn!(lua, &table, "openPath", |lua, args: Args| {
@@ -466,14 +584,19 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let values = args.to_vec();
         host.collector
             .emit(Op::open_path(&string_arg(lua, &values, 0)));
-        Ok(LuaValue::Boolean(true))
+        Ok(LuaValue::Nil)
     })?;
     set_fn!(lua, &table, "setWallpaper", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
-        host.collector
-            .emit(Op::set_wallpaper(&string_arg(lua, &values, 0)));
-        Ok(LuaValue::Boolean(true))
+        let first = string_arg(lua, &values, 0);
+        let op = if matches!(values.get(1), None | Some(LuaValue::Nil)) {
+            Op::set_wallpaper(&first)
+        } else {
+            Op::set_wallpaper_on(&first, &string_arg(lua, &values, 1))
+        };
+        host.collector.emit(op);
+        Ok(LuaValue::Nil)
     })?;
     set_fn!(lua, &table, "http", |lua, args: Args| {
         let host = host(lua)?;
@@ -481,15 +604,57 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let request = json_arg(lua, &values, 0)?;
         let callback = callback_marker(lua, &values, 1)?;
         host.collector.emit(Op::http(request, callback.as_deref()));
-        Ok(LuaValue::Nil)
+        Ok(LuaValue::Boolean(true))
+    })?;
+    set_fn!(lua, &table, "httpStream", |lua, args: Args| {
+        let host = host(lua)?;
+        let values = args.to_vec();
+        let request = json_arg(lua, &values, 0)?;
+        let on_line = json_arg(lua, &values, 1)?;
+        let on_close = json_arg(lua, &values, 2)?;
+        let result = runtime(lua, &host).query(
+            "noctalia",
+            &["httpStream"],
+            vec![request, on_line, on_close],
+        )?;
+        let handle = result.into_iter().next().unwrap_or(LuaValue::Nil);
+        if matches!(handle, LuaValue::Nil) {
+            return Ok(LuaValue::Nil);
+        }
+        let table = lua.create_table()?;
+        let stop = {
+            let handle = handle.clone();
+            let host = Arc::clone(&host);
+            function(lua, move |lua, _: Args| {
+                let token = to_json(lua, handle.clone(), FunctionRole::Call)?;
+                host.collector.emit(Op::host_call(
+                    "__noctalia_rs",
+                    &["httpStreamStop"],
+                    vec![token],
+                ));
+                Ok(LuaValue::Nil)
+            })?
+        };
+        table.set("stop", stop)?;
+        Ok(LuaValue::Table(table))
     })?;
     set_fn!(lua, &table, "runAsync", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
         let command = json_arg(lua, &values, 0)?;
         let callback = callback_marker(lua, &values, 1)?;
-        host.collector.emit(Op::run(command, callback.as_deref()));
-        Ok(LuaValue::Nil)
+        let timeout = values.get(2).cloned().unwrap_or(LuaValue::Nil);
+        let timeout = if matches!(timeout, LuaValue::Nil) {
+            None
+        } else {
+            lua.coerce_number(timeout).ok().flatten()
+        };
+        host.collector.emit(Op::run_with_timeout(
+            command,
+            callback.as_deref(),
+            timeout,
+        ));
+        Ok(LuaValue::Boolean(true))
     })?;
     set_fn!(lua, &table, "runStream", |lua, args: Args| {
         let host = host(lua)?;
@@ -497,41 +662,6 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let command = json_arg(lua, &values, 0)?;
         let id = callback_id(lua, &values, 1)?;
         host.collector.emit(Op::run_stream(command, &id));
-        Ok(LuaValue::Boolean(true))
-    })?;
-    set_fn!(lua, &table, "writeFile", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = string_arg(lua, &values, 0);
-        let content = json_arg(lua, &values, 1)?;
-        host.collector.emit(Op::host_call(
-            "noctalia",
-            &["writeFile"],
-            vec![JsonValue::String(path), content],
-        ));
-        Ok(LuaValue::Boolean(true))
-    })?;
-    set_fn!(lua, &table, "mkdirAll", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = string_arg(lua, &values, 0);
-        host.collector.emit(Op::host_call(
-            "noctalia",
-            &["mkdirAll"],
-            vec![JsonValue::String(path)],
-        ));
-        Ok(LuaValue::Boolean(true))
-    })?;
-    set_fn!(lua, &table, "renameFile", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let from = string_arg(lua, &values, 0);
-        let to = string_arg(lua, &values, 1);
-        host.collector.emit(Op::host_call(
-            "noctalia",
-            &["renameFile"],
-            vec![JsonValue::String(from), JsonValue::String(to)],
-        ));
         Ok(LuaValue::Boolean(true))
     })?;
 
@@ -544,13 +674,23 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let host = host(lua)?;
         let values = args.to_vec();
         let key = string_arg(lua, &values, 0);
-        from_json(lua, &host.snapshot.setting(&key))
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["getSetting"],
+            vec![JsonValue::String(key.clone())],
+            host.snapshot.setting(&key),
+        )
     })?;
     set_fn!(lua, &table, "getColor", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
         let role = string_arg(lua, &values, 0);
-        from_json(lua, &host.snapshot.color(&role))
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["getColor"],
+            vec![JsonValue::String(role.clone())],
+            host.snapshot.color(&role),
+        )
     })?;
     set_fn!(lua, &table, "nowMs", |lua, _: Args| {
         Ok(integer_value(host(lua)?.snapshot.now_ms()))
@@ -566,11 +706,52 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     })?;
     set_fn!(lua, &table, "outputs", |lua, _: Args| {
         let host = host(lua)?;
-        from_json(lua, &host.snapshot.host_path("outputs"))
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["outputs"],
+            Vec::new(),
+            host.snapshot.host_path("outputs"),
+        )
+    })?;
+    set_fn!(lua, &table, "tr", |lua, args: Args| {
+        let host = host(lua)?;
+        let values = args.to_vec();
+        let key = string_arg(lua, &values, 0);
+        let subst = values.get(1).cloned().unwrap_or(LuaValue::Nil);
+        let json = to_json(lua, subst, FunctionRole::Call)?;
+        let fallback = JsonValue::String(host.tr(&key, &params(&json)));
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["tr"],
+            vec![JsonValue::String(key), json],
+            fallback,
+        )
+    })?;
+    set_fn!(lua, &table, "trp", |lua, args: Args| {
+        let host = host(lua)?;
+        let values = args.to_vec();
+        let key = string_arg(lua, &values, 0);
+        let count = integer_arg(lua, &values, 1);
+        let subst = values.get(2).cloned().unwrap_or(LuaValue::Nil);
+        let json = to_json(lua, subst, FunctionRole::Call)?;
+        let mut pairs = params(&json);
+        pairs.push(("count".to_owned(), count.to_string()));
+        let fallback = JsonValue::String(host.tr(&key, &pairs));
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["trp"],
+            vec![JsonValue::String(key), json!(count), json],
+            fallback,
+        )
     })?;
     set_fn!(lua, &table, "focusedOutputName", |lua, _: Args| {
         let host = host(lua)?;
-        from_json(lua, &host.snapshot.host_path("focusedOutputName"))
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["focusedOutputName"],
+            Vec::new(),
+            host.snapshot.host_path("focused_output_name"),
+        )
     })?;
     set_fn!(lua, &table, "clipboardText", |lua, _: Args| {
         let host = host(lua)?;
@@ -590,132 +771,28 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     })?;
     set_fn!(lua, &table, "pluginDir", |lua, _: Args| {
         let host = host(lua)?;
-        Ok(LuaValue::String(
-            lua.create_string(host.snapshot.plugin_dir())?,
-        ))
+        let fallback = JsonValue::String(
+            host.snapshot.data_dir().to_string_lossy().into_owned(),
+        );
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["pluginDir"],
+            Vec::new(),
+            fallback,
+        )
     })?;
     set_fn!(lua, &table, "pluginDataDir", |lua, _: Args| {
         let host = host(lua)?;
-        Ok(LuaValue::String(
-            lua.create_string(host.snapshot.plugin_data_dir())?,
-        ))
-    })?;
-    set_fn!(lua, &table, "getenv", |lua, args: Args| {
-        let values = args.to_vec();
-        let key = string_arg(lua, &values, 0);
-        match env::var(key) {
-            Ok(value) => Ok(LuaValue::String(lua.create_string(value)?)),
-            Err(_) => Ok(LuaValue::Nil),
-        }
-    })?;
-    set_fn!(lua, &table, "expandPath", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = expand_path(&host, &string_arg(lua, &values, 0));
-        Ok(LuaValue::String(
-            lua.create_string(path.to_string_lossy().to_string())?,
-        ))
-    })?;
-    set_fn!(lua, &table, "commandExists", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let command = string_arg(lua, &values, 0);
-        let exists = if command.contains(std::path::MAIN_SEPARATOR) {
-            PathBuf::from(&command).is_file()
-        } else {
-            env::var_os("PATH").is_some_and(|paths| {
-                env::split_paths(&paths).any(|dir| dir.join(&command).is_file())
-            })
-        };
-        let _ = host;
-        Ok(LuaValue::Boolean(exists))
-    })?;
-    set_fn!(lua, &table, "fileExists", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = string_arg(lua, &values, 0);
-        Ok(LuaValue::Boolean(expand_path(&host, &path).exists()))
-    })?;
-    set_fn!(lua, &table, "readFile", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = string_arg(lua, &values, 0);
-        match fs::read_to_string(expand_path(&host, &path)) {
-            Ok(text) => Ok(LuaValue::String(lua.create_string(text)?)),
-            Err(_) => Ok(LuaValue::Nil),
-        }
-    })?;
-    set_fn!(lua, &table, "formatTime", |lua, args: Args| {
-        let values = args.to_vec();
-        let format = string_arg(lua, &values, 0);
-        let pattern = format
-            .strip_prefix("{:")
-            .and_then(|value| value.strip_suffix('}'))
-            .unwrap_or(&format);
-        let text = Local::now().format(pattern).to_string();
-        Ok(LuaValue::String(lua.create_string(text)?))
-    })?;
-    set_fn!(lua, &table, "listDir", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = string_arg(lua, &values, 0);
-        let result = lua.create_table()?;
-        match fs::read_dir(expand_path(&host, &path)) {
-            Ok(entries) => {
-                for (index, entry) in entries.enumerate() {
-                    if let Ok(entry) = entry {
-                        result.raw_set(
-                            index + 1,
-                            LuaValue::String(lua.create_string(
-                                entry.path().to_string_lossy().to_string(),
-                            )?),
-                        )?;
-                    }
-                }
-                Ok(LuaValue::Table(result))
-            }
-            Err(_) => Ok(LuaValue::Nil),
-        }
-    })?;
-    set_fn!(lua, &table, "fileInfo", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let path = string_arg(lua, &values, 0);
-        file_info_json(lua, &host, &path)
-    })?;
-    set_fn!(lua, &table, "tr", |lua, args: Args| {
-        let host = host(lua)?;
-        let values = args.to_vec();
-        let key = string_arg(lua, &values, 0);
-        let value = values.get(1).cloned().unwrap_or(LuaValue::Nil);
-        let json = to_json(lua, value, FunctionRole::Call)?;
-        let text = host.tr(&key, &params(&json));
-        Ok(LuaValue::String(lua.create_string(text)?))
-    })?;
-    set_fn!(lua, &table, "trp", |lua, args: Args| {
-        let text = lua
-            .globals()
-            .get::<Table>("noctalia")?
-            .get::<Function>("tr")?
-            .call::<String>(args)?;
-        Ok(LuaValue::String(lua.create_string(text)?))
+        let fallback = JsonValue::Null;
+        runtime(lua, &host).query_or_snapshot(
+            "noctalia",
+            &["pluginDataDir"],
+            Vec::new(),
+            fallback,
+        )
     })?;
     fallback!(lua, &table, "noctalia", &[])?;
     Ok(table)
-}
-
-fn file_info_json(lua: &Lua, host: &Host, path: &str) -> LuaResult<LuaValue> {
-    let metadata = match fs::metadata(expand_path(host, path)) {
-        Ok(value) => value,
-        Err(_) => return Ok(LuaValue::Nil),
-    };
-    let table = lua.create_table()?;
-    table.set("is_file", metadata.is_file())?;
-    table.set("is_dir", metadata.is_dir())?;
-    let size =
-        mlua::Integer::try_from(metadata.len()).unwrap_or(mlua::Integer::MAX);
-    table.set("size", size)?;
-    Ok(LuaValue::Table(table))
 }
 
 fn make_bar_table(lua: &Lua) -> LuaResult<Table> {
@@ -941,7 +1018,7 @@ pub fn register(lua: &Lua) -> LuaResult<()> {
     globals.set("desktopWidget", make_desktop_table(lua)?)?;
     globals.set("launcher", make_launcher_table(lua)?)?;
     globals.set("shortcut", make_shortcut_table(lua)?)?;
-    globals.set("layer", make_layer_table(lua, "layer")?)?;
+    globals.set("layer", make_global_layer_table(lua)?)?;
     globals.set("ui", make_ui_table(lua)?)?;
     Ok(())
 }

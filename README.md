@@ -7,6 +7,11 @@ Write Noctalia plugins in Rust. `noctalia.toml` describes the plugin. Rust
 handles behavior. The library emits `plugin.toml`, Luau entry stubs, the shared
 bridge, translations, and assets.
 
+When a Luau plugin is translated to Rust, the Rust handler must preserve the
+original algorithm exactly, including its complexity and habits. Performance
+gains come from the generated Luau, bridge, and runtime, not from changing what
+a plugin computes.
+
 ## Features
 
 - `noctalia.toml` as the source of truth for metadata, settings, and entries

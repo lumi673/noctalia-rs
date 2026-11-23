@@ -9,6 +9,7 @@ pub fn callback_for_event(event: &str) -> Option<&'static str> {
         "right_click" => Some("onRightClick"),
         "middle_click" => Some("onMiddleClick"),
         "double_click" => Some("onDoubleClick"),
+        "audio_spectrum" => Some("onAudioSpectrum"),
         "scroll" => Some("onScroll"),
         "hover" => Some("onHover"),
         "key" => Some("onKey"),
@@ -48,7 +49,8 @@ pub fn callback_args(snapshot: &Snapshot, callback: &str) -> Vec<Value> {
 
     let names: &[&str] = match callback {
         "onScroll" => &["axis", "steps", "starts_gesture", "startsGesture"],
-        "onKey" => &["key", "chord", "modifiers", "pressed"],
+        "onKey" => &["chord", "key", "pressed", "repeated", "modifiers"],
+        "onAudioSpectrum" => &["values_csv", "state_csv", "valuesCsv"],
         "onIpc" => &["event", "payload"],
         "onConfigChanged" => &["key", "value"],
         "onOpen" => &["context"],

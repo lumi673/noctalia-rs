@@ -1,0 +1,76 @@
+# Manifest keys documented at /noctalia/plugins/development/manifest/.
+# Format: root <key> | entry <kind> <key> <shape> | setting <key>.
+root id
+root name
+root version
+root plugin_api
+root author
+root license
+root deprecated
+root description
+root tags
+root icon
+root dependencies
+entry widget id string
+entry widget entry string
+entry widget actions array
+entry widget hover_highlight boolean
+entry widget debounce_ms integer
+entry widget category string
+entry shortcut id string
+entry shortcut entry string
+entry launcher_provider id string
+entry launcher_provider entry string
+entry launcher_provider prefix string
+entry launcher_provider glyph string
+entry launcher_provider include_in_global_search boolean
+entry launcher_provider debounce_ms integer
+entry desktop_widget id string
+entry desktop_widget entry string
+entry panel id string
+entry panel entry string
+entry panel placement string
+entry panel position string
+entry panel width integer
+entry panel width string
+entry panel height integer
+entry panel height string
+entry panel layer string
+entry panel open_near_click boolean
+entry panel dismiss_on_outside_click boolean
+entry panel keyboard_focus string
+entry panel keyboard_focus boolean
+entry panel max_height integer
+entry panel capture_keys boolean
+entry panel capture_keys array
+entry panel persistent boolean
+entry panel debounce_ms integer
+entry panel category string
+entry layer id string
+entry layer entry string
+entry layer layer string
+entry layer anchors array
+entry layer width integer
+entry layer height integer
+entry layer margins table
+entry layer exclusive_zone integer
+entry layer exclusive_zone string
+entry layer keyboard string
+entry layer click_through boolean
+entry layer output string
+entry layer visible boolean
+entry service id string
+entry service entry string
+setting key
+setting type
+setting label_key
+setting description_key
+setting default
+setting min
+setting max
+setting step
+setting options
+setting extensions
+setting visible_when
+setting advanced
+setting secret

@@ -1,11 +1,12 @@
-use std::path::PathBuf;
-
-use noctalia_rs::{Context, Parts};
-use serde_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::callback::{callback_args, callback_for_event};
 use crate::dispatch;
 use crate::host::Host;
+use noctalia_rs::{Context, Parts, api};
+use serde_json::{Value, json};
 
 struct Fixture<'a> {
     event: &'a str,
@@ -58,6 +59,94 @@ fn find<'a>(values: &'a [Value], name: &str) -> &'a Value {
 }
 
 #[test]
+fn missing_state_keys_query_the_global_state_service() {
+    let dir = QueryDir::new();
+    dir.respond("noctalia_rs_luau_1", json!({ "shared": [1, 2] }));
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"
+local value = state.get("shared.key")
+assert(type(value) == "table")
+assert(value.shared[2] == 2)
+"#;
+    let values = dispatch(&ctx, &[("entry", source)])
+        .expect("dispatch")
+        .into_iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    let query = find(&values, "query");
+    assert_eq!(query["path"], json!(["state", "get"]));
+    assert_eq!(query["args"][0], "shared.key");
+}
+
+#[test]
+fn plugin_data_dir_preserves_a_nil_host_result() {
+    let dir = QueryDir::new();
+    dir.respond("noctalia_rs_luau_1", json!(Value::Null));
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"assert(noctalia.pluginDataDir() == nil)"#;
+    assert!(dispatch(&ctx, &[("entry", source)]).is_ok());
+}
+
+#[test]
+fn query_results_decode_byte_markers() {
+    let dir = QueryDir::new();
+    dir.respond(
+        "noctalia_rs_luau_1",
+        json!({ "__noctalia_rs_bytes": "89504e470d0a1a0a" }),
+    );
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"
+local bytes = noctalia.appIconPath("app")
+assert(string.byte(bytes, 1) == 137)
+assert(string.byte(bytes, 2) == 80)
+"#;
+    assert!(dispatch(&ctx, &[("entry", source)]).is_ok());
+}
+
+#[test]
+fn seeded_rng_matches_embedded_luau_vm() {
+    use mlua::Lua;
+    use noctalia_rs::LuauRng;
+
+    let lua = Lua::new();
+    let floating: Vec<f64> = lua
+        .load(
+            "math.randomseed(42); local t = {} \
+             for i = 1, 8 do t[i] = math.random() end return t",
+        )
+        .eval()
+        .expect("luau floats");
+    let integers: Vec<i64> = lua
+        .load(
+            "math.randomseed(42); local t = {} \
+             for i = 1, 8 do t[i] = math.random(10) end return t",
+        )
+        .eval()
+        .expect("luau integers");
+    let ranges: Vec<i64> = lua
+        .load(
+            "math.randomseed(7); local t = {} \
+             for i = 1, 8 do t[i] = math.random(-3, 3) end return t",
+        )
+        .eval()
+        .expect("luau ranges");
+
+    let mut rng = LuauRng::seed(42);
+    let ported_floats: Vec<f64> = (0..8).map(|_| rng.next_f64()).collect();
+    let mut rng = LuauRng::seed(42);
+    let ported_integers: Vec<i64> = (0..8)
+        .map(|_| rng.below(10).expect("integer range"))
+        .collect();
+    let mut rng = LuauRng::seed(7);
+    let ported_ranges: Vec<i64> = (0..8)
+        .map(|_| rng.range(-3, 3).expect("inclusive range"))
+        .collect();
+
+    assert_eq!(ported_floats, floating);
+    assert_eq!(ported_integers, integers);
+    assert_eq!(ported_ranges, ranges);
+}
+#[test]
 fn json_encode_and_decode_round_trip() {
     let source = r#"
 local encoded = json.encode({ a = 1, b = { "x", "y" }, c = true })
@@ -106,7 +195,9 @@ noctalia.notify("Title", "Body")
 noctalia.setUpdateInterval(1000)
 state.set("answer", { value = 42 })
 noctalia.futureApi({ mode = "fast" }, 7)
-layer.show("badge")
+noctalia.layer.show("badge")
+assert(type(layer.render) == "function")
+assert(layer.show == nil)
 "#);
     assert_eq!(find(&values, "log")["message"], "hello");
     assert_eq!(find(&values, "notify")["title"], "Title");
@@ -202,7 +293,7 @@ barWidget.setTooltip({ { key = "k", value = "v" } })
 barWidget.render(ui.label({ text = "bar" }))
 desktopWidget.render(ui.label({ text = "desk" }))
 launcher.setResults("q", { { id = "one" } })
-layer.configure("osk", { output = "all" })
+noctalia.layer.configure("osk", { output = "all" })
 noctalia.copyToClipboard("clip")
 noctalia.runAsync({ "echo", "hi" }, function(result) noctalia.log(result.stdout) end)
 "#);
@@ -229,19 +320,13 @@ noctalia.runAsync({ "echo", "hi" }, function(result) noctalia.log(result.stdout)
 #[test]
 fn unknown_globals_emit_host_calls_with_full_path() {
     let values = run(r#"
-noctalia.compositor.subscribe({ events = { "windows" } }, function() end)
+noctalia.unknownFutureApi({ mode = "fast" }, 7)
 noctalia.osd.show("bell", "done", { progress = 0.5 })
 shortcut.setActive("main", true)
 "#);
-    let subscribe = values
-        .iter()
-        .find(|value| {
-            value.get("path") == Some(&json!(["compositor", "subscribe"]))
-        })
-        .expect("subscribe op");
-    assert_eq!(subscribe["root"], "noctalia");
-    assert_eq!(subscribe["args"][0]["events"][0], "windows");
-    assert_eq!(find(&values, "host_call")["root"], "noctalia");
+    let unknown = find(&values, "host_call");
+    assert_eq!(unknown["root"], "noctalia");
+    assert_eq!(unknown["path"], json!(["unknownFutureApi"]));
     let shortcut = values
         .iter()
         .find(|value| {
@@ -454,4 +539,260 @@ fn generated_callbacks_have_runtime_mappings() {
             "{event} has no runtime callback"
         );
     }
+}
+
+#[test]
+fn embedded_bridge_source_parses() {
+    let lua = mlua::Lua::new();
+    let source = noctalia_rs::bridge::SOURCE
+        .replace("{{HELPER}}", "helper")
+        .replace("{{PREFIX}}", "prefix");
+    lua.load(&source)
+        .into_function()
+        .expect("bridge.luau must parse");
+}
+
+const OFFICIAL_CALLBACKS: &str =
+    include_str!("../../lib/tests/fixtures/callbacks.txt");
+
+struct QueryDir(PathBuf);
+
+impl QueryDir {
+    fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("noctalia-query-{nanos}"));
+        fs::create_dir_all(root.join(".noctalia-rs/spool")).expect("spool");
+        fs::create_dir_all(root.join(".noctalia-rs/query")).expect("query");
+        Self(root)
+    }
+
+    fn path(&self) -> &PathBuf {
+        &self.0
+    }
+
+    fn respond(&self, id: &str, value: Value) {
+        let body = json!({ "ok": true, "value": value });
+        let path = self.0.join(".noctalia-rs/query").join(format!("{id}.json"));
+        fs::write(path, body.to_string()).expect("response");
+    }
+}
+
+impl Drop for QueryDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn context_in(fixture: Fixture<'_>, dir: &Path) -> Context {
+    let mut ctx = context(fixture);
+    ctx.data_dir = dir.to_path_buf();
+    ctx
+}
+
+#[test]
+fn registry_members_are_reachable_in_the_embedded_runtime() {
+    use std::fmt::Write as _;
+    let mut source = String::new();
+    for member in api::members() {
+        let mut path = member.root.to_owned();
+        for part in member.name.split('.') {
+            path.push_str("[\"");
+            path.push_str(part);
+            path.push_str("\"]");
+        }
+        let kind = match member.kind {
+            api::MemberKind::Namespace => "table",
+            _ => "function",
+        };
+        let label = format!("{}.{}", member.root, member.name);
+        let _ =
+            writeln!(source, "assert(type({path}) == \"{kind}\", \"{label}\")");
+    }
+    let ctx = context(empty_fixture("update"));
+    dispatch(&ctx, &[("entry", source.as_str())]).expect("dispatch");
+}
+
+#[test]
+fn official_callbacks_have_runtime_mappings() {
+    for line in OFFICIAL_CALLBACKS
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        let (event, function, arity) = (parts[0], parts[1], parts[2]);
+        assert_eq!(
+            callback_for_event(event),
+            Some(function),
+            "{event} has no runtime mapping"
+        );
+        assert!(arity.parse::<usize>().expect("arity") <= 3);
+    }
+
+    let host = Host::new(
+        &context(Fixture {
+            event: "key",
+            payload: json!({
+                "chord": "space",
+                "pressed": true,
+                "repeated": true
+            }),
+            config: json!({}),
+            state: json!({}),
+            host: json!({}),
+        }),
+        &[],
+    );
+    assert_eq!(
+        callback_args(&host.snapshot, "onKey"),
+        vec![json!("space"), json!(true), json!(true)]
+    );
+
+    let host = Host::new(
+        &context(Fixture {
+            event: "audio_spectrum",
+            payload: json!({ "values_csv": "1,2", "state_csv": "ok" }),
+            config: json!({}),
+            state: json!({}),
+            host: json!({}),
+        }),
+        &[],
+    );
+    assert_eq!(
+        callback_args(&host.snapshot, "onAudioSpectrum"),
+        vec![json!("1,2"), json!("ok")]
+    );
+}
+
+#[test]
+fn queries_use_the_host_result() {
+    let dir = QueryDir::new();
+    dir.respond("noctalia_rs_luau_1", json!("/icons/app.png"));
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"assert(noctalia.appIconPath("app") == "/icons/app.png")"#;
+    let values = dispatch(&ctx, &[("entry", source)])
+        .expect("dispatch")
+        .into_iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    let query = find(&values, "query");
+    assert_eq!(query["path"], json!(["appIconPath"]));
+    assert_eq!(query["args"][0], "app");
+}
+
+#[test]
+fn unwatch_returns_the_host_result() {
+    let dir = QueryDir::new();
+    dir.respond("noctalia_rs_luau_1", json!(false));
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"noctalia.log(tostring(noctalia.idle.unwatch(9)))"#;
+    let values = dispatch(&ctx, &[("entry", source)])
+        .expect("dispatch")
+        .into_iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    assert_eq!(find(&values, "log")["message"], "false");
+}
+
+#[test]
+fn http_stream_handle_forwards_stop() {
+    let dir = QueryDir::new();
+    for id in 1..=5 {
+        dir.respond(&format!("noctalia_rs_luau_{id}"), json!("stream-1"));
+    }
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"
+local handle = noctalia.httpStream({}, function() end, function() end)
+assert(type(handle) == "table")
+assert(type(handle.stop) == "function")
+handle.stop()
+"#;
+    let values = dispatch(&ctx, &[("entry", source)])
+        .expect("dispatch")
+        .into_iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    let query = find(&values, "query");
+    assert_eq!(query["path"], json!(["httpStream"]));
+    let stop = find(&values, "host_call");
+    assert_eq!(stop["root"], "__noctalia_rs");
+    assert_eq!(stop["path"], json!(["httpStreamStop"]));
+    assert_eq!(stop["args"][0], "stream-1");
+}
+
+#[test]
+fn typed_wrappers_keep_every_argument() {
+    let values = run(r#"
+noctalia.notify("T", "B", {
+  actions = { { id = "open", label = "Open" } },
+  onAction = "onAction",
+  context = "file",
+})
+noctalia.notifyError("E", nil, { onAction = "onError" })
+noctalia.copyToClipboard("uri", "text/uri-list")
+noctalia.runAsync({ "echo", "hi" }, function() end, 250)
+noctalia.setWallpaper("DP-1", "/wall.png")
+noctalia.revealPath("/file")
+noctalia.runInTerminal("htop")
+"#);
+    let notice = find(&values, "notify");
+    assert_eq!(notice["options"]["actions"][0]["id"], "open");
+    assert_eq!(notice["options"]["onAction"], "onAction");
+    assert_eq!(notice["options"]["context"], "file");
+    assert_eq!(
+        find(&values, "notify_error")["options"]["onAction"],
+        "onError"
+    );
+    let copy = values
+        .iter()
+        .find(|value| value["path"] == json!(["copyToClipboard"]))
+        .expect("copy op");
+    assert_eq!(copy["args"][1], "text/uri-list");
+    let run = values
+        .iter()
+        .find(|value| value["path"] == json!(["runAsync"]))
+        .expect("run op");
+    assert_eq!(run["args"][2].as_f64(), Some(250.0));
+    let wallpaper = values
+        .iter()
+        .find(|value| value["path"] == json!(["setWallpaper"]))
+        .expect("wallpaper op");
+    assert_eq!(wallpaper["args"], json!(["DP-1", "/wall.png"]));
+    assert!(
+        values
+            .iter()
+            .any(|value| value["path"] == json!(["revealPath"]))
+    );
+    assert!(
+        values
+            .iter()
+            .any(|value| value["path"] == json!(["runInTerminal"]))
+    );
+}
+
+#[test]
+fn host_callback_invokes_the_registered_function() {
+    const SOURCE: &str = r#"
+noctalia.http({ url = "https://example.invalid/" }, function(response)
+    noctalia.log(response.body)
+end)
+"#;
+    let ctx = context(empty_fixture("update"));
+    let ops = dispatch(&ctx, &[("entry", SOURCE)]).expect("first dispatch");
+    let value = serde_json::to_value(&ops[0]).expect("serialize");
+    let id = value["args"][1]["__host_callback"]
+        .as_str()
+        .expect("callback id");
+
+    let mut callback = empty_fixture("host_callback");
+    callback.payload = json!({ "id": id, "args": [{ "body": "ok" }] });
+    let ctx = context(callback);
+    let ops = dispatch(&ctx, &[("entry", SOURCE)]).expect("callback dispatch");
+    assert_eq!(ops.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&ops[0]).expect("serialize")["message"],
+        "ok"
+    );
 }

@@ -39,6 +39,7 @@ fn expire(ctx: &Context, store: &mut timer::Store, ops: &mut Vec<Op>) {
         ops.push(Op::Notify {
             title: ctx.tr("notify.title", &[]),
             body,
+            options: None,
         });
 
         false
