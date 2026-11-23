@@ -87,11 +87,7 @@ impl<T: Send + 'static> Coroutine<T> {
             CURRENT.with(|cell| {
                 *cell.borrow_mut() = Some(Current { yielded, resumed });
             });
-            let value = match panic::catch_unwind(AssertUnwindSafe(body)) {
-                Ok(value) => Some(value),
-                Err(payload) if payload.is::<Stopped>() => None,
-                Err(payload) => panic::resume_unwind(payload),
-            };
+            let value = outcome(panic::catch_unwind(AssertUnwindSafe(body)));
             CURRENT.with(|cell| {
                 if let Some(current) = cell.borrow_mut().take() {
                     let _ = current.yielded.send(Signal::Done);
@@ -136,6 +132,15 @@ impl<T: Send + 'static> Coroutine<T> {
 impl<T> Drop for Coroutine<T> {
     fn drop(&mut self) {
         drop(self.resume.take());
+    }
+}
+
+/// Maps a finished body to its value, keeping a stop and a bug apart.
+fn outcome<T>(result: Result<T, Box<dyn Any + Send>>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(payload) if payload.is::<Stopped>() => None,
+        Err(payload) => panic::resume_unwind(payload),
     }
 }
 
@@ -209,10 +214,42 @@ mod tests {
         assert_eq!(coroutine.join(), Some(0));
     }
 
+    fn boom() -> u32 {
+        panic!("boom")
+    }
+
     #[test]
-    fn body_panics_are_not_swallowed() {
-        let coroutine = Coroutine::spawn(|| -> u32 { panic!("boom") });
-        assert_eq!(coroutine.join(), None);
+    fn a_stopped_body_and_a_panicking_body_stay_distinct() {
+        let stopped = panic::catch_unwind(|| {
+            panic::resume_unwind(Box::new(Stopped));
+        });
+        assert_eq!(outcome::<u32>(stopped), None);
+
+        let caught =
+            panic::catch_unwind(|| outcome::<u32>(panic::catch_unwind(boom)));
+        let payload = caught.expect_err("a real panic is re-raised");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("boom"),
+            "the original message survives"
+        );
+    }
+
+    #[test]
+    fn dropping_does_not_wait_for_the_body() {
+        use std::time::{Duration, Instant};
+
+        let coroutine = Coroutine::spawn(|| {
+            thread::sleep(Duration::from_millis(300));
+            yield_now();
+            1_u32
+        });
+        let start = Instant::now();
+        drop(coroutine);
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "drop waited for the body"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use noctalia_rs::{Context, Op};
@@ -225,7 +225,8 @@ pub struct Host {
     pub snapshot: Snapshot,
     pub collector: Collector,
     translations: Translations,
-    query_dir: OnceLock<Option<PathBuf>>,
+    query_dir: OnceLock<PathBuf>,
+    miss_checked_ms: AtomicU64,
 }
 
 impl Host {
@@ -235,6 +236,7 @@ impl Host {
             collector: Collector::default(),
             translations: Translations::new(ctx, sources),
             query_dir: OnceLock::new(),
+            miss_checked_ms: AtomicU64::new(f64::NEG_INFINITY.to_bits()),
         }
     }
 
@@ -249,17 +251,23 @@ impl Host {
 
     /// Returns the spool directory when a host is attached.
     ///
-    /// The check is cached: a runtime either talks to a host for its whole
-    /// life or never does, and asking the filesystem on every host read was
-    /// measurable in plugin dispatch.
+    /// A hit is cached for the runtime's life. A miss is re-checked at most
+    /// once a second, so a host that attaches late is still found without
+    /// asking the filesystem on every host read.
     pub fn query_dir(&self) -> Option<&std::path::Path> {
-        self.query_dir
-            .get_or_init(|| {
-                let spool =
-                    self.snapshot.data_dir().join(".noctalia-rs").join("spool");
-                spool.is_dir().then_some(spool)
-            })
-            .as_deref()
+        if let Some(dir) = self.query_dir.get() {
+            return Some(dir);
+        }
+        let now = noctalia_rs::os_clock();
+        let last = f64::from_bits(self.miss_checked_ms.load(Ordering::Relaxed));
+        if now - last < 1.0 {
+            return None;
+        }
+        self.miss_checked_ms.store(now.to_bits(), Ordering::Relaxed);
+        let spool = self.snapshot.data_dir().join(".noctalia-rs").join("spool");
+        spool
+            .is_dir()
+            .then(|| self.query_dir.get_or_init(|| spool).as_path())
     }
 
     pub fn response_path(&self, id: &str) -> PathBuf {

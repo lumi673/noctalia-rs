@@ -151,7 +151,7 @@ Sanity check against the main-session numbers: this run measured `json_encode_ru
 
 ## Post-parity verification
 
-After API 57 parity landed, the same release harness was run again with `nix develop --command cargo run --release -p noctalia-bench -- --samples 200 --warmup 20`. The matched pairs stayed above the 3x goal. The Luau side also got faster here because a host read no longer stats the spool directory on every call.
+After API 57 parity landed, the same release harness was run again with `nix develop --command cargo run --release -p noctalia-bench -- --samples 200 --warmup 20`. The matched pairs stayed above the 3x goal. This run is on a busier machine than the earlier table, so most medians are higher on both sides; `snapshot_reads` improved because a host read no longer stats the spool directory on every call.
 
 | Workload | Rust median | Luau median | Speedup | 3x met |
 | :-- | --: | --: | --: | :-- |
