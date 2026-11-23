@@ -77,7 +77,7 @@ use noctalia::{Context, Op, Result};
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
 fn service(ctx: &Context) -> Result<Vec<Op>> {
-    let message = ctx.config_str("message").unwrap_or_default();
+    let message = ctx.config_str("message").unwrap_or_default().into_owned();
     let _ = serde_json::from_str::<serde_json::Value>("null")?;
     Ok(vec![Op::set_interval(1000), Op::log(message)])
 }

@@ -1,12 +1,12 @@
 use chrono::Local;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde::de::DeserializeOwned;
-use serde_json::Value;
 
 use crate::Result;
 
@@ -33,6 +33,7 @@ pub struct Context {
 }
 
 impl Context {
+    #[inline]
     #[must_use]
     pub fn new(parts: Parts, translations: Value) -> Self {
         let now_ms = parts
@@ -56,11 +57,11 @@ impl Context {
 
     #[inline]
     #[must_use]
-    pub fn config_str(&self, key: &str) -> Option<String> {
-        match self.config.get(key)? {
-            Value::String(value) => Some(value.clone()),
-            Value::Bool(value) => Some(value.to_string()),
-            Value::Number(value) => Some(value.to_string()),
+    pub fn config_str(&self, key: &str) -> Option<Cow<'_, str>> {
+        match object_get(&self.config, key)? {
+            Value::String(value) => Some(Cow::Borrowed(value.as_str())),
+            Value::Bool(value) => Some(Cow::Owned(value.to_string())),
+            Value::Number(value) => Some(Cow::Owned(value.to_string())),
             Value::Array(_) | Value::Object(_) | Value::Null => None,
         }
     }
@@ -68,8 +69,7 @@ impl Context {
     #[inline]
     #[must_use]
     pub fn config_bool(&self, key: &str, default: bool) -> bool {
-        self.config
-            .get(key)
+        object_get(&self.config, key)
             .and_then(Value::as_bool)
             .unwrap_or(default)
     }
@@ -110,13 +110,13 @@ impl Context {
     #[inline]
     #[must_use]
     pub fn setting(&self, path: &str) -> Option<&Value> {
-        self.host.get("setting")?.get(path)
+        object_get(&self.host, "setting")?.get(path)
     }
 
     #[inline]
     #[must_use]
     pub fn color(&self, role: &str) -> Option<&Value> {
-        self.host.get("colors")?.get(role)
+        object_get(&self.host, "colors")?.get(role)
     }
 
     #[inline]
@@ -284,9 +284,19 @@ fn now_ms() -> i64 {
     i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
 }
 
+#[inline]
+fn object_get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value.as_object()?.get(key)
+}
+
+#[inline]
 fn lookup<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-    path.split('.')
-        .try_fold(root, |value, part| value.get(part))
+    let mut parts = path.split('.');
+    let mut value = object_get(root, parts.next()?)?;
+    for part in parts {
+        value = object_get(value, part)?;
+    }
+    Some(value)
 }
 
 #[cfg(test)]
@@ -329,8 +339,12 @@ mod tests {
     fn test_config_str_reads_string_and_bool_values() {
         let context = make_context();
 
-        assert_eq!(context.config_str("name"), Some("Example".to_owned()));
-        assert_eq!(context.config_str("enabled"), Some("true".to_owned()));
+        assert_eq!(context.config_str("name").as_deref(), Some("Example"));
+        assert_eq!(context.config_str("enabled").as_deref(), Some("true"));
+        assert!(matches!(
+            context.config_str("name"),
+            Some(Cow::Borrowed("Example"))
+        ));
         assert_eq!(context.config_str("missing"), None);
     }
 
@@ -372,6 +386,9 @@ mod tests {
         assert!(context.bar_vertical());
         assert_eq!(context.bar_output_name(), Some("eDP-1"));
         assert_eq!(context.calendar(), None);
+        assert_eq!(context.host("bar.vertical"), Some(&json!(true)));
+        assert_eq!(context.host("bar.missing"), None);
+        assert_eq!(context.host("missing.key"), None);
     }
 
     #[test]

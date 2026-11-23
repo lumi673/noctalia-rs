@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
 
@@ -59,16 +60,16 @@ fn render(ctx: &Context) -> Result<Vec<Op>> {
     let use_urgency = ctx.config_bool("use_urgency_colors", true);
     let safe = ctx
         .config_str("safe_color")
-        .unwrap_or_else(|| "tertiary".to_owned());
+        .unwrap_or(Cow::Borrowed("tertiary"));
     let warning = ctx
         .config_str("warning_color")
-        .unwrap_or_else(|| "secondary".to_owned());
+        .unwrap_or(Cow::Borrowed("secondary"));
     let urgent = ctx
         .config_str("urgent_color")
-        .unwrap_or_else(|| "error".to_owned());
+        .unwrap_or(Cow::Borrowed("error"));
     let idle = ctx
         .config_str("idle_color")
-        .unwrap_or_else(|| "primary".to_owned());
+        .unwrap_or(Cow::Borrowed("primary"));
 
     if hide_when_idle && timers.is_empty() {
         return Ok(vec![
