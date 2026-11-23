@@ -97,8 +97,8 @@ impl Context {
     where
         T: DeserializeOwned,
     {
-        let value = self.state.get(key).cloned().unwrap_or_default();
-        Ok(serde_json::from_value(value)?)
+        let value = self.state.get(key).unwrap_or(&Value::Null);
+        Ok(T::deserialize(value)?)
     }
 
     #[inline]
