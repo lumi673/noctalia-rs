@@ -104,7 +104,7 @@ fn kind_expression(kind: &str) -> Result<TokenStream2> {
             height: 240,
         }),
         "layer" => quote!(::noctalia::EntryKind::Layer {
-            config: ::noctalia::LayerConfig::new(),
+            config: ::std::boxed::Box::new(::noctalia::LayerConfig::new()),
         }),
         other => {
             return Err(Error::new(

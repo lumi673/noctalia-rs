@@ -697,7 +697,7 @@ fn maximal_plugin() -> Plugin {
         (
             "layer",
             EntryKind::Layer {
-                config: layer_config(),
+                config: Box::new(layer_config()),
             },
         ),
     ];

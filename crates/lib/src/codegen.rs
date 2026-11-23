@@ -5,8 +5,13 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::bridge::SOURCE;
 use crate::manifest::{
-    Entry, EntryKind, LayerConfig, NumberConfig, Plugin, Setting, SettingKind,
+    Entry, EntryConfig, EntryKind, LayerConfig, NumberConfig, Plugin, Setting,
+    SettingKind,
 };
+
+fn config(entry: &Entry) -> EntryConfig {
+    entry.config.as_deref().cloned().unwrap_or_default()
+}
 
 pub fn emit(plugin: &Plugin, dir: &Path, helper: &str) -> io::Result<()> {
     fs::create_dir_all(dir.join("lib"))?;
@@ -63,7 +68,8 @@ pub fn emit(plugin: &Plugin, dir: &Path, helper: &str) -> io::Result<()> {
     fs::write(dir.join("lib/bridge.luau"), bridge)?;
 
     for entry in &plugin.entries {
-        let script = entry.config.script.as_deref().unwrap_or(&entry.id);
+        let config = config(entry);
+        let script = config.script.as_deref().unwrap_or(&entry.id);
         let name = format!("{script}.luau");
         let target = dir.join(name);
         if let Some(parent) = target.parent() {
@@ -167,7 +173,8 @@ const fn entry_table(kind: &EntryKind) -> &'static str {
 }
 
 fn write_entry(out: &mut String, entry: &Entry) {
-    let name = entry.config.script.as_deref().unwrap_or(&entry.id);
+    let config = config(entry);
+    let name = config.script.as_deref().unwrap_or(&entry.id);
     let script = format!("{name}.luau");
     let table = entry_table(&entry.kind);
     let _ = write!(
@@ -187,9 +194,9 @@ fn write_entry(out: &mut String, entry: &Entry) {
         | EntryKind::Shortcut
         | EntryKind::DesktopWidget => {}
     }
-    if !entry.config.action_map.is_empty() {
+    if !config.action_map.is_empty() {
         let _ = writeln!(out, "[{table}.actions]");
-        for (key, value) in &entry.config.action_map {
+        for (key, value) in &config.action_map {
             let _ = writeln!(out, "{key} = {}", quote(value));
         }
     }
@@ -200,6 +207,7 @@ fn write_entry(out: &mut String, entry: &Entry) {
 }
 
 fn write_launcher(out: &mut String, entry: &Entry) {
+    let config = config(entry);
     let EntryKind::LauncherProvider { prefix, glyph } = &entry.kind else {
         return;
     };
@@ -209,9 +217,9 @@ fn write_launcher(out: &mut String, entry: &Entry) {
         quote(prefix),
         quote(glyph)
     );
-    let include = entry.config.include_in_global_search.unwrap_or(false);
+    let include = config.include_in_global_search.unwrap_or(false);
     let _ = writeln!(out, "include_in_global_search = {include}");
-    for category in &entry.config.categories {
+    for category in &config.categories {
         let _ = writeln!(out, "\n[[launcher_provider.category]]");
         let _ = writeln!(out, "label = {}", quote(&category.label));
         let _ = writeln!(out, "glyph = {}", quote(&category.glyph));
@@ -219,30 +227,31 @@ fn write_launcher(out: &mut String, entry: &Entry) {
 }
 
 fn write_panel(out: &mut String, entry: &Entry) {
+    let config = config(entry);
     let EntryKind::Panel { width, height } = entry.kind else {
         return;
     };
-    if let Some(value) = &entry.config.width_text {
+    if let Some(value) = &config.width_text {
         let _ = writeln!(out, "width = {}", quote(value));
     } else {
         let _ = writeln!(out, "width = {width}");
     }
-    if let Some(value) = &entry.config.height_text {
+    if let Some(value) = &config.height_text {
         let _ = writeln!(out, "height = {}", quote(value));
     } else {
         let _ = writeln!(out, "height = {height}");
     }
-    let placement = entry.config.placement.as_deref().unwrap_or("floating");
-    let position = entry.config.position.as_deref().unwrap_or("center");
+    let placement = config.placement.as_deref().unwrap_or("floating");
+    let position = config.position.as_deref().unwrap_or("center");
     let _ = writeln!(out, "placement = {}", quote(placement));
     let _ = writeln!(out, "position = {}", quote(position));
-    if let Some(value) = &entry.config.panel_layer {
+    if let Some(value) = &config.panel_layer {
         let _ = writeln!(out, "layer = {}", quote(value));
     }
 }
 
 fn write_entry_config(out: &mut String, entry: &Entry) {
-    let config = &entry.config;
+    let config = config(entry);
     if !config.actions.is_empty() {
         let _ = writeln!(out, "actions = {}", toml_list(&config.actions));
     }
@@ -416,7 +425,7 @@ fn write_setting_kind(out: &mut String, setting: &Setting, table: &str) {
                 quote(default)
             );
             let options_table = format!("{}.options", setting_table(table));
-            for (value, label_key) in options {
+            for (value, label_key) in options.iter() {
                 let _ = write!(
                     out,
                     "\n  [[{options_table}]]\nvalue = {}\nlabel_key = {}\n",

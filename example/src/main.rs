@@ -286,7 +286,7 @@ fn build_plugin() -> Plugin {
         .entry(layer::update_entry());
 
     for (key, value) in TRANSLATIONS {
-        plugin = plugin.tr(key, value);
+        plugin = plugin.tr(*key, *value);
     }
 
     plugin

@@ -310,6 +310,7 @@ dependencies = [
  "noctalia-macros",
  "serde",
  "serde_json",
+ "smallvec",
  "toml",
 ]
 

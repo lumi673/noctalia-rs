@@ -1,16 +1,24 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
 use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use serde_json::{Map, Value};
+use smallvec::SmallVec;
 
 use crate::Result;
 use crate::codegen;
 use crate::context::Context;
 use crate::ops::Op;
-
 pub type Handler = fn(&Context) -> Result<Vec<Op>>;
+
+pub type Text = Cow<'static, str>;
+type Entries = SmallVec<[Entry; 1]>;
+type Settings = SmallVec<[Setting; 1]>;
+type Translations = SmallVec<[(Text, Text); 1]>;
 
 type SelectConfig<'a> = (&'a str, &'a [(&'a str, &'a str)]);
 pub type NumberConfig = (f64, Option<f64>, Option<f64>);
@@ -18,42 +26,76 @@ type FileConfig<'a> = (&'a str, &'a [&'a str]);
 
 #[derive(Clone, Debug)]
 pub struct Meta {
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub author: String,
+    pub id: Text,
+    pub name: Text,
+    pub version: Text,
     pub plugin_api: u32,
-    pub license: String,
-    pub description: String,
+    extras: Option<Box<MetaExtras>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MetaExtras {
+    pub author: Text,
+    pub license: Text,
+    pub description: Text,
     pub tags: Vec<String>,
-    pub icon: String,
+    pub icon: Text,
     pub dependencies: Vec<String>,
     pub deprecated: bool,
+}
+
+impl Default for MetaExtras {
+    fn default() -> Self {
+        Self {
+            author: Text::Borrowed(""),
+            license: Text::Borrowed("MIT"),
+            description: Text::Borrowed(""),
+            tags: Vec::new(),
+            icon: Text::Borrowed(""),
+            dependencies: Vec::new(),
+            deprecated: false,
+        }
+    }
+}
+
+static DEFAULT_META_EXTRAS: LazyLock<MetaExtras> =
+    LazyLock::new(MetaExtras::default);
+
+impl Deref for Meta {
+    type Target = MetaExtras;
+
+    fn deref(&self) -> &Self::Target {
+        self.extras.as_deref().unwrap_or(&DEFAULT_META_EXTRAS)
+    }
+}
+
+impl DerefMut for Meta {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.extras.get_or_insert_with(Box::default)
+    }
 }
 
 impl Meta {
     #[inline]
     #[must_use]
-    pub fn new(id: &str, name: &str, version: &str) -> Self {
+    pub fn new(
+        id: impl Into<Text>,
+        name: impl Into<Text>,
+        version: impl Into<Text>,
+    ) -> Self {
         Self {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            version: version.to_owned(),
-            author: String::new(),
+            id: id.into(),
+            name: name.into(),
+            version: version.into(),
             plugin_api: 57,
-            license: "MIT".to_owned(),
-            description: String::new(),
-            tags: Vec::new(),
-            icon: String::new(),
-            dependencies: Vec::new(),
-            deprecated: false,
+            extras: None,
         }
     }
 
     #[inline]
     #[must_use]
-    pub fn author(mut self, value: &str) -> Self {
-        value.clone_into(&mut self.author);
+    pub fn author(mut self, value: impl Into<Text>) -> Self {
+        self.author = value.into();
         self
     }
 
@@ -66,8 +108,8 @@ impl Meta {
 
     #[inline]
     #[must_use]
-    pub fn description(mut self, value: &str) -> Self {
-        value.clone_into(&mut self.description);
+    pub fn description(mut self, value: impl Into<Text>) -> Self {
+        self.description = value.into();
         self
     }
 
@@ -80,15 +122,15 @@ impl Meta {
 
     #[inline]
     #[must_use]
-    pub fn icon(mut self, value: &str) -> Self {
-        value.clone_into(&mut self.icon);
+    pub fn icon(mut self, value: impl Into<Text>) -> Self {
+        self.icon = value.into();
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn license(mut self, value: &str) -> Self {
-        value.clone_into(&mut self.license);
+    pub fn license(mut self, value: impl Into<Text>) -> Self {
+        self.license = value.into();
         self
     }
 
@@ -102,7 +144,7 @@ impl Meta {
 
     #[inline]
     #[must_use]
-    pub const fn deprecated(mut self, value: bool) -> Self {
+    pub fn deprecated(mut self, value: bool) -> Self {
         self.deprecated = value;
         self
     }
@@ -130,8 +172,8 @@ impl MetaBuilder<NeedId> {
 
     #[inline]
     #[must_use]
-    pub fn id(mut self, value: &str) -> MetaBuilder<NeedName> {
-        value.clone_into(&mut self.meta.id);
+    pub fn id(mut self, value: impl Into<Text>) -> MetaBuilder<NeedName> {
+        self.meta.id = value.into();
         MetaBuilder {
             meta: self.meta,
             marker: PhantomData,
@@ -142,8 +184,8 @@ impl MetaBuilder<NeedId> {
 impl MetaBuilder<NeedName> {
     #[inline]
     #[must_use]
-    pub fn name(mut self, value: &str) -> MetaBuilder<NeedVersion> {
-        value.clone_into(&mut self.meta.name);
+    pub fn name(mut self, value: impl Into<Text>) -> MetaBuilder<NeedVersion> {
+        self.meta.name = value.into();
         MetaBuilder {
             meta: self.meta,
             marker: PhantomData,
@@ -154,8 +196,8 @@ impl MetaBuilder<NeedName> {
 impl MetaBuilder<NeedVersion> {
     #[inline]
     #[must_use]
-    pub fn version(mut self, value: &str) -> MetaBuilder<MetaReady> {
-        value.clone_into(&mut self.meta.version);
+    pub fn version(mut self, value: impl Into<Text>) -> MetaBuilder<MetaReady> {
+        self.meta.version = value.into();
         MetaBuilder {
             meta: self.meta,
             marker: PhantomData,
@@ -166,7 +208,7 @@ impl MetaBuilder<NeedVersion> {
 impl<S> MetaBuilder<S> {
     #[inline]
     #[must_use]
-    pub fn author(mut self, value: &str) -> Self {
+    pub fn author(mut self, value: impl Into<Text>) -> Self {
         self.meta = self.meta.author(value);
         self
     }
@@ -180,7 +222,7 @@ impl<S> MetaBuilder<S> {
 
     #[inline]
     #[must_use]
-    pub fn description(mut self, value: &str) -> Self {
+    pub fn description(mut self, value: impl Into<Text>) -> Self {
         self.meta = self.meta.description(value);
         self
     }
@@ -194,14 +236,14 @@ impl<S> MetaBuilder<S> {
 
     #[inline]
     #[must_use]
-    pub fn icon(mut self, value: &str) -> Self {
+    pub fn icon(mut self, value: impl Into<Text>) -> Self {
         self.meta = self.meta.icon(value);
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn license(mut self, value: &str) -> Self {
+    pub fn license(mut self, value: impl Into<Text>) -> Self {
         self.meta = self.meta.license(value);
         self
     }
@@ -357,7 +399,7 @@ pub enum EntryKind {
     LauncherProvider { prefix: String, glyph: String },
     DesktopWidget,
     Panel { width: u32, height: u32 },
-    Layer { config: LayerConfig },
+    Layer { config: Box<LayerConfig> },
 }
 #[derive(Clone, Debug)]
 pub struct LauncherCategory {
@@ -565,16 +607,16 @@ pub enum SettingKind {
     Bool(bool),
     String(String),
     StringList(Vec<String>),
-    StringMap(BTreeMap<String, String>),
+    StringMap(Box<BTreeMap<String, String>>),
     Int(NumberConfig),
     Double(NumberConfig),
     Select {
         default: String,
-        options: Vec<(String, String)>,
+        options: Box<Vec<(String, String)>>,
     },
     File {
         default: String,
-        extensions: Vec<String>,
+        extensions: Box<Vec<String>>,
     },
     Folder(String),
     Glyph(String),
@@ -583,31 +625,65 @@ pub enum SettingKind {
 
 #[derive(Clone, Debug)]
 pub struct Setting {
-    pub key: String,
-    pub label_key: String,
-    pub description_key: Option<String>,
+    pub key: Text,
+    pub label_key: Text,
     pub kind: SettingKind,
-    pub visible_when: Option<(String, Vec<String>)>,
+    extras: Option<Box<SettingExtras>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SettingExtras {
+    pub description_key: Option<Text>,
+    pub visible_when: Option<(Text, Vec<String>)>,
     pub step: Option<f64>,
     pub advanced: Option<bool>,
+}
+
+static DEFAULT_SETTING_EXTRAS: LazyLock<SettingExtras> =
+    LazyLock::new(SettingExtras::default);
+
+impl Deref for Setting {
+    type Target = SettingExtras;
+
+    fn deref(&self) -> &Self::Target {
+        self.extras.as_deref().unwrap_or(&DEFAULT_SETTING_EXTRAS)
+    }
+}
+
+impl DerefMut for Setting {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.extras.get_or_insert_with(Box::default)
+    }
 }
 
 impl Setting {
     #[inline]
     #[must_use]
-    pub fn bool(key: &str, label_key: &str, default: bool) -> Self {
+    pub fn bool(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        default: bool,
+    ) -> Self {
         Self::new(key, label_key, SettingKind::Bool(default))
     }
 
     #[inline]
     #[must_use]
-    pub fn string(key: &str, label_key: &str, default: &str) -> Self {
+    pub fn string(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        default: &str,
+    ) -> Self {
         Self::new(key, label_key, SettingKind::String(default.to_owned()))
     }
 
     #[inline]
     #[must_use]
-    pub fn string_list(key: &str, label_key: &str, values: &[&str]) -> Self {
+    pub fn string_list(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        values: &[&str],
+    ) -> Self {
         let value_list =
             values.iter().map(|value| (*value).to_owned()).collect();
         Self::new(key, label_key, SettingKind::StringList(value_list))
@@ -616,34 +692,46 @@ impl Setting {
     #[inline]
     #[must_use]
     pub fn string_map(
-        key: &str,
-        label_key: &str,
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
         values: &[(&str, &str)],
     ) -> Self {
         let map_entries = values
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
-        Self::new(key, label_key, SettingKind::StringMap(map_entries))
+        Self::new(
+            key,
+            label_key,
+            SettingKind::StringMap(Box::new(map_entries)),
+        )
     }
 
     #[inline]
     #[must_use]
-    pub fn int(key: &str, label_key: &str, config: NumberConfig) -> Self {
+    pub fn int(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        config: NumberConfig,
+    ) -> Self {
         Self::new(key, label_key, SettingKind::Int(config))
     }
 
     #[inline]
     #[must_use]
-    pub fn double(key: &str, label_key: &str, config: NumberConfig) -> Self {
+    pub fn double(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        config: NumberConfig,
+    ) -> Self {
         Self::new(key, label_key, SettingKind::Double(config))
     }
 
     #[inline]
     #[must_use]
     pub fn select(
-        key: &str,
-        label_key: &str,
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
         config: SelectConfig<'_>,
     ) -> Self {
         let (default, option_values) = config;
@@ -656,58 +744,80 @@ impl Setting {
             label_key,
             SettingKind::Select {
                 default: default.to_owned(),
-                options,
+                options: Box::new(options),
             },
         )
     }
 
     #[inline]
     #[must_use]
-    pub fn file(key: &str, label_key: &str, config: FileConfig<'_>) -> Self {
+    pub fn file(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        config: FileConfig<'_>,
+    ) -> Self {
         let (default, extensions) = config;
         Self::new(
             key,
             label_key,
             SettingKind::File {
                 default: default.to_owned(),
-                extensions: extensions
-                    .iter()
-                    .map(|value| (*value).to_owned())
-                    .collect(),
+                extensions: Box::new(
+                    extensions
+                        .iter()
+                        .map(|value| (*value).to_owned())
+                        .collect(),
+                ),
             },
         )
     }
 
     #[inline]
     #[must_use]
-    pub fn folder(key: &str, label_key: &str, default: &str) -> Self {
+    pub fn folder(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        default: &str,
+    ) -> Self {
         Self::new(key, label_key, SettingKind::Folder(default.to_owned()))
     }
 
     #[inline]
     #[must_use]
-    pub fn glyph(key: &str, label_key: &str, default: &str) -> Self {
+    pub fn glyph(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        default: &str,
+    ) -> Self {
         Self::new(key, label_key, SettingKind::Glyph(default.to_owned()))
     }
 
     #[inline]
     #[must_use]
-    pub fn color(key: &str, label_key: &str, default: &str) -> Self {
+    pub fn color(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        default: &str,
+    ) -> Self {
         Self::new(key, label_key, SettingKind::Color(default.to_owned()))
     }
 
     #[inline]
     #[must_use]
-    pub fn description(mut self, key: &str) -> Self {
-        self.description_key = Some(key.to_owned());
+    pub fn description(mut self, key: impl Into<Text>) -> Self {
+        self.description_key = Some(key.into());
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn visible_when(mut self, key: &str, values: &[&str]) -> Self {
+    pub fn visible_when(
+        mut self,
+        key: impl Into<Text>,
+        values: &[&str],
+    ) -> Self {
         self.visible_when = Some((
-            key.to_owned(),
+            key.into(),
             values.iter().map(|value| (*value).to_owned()).collect(),
         ));
         self
@@ -715,63 +825,70 @@ impl Setting {
 
     #[inline]
     #[must_use]
-    pub const fn step(mut self, value: f64) -> Self {
+    pub fn step(mut self, value: f64) -> Self {
         self.step = Some(value);
         self
     }
 
     #[inline]
     #[must_use]
-    pub const fn advanced(mut self, value: bool) -> Self {
+    pub fn advanced(mut self, value: bool) -> Self {
         self.advanced = Some(value);
         self
     }
 
-    fn new(key: &str, label_key: &str, kind: SettingKind) -> Self {
+    fn new(
+        key: impl Into<Text>,
+        label_key: impl Into<Text>,
+        kind: SettingKind,
+    ) -> Self {
         Self {
-            key: key.to_owned(),
-            label_key: label_key.to_owned(),
-            description_key: None,
+            key: key.into(),
+            label_key: label_key.into(),
             kind,
-            visible_when: None,
-            step: None,
-            advanced: None,
+            extras: None,
         }
     }
 }
 
 #[derive(Clone)]
 pub struct Entry {
-    pub id: String,
+    pub id: Text,
     pub kind: EntryKind,
     pub settings: Vec<Setting>,
-    pub config: EntryConfig,
+    pub config: Option<Box<EntryConfig>>,
     pub handler: Handler,
 }
 
 impl Entry {
     #[inline]
     #[must_use]
-    pub fn new(
-        spec: (String, EntryKind, Vec<Setting>),
+    pub fn new<S: Into<Text>>(
+        spec: (S, EntryKind, Vec<Setting>),
         handler: Handler,
     ) -> Self {
         let (id, kind, settings) = spec;
-        Self::configured((id, kind, settings, EntryConfig::new()), handler)
+        Self {
+            id: id.into(),
+            kind,
+            settings,
+            config: None,
+            handler,
+        }
     }
 
     #[inline]
     #[must_use]
-    pub fn configured(
-        spec: (String, EntryKind, Vec<Setting>, EntryConfig),
+    pub fn configured<S: Into<Text>>(
+        spec: (S, EntryKind, Vec<Setting>, EntryConfig),
         handler: Handler,
     ) -> Self {
         let (id, kind, settings, config) = spec;
         Self {
-            id,
+            id: id.into(),
             kind,
             settings,
-            config,
+            config: Some(Box::new(config)),
             handler,
         }
     }
@@ -779,9 +896,9 @@ impl Entry {
 
 pub struct Plugin {
     pub meta: Meta,
-    pub entries: Vec<Entry>,
-    pub settings: Vec<Setting>,
-    pub translations: BTreeMap<String, String>,
+    pub entries: Entries,
+    pub settings: Settings,
+    pub translations: Translations,
     pub assets: BTreeMap<String, Vec<u8>>,
     pub translation_files: BTreeMap<String, String>,
 }
@@ -789,12 +906,12 @@ pub struct Plugin {
 impl Plugin {
     #[inline]
     #[must_use]
-    pub const fn new(meta: Meta) -> Self {
+    pub fn new(meta: Meta) -> Self {
         Self {
             meta,
-            entries: Vec::new(),
-            settings: Vec::new(),
-            translations: BTreeMap::new(),
+            entries: Entries::new(),
+            settings: Settings::new(),
+            translations: Translations::new(),
             assets: BTreeMap::new(),
             translation_files: BTreeMap::new(),
         }
@@ -809,42 +926,44 @@ impl Plugin {
 
     #[inline]
     #[must_use]
-    pub fn service(mut self, id: &str, handler: Handler) -> Self {
-        self.entries.push(Entry::new(
-            (id.to_owned(), EntryKind::Service, Vec::new()),
-            handler,
-        ));
+    pub fn service(mut self, id: impl Into<Text>, handler: Handler) -> Self {
+        self.entries
+            .push(Entry::new((id, EntryKind::Service, Vec::new()), handler));
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn widget(mut self, id: &str, spec: (Vec<Setting>, Handler)) -> Self {
+    pub fn widget(
+        mut self,
+        id: impl Into<Text>,
+        spec: (Vec<Setting>, Handler),
+    ) -> Self {
         let (settings, handler) = spec;
-        self.entries.push(Entry::new(
-            (id.to_owned(), EntryKind::Widget, settings),
-            handler,
-        ));
+        self.entries
+            .push(Entry::new((id, EntryKind::Widget, settings), handler));
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn shortcut(mut self, id: &str, handler: Handler) -> Self {
-        self.entries.push(Entry::new(
-            (id.to_owned(), EntryKind::Shortcut, Vec::new()),
-            handler,
-        ));
+    pub fn shortcut(mut self, id: impl Into<Text>, handler: Handler) -> Self {
+        self.entries
+            .push(Entry::new((id, EntryKind::Shortcut, Vec::new()), handler));
         self
     }
 
     #[inline]
     #[must_use]
-    pub fn launcher(mut self, id: &str, spec: (&str, &str, Handler)) -> Self {
+    pub fn launcher(
+        mut self,
+        id: impl Into<Text>,
+        spec: (&str, &str, Handler),
+    ) -> Self {
         let (prefix, glyph, handler) = spec;
         self.entries.push(Entry::new(
             (
-                id.to_owned(),
+                id,
                 EntryKind::LauncherProvider {
                     prefix: prefix.to_owned(),
                     glyph: glyph.to_owned(),
@@ -858,9 +977,13 @@ impl Plugin {
 
     #[inline]
     #[must_use]
-    pub fn desktop_widget(mut self, id: &str, handler: Handler) -> Self {
+    pub fn desktop_widget(
+        mut self,
+        id: impl Into<Text>,
+        handler: Handler,
+    ) -> Self {
         self.entries.push(Entry::new(
-            (id.to_owned(), EntryKind::DesktopWidget, Vec::new()),
+            (id, EntryKind::DesktopWidget, Vec::new()),
             handler,
         ));
         self
@@ -868,14 +991,14 @@ impl Plugin {
 
     #[inline]
     #[must_use]
-    pub fn panel(mut self, id: &str, spec: (u32, u32, Handler)) -> Self {
+    pub fn panel(
+        mut self,
+        id: impl Into<Text>,
+        spec: (u32, u32, Handler),
+    ) -> Self {
         let (width, height, handler) = spec;
         self.entries.push(Entry::new(
-            (
-                id.to_owned(),
-                EntryKind::Panel { width, height },
-                Vec::new(),
-            ),
+            (id, EntryKind::Panel { width, height }, Vec::new()),
             handler,
         ));
         self
@@ -883,10 +1006,20 @@ impl Plugin {
 
     #[inline]
     #[must_use]
-    pub fn layer(mut self, id: &str, spec: (LayerConfig, Handler)) -> Self {
+    pub fn layer(
+        mut self,
+        id: impl Into<Text>,
+        spec: (LayerConfig, Handler),
+    ) -> Self {
         let (config, handler) = spec;
         self.entries.push(Entry::new(
-            (id.to_owned(), EntryKind::Layer { config }, Vec::new()),
+            (
+                id,
+                EntryKind::Layer {
+                    config: Box::new(config),
+                },
+                Vec::new(),
+            ),
             handler,
         ));
         self
@@ -900,8 +1033,18 @@ impl Plugin {
     }
     #[inline]
     #[must_use]
-    pub fn tr(mut self, key: &str, value: &str) -> Self {
-        self.translations.insert(key.to_owned(), value.to_owned());
+    pub fn tr(mut self, key: impl Into<Text>, value: impl Into<Text>) -> Self {
+        let owned_key = key.into();
+        let owned_value = value.into();
+        if let Some((_, existing)) = self
+            .translations
+            .iter_mut()
+            .find(|(item, _)| *item == owned_key)
+        {
+            *existing = owned_value;
+        } else {
+            self.translations.push((owned_key, owned_value));
+        }
         self
     }
 
@@ -927,15 +1070,19 @@ impl Plugin {
             .id
             .split('/')
             .next_back()
-            .unwrap_or(&self.meta.id)
+            .unwrap_or_else(|| self.meta.id.as_ref())
             .to_owned()
     }
 
     #[must_use]
     pub fn translations_value(&self) -> Value {
         let mut root = Map::new();
-
+        let mut ordered: BTreeMap<&str, &str> = BTreeMap::new();
         for (key, value) in &self.translations {
+            ordered.insert(key.as_ref(), value.as_ref());
+        }
+
+        for (key, value) in ordered {
             let parts: Vec<&str> = key.split('.').collect();
             insert_translation(&mut root, &parts, value);
         }
@@ -947,7 +1094,7 @@ impl Plugin {
         let entry = self
             .entries
             .iter()
-            .find(|entry| entry.id == ctx.entry)
+            .find(|entry| entry.id.as_ref() == ctx.entry)
             .ok_or_else(|| format!("unknown entry {}", ctx.entry))?;
         (entry.handler)(ctx)
     }

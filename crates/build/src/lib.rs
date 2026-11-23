@@ -650,7 +650,7 @@ fn entry_expression(
         }
         "layer" => {
             let config = layer_config(row)?;
-            format!("EntryKind::Layer {{ config: {config} }}")
+            format!("EntryKind::Layer {{ config: Box::new({config}) }}")
         }
         other => {
             return Err(
