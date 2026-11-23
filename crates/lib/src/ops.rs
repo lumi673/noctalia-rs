@@ -1,13 +1,48 @@
-use serde::Serialize;
+use crate::ui::{UiNode, callback};
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use crate::ui::{UiNode, callback};
+#[derive(Clone, Copy, Debug)]
+pub struct SharedStr(&'static str);
+
+impl Serialize for SharedStr {
+    #[inline]
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SharedValue(&'static Value);
+
+impl Serialize for SharedValue {
+    #[inline]
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn parse_json_static(json: &'static str) -> Value {
+    serde_json::from_str(json).unwrap_or_default()
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     Log {
         message: String,
+    },
+    #[serde(rename = "log")]
+    LogShared {
+        message: SharedStr,
     },
     Notify {
         title: String,
@@ -23,6 +58,11 @@ pub enum Op {
     StateSet {
         key: String,
         value: Value,
+    },
+    #[serde(rename = "state_set")]
+    StateSetShared {
+        key: SharedStr,
+        value: SharedValue,
     },
     TogglePanel {
         id: String,
@@ -93,10 +133,30 @@ impl Op {
 
     #[inline]
     #[must_use]
+    pub const fn log_static(message: &'static str) -> Self {
+        Self::LogShared {
+            message: SharedStr(message),
+        }
+    }
+
+    #[inline]
+    #[must_use]
     pub fn state(key: &str, value: Value) -> Self {
         Self::StateSet {
             key: key.to_owned(),
             value,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn state_static(
+        key: &'static str,
+        value: &'static Value,
+    ) -> Self {
+        Self::StateSetShared {
+            key: SharedStr(key),
+            value: SharedValue(value),
         }
     }
 
@@ -217,6 +277,16 @@ impl Op {
     }
 }
 
+#[macro_export]
+macro_rules! state_json {
+    ($key:expr, $json:literal) => {{
+        static VALUE: ::std::sync::OnceLock<$crate::Value> =
+            ::std::sync::OnceLock::new();
+        let value: &'static $crate::Value =
+            VALUE.get_or_init(|| $crate::ops::parse_json_static($json));
+        $crate::Op::state_static($key, value)
+    }};
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +307,40 @@ mod tests {
         assert_eq!(
             value,
             json!({ "op": "state_set", "key": "key", "value": [1, 2] })
+        );
+    }
+
+    #[test]
+    fn test_static_ops_match_json_construction() {
+        let expected = vec![
+            Op::state(
+                "bench.state",
+                json!({
+                    "count": 1,
+                    "items": [{
+                        "id": "row-1",
+                        "tags": ["a", "b"],
+                        "value": 42
+                    }]
+                }),
+            ),
+            Op::log("published"),
+        ];
+        let actual = vec![
+            crate::state_json!(
+                "bench.state",
+                r#"{"count":1,"items":[{"id":"row-1","tags":["a","b"],"value":42}]}"#
+            ),
+            Op::log_static("published"),
+        ];
+
+        assert_eq!(
+            serde_json::to_string(&expected).expect("serialize expected"),
+            serde_json::to_string(&actual).expect("serialize actual")
+        );
+        assert_eq!(
+            serde_json::to_value(&expected).expect("value expected"),
+            serde_json::to_value(&actual).expect("value actual")
         );
     }
 
