@@ -54,13 +54,12 @@ fn context(dir: &Dir, responder: fn(&[String]) -> Value) -> Context {
         let query_path: Vec<String> = value
             .get("path")
             .and_then(Value::as_array)
-            .map(|values| {
+            .map_or_else(Vec::new, |values| {
                 values
                     .iter()
                     .filter_map(|item| item.as_str().map(str::to_owned))
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         let response = json!({
             "ok": true,
             "value": responder(&query_path),
