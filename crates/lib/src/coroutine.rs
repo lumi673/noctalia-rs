@@ -4,7 +4,7 @@
 //! by calling [`yield_now`] inside a spawned [`Coroutine`]. The driver resumes
 //! suspended coroutines until a [`ClockBudget`] expires. Dropping a coroutine
 //! stops it at its next yield, the same way the shell discards a Luau
-//! coroutine it never resumes again.
+//! coroutine it never resumes again; the drop does not wait for that yield.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -13,6 +13,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use crate::clock::ClockBudget;
+
+/// Payload used to stop a body whose driver is gone.
+struct Stopped;
 
 enum Signal {
     Yield(Box<dyn Any + Send>),
@@ -44,10 +47,9 @@ pub fn yield_value<T: Send + 'static>(value: T) {
             return;
         };
         let _ = current.yielded.send(Signal::Yield(Box::new(value)));
-        assert!(
-            current.resumed.recv().is_ok(),
-            "coroutine stopped: driver dropped"
-        );
+        if current.resumed.recv().is_err() {
+            panic::resume_unwind(Box::new(Stopped));
+        }
     });
 }
 
@@ -85,7 +87,11 @@ impl<T: Send + 'static> Coroutine<T> {
             CURRENT.with(|cell| {
                 *cell.borrow_mut() = Some(Current { yielded, resumed });
             });
-            let value = panic::catch_unwind(AssertUnwindSafe(body)).ok();
+            let value = match panic::catch_unwind(AssertUnwindSafe(body)) {
+                Ok(value) => Some(value),
+                Err(payload) if payload.is::<Stopped>() => None,
+                Err(payload) => panic::resume_unwind(payload),
+            };
             CURRENT.with(|cell| {
                 if let Some(current) = cell.borrow_mut().take() {
                     let _ = current.yielded.send(Signal::Done);
@@ -130,9 +136,6 @@ impl<T: Send + 'static> Coroutine<T> {
 impl<T> Drop for Coroutine<T> {
     fn drop(&mut self) {
         drop(self.resume.take());
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -204,6 +207,12 @@ mod tests {
         assert!(saw_value);
         assert_eq!(value, Some(41));
         assert_eq!(coroutine.join(), Some(0));
+    }
+
+    #[test]
+    fn body_panics_are_not_swallowed() {
+        let coroutine = Coroutine::spawn(|| -> u32 { panic!("boom") });
+        assert_eq!(coroutine.join(), None);
     }
 
     #[test]

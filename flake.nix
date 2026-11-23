@@ -100,7 +100,7 @@
             comrak = {
               enable = true;
               # PR templates carry checkbox syntax the formatter escapes.
-              excludes = ["^\.forgejo/"];
+              excludes = ["^\\.forgejo/"];
             };
             ripsecrets.enable = true;
             typos.enable = true;

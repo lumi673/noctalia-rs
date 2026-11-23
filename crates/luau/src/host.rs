@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use noctalia_rs::{Context, Op};
 use serde_json::Value;
@@ -225,6 +225,7 @@ pub struct Host {
     pub snapshot: Snapshot,
     pub collector: Collector,
     translations: Translations,
+    query_dir: OnceLock<Option<PathBuf>>,
 }
 
 impl Host {
@@ -233,6 +234,7 @@ impl Host {
             snapshot: Snapshot::new(ctx),
             collector: Collector::default(),
             translations: Translations::new(ctx, sources),
+            query_dir: OnceLock::new(),
         }
     }
 
@@ -243,6 +245,21 @@ impl Host {
 
     pub fn tr(&self, key: &str, params: &[(String, String)]) -> String {
         self.translations.render(key, params)
+    }
+
+    /// Returns the spool directory when a host is attached.
+    ///
+    /// The check is cached: a runtime either talks to a host for its whole
+    /// life or never does, and asking the filesystem on every host read was
+    /// measurable in plugin dispatch.
+    pub fn query_dir(&self) -> Option<&std::path::Path> {
+        self.query_dir
+            .get_or_init(|| {
+                let spool =
+                    self.snapshot.data_dir().join(".noctalia-rs").join("spool");
+                spool.is_dir().then_some(spool)
+            })
+            .as_deref()
     }
 
     pub fn response_path(&self, id: &str) -> PathBuf {

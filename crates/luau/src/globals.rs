@@ -126,13 +126,7 @@ impl Runtime<'_> {
         path: &[&str],
         args: Vec<JsonValue>,
     ) -> LuaResult<MultiValue> {
-        let spool = self
-            .host
-            .snapshot
-            .data_dir()
-            .join(".noctalia-rs")
-            .join("spool");
-        if !spool.is_dir() {
+        if self.host.query_dir().is_none() {
             return Ok(MultiValue::from_vec(vec![LuaValue::Nil]));
         }
         let id = self.host.collector.callback_id();

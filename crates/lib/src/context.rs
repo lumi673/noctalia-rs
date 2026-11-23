@@ -144,10 +144,9 @@ impl Context {
         *current = Some(sink);
     }
 
-    /// Drains ops produced by queries made without an op writer.
+    /// Drains ops buffered while no op sink is installed.
     #[doc(hidden)]
     #[must_use]
-    /// Drains ops buffered while no op sink is installed.
     pub fn take_pending_ops(&self) -> Vec<Op> {
         let mut pending = lock(&self.pending_ops);
         mem::take(&mut pending)
