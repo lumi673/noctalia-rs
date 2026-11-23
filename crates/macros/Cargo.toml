@@ -1,5 +1,5 @@
 [package]
-name                 = "noctalia-macros"
+name                 = "noctalia-rs-macros"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -7,6 +7,7 @@ description          = "Unofficial proc macros for noctalia"
 readme               = "../../README.md"
 
 [lib]
+name = "noctalia_macros"
 proc-macro = true
 
 [dependencies]

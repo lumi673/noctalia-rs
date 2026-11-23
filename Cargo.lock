@@ -303,11 +303,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "noctalia"
-version = "0.1.0"
+name = "noctalia-bench"
+version = "0.1.2"
 dependencies = [
  "chrono",
- "noctalia-macros",
+ "noctalia-rs",
+ "noctalia-rs-build",
+ "noctalia-rs-luau",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "noctalia-example"
+version = "0.1.2"
+dependencies = [
+ "noctalia-rs",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "noctalia-rs"
+version = "0.1.2"
+dependencies = [
+ "chrono",
+ "noctalia-rs-macros",
  "serde",
  "serde_json",
  "smallvec",
@@ -315,46 +336,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "noctalia-bench"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "noctalia",
- "noctalia-build",
- "noctalia-luau",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "noctalia-build"
-version = "0.1.0"
+name = "noctalia-rs-build"
+version = "0.1.2"
 dependencies = [
  "toml",
 ]
 
 [[package]]
-name = "noctalia-example"
-version = "0.1.0"
-dependencies = [
- "noctalia",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "noctalia-luau"
-version = "0.1.0"
+name = "noctalia-rs-luau"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "mlua",
- "noctalia",
+ "noctalia-rs",
  "serde_json",
 ]
 
 [[package]]
-name = "noctalia-macros"
-version = "0.1.0"
+name = "noctalia-rs-macros"
+version = "0.1.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -365,9 +365,9 @@ dependencies = [
 name = "noctalia-template"
 version = "0.1.0"
 dependencies = [
- "noctalia",
- "noctalia-build",
- "noctalia-luau",
+ "noctalia-rs",
+ "noctalia-rs-build",
+ "noctalia-rs-luau",
  "serde_json",
 ]
 

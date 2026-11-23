@@ -436,3 +436,22 @@ fn callback_mapping_covers_host_events() {
         vec![json!("query")]
     );
 }
+
+#[test]
+fn generated_callbacks_have_runtime_mappings() {
+    for callback in noctalia::codegen::CALLBACKS {
+        assert_eq!(
+            callback_for_event(callback.event),
+            Some(callback.function),
+            "{} has no runtime callback",
+            callback.event
+        );
+    }
+
+    for event in ["init", "update", "render", "frame_tick"] {
+        assert!(
+            callback_for_event(event).is_some(),
+            "{event} has no runtime callback"
+        );
+    }
+}

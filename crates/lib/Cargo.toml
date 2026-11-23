@@ -1,5 +1,5 @@
 [package]
-name                 = "noctalia"
+name                 = "noctalia-rs"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
@@ -8,9 +8,12 @@ readme               = "../../README.md"
 keywords             = ["noctalia", "luau", "plugin", "shell", "framework"]
 categories           = ["development-tools"]
 
+[lib]
+name = "noctalia"
+
 [dependencies]
 chrono.workspace          = true
-noctalia-macros.workspace = true
+noctalia-rs-macros.workspace = true
 serde.workspace           = true
 serde_json.workspace      = true
 smallvec                  = "1.16"

@@ -1,0 +1,8 @@
+{
+  "settings": {
+    "message": {
+      "label": "Message",
+      "description": "Text shown by the plugin"
+    }
+  }
+}

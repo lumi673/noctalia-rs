@@ -1,19 +1,22 @@
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use toml::Value;
 
 type BoxError = Box<dyn Error>;
 type EntryScripts = Vec<(String, String)>;
 
-struct FileContext<'a> {
-    generated: &'a mut Generated,
-    root: &'a Path,
-    out_dir: &'a Path,
-    sources: &'a mut EntryScripts,
-}
+const ENTRY_KINDS: &[&str] = &[
+    "service",
+    "widget",
+    "shortcut",
+    "launcher_provider",
+    "desktop_widget",
+    "panel",
+    "layer",
+];
 
 #[derive(Default)]
 struct Generated {
@@ -21,6 +24,12 @@ struct Generated {
     body: String,
 }
 
+struct FileContext<'a> {
+    generated: &'a mut Generated,
+    source: &'a Path,
+    out_dir: &'a Path,
+    root: &'a toml::Table,
+}
 fn identifier(value: &str) -> String {
     let mut out = String::new();
     for (index, item) in value.chars().enumerate() {
@@ -82,8 +91,15 @@ pub fn generate_to(manifest: &Path, out_dir: &Path) -> Result<(), BoxError> {
         .map_err(|error| format!("settings: {error}"))?;
     write_entries(&mut generated.body, root)
         .map_err(|error| format!("entries: {error}"))?;
-    write_files(&mut generated, source, out_dir)
-        .map_err(|error| format!("files: {error}"))?;
+    {
+        let mut context = FileContext {
+            generated: &mut generated,
+            source,
+            out_dir,
+            root,
+        };
+        write_files(&mut context).map_err(|error| format!("files: {error}"))?;
+    }
     let _ = write!(generated.body, "    plugin\n}}\n");
     let defaults = default_entry_scripts(root)?;
     if !defaults.is_empty() {
@@ -131,15 +147,7 @@ pub fn generate_to(manifest: &Path, out_dir: &Path) -> Result<(), BoxError> {
 
 fn default_entry_scripts(root: &toml::Table) -> Result<EntryScripts, BoxError> {
     let mut result = Vec::new();
-    for kind in [
-        "service",
-        "widget",
-        "shortcut",
-        "launcher_provider",
-        "desktop_widget",
-        "panel",
-        "layer",
-    ] {
+    for &kind in ENTRY_KINDS {
         let Some(value) = root.get(kind) else {
             continue;
         };
@@ -252,16 +260,38 @@ fn valid_translation(name: &str) -> bool {
         && !name.contains("..")
 }
 
-fn skip_asset(name: &str) -> bool {
-    name == "plugin.toml"
-        || name == "noctalia.toml"
-        || name == "Cargo.toml"
-        || name == "Cargo.lock"
-        || name == "build.rs"
-        || name.starts_with("README")
-        || name == "thumbnail.webp"
+fn optional_string_list(
+    root: &toml::Table,
+    key: &str,
+) -> Result<Vec<String>, BoxError> {
+    match root.get(key) {
+        Some(value) => string_list(value, key),
+        None => Ok(Vec::new()),
+    }
 }
 
+fn safe_relative_path(value: &str, label: &str) -> Result<PathBuf, BoxError> {
+    let normalized = value.replace('\\', "/");
+    let path = Path::new(&normalized);
+    let safe = !normalized.is_empty()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)));
+    if safe {
+        Ok(path.to_path_buf())
+    } else {
+        Err(format!("{label} must be a relative path: {value}").into())
+    }
+}
+
+fn reserved_asset_path(value: &str) -> bool {
+    value == "plugin.toml"
+        || value == "lib"
+        || value == "translations"
+        || value.starts_with("lib/")
+        || value.starts_with("translations/")
+        || value.to_ascii_lowercase().ends_with(".luau")
+}
 fn text<'a>(value: &'a Value, label: &str) -> Result<&'a str, BoxError> {
     value
         .as_str()
@@ -585,15 +615,7 @@ fn optional_number(item: &toml::Table, key: &str) -> Result<String, BoxError> {
 }
 
 fn write_entries(out: &mut String, root: &toml::Table) -> Result<(), BoxError> {
-    for kind in [
-        "service",
-        "widget",
-        "shortcut",
-        "launcher_provider",
-        "desktop_widget",
-        "panel",
-        "layer",
-    ] {
+    for &kind in ENTRY_KINDS {
         let Some(value) = root.get(kind) else {
             continue;
         };
@@ -843,46 +865,15 @@ fn layer_config(row: &toml::Table) -> Result<String, BoxError> {
     Ok(chain)
 }
 
-fn write_files(
-    generated: &mut Generated,
-    source: &Path,
-    out_dir: &Path,
-) -> Result<(), BoxError> {
-    let mut sources = Vec::new();
-    write_translations(generated, source, out_dir)?;
-    {
-        let mut context = FileContext {
-            generated,
-            root: source,
-            out_dir,
-            sources: &mut sources,
-        };
-        write_tree(&mut context, source)?;
-    }
-    if !sources.is_empty() {
-        let _ = writeln!(
-            generated.prefix,
-            "pub const LUAU_SOURCES: &[(&str, &str)] = &["
-        );
-        for (name, _) in &sources {
-            let _ = writeln!(
-                generated.prefix,
-                "    ({}, include_str!(concat!(env!(\"OUT_DIR\"), \"/luau/{name}\"))),",
-                quote(name)
-            );
-        }
-        let _ = writeln!(generated.prefix, "];");
-        let _ = writeln!(generated.prefix);
-    }
-    Ok(())
+fn write_files(context: &mut FileContext<'_>) -> Result<(), BoxError> {
+    write_translations(context)?;
+    write_assets(context)?;
+    let sources = declared_luau_sources(context.root)?;
+    write_luau_sources(context, &sources)
 }
 
-fn write_translations(
-    generated: &mut Generated,
-    source: &Path,
-    out_dir: &Path,
-) -> Result<(), BoxError> {
-    let translations = source.join("translations");
+fn write_translations(context: &mut FileContext<'_>) -> Result<(), BoxError> {
+    let translations = context.source.join("translations");
     if !translations.is_dir() {
         return Ok(());
     }
@@ -900,13 +891,13 @@ fn write_translations(
             continue;
         }
         let language = name.trim_end_matches(".json");
-        let target_dir = out_dir.join("translations");
+        let target_dir = context.out_dir.join("translations");
         fs::create_dir_all(&target_dir)
             .map_err(|error| format!("create translations dir: {error}"))?;
         fs::copy(&path, target_dir.join(name))
             .map_err(|error| format!("copy translation {name}: {error}"))?;
         let _ = writeln!(
-            generated.body,
+            context.generated.body,
             "    plugin = plugin.translation_file({}, include_str!(concat!(env!(\"OUT_DIR\"), \"/translations/{name}\")));",
             quote(language)
         );
@@ -914,55 +905,62 @@ fn write_translations(
     Ok(())
 }
 
-fn write_tree(
-    context: &mut FileContext<'_>,
-    dir: &Path,
-) -> Result<(), BoxError> {
-    for entry in
-        fs::read_dir(dir).map_err(|error| format!("read source: {error}"))?
-    {
-        let path = entry
-            .map_err(|error| format!("read source entry: {error}"))?
-            .path();
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if path.is_dir() {
-            if matches!(name, "target" | ".git" | ".tmp" | "translations") {
+fn declared_luau_sources(root: &toml::Table) -> Result<Vec<String>, BoxError> {
+    let mut sources = Vec::new();
+
+    for &kind in ENTRY_KINDS {
+        let Some(value) = root.get(kind) else {
+            continue;
+        };
+        for item in array(value, kind)? {
+            let row = table(item, kind)?;
+            if row.contains_key("handler") {
                 continue;
             }
-            write_tree(context, &path)?;
-            continue;
-        }
-        if !path.is_file() || skip_asset(name) {
-            continue;
-        }
-        let relative = path
-            .strip_prefix(context.root)
-            .map_err(|error| format!("strip source prefix: {error}"))?;
-        if !relative
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
-        {
-            continue;
-        }
-        let key = relative.to_string_lossy().replace('\\', "/");
-        if key.to_ascii_lowercase().ends_with(".luau") {
-            let target = context.out_dir.join("luau").join(&key);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
+            let id = text(row.get("id").ok_or("missing entry id")?, "id")?;
+            let name = row
+                .get("entry")
+                .map(|value| text(value, "entry"))
+                .transpose()?
+                .unwrap_or(id);
+            let name = if name.to_ascii_lowercase().ends_with(".luau") {
+                name.to_owned()
+            } else {
+                format!("{name}.luau")
+            };
+            if !sources.contains(&name) {
+                sources.push(name);
             }
-            fs::copy(&path, target)
-                .map_err(|error| format!("copy luau {key}: {error}"))?;
-            context.sources.push((key.clone(), key));
-            continue;
         }
-        let target = context.out_dir.join("assets").join(&key);
+    }
+
+    for name in optional_string_list(root, "luau_sources")? {
+        if !name.to_ascii_lowercase().ends_with(".luau") {
+            return Err(format!(
+                "luau_sources entry must end in .luau: {name}"
+            )
+            .into());
+        }
+        if !sources.contains(&name) {
+            sources.push(name);
+        }
+    }
+
+    Ok(sources)
+}
+
+fn write_assets(context: &mut FileContext<'_>) -> Result<(), BoxError> {
+    for name in optional_string_list(context.root, "assets")? {
+        let relative = safe_relative_path(&name, "asset")?;
+        let key = relative.to_string_lossy().replace('\\', "/");
+        if reserved_asset_path(&key) {
+            return Err(format!("reserved asset path: {name}").into());
+        }
+        let target = context.out_dir.join("assets").join(Path::new(&key));
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(&path, target)
+        fs::copy(context.source.join(relative), &target)
             .map_err(|error| format!("copy asset {key}: {error}"))?;
         let _ = writeln!(
             context.generated.body,
@@ -970,6 +968,44 @@ fn write_tree(
             quote(&key)
         );
     }
+    Ok(())
+}
+
+fn write_luau_sources(
+    context: &mut FileContext<'_>,
+    names: &[String],
+) -> Result<(), BoxError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+
+    let mut keys = Vec::new();
+    for name in names {
+        let relative = safe_relative_path(name, "luau source")?;
+        let key = relative.to_string_lossy().replace('\\', "/");
+        keys.push(key.clone());
+        let target = context.out_dir.join("luau").join(Path::new(&key));
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(context.source.join(relative), &target)
+            .map_err(|error| format!("copy luau {key}: {error}"))?;
+    }
+
+    let _ = writeln!(
+        context.generated.prefix,
+        "pub const LUAU_SOURCES: &[(&str, &str)] = &["
+    );
+    for key in &keys {
+        let _ = writeln!(
+            context.generated.prefix,
+            "    ({}, include_str!(concat!(env!(\"OUT_DIR\"), \"/luau/{key}\"))),",
+            quote(key)
+        );
+    }
+    let _ = writeln!(context.generated.prefix, "];");
+    let _ = writeln!(context.generated.prefix);
+
     Ok(())
 }
 
@@ -996,6 +1032,147 @@ mod tests {
         assert!(generated.contains("env!(\"CARGO_PKG_VERSION\")"));
         assert!(generated.contains("Entry::configured"));
         assert!(generated.contains("tick"));
+        Ok(())
+    }
+
+    #[test]
+    fn generate_to_copies_only_declared_files() -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("noctalia-build-assets-{nanos}"));
+        fs::create_dir_all(dir.join("icons"))?;
+        fs::create_dir_all(dir.join("lib"))?;
+        fs::create_dir_all(dir.join("src"))?;
+        fs::write(
+            dir.join("noctalia.toml"),
+            "id = \"me/test\"\nname = \"Test\"\nassets = [\"icons/clock.svg\"]\nluau_sources = [\"lib/util.luau\"]\n\n[[service]]\nid = \"service\"\nentry = \"service.luau\"\n",
+        )?;
+        fs::write(dir.join("icons/clock.svg"), "<svg />")?;
+        fs::write(dir.join("lib/util.luau"), "return {}")?;
+        fs::write(dir.join("service.luau"), "return {}")?;
+        fs::write(dir.join("src/main.rs"), "fn main() {}")?;
+        fs::write(dir.join("README.md"), "readme")?;
+
+        generate_to(&dir.join("noctalia.toml"), &dir)?;
+        let generated = fs::read_to_string(dir.join("generated.rs"))?;
+        let has_asset = dir.join("assets/icons/clock.svg").exists();
+        let has_service = dir.join("luau/service.luau").exists();
+        let has_util = dir.join("luau/lib/util.luau").exists();
+        let leaked_source = dir.join("assets/src/main.rs").exists();
+        let leaked_readme = dir.join("assets/README.md").exists();
+        fs::remove_dir_all(&dir)?;
+
+        assert!(has_asset);
+        assert!(has_service);
+        assert!(has_util);
+        assert!(!leaked_source);
+        assert!(!leaked_readme);
+        assert!(generated.contains("plugin.asset(\"icons/clock.svg\""));
+        assert!(generated.contains("\"lib/util.luau\""));
+        assert!(generated.contains("\"service.luau\""));
+        assert!(!generated.contains("src/main.rs"));
+        assert!(!generated.contains("README.md"));
+        Ok(())
+    }
+
+    #[test]
+    fn generate_to_rejects_reserved_assets() -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        for (index, path) in ["plugin.toml", "lib", "translations"]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = std::env::temp_dir()
+                .join(format!("noctalia-build-reserved-{nanos}-{index}"));
+            fs::create_dir_all(&dir)?;
+            fs::write(
+                dir.join("noctalia.toml"),
+                format!(
+                    "id = \"me/test\"\nname = \"Test\"\nassets = [\"{path}\"]\n"
+                ),
+            )?;
+
+            let result = generate_to(&dir.join("noctalia.toml"), &dir);
+            fs::remove_dir_all(&dir)?;
+
+            assert!(result.is_err(), "{path} was accepted");
+            assert!(
+                result.err().is_some_and(|error| error
+                    .to_string()
+                    .contains("reserved asset")),
+                "{path} was not rejected as reserved"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generate_to_normalizes_declared_paths() -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("noctalia-build-paths-{nanos}"));
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("noctalia.toml"),
+            "id = \"me/test\"\nname = \"Test\"\nassets = [\"icons\\\\clock.svg\"]\nluau_sources = [\"lib\\\\util.luau\"]\n",
+        )?;
+        for (source, contents) in [
+            (dir.join("icons/clock.svg"), "<svg />"),
+            (dir.join("lib/util.luau"), "return {}"),
+        ] {
+            if let Some(parent) = source.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(source, contents)?;
+        }
+
+        generate_to(&dir.join("noctalia.toml"), &dir)?;
+        let generated = fs::read_to_string(dir.join("generated.rs"))?;
+        let asset_copied = dir.join("assets/icons/clock.svg").exists();
+        let luau_copied = dir.join("luau/lib/util.luau").exists();
+        fs::remove_dir_all(&dir)?;
+
+        assert!(asset_copied);
+        assert!(luau_copied);
+        assert!(generated.contains("\"/assets/icons/clock.svg\""));
+        assert!(generated.contains("plugin.asset(\"icons/clock.svg\""));
+        assert!(generated.contains("\"/luau/lib/util.luau\""));
+        assert!(!generated.contains("/luau/lib\\\\util.luau"));
+        Ok(())
+    }
+
+    #[test]
+    fn generate_to_rejects_traversal_paths() -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let cases = [
+            ("assets", "..\\escape.svg"),
+            ("assets", "icons/../../escape.svg"),
+            ("luau_sources", "../escape.luau"),
+            ("luau_sources", "..\\escape.luau"),
+        ];
+        for (index, (key, path)) in cases.into_iter().enumerate() {
+            let dir = std::env::temp_dir()
+                .join(format!("noctalia-build-traversal-{nanos}-{index}"));
+            fs::create_dir_all(&dir)?;
+            let toml_path = path.replace('\\', "\\\\");
+            fs::write(
+                dir.join("noctalia.toml"),
+                format!(
+                    "id = \"me/test\"\nname = \"Test\"\n{key} = [\"{toml_path}\"]\n"
+                ),
+            )?;
+
+            let result = generate_to(&dir.join("noctalia.toml"), &dir);
+            fs::remove_dir_all(&dir)?;
+
+            assert!(result.is_err(), "{key} {path} was accepted");
+            assert!(
+                result.err().is_some_and(|error| error
+                    .to_string()
+                    .contains("relative path")),
+                "{key} {path} was not rejected as relative"
+            );
+        }
         Ok(())
     }
 }

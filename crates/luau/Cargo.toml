@@ -1,15 +1,17 @@
 [package]
-name = "noctalia-luau"
+name = "noctalia-rs-luau"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Luau-compatible compatibility runtime for noctalia plugins"
-publish = false
+[lib]
+name = "noctalia_luau"
+
 
 [dependencies]
 chrono.workspace      = true
 mlua.workspace = true
-noctalia.workspace = true
+noctalia-rs.workspace = true
 serde_json.workspace = true
 
 [lints.clippy]

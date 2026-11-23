@@ -1,6 +1,7 @@
 # NoctaliaRs
 
 Unofficial project. It is not maintained by or affiliated with the Noctalia team.
+Source: https://github.com/lumi673/noctalia-rs
 
 Write Noctalia plugins in Rust. `noctalia.toml` describes the plugin. Rust
 handles behavior. The library emits `plugin.toml`, Luau entry stubs, the shared
@@ -22,12 +23,15 @@ bridge, translations, and assets.
 
 ```toml
 [dependencies]
-noctalia = "0.1"
+noctalia-rs = "0.1"
 serde_json = "1.0"
 
 [build-dependencies]
-noctalia-build = "0.1"
+noctalia-rs-build = "0.1"
 ```
+
+For entries that keep their logic in `.luau` files, add `noctalia-rs-luau = "0.1"` to `[dependencies]`. Rust handlers do not need it.
+The package names changed, but the Rust library names did not. Plugin code still imports `noctalia::`, and `build.rs` still calls `noctalia_build::generate()`.
 
 Add `build.rs`:
 
@@ -66,6 +70,15 @@ handler = "service"
 
 Each entry names a handler function in your crate. The generated plugin takes
 its version from `Cargo.toml`.
+
+Declare non-code files with `assets`. Shared Luau modules go in `luau_sources`. Entries without `handler` embed the script named in `entry` automatically. Only declared files are copied into the plugin directory.
+
+```toml
+assets = ["icons/clock.svg"]
+luau_sources = ["lib/util.luau"]
+```
+
+Put the strings for `label_key` and `description_key` in `translations/en.json` or another language file.
 
 Write `src/main.rs`:
 
@@ -106,7 +119,7 @@ The `template/` crate in this workspace is a complete minimal example.
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    noctalia-rs.url = "path:/path/to/noctalia-rs";
+    noctalia-rs.url = "github:lumi673/noctalia-rs";
   };
 
   outputs = { self, nixpkgs, noctalia-rs }:

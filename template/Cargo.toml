@@ -7,12 +7,12 @@ description = "Noctalia plugin template using noctalia.toml"
 publish = false
 
 [dependencies]
-noctalia.workspace = true
-noctalia-luau.workspace   = true
+noctalia-rs.workspace        = true
+noctalia-rs-luau.workspace   = true
 serde_json.workspace = true
 
 [build-dependencies]
-noctalia-build.workspace = true
+noctalia-rs-build.workspace = true
 
 [lints]
 workspace = true

@@ -436,8 +436,8 @@ impl Fixture {
         let deps = workspace.display().to_string();
         let manifest = format!(
             "[package]\nname = \"noctalia-bench-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n\
-             [dependencies]\nnoctalia = {{ path = \"{deps}/crates/lib\" }}\nnoctalia-luau = {{ path = \"{deps}/crates/luau\" }}\nserde_json = \"1\"\n\n\
-             [build-dependencies]\nnoctalia-build = {{ path = \"{deps}/crates/build\" }}\n\n[workspace]\n"
+             [dependencies]\nnoctalia-rs = {{ path = \"{deps}/crates/lib\" }}\nnoctalia-rs-luau = {{ path = \"{deps}/crates/luau\" }}\nserde_json = \"1\"\n\n\
+             [build-dependencies]\nnoctalia-rs-build = {{ path = \"{deps}/crates/build\" }}\n\n[workspace]\n"
         );
         fs::write(root.join("Cargo.toml"), manifest)?;
         fs::write(

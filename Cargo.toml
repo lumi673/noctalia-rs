@@ -6,16 +6,16 @@ resolver = "3"
 name = "noctalia_rs"
 
 [workspace.package]
-version    = "0.1.0"
+version    = "0.1.2"
 edition    = "2024"
 license    = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 chrono          = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
-noctalia-build  = { path = "crates/build", version = "0.1.0" }
-noctalia-luau   = { path = "crates/luau", version = "0.1.0" }
-noctalia        = { path = "crates/lib", version = "0.1.0" }
-noctalia-macros = { path = "crates/macros", version = "0.1.0" }
+noctalia-rs-build  = { path = "crates/build", version = "0.1.2" }
+noctalia-rs-luau   = { path = "crates/luau", version = "0.1.2" }
+noctalia-rs        = { path = "crates/lib", version = "0.1.2" }
+noctalia-rs-macros = { path = "crates/macros", version = "0.1.2" }
 proc-macro2     = "1.0.107"
 quote           = "1.0.47"
 serde           = { version = "1.0.229", features = ["derive"] }

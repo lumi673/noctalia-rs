@@ -1,10 +1,12 @@
 [package]
-name = "noctalia-build"
+name = "noctalia-rs-build"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Build-time generator for noctalia plugins using noctalia.toml"
-publish = false
+[lib]
+name = "noctalia_build"
+
 
 [dependencies]
 toml.workspace = true

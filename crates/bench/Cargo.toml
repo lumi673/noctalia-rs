@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 chrono.workspace    = true
-noctalia.workspace  = true
-noctalia-build.workspace = true
-noctalia-luau.workspace  = true
+noctalia-rs.workspace       = true
+noctalia-rs-build.workspace = true
+noctalia-rs-luau.workspace  = true
 serde               = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

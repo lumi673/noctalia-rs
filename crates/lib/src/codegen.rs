@@ -456,36 +456,210 @@ fn write_number(out: &mut String, config: &NumberConfig, is_double: bool) {
         let _ = writeln!(out, "max = {value}");
     }
 }
-const CALLBACKS: &str = r#"
-function onClick() bridge.call("click") end
-function onRightClick() bridge.call("right_click") end
-function onMiddleClick() bridge.call("middle_click") end
-function onDoubleClick() bridge.call("double_click") end
-function onScroll(axis, steps, startsGesture) bridge.call("scroll", { axis = axis, steps = steps, starts_gesture = startsGesture }) end
-function onHover(hovered) bridge.call("hover", { hovered = hovered }) end
-function onKey(key, pressed) bridge.call("key", { key = key, pressed = pressed }) end
-function onIpc(event, payload) bridge.call("ipc", { event = event, payload = payload }) end
-function onConfigChanged(key, value) bridge.call("config_changed", { key = key, value = value }) end
-function onOutputsChanged() bridge.call("outputs_changed") end
-function onEnable() bridge.call("enable") end
-function onDisable() bridge.call("disable") end
-function onExit(signal, reason) bridge.call("exit", { signal = signal, reason = reason }) end
-function onSuspend() bridge.call("suspend") end
-function onResume() bridge.call("resume") end
-function onRefresh() bridge.call("refresh") end
-function onOpen() bridge.call("open") end
-function onClose() bridge.call("close") end
-function onCloseClicked() bridge.call("close_clicked") end
-function onRefreshClicked() bridge.call("refresh_clicked") end
-function onSettingsClicked() bridge.call("settings_clicked") end
-function onOpenSettings() bridge.call("open_settings") end
-function onClosePanel() bridge.call("close_panel") end
-function onFrameTick(delta) bridge.call("frame", { delta = delta }) end
-function onQuery(text) bridge.query(text) end
-function onActivate(id) bridge.call("activate", { id = id }) end
-function onSearch(text) bridge.call("search", { text = text }) end
-function onSearchChange(text) bridge.call("search_change", { text = text }) end
-"#;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Callback {
+    pub event: &'static str,
+    pub function: &'static str,
+    pub params: &'static str,
+    pub payload: &'static str,
+}
+
+pub const CALLBACKS: &[Callback] = &[
+    Callback {
+        event: "click",
+        function: "onClick",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "right_click",
+        function: "onRightClick",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "middle_click",
+        function: "onMiddleClick",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "double_click",
+        function: "onDoubleClick",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "scroll",
+        function: "onScroll",
+        params: "axis, steps, startsGesture",
+        payload: "{ axis = axis, steps = steps, starts_gesture = startsGesture }",
+    },
+    Callback {
+        event: "hover",
+        function: "onHover",
+        params: "hovered",
+        payload: "{ hovered = hovered }",
+    },
+    Callback {
+        event: "key",
+        function: "onKey",
+        params: "key, pressed",
+        payload: "{ key = key, pressed = pressed }",
+    },
+    Callback {
+        event: "ipc",
+        function: "onIpc",
+        params: "event, payload",
+        payload: "{ event = event, payload = payload }",
+    },
+    Callback {
+        event: "config_changed",
+        function: "onConfigChanged",
+        params: "key, value",
+        payload: "{ key = key, value = value }",
+    },
+    Callback {
+        event: "outputs_changed",
+        function: "onOutputsChanged",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "enable",
+        function: "onEnable",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "disable",
+        function: "onDisable",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "exit",
+        function: "onExit",
+        params: "signal, reason",
+        payload: "{ signal = signal, reason = reason }",
+    },
+    Callback {
+        event: "suspend",
+        function: "onSuspend",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "resume",
+        function: "onResume",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "refresh",
+        function: "onRefresh",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "open",
+        function: "onOpen",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "close",
+        function: "onClose",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "close_clicked",
+        function: "onCloseClicked",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "refresh_clicked",
+        function: "onRefreshClicked",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "settings_clicked",
+        function: "onSettingsClicked",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "open_settings",
+        function: "onOpenSettings",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "close_panel",
+        function: "onClosePanel",
+        params: "",
+        payload: "",
+    },
+    Callback {
+        event: "frame",
+        function: "onFrameTick",
+        params: "delta",
+        payload: "{ delta = delta }",
+    },
+    Callback {
+        event: "query",
+        function: "onQuery",
+        params: "text",
+        payload: "",
+    },
+    Callback {
+        event: "activate",
+        function: "onActivate",
+        params: "id",
+        payload: "{ id = id }",
+    },
+    Callback {
+        event: "search",
+        function: "onSearch",
+        params: "text",
+        payload: "{ text = text }",
+    },
+    Callback {
+        event: "search_change",
+        function: "onSearchChange",
+        params: "text",
+        payload: "{ text = text }",
+    },
+];
+
+fn write_callbacks(out: &mut String) {
+    for callback in CALLBACKS {
+        if callback.function == "onQuery" {
+            let _ =
+                writeln!(out, "function onQuery(text) bridge.query(text) end");
+            continue;
+        }
+        if callback.payload.is_empty() {
+            let _ = writeln!(
+                out,
+                "function {}({}) bridge.call(\"{}\") end",
+                callback.function, callback.params, callback.event
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "function {}({}) bridge.call(\"{}\", {}) end",
+                callback.function,
+                callback.params,
+                callback.event,
+                callback.payload
+            );
+        }
+    }
+}
 
 fn entry_script(
     entry: &Entry,
@@ -510,7 +684,7 @@ fn entry_script(
         keys
     );
 
-    out.push_str(CALLBACKS);
+    write_callbacks(&mut out);
     let update_event = match entry.kind {
         EntryKind::Service | EntryKind::LauncherProvider { .. } => "update",
         EntryKind::Widget
