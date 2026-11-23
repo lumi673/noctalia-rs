@@ -1,4 +1,5 @@
 mod metadata;
+mod plugins;
 mod process;
 mod stats;
 
@@ -470,6 +471,8 @@ fn run() -> Result<()> {
         })?;
     results.push(service_rust);
     pairs.push(Pair::new("service_update", service_rust, service_luau));
+
+    plugins::run(&options, scratch.path(), &mut results, &mut pairs)?;
 
     let mut fixture = Fixture::new(&workspace, scratch.path())?;
     results.push(measure(options.phase("codegen_generate", true), || {

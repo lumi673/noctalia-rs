@@ -4,6 +4,64 @@ Branch `bench/api57-baseline`, commit `40c0111` (benchmark changes are local and
 
 Each pair runs the same algorithm and API call order on both sides. The Luau side is executed through `noctalia_rs_luau::dispatch` with a warm cached VM, so dispatch, snapshot update, callback lookup, and op collection are included. The Rust side calls the equivalent handler directly. Contexts and payloads are built from deterministic fixtures; no user Noctalia config is read. Speedup is `Luau median / Rust median`.
 
+## Community plugin baseline
+
+Branch `bench/plugin-speedup`, based on `feat/api57-full-parity`. Head `ae66290`; benchmark changes are local and uncommitted. Raw report: `plugin-baseline.json`.
+
+The original Luau modules and the rewritten Rust modules are vendored unchanged in logic under `crates/bench/src/plugins/`. Luau sources came from `/home/user/.local/share/Trash/files/noctalia-rs/.tmp/community-plugins/`, Rust sources from `/home/user/projects/community-plugins-rs/`. The only edits to vendored Rust files are module paths (`crate::` to `super::`), the bundled translation path, and rustfmt normalization. No library behavior and no community checkout changed.
+
+Each pair uses one deterministic fixture. The Luau side calls the original pure function from a wrapper through `noctalia_rs_luau::dispatch` with a warm cached VM. The Rust side calls the rewritten function directly. Both sides emit the same op sequence through `noctalia.log`. The harness canonicalizes both op outputs as JSON and fails before timing if they differ. Mihomo groups are sorted by name before emission because the original iterates Lua `pairs`.
+
+### Exact commands
+
+```sh
+nix develop --command cargo run --release -p noctalia-bench --offline -- \
+  --samples 200 --warmup 20 --report plugin-baseline.json
+
+node .github/scripts/performance-aggregate.test.cjs
+```
+
+### Machine metadata
+
+| Field | Value |
+| :-- | :-- |
+| Timestamp | 2026-11-23T18:45:10Z |
+| OS | Linux 7.3.5 x86\_64 |
+| CPU | AMD Ryzen 7 8845HS w/ Radeon 780M Graphics |
+| Logical CPUs | 16 |
+| Max frequency | 3,801,000 kHz |
+| Memory | 96,582,428 KiB |
+| rustc | 1.99.1 (58cf8f9c3 2026-10-13) |
+| cargo | 1.99.1 (5f94df478 2026-08-27) |
+| Profile | release, fat LTO, codegen-units 1 |
+| Samples | 200 per surface, 20 warmup |
+| Percentiles | nearest rank |
+| Timer | `std::time::Instant` |
+
+### Plugin results
+
+Times are microseconds. Speedup is `Luau median / Rust median`.
+
+| Workload | Function | Rust median | Rust p95 | Rust p99 | Luau median | Luau p95 | Luau p99 | Speedup median | Speedup p95 | Speedup p99 |
+| :-- | :-- | --: | --: | --: | --: | --: | --: | --: | --: | --: |
+| plugin\_case\_convert | `cases.convertAll` over 18 conversions | 24.136 | 33.032 | 38.011 | 224.361 | 366.937 | 863.909 | 9.30x | 11.11x | 22.73x |
+| plugin\_color\_picker | RGB/HSL/HEX conversions and formatting over 128 colors | 191.043 | 248.877 | 325.330 | 401.272 | 502.141 | 710.421 | 2.10x | 2.02x | 2.18x |
+| plugin\_vietnamese\_lunar\_calendar | `solarToLunar` over 730 dates | 1,442.328 | 1,945.836 | 2,870.870 | 8,868.475 | 11,087.497 | 11,784.704 | 6.15x | 5.70x | 4.10x |
+| plugin\_als\_brightness | `compile` plus 256 `eval` samples | 29.335 | 40.617 | 45.615 | 241.267 | 290.694 | 341.710 | 8.22x | 7.16x | 7.49x |
+| plugin\_mihomo\_control | `normalizeServersStore` over 400 servers and 40 group orders | 849.072 | 1,087.207 | 1,334.782 | 1,837.538 | 2,792.793 | 3,486.273 | 2.16x | 2.57x | 2.61x |
+| plugin\_file\_search | `slices`, `entries`, and `commonDir` over a nested disk-usage index | 7.534 | 8.125 | 12.424 | 23.714 | 32.701 | 36.158 | 3.15x | 4.02x | 2.91x |
+
+All six clear 2x at the median, p95, and p99. None clears 10x at the median; `plugin_case_convert` reaches 11.11x at p95 and 22.73x at p99. The closest are `plugin_case_convert` at 9.30x and `plugin_als_brightness` at 8.22x. The three lowest ratios are limited by the work itself rather than dispatch. Color and mihomo build many small JSON values on both sides, so allocation dominates. File search sorts a small index where fixed dispatch cost is a large share. The lunar calendar calls native Luau math for every date, which narrows the gap despite a large fixture.
+
+### Excluded plugins
+
+`token-monitor` was tried and skipped. Its Rust rewrites diverge from the original output, and the community checkout was left untouched:
+
+- `analytics.normalize` returns `models: []` and `sessions: []` for unavailable periods, while the Luau original returns empty tables, which encode as `{}`.
+- `heatmap.build` returns `value: null` for future and outside cells, while the Luau original omits the `value` key.
+
+Other candidates were not selected because their heavy work is outside the plugin algorithm: `calculator-plus` delegates evaluation to the external `qalc` process, `mathsym` delegates search to `fzf` in `search.sh`, and `calculator`, `bitdjinn`, `arch-updater`, and `file-search` launcher paths are dominated by host I/O or UI construction.
+
 ## Exact commands
 
 ```sh
@@ -65,7 +123,7 @@ All six pairs exceed the 3x aspiration at the median, p95, and p99.
 
 ## CI-style rounds
 
-Three rounds used the CI sample plan (60 samples, 6 warmup, 2 build samples, 1 build warmup). Raw runs are in `performance/raw/40c01111f67a70b4076627b19c124c8f5748b115-{1,2,3}.json`; the best-of-three aggregate is `performance/40c01111f67a70b4076627b19c124c8f5748b115.json`.
+Three rounds used the CI sample plan (60 samples, 6 warmup, 2 build samples, 1 build warmup). CI publishes the raw runs and the best-of-three aggregate under `performance/`; they are not committed.
 
 | Workload | Speedup, round 1 | Round 2 | Round 3 |
 | :-- | --: | --: | --: |
