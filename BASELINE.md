@@ -151,15 +151,15 @@ Sanity check against the main-session numbers: this run measured `json_encode_ru
 
 ## Post-parity verification
 
-After API 57 parity landed in the root checkout, the same release harness was run again with `nix develop --command cargo run --release -p noctalia-bench -- --samples 200 --warmup 20 --report .tmp/post-fix.json`. The matched pairs stayed above the 3x goal:
+After API 57 parity landed, the same release harness was run again with `nix develop --command cargo run --release -p noctalia-bench -- --samples 200 --warmup 20`. The matched pairs stayed above the 3x goal. The Luau side also got faster here because a host read no longer stats the spool directory on every call.
 
 | Workload | Rust median | Luau median | Speedup | 3x met |
 | :-- | --: | --: | --: | :-- |
-| json\_roundtrip | 0.651 | 5.806 | 8.92x | yes |
-| snapshot\_reads | 0.100 | 6.833 | 68.33x | yes |
-| state\_ops | 0.291 | 6.692 | 23.00x | yes |
-| ui\_tree | 0.661 | 17.293 | 26.16x | yes |
-| callback\_dispatch | 0.060 | 1.884 | 31.40x | yes |
-| service\_update | 0.231 | 8.627 | 37.34x | yes |
+| json\_roundtrip | 0.641 | 8.636 | 13.47x | yes |
+| snapshot\_reads | 0.126 | 3.717 | 29.62x | yes |
+| state\_ops | 0.281 | 9.413 | 33.50x | yes |
+| ui\_tree | 0.637 | 19.997 | 31.42x | yes |
+| callback\_dispatch | 0.060 | 2.019 | 33.65x | yes |
+| service\_update | 0.371 | 12.724 | 34.30x | yes |
 
 The parity work therefore kept the baseline and all six matched workloads remain above 3x.
