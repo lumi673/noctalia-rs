@@ -1,9 +1,10 @@
+use std::borrow::Cow;
+
 use serde::Serialize;
 use serde_json::{Value, json};
-
 #[derive(Clone, Debug, Serialize)]
 pub struct UiNode {
-    kind: String,
+    kind: Cow<'static, str>,
     props: Value,
     children: Vec<Self>,
 }
@@ -11,8 +12,17 @@ pub struct UiNode {
 #[inline]
 #[must_use]
 pub fn node(kind: &str, props: Value, children: Vec<UiNode>) -> UiNode {
+    owned_node(kind.to_owned(), props, children)
+}
+
+#[inline]
+fn owned_node(
+    kind: impl Into<Cow<'static, str>>,
+    props: Value,
+    children: Vec<UiNode>,
+) -> UiNode {
     UiNode {
-        kind: kind.to_owned(),
+        kind: kind.into(),
         props,
         children,
     }
@@ -21,43 +31,43 @@ pub fn node(kind: &str, props: Value, children: Vec<UiNode>) -> UiNode {
 #[inline]
 #[must_use]
 pub fn column(props: Value, children: Vec<UiNode>) -> UiNode {
-    node("column", props, children)
+    owned_node("column", props, children)
 }
 
 #[inline]
 #[must_use]
 pub fn row(props: Value, children: Vec<UiNode>) -> UiNode {
-    node("row", props, children)
+    owned_node("row", props, children)
 }
 
 #[inline]
 #[must_use]
 pub fn scroll(props: Value, children: Vec<UiNode>) -> UiNode {
-    node("scroll", props, children)
+    owned_node("scroll", props, children)
 }
 
 #[inline]
 #[must_use]
 pub fn label(props: Value) -> UiNode {
-    node("label", props, Vec::new())
+    owned_node("label", props, Vec::new())
 }
 
 #[inline]
 #[must_use]
 pub fn button(props: Value) -> UiNode {
-    node("button", props, Vec::new())
+    owned_node("button", props, Vec::new())
 }
 
 #[inline]
 #[must_use]
 pub fn input(props: Value) -> UiNode {
-    node("input", props, Vec::new())
+    owned_node("input", props, Vec::new())
 }
 
 #[inline]
 #[must_use]
 pub fn progress(props: Value) -> UiNode {
-    node("progress", props, Vec::new())
+    owned_node("progress", props, Vec::new())
 }
 
 #[inline]
