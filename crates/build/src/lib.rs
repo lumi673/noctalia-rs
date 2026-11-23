@@ -127,7 +127,7 @@ pub fn generate_to(manifest: &Path, out_dir: &Path) -> Result<(), BoxError> {
             let _ = writeln!(generated.prefix, "    }};");
             let _ = writeln!(
                 generated.prefix,
-                "    noctalia_luau::dispatch_entry(ctx, LUAU_SOURCES, script)"
+                "    noctalia_rs_luau::dispatch_entry(ctx, LUAU_SOURCES, script)"
             );
         } else {
             let _ = writeln!(
@@ -183,17 +183,20 @@ fn quote(value: &str) -> String {
 
 fn qualify_types(source: &str) -> String {
     let replacements = [
-        ("MetaBuilder::", "noctalia::MetaBuilder::"),
-        ("Plugin::", "noctalia::Plugin::"),
-        ("-> Plugin", "-> noctalia::Plugin"),
-        ("Setting::", "noctalia::Setting::"),
-        ("Entry::configured", "noctalia::Entry::configured"),
-        ("EntryKind::", "noctalia::EntryKind::"),
-        ("EntryConfig::", "noctalia::EntryConfig::"),
-        ("LauncherCategory::", "noctalia::LauncherCategory::"),
-        ("LayerConfig::", "noctalia::LayerConfig::"),
-        ("ctx: &Context", "ctx: &noctalia::Context"),
-        ("Result<Vec<Op>>", "noctalia::Result<Vec<noctalia::Op>>"),
+        ("MetaBuilder::", "noctalia_rs::MetaBuilder::"),
+        ("Plugin::", "noctalia_rs::Plugin::"),
+        ("-> Plugin", "-> noctalia_rs::Plugin"),
+        ("Setting::", "noctalia_rs::Setting::"),
+        ("Entry::configured", "noctalia_rs::Entry::configured"),
+        ("EntryKind::", "noctalia_rs::EntryKind::"),
+        ("EntryConfig::", "noctalia_rs::EntryConfig::"),
+        ("LauncherCategory::", "noctalia_rs::LauncherCategory::"),
+        ("LayerConfig::", "noctalia_rs::LayerConfig::"),
+        ("ctx: &Context", "ctx: &noctalia_rs::Context"),
+        (
+            "Result<Vec<Op>>",
+            "noctalia_rs::Result<Vec<noctalia_rs::Op>>",
+        ),
     ];
     let mut out = String::with_capacity(source.len());
     let mut rest = source;

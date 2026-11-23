@@ -80,8 +80,8 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
         #function
 
         #[must_use]
-        pub fn #entry_name() -> ::noctalia::Entry {
-            ::noctalia::Entry::new(
+        pub fn #entry_name() -> ::noctalia_rs::Entry {
+            ::noctalia_rs::Entry::new(
                 (#id.to_string(), #kind, ::std::vec::Vec::new()),
                 #name,
             )
@@ -91,20 +91,20 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
 
 fn kind_expression(kind: &str) -> Result<TokenStream2> {
     let expression = match kind {
-        "service" => quote!(::noctalia::EntryKind::Service),
-        "widget" => quote!(::noctalia::EntryKind::Widget),
-        "shortcut" => quote!(::noctalia::EntryKind::Shortcut),
-        "desktop_widget" => quote!(::noctalia::EntryKind::DesktopWidget),
-        "launcher" => quote!(::noctalia::EntryKind::LauncherProvider {
+        "service" => quote!(::noctalia_rs::EntryKind::Service),
+        "widget" => quote!(::noctalia_rs::EntryKind::Widget),
+        "shortcut" => quote!(::noctalia_rs::EntryKind::Shortcut),
+        "desktop_widget" => quote!(::noctalia_rs::EntryKind::DesktopWidget),
+        "launcher" => quote!(::noctalia_rs::EntryKind::LauncherProvider {
             prefix: "plugin".to_owned(),
             glyph: "puzzle".to_owned(),
         }),
-        "panel" => quote!(::noctalia::EntryKind::Panel {
+        "panel" => quote!(::noctalia_rs::EntryKind::Panel {
             width: 320,
             height: 240,
         }),
-        "layer" => quote!(::noctalia::EntryKind::Layer {
-            config: ::std::boxed::Box::new(::noctalia::LayerConfig::new()),
+        "layer" => quote!(::noctalia_rs::EntryKind::Layer {
+            config: ::std::boxed::Box::new(::noctalia_rs::LayerConfig::new()),
         }),
         other => {
             return Err(Error::new(
@@ -127,8 +127,9 @@ mod tests {
             quote!(kind = "service", id = "service"),
             quote!(
                 fn update(
-                    _ctx: &::noctalia::Context,
-                ) -> ::noctalia::Result<Vec<::noctalia::Op>> {
+                    _ctx: &::noctalia_rs::Context,
+                ) -> ::noctalia_rs::Result<Vec<::noctalia_rs::Op>>
+                {
                     Ok(Vec::new())
                 }
             ),

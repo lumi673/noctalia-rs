@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::PathBuf;
 
-use noctalia::{Context, Result};
+use noctalia_rs::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const MAX_INTERVAL_MS: i64 = 86_400_000;
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_roundtrip() {
-        use noctalia::Parts;
+        use noctalia_rs::Parts;
         use serde_json::json;
         use std::env;
         use std::fs;

@@ -170,7 +170,7 @@ fn run() -> Result<()> {
         let dir = scratch.path().join(format!("vm-cold/{vm_counter}"));
         vm_counter += 1;
         let ctx = context(("entry", "update"), &dir, payload("{}"));
-        let ops = noctalia_luau::dispatch(&ctx, SOURCES_VM)?;
+        let ops = noctalia_rs_luau::dispatch(&ctx, SOURCES_VM)?;
         std::hint::black_box(ops);
         Ok(())
     })?);
@@ -180,7 +180,7 @@ fn run() -> Result<()> {
         options.phase("luau_vm_cache_reuse", false),
         || {
             let ctx = context(("entry", "update"), &vm_dir, payload("{}"));
-            let ops = noctalia_luau::dispatch(&ctx, SOURCES_VM)?;
+            let ops = noctalia_rs_luau::dispatch(&ctx, SOURCES_VM)?;
             std::hint::black_box(ops);
             Ok(())
         },
@@ -195,8 +195,11 @@ fn run() -> Result<()> {
         || {
             let ctx =
                 context(("entry", "update"), &runtime_dir, payload(&rows));
-            let ops =
-                noctalia_luau::dispatch_entry(&ctx, SOURCES_RUNTIME, "entry")?;
+            let ops = noctalia_rs_luau::dispatch_entry(
+                &ctx,
+                SOURCES_RUNTIME,
+                "entry",
+            )?;
             std::hint::black_box(ops);
             Ok(())
         },
@@ -207,7 +210,7 @@ fn run() -> Result<()> {
         options.phase("json_roundtrip_luau", false),
         || {
             let ctx = context(("entry", "update"), &json_dir, payload("{}"));
-            let ops = noctalia_luau::dispatch(&ctx, SOURCES_JSON)?;
+            let ops = noctalia_rs_luau::dispatch(&ctx, SOURCES_JSON)?;
             std::hint::black_box(ops);
             Ok(())
         },
@@ -220,7 +223,7 @@ fn run() -> Result<()> {
         options.phase("bridge_snapshot_reads", false),
         || {
             let ctx = context(("entry", "update"), &bridge_dir, payload("{}"));
-            let ops = noctalia_luau::dispatch(&ctx, &bridge_sources)?;
+            let ops = noctalia_rs_luau::dispatch(&ctx, &bridge_sources)?;
             std::hint::black_box(ops);
             Ok(())
         },
@@ -262,7 +265,7 @@ fn run() -> Result<()> {
         || {
             let ctx =
                 context(("entry", "update"), &snapshot_luau_dir, payload("{}"));
-            let ops = noctalia_luau::dispatch(&ctx, SOURCES_SNAPSHOT)?;
+            let ops = noctalia_rs_luau::dispatch(&ctx, SOURCES_SNAPSHOT)?;
             std::hint::black_box(ops);
             Ok(())
         },
@@ -270,7 +273,7 @@ fn run() -> Result<()> {
 
     let mut fixture = Fixture::new(&workspace, scratch.path())?;
     results.push(measure(options.phase("codegen_generate", true), || {
-        noctalia_build::generate_to(&fixture.manifest, &fixture.out_dir)?;
+        noctalia_rs_build::generate_to(&fixture.manifest, &fixture.out_dir)?;
         Ok(())
     })?);
     results.push(measure(
@@ -306,9 +309,9 @@ fn context(
     names: (&str, &str),
     data_dir: &Path,
     payload: Value,
-) -> noctalia::Context {
-    noctalia::Context::new(
-        noctalia::Parts {
+) -> noctalia_rs::Context {
+    noctalia_rs::Context::new(
+        noctalia_rs::Parts {
             entry: names.0.to_owned(),
             event: names.1.to_owned(),
             payload,
@@ -322,7 +325,7 @@ fn context(
 }
 
 fn bridge_snapshot_source() -> String {
-    let bridge = noctalia::bridge::SOURCE
+    let bridge = noctalia_rs::bridge::SOURCE
         .replace("{{HELPER}}", "bench-helper")
         .replace("{{PREFIX}}", "bench");
     format!(
@@ -442,7 +445,7 @@ impl Fixture {
         fs::write(root.join("Cargo.toml"), manifest)?;
         fs::write(
             root.join("build.rs"),
-            "fn main() -> Result<(), Box<dyn std::error::Error>> {\n    noctalia_build::generate()\n}\n",
+            "fn main() -> Result<(), Box<dyn std::error::Error>> {\n    noctalia_rs_build::generate()\n}\n",
         )?;
         fs::write(root.join("noctalia.toml"), FIXTURE_MANIFEST)?;
         fs::write(

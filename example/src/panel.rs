@@ -1,5 +1,5 @@
-use noctalia::entry;
-use noctalia::{Context, Op, Result, ui};
+use noctalia_rs::entry;
+use noctalia_rs::{Context, Op, Result, ui};
 use serde_json::{Value, json};
 
 use super::duration;
@@ -260,7 +260,7 @@ fn controls_row(ctx: &Context, draft: &str) -> ui::UiNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia::{Parts, Value};
+    use noctalia_rs::{Parts, Value};
     use std::env;
     use std::fs;
     use std::process;

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use noctalia::{Context, Op};
+use noctalia_rs::{Context, Op};
 use serde_json::Value;
 
 const MAX_TRANSLATION_KEYS: usize = 5000;
@@ -21,7 +21,7 @@ impl Collector {
 
     pub fn callback_id(&self) -> String {
         let index = self.callbacks.fetch_add(1, Ordering::Relaxed) + 1;
-        format!("noctalia_luau_{index}")
+        format!("noctalia_rs_luau_{index}")
     }
 
     pub fn take_ops(&self) -> Vec<Op> {

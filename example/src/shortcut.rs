@@ -1,5 +1,5 @@
-use noctalia::entry;
-use noctalia::{Context, Op, Result};
+use noctalia_rs::entry;
+use noctalia_rs::{Context, Op, Result};
 use serde_json::json;
 
 #[entry(kind = "shortcut", id = "shortcut")]
@@ -24,7 +24,7 @@ pub fn update(ctx: &Context) -> Result<Vec<Op>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia::{Parts, Value};
+    use noctalia_rs::{Parts, Value};
     use std::path::PathBuf;
 
     fn context(event: &str, enabled: bool) -> Context {

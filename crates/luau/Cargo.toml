@@ -4,8 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Luau-compatible compatibility runtime for noctalia plugins"
-[lib]
-name = "noctalia_luau"
 
 
 [dependencies]

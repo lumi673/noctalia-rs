@@ -9,7 +9,7 @@ use std::process;
 use std::result::Result as StdResult;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use noctalia::{
+use noctalia_rs::{
     Context, Entry, EntryConfig, EntryKind, LauncherCategory, LayerConfig,
     Meta, Op, Plugin, Setting,
 };
@@ -557,7 +557,7 @@ fn load_fixtures() -> Result<Vec<Fixture>, Box<dyn Error>> {
         .collect()
 }
 
-fn handler(ctx: &Context) -> noctalia::Result<Vec<Op>> {
+fn handler(ctx: &Context) -> noctalia_rs::Result<Vec<Op>> {
     let _ = ctx.payload_str("ignored").ok_or("missing payload")?;
     Ok(Vec::new())
 }

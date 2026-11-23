@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use mlua::{Function, Lua, MultiValue, Value as LuaValue};
-use noctalia::{Context, Op, Result};
+use noctalia_rs::{Context, Op, Result};
 
 use crate::callback::{callback_args, callback_for_event};
 use crate::host::Host;

@@ -10,8 +10,10 @@ mod widget;
 
 use std::process::ExitCode;
 
-use noctalia::run as run_cli;
-use noctalia::{Context, Entry, EntryKind, MetaBuilder, Op, Plugin, Setting};
+use noctalia_rs::run as run_cli;
+use noctalia_rs::{
+    Context, Entry, EntryKind, MetaBuilder, Op, Plugin, Setting,
+};
 use serde_json::json;
 
 use self::timer::{Store, Timer};
@@ -304,7 +306,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia::{Parts, Value};
+    use noctalia_rs::{Parts, Value};
     use std::path::PathBuf;
 
     fn context() -> Context {

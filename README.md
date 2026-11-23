@@ -31,7 +31,7 @@ noctalia-rs-build = "0.1"
 ```
 
 For entries that keep their logic in `.luau` files, add `noctalia-rs-luau = "0.1"` to `[dependencies]`. Rust handlers do not need it.
-The package names changed, but the Rust library names did not. Plugin code still imports `noctalia::`, and `build.rs` still calls `noctalia_build::generate()`.
+Package names and Rust library names now match. Plugin code imports `noctalia_rs::`, and `build.rs` calls `noctalia_rs_build::generate()`.
 
 Add `build.rs`:
 
@@ -39,7 +39,7 @@ Add `build.rs`:
 use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    noctalia_build::generate()
+    noctalia_rs_build::generate()
 }
 ```
 
@@ -85,7 +85,7 @@ Write `src/main.rs`:
 ```rust
 use std::process::ExitCode;
 
-use noctalia::{Context, Op, Result};
+use noctalia_rs::{Context, Op, Result};
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
@@ -96,7 +96,7 @@ fn service(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 fn main() -> ExitCode {
-    noctalia::run(&plugin())
+    noctalia_rs::run(&plugin())
 }
 ```
 

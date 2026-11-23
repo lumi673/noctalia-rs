@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fs;
 use std::path::PathBuf;
 
-use noctalia::{Context, Op, Result};
+use noctalia_rs::{Context, Op, Result};
 use serde_json::{Value, json};
 
 use super::PANEL_ID;
@@ -201,7 +201,7 @@ fn temporary_path(ctx: &Context) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia::{Parts, Value};
+    use noctalia_rs::{Parts, Value};
     use serde_json::json;
     use std::env;
     use std::fs;

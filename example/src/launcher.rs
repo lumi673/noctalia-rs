@@ -1,5 +1,5 @@
-use noctalia::entry;
-use noctalia::{Context, Op, Result};
+use noctalia_rs::entry;
+use noctalia_rs::{Context, Op, Result};
 use serde_json::{Value, json};
 
 use super::duration;
@@ -200,7 +200,7 @@ fn row(parts: (&str, String, String, &str)) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia::{Parts, Value};
+    use noctalia_rs::{Parts, Value};
     use serde_json::json;
     use std::env;
     use std::fs;

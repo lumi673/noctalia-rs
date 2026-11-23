@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use noctalia::{Context, Op, Result};
+use noctalia_rs::{Context, Op, Result};
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
@@ -27,5 +27,5 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 fn main() -> ExitCode {
-    noctalia::run(&plugin())
+    noctalia_rs::run(&plugin())
 }

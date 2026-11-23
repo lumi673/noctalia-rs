@@ -3,7 +3,7 @@ use mlua::{
     Function, IntoLuaMulti, Lua, MultiValue, Result as LuaResult, Table,
     Value as LuaValue, Variadic,
 };
-use noctalia::Op;
+use noctalia_rs::Op;
 use serde_json::Value as JsonValue;
 use std::env;
 use std::fs;
@@ -208,7 +208,7 @@ fn to_json(
     Convert::new(lua, role, &host.collector).to_json(value)
 }
 
-fn ui_node(lua: &Lua, value: LuaValue) -> LuaResult<noctalia::ui::UiNode> {
+fn ui_node(lua: &Lua, value: LuaValue) -> LuaResult<noctalia_rs::ui::UiNode> {
     let host = host(lua)?;
     call_converter(lua, &host).ui_node(value)
 }

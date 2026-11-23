@@ -1,5 +1,5 @@
 use mlua::{Lua, Result as LuaResult, Table, Value as LuaValue};
-use noctalia::ui::{UiNode, node};
+use noctalia_rs::ui::{UiNode, node};
 use serde_json::{Map, Value as JsonValue, json};
 
 use crate::host::Collector;

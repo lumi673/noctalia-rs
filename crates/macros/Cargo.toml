@@ -7,7 +7,6 @@ description          = "Unofficial proc macros for noctalia"
 readme               = "../../README.md"
 
 [lib]
-name = "noctalia_macros"
 proc-macro = true
 
 [dependencies]

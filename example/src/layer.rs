@@ -1,5 +1,5 @@
-use noctalia::entry;
-use noctalia::{Context, Op, Result, ui};
+use noctalia_rs::entry;
+use noctalia_rs::{Context, Op, Result, ui};
 use serde_json::json;
 
 #[entry(kind = "layer", id = "layer")]
@@ -27,7 +27,7 @@ pub fn update(ctx: &Context) -> Result<Vec<Op>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia::{Parts, Value};
+    use noctalia_rs::{Parts, Value};
     use std::path::PathBuf;
 
     fn context(event: &str) -> Context {

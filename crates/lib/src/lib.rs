@@ -16,7 +16,7 @@ pub use manifest::{
     MetaBuilder, MetaReady, NeedId, NeedName, NeedVersion, NumberConfig,
     Plugin, Setting, SettingKind,
 };
-pub use noctalia_macros::entry;
+pub use noctalia_rs_macros::entry;
 pub use ops::Op;
 pub use serde_json::Value;
 

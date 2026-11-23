@@ -1,5 +1,5 @@
 use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    noctalia_build::generate()
+    noctalia_rs_build::generate()
 }

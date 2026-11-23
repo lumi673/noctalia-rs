@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use noctalia::{Context, Parts};
+use noctalia_rs::{Context, Parts};
 use serde_json::{Value, json};
 
 use crate::callback::{callback_args, callback_for_event};
@@ -439,7 +439,7 @@ fn callback_mapping_covers_host_events() {
 
 #[test]
 fn generated_callbacks_have_runtime_mappings() {
-    for callback in noctalia::codegen::CALLBACKS {
+    for callback in noctalia_rs::codegen::CALLBACKS {
         assert_eq!(
             callback_for_event(callback.event),
             Some(callback.function),
