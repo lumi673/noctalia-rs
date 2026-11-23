@@ -3,6 +3,7 @@ name                 = "noctalia-rs"
 version.workspace    = true
 edition.workspace    = true
 license.workspace    = true
+repository.workspace = true
 description          = "Unofficial Rust framework for Noctalia plugins"
 readme               = "../../README.md"
 keywords             = ["noctalia", "luau", "plugin", "shell", "framework"]
