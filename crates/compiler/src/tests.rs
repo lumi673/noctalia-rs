@@ -36,7 +36,6 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 
     assert!(compiled.source.contains("local function body_"));
     assert!(compiled.source.contains("function update() body_"));
-    assert!(compiled.source.contains("function update() body_"));
     assert!(
         compiled.source.contains(
             "local message = (noctalia.getConfig(\"message\") or \"\")"
