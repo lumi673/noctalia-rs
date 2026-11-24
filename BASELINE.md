@@ -163,3 +163,74 @@ After API 57 parity landed, the same release harness was run again with `nix dev
 | service\_update | 0.371 | 12.724 | 34.30x | yes |
 
 The parity work therefore kept the baseline and all six matched workloads remain above 3x.
+
+## Compiled Luau entries
+
+The compiler turns one Rust handler into a complete Luau entry. This section
+measures that output against hand-written Luau doing the same work.
+
+Each fixture uses one deterministic `Context`. The compiled side is generated
+by `noctalia-rs-compiler` from the Rust handler in `crates/bench/src/generated.rs`.
+The hand-written side is the equivalent plugin a person would write, including
+the same load render, state watch, and `panel.setWantsSecondTicks` startup.
+Both run through `noctalia_rs_luau::dispatch` with a warm cached VM. Op output is
+compared before timing and must match after filtering the startup `host_call`
+ops that the Rust handler does not perform.
+
+Speedup is `hand-written median / compiled median`, so 1.0 is parity. Times are
+microseconds.
+
+| Workload | Compiled median | p95 | p99 | Hand-written median | p95 | p99 | Speedup | Source bytes compiled / hand-written |
+| :-- | --: | --: | --: | --: | --: | --: | --: | :-- |
+| generated\_hello\_bar | 2.746 | 3.106 | 3.236 | 2.936 | 3.847 | 5.080 | 1.07x | 648 / 467 |
+| generated\_ui\_panel | 16.531 | 25.909 | 45.195 | 22.823 | 31.839 | 37.520 | 1.38x | 1009 / 637 |
+| generated\_event | 5.230 | 8.385 | 10.861 | 6.292 | 10.379 | 15.339 | 1.20x | 584 / 447 |
+
+All three clear parity at the median. `generated_ui_panel` is the largest win:
+the compiler emits `{ kind = "row", props = ..., children = ... }` tables
+directly, while hand-written Luau calls the `ui.row` constructor for every node.
+The two small fixtures sit on the same roughly 2 us dispatch floor, so their
+ratios are bounded by machine variance. An earlier run on a quieter host
+measured 1.43x, 1.76x, and 1.02x for the same three fixtures.
+
+The 3x target is not measured against hand-written Luau. Both sides pay the
+same dispatch floor, so 3x is not reachable there. It is measured against the
+bridge path this replaces: `spool_dispatch` is 1,260 us in this run, against
+2.7 us to 16.5 us for compiled renders, or 76x to 459x.
+
+### Template output
+
+The same release build emitted the template before and after opting both
+entries into `luau = "src/main.rs"`.
+
+| File | Bridge stub | Compiled |
+| :-- | --: | --: |
+| `widget.luau` | 2,255 B | 456 B |
+| `service.luau` | 2,175 B | 307 B |
+| `lib/bridge.luau` | 437 lines | not emitted |
+| total lines in the plugin directory | 545 | 63 |
+
+### Exact command
+
+```sh
+nix develop --command cargo run --release -p noctalia-bench --offline -- \
+  --samples 300 --warmup 30 --build-samples 1 --build-warmup 0 \
+  --report .tmp/bench-final.json
+```
+
+### Machine metadata
+
+| Field | Value |
+| :-- | :-- |
+| Timestamp | 2026-11-24T03:24:00Z |
+| OS | Linux 7.3.5 x86\_64 |
+| CPU | AMD Ryzen 7 8845HS w/ Radeon 780M Graphics |
+| Logical CPUs | 16 |
+| Max frequency | 3,801,000 kHz |
+| Memory | 96,582,424 KiB |
+| rustc | 1.99.1 (58cf8f9c3 2026-10-13) |
+| cargo | 1.99.1 (5f94df478 2026-08-27) |
+| Profile | release, fat LTO, codegen-units 1 |
+| Samples | 300 per surface, 30 warmup |
+| Percentiles | nearest rank |
+| Timer | `std::time::Instant` |

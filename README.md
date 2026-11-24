@@ -15,6 +15,7 @@ a plugin computes.
 ## Features
 
 - `noctalia.toml` as the source of truth for metadata, settings, and entries
+- Optional compiled Luau entries with no helper process or spool IPC
 - Version taken from `Cargo.toml` through `CARGO_PKG_VERSION`
 - No Nix requirement; Nix packaging stays optional
 - All Noctalia setting types and entry kinds
@@ -121,16 +122,22 @@ luau = "src/main.rs"
 ```
 
 The value is the Rust file holding the handler. The build translates the handler
-to Luau and embeds it, so the entry runs as a plain Luau script with no helper
-process and no spool IPC: raw Luau speed instead of the roughly 1.25 ms bridge
-round trip. The handler keeps the signature
+to Luau and embeds it, so the entry runs without the helper process and spool
+IPC. The handler keeps the signature
 `fn handler(ctx: &Context) -> Result<Vec<Op>>`.
 
-The compiler covers the plugin API used by the template: events, config,
-payload, state, settings, `tr`, host reads, the common ops, and plain Rust
-control flow, arithmetic, and string work. Anything outside that subset fails
-the build with `file:line:column`. Omit `luau` and the entry keeps the generated
-stub that forwards every callback to the Rust helper.
+Compiled entries match hand-written Luau on the benchmark fixtures and beat it
+on UI trees, where the compiler emits node tables directly instead of calling
+`ui.*` constructors. The 3x target is measured against the bridge path: a spool
+round trip is about 1.26 ms, compiled renders are 3 us to 17 us.
+
+The compiler specializes each handler per event. Event comparisons and match
+arms are folded at compile time, callbacks that emit nothing are dropped, and
+`format!` becomes string concatenation. It covers events, config, payload,
+state, settings, `tr`, host reads, the common ops, `const` strings and integers,
+and plain Rust control flow, arithmetic, and string work. Anything outside that
+subset fails the build with `file:line:column`. Omit `luau` and the entry keeps
+the generated stub that forwards every callback to the Rust helper.
 
 Build and install:
 
