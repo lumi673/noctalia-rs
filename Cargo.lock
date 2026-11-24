@@ -396,12 +396,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "noctalia-rs-compiler"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "syn 3.0.10",
+]
+
+[[package]]
 name = "noctalia-rs-luau"
 version = "0.2.1"
 dependencies = [
  "chrono",
  "mlua",
  "noctalia-rs",
+ "noctalia-rs-compiler",
  "serde_json",
 ]
 

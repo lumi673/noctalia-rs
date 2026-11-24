@@ -1,0 +1,15 @@
+[package]
+name                 = "noctalia-rs-compiler"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description          = "Compiles Rust plugin handlers into Luau entry scripts"
+
+[dependencies]
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+syn.workspace = true
+
+[lints.clippy]
+excessive_nesting = "allow"
+too_many_arguments = "allow"

@@ -14,10 +14,11 @@ homepage     = "https://github.com/lumi673/noctalia-rs"
 
 [workspace.dependencies]
 chrono          = { version = "0.4.41", default-features = false, features = ["clock", "std"] }
-noctalia-rs-build  = { path = "crates/build", version = "0.2.1" }
-noctalia-rs-luau   = { path = "crates/luau", version = "0.2.1" }
-noctalia-rs        = { path = "crates/lib", version = "0.2.1" }
-noctalia-rs-macros = { path = "crates/macros", version = "0.2.1" }
+noctalia-rs-build    = { path = "crates/build", version = "0.2.1" }
+noctalia-rs-compiler = { path = "crates/compiler", version = "0.2.1" }
+noctalia-rs-luau     = { path = "crates/luau", version = "0.2.1" }
+noctalia-rs          = { path = "crates/lib", version = "0.2.1" }
+noctalia-rs-macros   = { path = "crates/macros", version = "0.2.1" }
 proc-macro2     = "1.0.107"
 quote           = "1.0.47"
 serde           = { version = "1.0.229", features = ["derive"] }
