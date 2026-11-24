@@ -15,16 +15,16 @@
       "updatedAt": "2026-11-23T00:53:41.071Z"
     },
     "spool_dispatch": {
-      "sha": "a412da4b62a6ab4bb501534b5b961c0d127c3ec2",
+      "sha": "ae1ca0fa7e63ebdc874927b8638520c2317bcf27",
       "method": 1,
-      "medianMs": 0.0466255,
-      "worstMedianMs": 0.048097,
-      "p95Ms": 0.056830000000000006,
-      "worstP95Ms": 0.061802,
-      "p99Ms": 0.093635,
-      "worstP99Ms": 0.142518,
+      "medianMs": 0.047888,
+      "worstMedianMs": 0.047906000000000004,
+      "p95Ms": 0.057231000000000004,
+      "worstP95Ms": 0.06399200000000001,
+      "p99Ms": 0.075211,
+      "worstP99Ms": 0.117805,
       "budgetMs": 10,
-      "updatedAt": "2026-11-24T02:57:10.701Z"
+      "updatedAt": "2026-11-24T04:44:26.093Z"
     },
     "luau_vm_creation": {
       "sha": "522faec3b4b0581498d0cd6883bfecb6e7438f05",
@@ -75,16 +75,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "bridge_snapshot_reads": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "ae1ca0fa7e63ebdc874927b8638520c2317bcf27",
       "method": 1,
-      "medianMs": 0.0024739999999999996,
-      "worstMedianMs": 0.0025785,
-      "p95Ms": 0.004577,
-      "worstP95Ms": 0.004937,
-      "p99Ms": 0.006309,
-      "worstP99Ms": 0.007632000000000001,
+      "medianMs": 0.002643,
+      "worstMedianMs": 0.0026950000000000003,
+      "p95Ms": 0.0034699999999999996,
+      "worstP95Ms": 0.0038139999999999997,
+      "p99Ms": 0.004085,
+      "worstP99Ms": 0.017052,
       "budgetMs": 5,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-24T04:44:26.093Z"
     },
     "json_encode_rust": {
       "sha": "3d81f62a9c12ce2dec0c0adb1c22a12098b1a98c",
@@ -219,16 +219,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "callback_dispatch_luau": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "ae1ca0fa7e63ebdc874927b8638520c2317bcf27",
       "method": 1,
-      "medianMs": 0.0020729999999999998,
-      "worstMedianMs": 0.002193,
-      "p95Ms": 0.0022429999999999998,
-      "worstP95Ms": 0.0036349999999999998,
-      "p99Ms": 0.0022630000000000003,
-      "worstP99Ms": 0.025527,
+      "medianMs": 0.0022294999999999997,
+      "worstMedianMs": 0.0022375,
+      "p95Ms": 0.002361,
+      "worstP95Ms": 0.0024159999999999997,
+      "p99Ms": 0.0024739999999999996,
+      "worstP99Ms": 0.0025139999999999997,
       "budgetMs": 5,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-24T04:44:26.093Z"
     },
     "callback_dispatch_rust": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
