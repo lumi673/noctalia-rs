@@ -599,3 +599,54 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(compiled.source.contains("local __t"));
     assert!(compiled.source.contains("type("));
 }
+
+#[test]
+fn rejects_local_functions_that_shadow_op_or_ui_names() {
+    for name in ["label", "state", "log", "column", "OpenSettings"] {
+        let handler = format!(
+            "fn {name}() {{}}\nfn handler(ctx: &Context) -> Result<Vec<Op>> {{ let _ = {name}(); Ok(vec![]) }}"
+        );
+        assert!(
+            compile(&source(&handler), &options("handler", EntryKind::Widget))
+                .is_err(),
+            "should reject shadowing `{name}`"
+        );
+    }
+}
+
+#[test]
+fn compiles_op_constructor_call_forms() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let _ = ctx.now_ms;
+    Ok(vec![
+        Op::host_call("noctalia", &["systemStats"], vec![json!(1)]),
+        Op::notify("title", "body"),
+        Op::notify_with_options("title", "body", Some(json!({ "a": 1 }))),
+        Op::notify_error("title", "body"),
+        Op::copy("text"),
+        Op::copy_with_mime("text", "text/plain"),
+        Op::open_path("/tmp/x"),
+    ])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    for needle in [
+        "host_call(\"noctalia\", { \"systemStats\" }, { 1 })",
+        "noctalia.notify(\"title\", \"body\", nil)",
+        "noctalia.notify(\"title\", \"body\", { a = 1 })",
+        "noctalia.notifyError(\"title\", \"body\", nil)",
+        "noctalia.copyToClipboard(\"text\")",
+        "noctalia.copyToClipboard(\"text\", \"text/plain\")",
+        "noctalia.openPath(\"/tmp/x\")",
+        "local function host_call(root, path, args)",
+    ] {
+        assert!(
+            compiled.source.contains(needle),
+            "missing {needle}\n{}",
+            compiled.source
+        );
+    }
+}

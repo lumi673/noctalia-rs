@@ -896,6 +896,13 @@ impl Emitter {
                 self.line("end");
                 Ok((name, ty))
             }
+            Expr::Array(array) => {
+                let mut values = Vec::new();
+                for item in &array.elems {
+                    values.push(self.expr(item)?.0);
+                }
+                Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
+            }
             Expr::Tuple(tuple) if tuple.elems.is_empty() => {
                 Ok(("nil".to_owned(), Ty::VOID))
             }
@@ -1667,14 +1674,22 @@ impl Emitter {
         self.emitted = true;
         match expr {
             Expr::Struct(item) => {
-                let name = item
+                let segments = item
                     .path
                     .segments
-                    .last()
+                    .iter()
                     .map(|segment| segment.ident.to_string())
-                    .ok_or_else(|| {
-                        Error::at(item.span(), "unsupported op expression")
-                    })?;
+                    .collect::<Vec<_>>();
+                if segments.len() < 2
+                    || segments.get(segments.len().saturating_sub(2))
+                        != Some(&"Op".to_owned())
+                {
+                    return Err(Error::at(
+                        item.span(),
+                        "expected an Op constructor",
+                    ));
+                }
+                let name = segments.last().cloned().unwrap_or_default();
                 self.op_struct(&name, item)
             }
             Expr::Call(call) => {
@@ -1691,12 +1706,20 @@ impl Emitter {
             Expr::Paren(paren) => self.op_expr(&paren.expr),
             Expr::Group(group) => self.op_expr(&group.expr),
             Expr::Path(path) => {
-                let name = path
+                let segments = path
                     .path
                     .segments
-                    .last()
+                    .iter()
                     .map(|segment| segment.ident.to_string())
-                    .unwrap_or_default();
+                    .collect::<Vec<_>>();
+                let name = if segments.len() >= 2
+                    && segments.get(segments.len().saturating_sub(2))
+                        == Some(&"Op".to_owned())
+                {
+                    segments.last().cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 if name == "OpenSettings" {
                     self.line("noctalia.openSettings()");
                     Ok(())
@@ -1872,6 +1895,50 @@ impl Emitter {
                 let ms = self.expr(arg(&args, 0, call)?)?.0;
                 self.line(&format!("noctalia.setUpdateInterval({ms})"));
             }
+            "host_call" => {
+                self.uses_host_call = true;
+                let root = self.expr(arg(&args, 0, call)?)?.0;
+                let path = self.expr(arg(&args, 1, call)?)?.0;
+                let value = self.expr(arg(&args, 2, call)?)?.0;
+                self.line(&format!("host_call({root}, {path}, {value})"));
+            }
+            "notify" | "notify_with_options" => {
+                let title = self.expr(arg(&args, 0, call)?)?.0;
+                let body = self.expr(arg(&args, 1, call)?)?.0;
+                let options = if name == "notify_with_options" {
+                    self.expr(arg(&args, 2, call)?)?.0
+                } else {
+                    "nil".to_owned()
+                };
+                self.line(&format!(
+                    "noctalia.notify({title}, {body}, {options})"
+                ));
+            }
+            "notify_error" | "notify_error_with_options" => {
+                let title = self.expr(arg(&args, 0, call)?)?.0;
+                let body = self.expr(arg(&args, 1, call)?)?.0;
+                let options = if name == "notify_error_with_options" {
+                    self.expr(arg(&args, 2, call)?)?.0
+                } else {
+                    "nil".to_owned()
+                };
+                self.line(&format!(
+                    "noctalia.notifyError({title}, {body}, {options})"
+                ));
+            }
+            "copy" => {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!("noctalia.copyToClipboard({text})"));
+            }
+            "copy_with_mime" => {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                let mime = self.expr(arg(&args, 1, call)?)?.0;
+                self.line(&format!("noctalia.copyToClipboard({text}, {mime})"));
+            }
+            "open_path" => {
+                let path = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!("noctalia.openPath({path})"));
+            }
             other => {
                 return Err(Error::at(
                     call.span(),
@@ -2014,15 +2081,34 @@ fn host_path(path: &str) -> Result<&'static str, Error> {
     Ok(value)
 }
 
+fn qualified_variant<'a>(name: &'a str, root: &str) -> Option<&'a str> {
+    let mut parts = name.rsplit("::");
+    let variant = parts.next()?;
+    (parts.next()? == root).then_some(variant)
+}
+
 fn op_constructor(name: &str) -> Option<String> {
-    let variant = name.rsplit("::").next().unwrap_or(name);
-    let supported =
-        ["log", "log_static", "state", "state_watch", "set_interval"];
+    let variant = qualified_variant(name, "Op")?;
+    let supported = [
+        "log",
+        "log_static",
+        "state",
+        "state_watch",
+        "set_interval",
+        "host_call",
+        "notify",
+        "notify_with_options",
+        "notify_error",
+        "notify_error_with_options",
+        "copy",
+        "copy_with_mime",
+        "open_path",
+    ];
     supported.contains(&variant).then(|| variant.to_owned())
 }
 
 fn ui_constructor(name: &str) -> Option<&'static str> {
-    let variant = name.rsplit("::").next().unwrap_or(name);
+    let variant = qualified_variant(name, "ui")?;
     match variant {
         "column" => Some("column"),
         "row" => Some("row"),
@@ -2081,13 +2167,15 @@ fn is_ops_push(call: &ExprCall) -> bool {
 
 fn is_op_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::Struct(item) => item
-            .path
-            .segments
-            .first()
-            .is_some_and(|segment| segment.ident == "Op"),
+        Expr::Struct(item) => {
+            let segments = item.path.segments.iter().collect::<Vec<_>>();
+            segments.len() >= 2
+                && segments
+                    .get(segments.len().saturating_sub(2))
+                    .is_some_and(|segment| segment.ident == "Op")
+        }
         Expr::Call(call) => path_last_name(&call.func)
-            .is_some_and(|name| name.starts_with("Op::")),
+            .is_some_and(|name| op_constructor(&name).is_some()),
         _ => false,
     }
 }
