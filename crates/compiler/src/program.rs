@@ -458,13 +458,14 @@ fn collect(
             }
             Item::Struct(item_struct) => {
                 if let syn::Fields::Named(fields) = &item_struct.fields {
-                    let derives_default = item_struct.attrs.iter().any(|attr| {
-                        let syn::Meta::List(list) = &attr.meta else {
-                            return false;
-                        };
-                        list.path.is_ident("derive")
-                            && list.tokens.to_string().contains("Default")
-                    });
+                    let derives_default =
+                        item_struct.attrs.iter().any(|attr| {
+                            let syn::Meta::List(list) = &attr.meta else {
+                                return false;
+                            };
+                            list.path.is_ident("derive")
+                                && list.tokens.to_string().contains("Default")
+                        });
                     let fields = fields
                         .named
                         .iter()

@@ -374,7 +374,9 @@ fn resolve_includes(source: &str, file: &Path) -> Result<String, BoxError> {
         let Some(end) = after.find('"') else {
             let before = &source[..source.len() - rest.len() + index];
             let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
-            let column = before.rfind('\n').map_or(before.len() + 1, |at| before.len() - at);
+            let column = before
+                .rfind('\n')
+                .map_or(before.len() + 1, |at| before.len() - at);
             return Err(format!(
                 "{}:{line}:{column}: unterminated include_str! path",
                 file.display()
@@ -1220,7 +1222,8 @@ fn compile_entry(
             source,
         })
         .collect::<Vec<_>>();
-    let source = resolve_includes(&site.source, &context.source.join(&site.file))?;
+    let source =
+        resolve_includes(&site.source, &context.source.join(&site.file))?;
     let display = site.file.to_string_lossy();
     let result = compiler::compile(
         &source,
