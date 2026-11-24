@@ -39,16 +39,16 @@
       "updatedAt": "2026-11-23T21:44:29.693Z"
     },
     "luau_vm_cache_reuse": {
-      "sha": "8f1449425930b6928dbc9a46c2d6d8255fa3fb92",
+      "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
       "method": 1,
-      "medianMs": 0.002725,
-      "worstMedianMs": 0.002875,
-      "p95Ms": 0.002886,
-      "worstP95Ms": 0.0030960000000000002,
-      "p99Ms": 0.0029950000000000003,
-      "worstP99Ms": 0.003387,
+      "medianMs": 0.0023464999999999996,
+      "worstMedianMs": 0.002399,
+      "p95Ms": 0.002463,
+      "worstP95Ms": 0.002601,
+      "p99Ms": 0.0026160000000000003,
+      "worstP99Ms": 0.0070550000000000005,
       "budgetMs": 1,
-      "updatedAt": "2026-11-23T13:14:47.475Z"
+      "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "luau_runtime_dispatch": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -99,16 +99,16 @@
       "updatedAt": "2026-11-23T00:53:41.071Z"
     },
     "json_decode_rust": {
-      "sha": "3d81f62a9c12ce2dec0c0adb1c22a12098b1a98c",
+      "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
       "method": 1,
-      "medianMs": 0.0011855,
-      "worstMedianMs": 0.001192,
-      "p95Ms": 0.001234,
-      "worstP95Ms": 0.0012569999999999999,
-      "p99Ms": 0.001268,
-      "worstP99Ms": 0.0014,
+      "medianMs": 0.00088,
+      "worstMedianMs": 0.000885,
+      "p95Ms": 0.0009540000000000001,
+      "worstP95Ms": 0.001012,
+      "p99Ms": 0.000998,
+      "worstP99Ms": 0.001096,
       "budgetMs": 1,
-      "updatedAt": "2026-11-23T00:53:41.071Z"
+      "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "snapshot_reads_rust": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -255,16 +255,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "service_update_rust": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
       "method": 1,
-      "medianMs": 0.00022999999999999998,
-      "worstMedianMs": 0.00026000000000000003,
-      "p95Ms": 0.000241,
-      "worstP95Ms": 0.000271,
-      "p99Ms": 0.00026000000000000003,
-      "worstP99Ms": 0.00028000000000000003,
+      "medianMs": 0.000205,
+      "worstMedianMs": 0.000207,
+      "p95Ms": 0.000224,
+      "worstP95Ms": 0.00023799999999999998,
+      "p99Ms": 0.000228,
+      "worstP99Ms": 0.004921,
       "budgetMs": 2,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "plugin_case_convert_luau": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -291,16 +291,16 @@
       "updatedAt": "2026-11-24T02:57:10.701Z"
     },
     "plugin_color_picker_luau": {
-      "sha": "a412da4b62a6ab4bb501534b5b961c0d127c3ec2",
+      "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
       "method": 1,
-      "medianMs": 0.35157,
-      "worstMedianMs": 0.3571575,
-      "p95Ms": 0.364639,
-      "worstP95Ms": 0.371818,
-      "p99Ms": 0.37394,
-      "worstP99Ms": 0.37633099999999997,
+      "medianMs": 0.35599349999999996,
+      "worstMedianMs": 0.3607865,
+      "p95Ms": 0.36696500000000004,
+      "worstP95Ms": 0.373003,
+      "p99Ms": 0.368904,
+      "worstP99Ms": 0.380164,
       "budgetMs": 3,
-      "updatedAt": "2026-11-24T02:57:10.701Z"
+      "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "plugin_color_picker_rust": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -315,16 +315,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_vietnamese_lunar_calendar_luau": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
       "method": 1,
-      "medianMs": 8.6377545,
-      "worstMedianMs": 10.990077,
-      "p95Ms": 8.693537000000001,
-      "worstP95Ms": 11.093035,
-      "p99Ms": 8.740878,
-      "worstP99Ms": 11.943129,
+      "medianMs": 6.650220999999999,
+      "worstMedianMs": 6.7124695,
+      "p95Ms": 6.752779,
+      "worstP95Ms": 6.827328,
+      "p99Ms": 6.790385000000001,
+      "worstP99Ms": 7.524002,
       "budgetMs": 60,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "plugin_vietnamese_lunar_calendar_rust": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
