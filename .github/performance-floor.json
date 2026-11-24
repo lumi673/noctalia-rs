@@ -303,16 +303,16 @@
       "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "plugin_color_picker_rust": {
-      "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
+      "sha": "913db3fe9174122642756ecca98f35c2be996dbf",
       "method": 1,
-      "medianMs": 0.20700749999999998,
-      "worstMedianMs": 0.2101175,
-      "p95Ms": 0.218631,
-      "worstP95Ms": 0.22280800000000003,
-      "p99Ms": 0.22228399999999998,
-      "worstP99Ms": 0.236558,
+      "medianMs": 0.20588100000000004,
+      "worstMedianMs": 0.20793,
+      "p95Ms": 0.21706,
+      "worstP95Ms": 0.21797400000000003,
+      "p99Ms": 0.218119,
+      "worstP99Ms": 0.221352,
       "budgetMs": 2,
-      "updatedAt": "2026-11-24T17:00:24.601Z"
+      "updatedAt": "2026-11-24T20:42:09.873Z"
     },
     "plugin_vietnamese_lunar_calendar_luau": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
