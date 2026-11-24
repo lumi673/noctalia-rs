@@ -129,7 +129,7 @@ IPC. The handler keeps the signature
 Compiled entries match hand-written Luau on the benchmark fixtures and beat it
 on UI trees, where the compiler emits node tables directly instead of calling
 `ui.*` constructors. The 3x target is measured against the bridge path: a spool
-round trip is about 1.26 ms, compiled renders are 3 us to 17 us.
+round trip is about 1.13 ms, compiled renders are about 2 us to 10 us.
 
 The compiler specializes each handler per event. Event comparisons and match
 arms are folded at compile time, callbacks that emit nothing are dropped, and
