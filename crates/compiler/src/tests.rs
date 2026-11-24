@@ -421,14 +421,18 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     for index in 0..=3 {
         total += rows.get(index).as_i64().unwrap_or(0);
     }
-    let text = format!("{total:?}");
+    let text = format!("{total:x}");
     Ok(vec![Op::log(text)])
 }
 "#;
     let error =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect_err("format spec is rejected");
-    assert!(error.message.contains("format specifiers"));
+    assert!(
+        error.message.contains("format specifier"),
+        "{}",
+        error.message
+    );
 
     let handler = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
@@ -488,7 +492,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn rejects_constructs_outside_the_subset() {
     for handler in [
-        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.fuzzy_score(\"a\", \"b\"); Ok(vec![]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.calendar_events(\"a\"); Ok(vec![]) }",
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { match ctx.event.as_str() { other => { let _ = other; Ok(Vec::new()) } } }",
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = std::process::id(); Ok(vec![]) }",
     ] {
@@ -1047,16 +1051,16 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn rejects_callback_ops_with_a_reason() {
+fn rejects_queries_that_need_a_response_path() {
     let handler = r#"
 fn widget(_ctx: &Context) -> Result<Vec<Op>> {
-    Ok(vec![Op::run(json!("true"), None)])
+    Ok(vec![Op::query("id", "noctalia", &["nowMs"], vec![], "out.json")])
 }
 "#;
     let error =
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect_err("bail");
-    assert!(error.message.contains("callback id"), "{}", error.message);
+    assert!(error.message.contains("response path"), "{}", error.message);
 }
 
 #[test]
@@ -1237,7 +1241,8 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
     assert!(compiled.source.contains("ipairs("));
-    assert!(compiled.source.contains("elseif (true) and ("));
+    assert!(compiled.source.contains("elseif true then"));
+    assert!(compiled.source.contains("if (noctalia.nowMs() > 0) then"));
 }
 
 #[test]
@@ -1320,13 +1325,13 @@ fn rejects_inline_depth_and_unsupported_ops() {
 
     let handler = r#"
 fn widget(_ctx: &Context) -> Result<Vec<Op>> {
-    Ok(vec![Op::http(json!({}))])
+    Ok(vec![Op::query("id", "noctalia", &["nowMs"], vec![], "out.json")])
 }
 "#;
     let error =
         compile(&source(handler), &options("widget", EntryKind::Widget))
-            .expect_err("http");
-    assert!(error.message.contains("callback id"), "{}", error.message);
+            .expect_err("query");
+    assert!(error.message.contains("response path"), "{}", error.message);
 }
 
 #[test]
@@ -1488,14 +1493,15 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
     assert!(compiled.source.contains("local first, second ="));
-    assert!(compiled.source.contains("if (value ~= nil) then"));
+    assert!(compiled.source.contains("local value = __t"));
+    assert!(compiled.source.contains("value ~= nil"));
     assert!(!compiled.source.contains("if __static"));
 }
 
 #[test]
 fn bails_on_constructs_without_a_safe_translation() {
     for handler in [
-        "fn widget(_ctx: &Context) -> Result<Vec<Op>> { Ok(vec![Op::run(json!(\"x\"), None)]) }",
+        "fn widget(_ctx: &Context) -> Result<Vec<Op>> { Ok(vec![Op::http_bytes(json!({}), 1)]) }",
         "fn widget(_ctx: &Context) -> Result<Vec<Op>> { other = 1; Ok(vec![]) }",
     ] {
         let error =
@@ -2060,9 +2066,8 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
-    assert!(compiled.source.contains("if __t"));
-    assert!(compiled.source.contains("== nil) then"));
-    assert!(compiled.source.contains("== nil) then"));
+    assert!(compiled.source.contains("if ((__t2 == nil)) then"));
+    assert!(compiled.source.contains("if not (((__t6 == nil))) then"));
 }
 
 #[test]
@@ -2215,17 +2220,19 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn bails_on_callback_id_host_methods() {
+fn bails_on_host_start_methods_that_report_acceptance() {
     let handler = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    ctx.run_async_start(json!([]), None, None);
+    if !ctx.run_async_start(json!([]), None, None) {
+        return Ok(Vec::new());
+    }
     Ok(Vec::new())
 }
 "#;
     let error =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect_err("bails");
-    assert!(error.message.contains("host callback id"));
+    assert!(error.message.contains("must be discarded"));
     assert!(error.line > 0 && error.column > 0);
 }
 
@@ -2772,14 +2779,19 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(bad)])
 }
 "#;
-    let error = compile(&source(map), &options("handler", EntryKind::Service))
-        .expect_err("bails");
+    let compiled =
+        compile(&source(map), &options("handler", EntryKind::Service))
+            .expect("compiles with a runtime join");
     assert!(
-        error.message.contains("join() needs a list"),
+        compiled.source.contains("join(table, \",\")"),
         "{}",
-        error.message
+        compiled.source
     );
-    assert!(error.line > 0 && error.column > 0);
+    assert!(
+        compiled
+            .source
+            .contains("local function join(value, separator)")
+    );
 }
 
 #[test]
@@ -2820,14 +2832,10 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(Vec::new())
 }
 "#;
-    let error = compile(&source(set), &options("handler", EntryKind::Service))
-        .expect_err("bails");
-    assert!(
-        error.message.contains("remove() needs a list"),
-        "{}",
-        error.message
-    );
-    assert!(error.line > 0 && error.column > 0);
+    let compiled =
+        compile(&source(set), &options("handler", EntryKind::Service))
+            .expect("compiles as a map removal");
+    assert!(compiled.source.contains("names[\"a\"] = nil"));
 }
 
 #[test]
@@ -3022,4 +3030,648 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         error.message
     );
     assert!(error.line > 0 && error.column > 0);
+}
+
+#[test]
+fn compiles_host_callback_ops_with_stable_names() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    if ctx.is_load_event() {
+        ops.push(Op::run_stream(json!(["tail", "-f"]), "stream_name"));
+        ops.push(Op::run(json!(["echo"]), Some("done_name")));
+        ops.push(Op::run(json!(["true"]), None));
+        ops.push(Op::http(json!({ "url": "x" }), Some("http_name")));
+        ops.push(Op::state_watch("key", "watch_name"));
+    }
+    if ctx.event == "host_callback" && ctx.payload_str("id").as_deref() == Some("stream_name") {
+        let line = ctx.payload_arg(0).and_then(Value::as_str).unwrap_or_default();
+        ops.push(Op::log(line.to_owned()));
+    }
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(
+        source.contains(
+            "noctalia.runStream({ \"tail\", \"-f\" }, { __host_callback = \"stream_name\" })"
+        ),
+        "{source}"
+    );
+    assert!(
+        source.contains("noctalia.runAsync({ \"echo\" }, { __host_callback = \"done_name\" })"),
+        "{source}"
+    );
+    assert!(
+        source.contains("noctalia.runAsync({ \"true\" })"),
+        "{source}"
+    );
+    assert!(
+        source.contains("noctalia.http({ url = \"x\" }, { __host_callback = \"http_name\" })"),
+        "{source}"
+    );
+    assert!(
+        source.contains(
+            "state.watch(\"key\", { __host_callback = \"watch_name\" })"
+        ),
+        "{source}"
+    );
+    assert!(
+        source.contains("function onHostCallback(payload) body_"),
+        "{source}"
+    );
+}
+
+#[test]
+fn compiles_ui_call_markers() {
+    let handler = r#"
+fn widget(_ctx: &Context) -> Result<Vec<Op>> {
+    let props = json!({ "onClick": ui::call("onRefresh"), "onRightClick": ui::callback("row") });
+    Ok(vec![Op::BarRender { tree: ui::button(props) }])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("{ __call = \"onRefresh\" }"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("{ __host_callback = \"row\" }"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn host_start_methods_compile_only_when_their_result_is_dropped() {
+    let dropped = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    ctx.run_async_start(json!(["true"]), Some("cb"), Some(250.0));
+    ctx.run_stream_start(json!(["tail"]), "stream");
+    ctx.http_start(json!({}), "req");
+    Ok(Vec::new())
+}
+"#;
+    let compiled =
+        compile(&source(dropped), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains(
+            "noctalia.runAsync({ \"true\" }, { __host_callback = \"cb\" }, 250.0)"
+        ),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains(
+            "noctalia.runStream({ \"tail\" }, { __host_callback = \"stream\" })"
+        ),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("noctalia.http({  }, { __host_callback = \"req\" })"),
+        "{}",
+        compiled.source
+    );
+
+    let used = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if !ctx.http_start(json!({}), "req") {
+        return Ok(Vec::new());
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error = compile(&source(used), &options("handler", EntryKind::Service))
+        .expect_err("bails");
+    assert!(error.message.contains("must be discarded"));
+}
+
+#[test]
+fn match_guards_read_pattern_bindings() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = match ctx.config.get("host").and_then(Value::as_str) {
+        Some(value) if !value.is_empty() => value.to_owned(),
+        _ => "127.0.0.1".to_owned(),
+    };
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("local value = __t"), "{source}");
+    assert!(source.contains("if (not (#value == 0)) then"), "{source}");
+}
+
+#[test]
+fn compiles_nested_or_patterns() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config.get("x").cloned().unwrap_or(Value::Null);
+    let kind = match &value {
+        Some(Value::Array(_) | Value::Object(_)) => "table",
+        _ => "other",
+    };
+    let table = matches!(value, None | Some(Value::Null | Value::Bool(false)));
+    Ok(vec![Op::log(format!("{kind} {table}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("\"table\""), "{}", compiled.source);
+}
+
+#[test]
+fn compiles_function_references_as_callbacks() {
+    let handler = r#"
+fn text(value: Value) -> String {
+    value.as_str().unwrap_or_default().to_owned()
+}
+fn snapshot() -> Value {
+    json!({})
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let named = ctx.config.get("name").map(text).unwrap_or_default();
+    let fallback = ctx.config.get("grid").cloned().unwrap_or_else(snapshot);
+    let empty = ctx.config.get("list").and_then(Value::as_array).is_some_and(Vec::is_empty);
+    let owned = ctx.config.get("list").and_then(Value::as_array).map_or(Vec::new(), |list| list.clone());
+    Ok(vec![Op::log(format!("{named} {empty} {fallback} {owned}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("local value = __t"), "{generated}");
+    assert!(generated.contains("#__value == 0"), "{generated}");
+    assert!(generated.contains("local list = __t"), "{generated}");
+}
+
+#[test]
+fn unit_helpers_compile_inside_closures() {
+    let handler = r#"
+fn refresh(_ctx: &Context, ops: &mut Vec<Op>) {
+    ops.push(Op::log("tick"));
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    static INIT: Once = Once::new();
+    INIT.call_once(|| refresh(ctx, &mut ops));
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("noctalia.log(\"tick\")"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn compiles_richer_constants_and_defaults() {
+    let handler = r#"
+const LIMIT: f64 = 380.0;
+const FLOOR: f64 = -1.0;
+const TIERS: [(&str, i64); 2] = [("a", 1), ("b", 2)];
+struct State { items: Vec<String> }
+impl State {
+    const EMPTY: State = State { items: Vec::new() };
+}
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = LIMIT + FLOOR;
+    for (name, weight) in TIERS {
+        total += weight as f64;
+        let _ = name;
+    }
+    let state = State::EMPTY;
+    let capacity = Vec::with_capacity(4);
+    let biggest = std::cmp::max(1, 2);
+    let ceiling = i64::MAX;
+    let smallest = f64::MIN;
+    let empty: Map<String, Value> = Map::default();
+    Ok(vec![Op::log(format!("{total} {} {} {} {} {}", state.items, capacity.len(), biggest, ceiling, smallest, empty))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("380.0"), "{source}");
+    assert!(source.contains("(-1.0)"), "{source}");
+    assert!(source.contains("9223372036854775807"), "{source}");
+    assert!(source.contains("math.max(1, 2)"), "{source}");
+    assert!(source.contains("{}"), "{source}");
+}
+
+#[test]
+fn compiles_format_specifiers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = 3.14159;
+    let count = 7;
+    let label = "hi";
+    Ok(vec![Op::log(format!("{value:.2} {count:03} {label:>4} {count}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(
+        generated.contains("string.format(\"%.2f\", value)"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("string.format(\"%03d\", count)"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("string.format(\"%4s\", label)"),
+        "{generated}"
+    );
+
+    let bail = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let count = 7;
+    Ok(vec![Op::log(format!("{count:x}"))])
+}
+"#;
+    let error = compile(&source(bail), &options("handler", EntryKind::Service))
+        .expect_err("bails");
+    assert!(
+        error.message.contains("format specifier"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn compiles_character_sets_and_slices() {
+    let handler = r#"
+fn is_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n')
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.payload_str("text").unwrap_or_default();
+    let trimmed = text.trim_matches(is_space);
+    let closed = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let listed = text.trim_matches(&[' ', '\t'][..]);
+    let head = &text[..2];
+    let tail = &text[1..];
+    let middle = &text[1..3];
+    Ok(vec![Op::log(format!("{trimmed} {closed} {listed} {head} {tail} {middle}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("string.sub(text, 1, 2)"), "{source}");
+    assert!(
+        source.contains("string.sub(text, (1) + 1, #text)"),
+        "{source}"
+    );
+    assert!(source.contains("string.sub(text, (1) + 1, 3)"), "{source}");
+}
+
+#[test]
+fn compiles_host_queries_and_join() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let dark = ctx.query_bool("noctalia", &["isDarkMode"], Vec::new());
+    let value = ctx.query_value("noctalia", &["getSetting"], vec![json!("shell.lang")]);
+    let score = ctx.fuzzy_score("abc", "abcdef");
+    let dir = ctx.plugin_dir();
+    let path = dir.join("icons");
+    let parts = ctx.list_dir(&path);
+    let joined = parts.join("/");
+    Ok(vec![Op::log(format!("{dark} {value} {score} {path} {joined}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("local function host_query("), "{source}");
+    assert!(
+        source.contains("noctalia.fuzzyScore(\"abc\", \"abcdef\")"),
+        "{source}"
+    );
+    assert!(source.contains("table.concat("), "{source}");
+}
+
+#[test]
+fn read_file_reports_errors_like_a_result() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if let Ok(raw) = ctx.read_file("/tmp/x") {
+        return Ok(vec![Op::log(raw)]);
+    }
+    let Ok(exact) = ctx.read_file("/tmp/y") else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![Op::log(exact)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(
+        source.contains("local __t1, __t2 = noctalia.readFile(\"/tmp/x\")"),
+        "{source}"
+    );
+    assert!(source.contains("local exact = __t"), "{source}");
+}
+
+#[test]
+fn compiles_map_removals_and_unit_defaults() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut queries: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    queries.insert("a".to_owned(), json!(1));
+    let removed = queries.remove("a");
+    let empty: std::collections::HashMap<String, Value> = Default::default();
+    Ok(vec![Op::log(format!("{removed} {empty}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("= nil"), "{}", compiled.source);
+}
+
+#[test]
+fn compiles_iterator_aggregates() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let items = ctx.config.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+    let any = items.iter().any(|item| item.is_string());
+    let all = items.iter().all(|item| item.is_string());
+    let sum: f64 = items.len() as f64;
+    let count = items.iter().count();
+    let mut seen = 0;
+    items.iter().for_each(|_| { seen += 1 });
+    Ok(vec![Op::log(format!("{any} {all} {sum} {count} {seen}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("= true"), "{source}");
+    assert!(source.contains("= false"), "{source}");
+    assert!(source.contains("break"), "{source}");
+}
+
+#[test]
+fn compiles_the_remaining_string_and_number_methods() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.payload_str("text").unwrap_or_default();
+    let mut list = vec![text.clone()];
+    let first = list.first().cloned().unwrap_or_default();
+    list.push_back("tail".to_owned());
+    let popped = list.pop().unwrap_or_default();
+    let found = text.find("|").unwrap_or(0);
+    let nan = (0.0f64 / 0.0).is_nan();
+    let quotient = 7.0.div_euclid(2.0);
+    let rounded = 1.5f64.round();
+    let optional = ctx.config.get("name").cloned();
+    let chosen = optional.clone().or(Some(json!("x")));
+    let flag = optional.clone().is_none_or(|value| value.is_string());
+    let upper = text.is_ascii_uppercase();
+    let alnum = text.is_ascii_alphanumeric();
+    let digit = text.is_ascii_digit();
+    let space = text.is_whitespace();
+    let started = text.trim_start();
+    let ended = text.trim_end();
+    let suffix = text.strip_suffix(".txt").unwrap_or_default();
+    let bytes = text.as_bytes();
+    let owned: String = text.clone().into();
+    let sized = bytes.len();
+    let pushed = pushed_value(text);
+    Ok(vec![Op::log(format!("{first}{popped}{found}{nan}{quotient}{rounded}{chosen:?}{flag}{upper}{alnum}{digit}{space}{started}{ended}{suffix}{sized}{pushed}"))])
+}
+fn pushed_value(text: String) -> String {
+    let mut buffer = String::new();
+    buffer.push_str(&text);
+    buffer
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("table.remove(list)"), "{source}");
+    assert!(
+        source.contains("string.find(text, \"|\", 1, true)"),
+        "{source}"
+    );
+    assert!(source.contains("math.floor(7.0 / 2.0)"), "{source}");
+    assert!(source.contains("json.encode(chosen)"), "{source}");
+}
+
+#[test]
+fn compiles_character_set_variants() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.payload_str("text").unwrap_or_default();
+    let bytes = text.trim_matches(b' ');
+    let packed = text.trim_matches(b" \t");
+    let digits = text.trim_matches(|c: char| c.is_ascii_digit());
+    let matched = text.trim_matches(|c: char| matches!(c, '-' | '+'));
+    let wrapped = text.trim_matches(&['^', ']', '%', '-'][..]);
+    Ok(vec![Op::log(format!("{bytes}{packed}{digits}{matched}{wrapped}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("[%^%]%%%-]"), "{source}");
+    assert!(source.contains("0123456789"), "{source}");
+    assert!(source.contains("[%-+]"), "{source}");
+}
+
+#[test]
+fn bails_on_character_sets_it_cannot_read() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.payload_str("text").unwrap_or_default();
+    let unknown = text.trim_matches(|c: char| c == 'a' && c != 'b');
+    Ok(vec![Op::log(unknown)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error.message.contains("string or char literal"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn compiles_debug_and_alignment_specifiers() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config.get("value").cloned().unwrap_or(Value::Null);
+    let count = 7;
+    let label = "hi";
+    Ok(vec![Op::log(format!("{value:?} {count:?} {label:<4} {label:^4}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("centering bails");
+    assert!(
+        error.message.contains("format specifier"),
+        "{}",
+        error.message
+    );
+
+    let simple = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config.get("value").cloned().unwrap_or(Value::Null);
+    let count = 7;
+    let label = "hi";
+    Ok(vec![Op::log(format!("{value:?} {count:?} {label:<4}"))])
+}
+"#;
+    let compiled =
+        compile(&source(simple), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("string.format(\"%-4s\", label)"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn bails_on_debug_specifiers_for_strings() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let label = "hi";
+    Ok(vec![Op::log(format!("{label:?}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error.message.contains("format specifier"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn compiles_container_callbacks_and_bounds() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let list = ctx.config.get("list").and_then(Value::as_array).cloned();
+    let owned = list.clone().map_or(Vec::new(), Vec::as_slice);
+    let fresh = list.clone().unwrap_or_else(Map::new);
+    let default = list.clone().unwrap_or_else(Default::default);
+    let empty = list.clone().is_some_and(Vec::is_empty);
+    let bounded = ctx.config.get("n").and_then(Value::as_f64).unwrap_or(i64::MAX as f64);
+    let endless = f64::MAX;
+    let lowest = i64::MIN;
+    let minimal = f64::MIN;
+    Ok(vec![Op::log(format!("{owned:?}{fresh}{default}{empty}{bounded}{endless}{lowest}{minimal}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(source.contains("math.huge"), "{source}");
+    assert!(source.contains("9223372036854775807"), "{source}");
+}
+
+#[test]
+fn bails_on_open_ended_list_slices() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let list = ctx.config.get("list").and_then(Value::as_array).cloned().unwrap_or_default();
+    let tail = &list[1..];
+    Ok(vec![Op::log(format!("{tail:?}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error.message.contains("open-ended slices"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn compiles_glob_imported_constants_and_associated_values() {
+    let main = r#"
+mod state;
+use state::*;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = STATE_KEY;
+    let preset = Preset::EMPTY;
+    Ok(vec![Op::log(format!("{value} {preset}"))])
+}
+"#;
+    let state = r#"
+pub const STATE_KEY: &str = "me.state";
+pub struct Preset { pub name: String }
+impl Preset {
+    pub const EMPTY: Preset = Preset { name: String::new() };
+}
+"#;
+    let modules = [Module {
+        path: "state",
+        source: state,
+    }];
+    let compiled = compile(
+        &source(main),
+        &module_options("handler", EntryKind::Service, &modules),
+    )
+    .expect("compiles");
+    assert!(compiled.source.contains("me.state"), "{}", compiled.source);
+}
+
+#[test]
+fn compiles_result_patterns_and_err_arms() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let Ok(count) = serde_json::from_str::<i64>("1") else {
+        return Ok(Vec::new());
+    };
+    if let Ok(Value::Object(value)) = serde_json::from_str::<Value>("{}") {
+        let _ = value;
+    }
+    Ok(vec![Op::log(format!("{count}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("if not ("), "{}", compiled.source);
 }

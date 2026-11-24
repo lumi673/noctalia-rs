@@ -82,25 +82,43 @@ impl Runtime {
         Ok(self.host.collector.take_ops())
     }
 
+    /// Runs a host callback delivered by name.
+    ///
+    /// Hand-written scripts pass Luau functions to the host, so the runtime
+    /// resolves those ids here. A compiled entry passes a stable name instead
+    /// and receives the payload in its `onHostCallback` global.
     fn dispatch_host_callback(&self, ctx: &Context) -> Result<Vec<Op>> {
         let Some(id) = ctx.payload.get("id").and_then(Json::as_str) else {
             return Ok(self.host.collector.take_ops());
         };
-        let Some(function) = self.host.collector.function(id) else {
+        if let Some(function) = self.host.collector.function(id) {
+            let args = ctx
+                .payload
+                .get("args")
+                .and_then(Json::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|value| from_json_with_bytes(&self.lua, value))
+                .collect::<mlua::Result<Vec<_>>>()?;
+            if let Err(error) =
+                function.call::<MultiValue>(MultiValue::from_vec(args))
+            {
+                return Err(format!(
+                    "{} host callback {id}: {}",
+                    self.entry,
+                    traceback(&self.lua, &error)
+                )
+                .into());
+            }
+            return Ok(self.host.collector.take_ops());
+        }
+        let Ok(function) = self.lua.globals().get::<Function>("onHostCallback")
+        else {
             return Ok(self.host.collector.take_ops());
         };
-        let args = ctx
-            .payload
-            .get("args")
-            .and_then(Json::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|value| from_json_with_bytes(&self.lua, value))
-            .collect::<mlua::Result<Vec<_>>>()?;
-        if let Err(error) =
-            function.call::<MultiValue>(MultiValue::from_vec(args))
-        {
+        let payload = from_json_with_bytes(&self.lua, &ctx.payload)?;
+        if let Err(error) = function.call::<MultiValue>(payload) {
             return Err(format!(
                 "{} host callback {id}: {}",
                 self.entry,

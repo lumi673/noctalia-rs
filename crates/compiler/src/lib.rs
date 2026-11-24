@@ -464,17 +464,45 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "end\n",
         ));
     }
-    if uses_host_call {
+    let uses_query = bodies.iter().any(|slot| slot.body.uses_query);
+    if uses_host_call || uses_query {
         out.push_str(concat!(
             "local ROOTS = { noctalia = noctalia, barWidget = barWidget, desktopWidget = desktopWidget, shortcut = shortcut, panel = panel, launcher = launcher, layer = layer, ui = ui }\n",
-            "local function host_call(root, path, args)\n",
+            "local function resolve_root(root, path)\n",
             "  local target = ROOTS[root]\n",
             "  for _, part in ipairs(path) do\n",
-            "    if type(target) ~= \"table\" then return false end\n",
+            "    if type(target) ~= \"table\" then return nil end\n",
             "    target = target[part]\n",
             "  end\n",
+            "  return target\n",
+            "end\n",
+        ));
+    }
+    if uses_host_call {
+        out.push_str(concat!(
+            "local function host_call(root, path, args)\n",
+            "  local target = resolve_root(root, path)\n",
             "  if type(target) ~= \"function\" then return false end\n",
             "  return pcall(target, table.unpack(args))\n",
+            "end\n",
+        ));
+    }
+    if bodies.iter().any(|slot| slot.body.uses_join) {
+        out.push_str(concat!(
+            "local function join(value, separator)\n",
+            "  if type(value) == \"table\" then return table.concat(value, separator) end\n",
+            "  local base = tostring(value)\n",
+            "  if string.sub(base, -1) == \"/\" then return base .. separator end\n",
+            "  return base .. \"/\" .. separator\n",
+            "end\n",
+        ));
+    }
+    if uses_query {
+        out.push_str(concat!(
+            "local function host_query(root, path, args)\n",
+            "  local target = resolve_root(root, path)\n",
+            "  if type(target) ~= \"function\" then return nil end\n",
+            "  return target(table.unpack(args))\n",
             "end\n",
         ));
     }
@@ -512,6 +540,24 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         let _ = writeln!(out, "function update() {}({args}) end", slot.name);
     } else {
         out.push_str("function update() end\n");
+    }
+
+    if let Some(slot) = slot("host_callback").filter(|slot| !slot.body.is_empty)
+    {
+        let args = call_args(
+            &slot.body,
+            &[],
+            &[],
+            None,
+            Some("payload"),
+            false,
+            "host_callback",
+        );
+        let _ = writeln!(
+            out,
+            "function onHostCallback(payload) {}({args}) end",
+            slot.name
+        );
     }
 
     if options.kind == EntryKind::Launcher

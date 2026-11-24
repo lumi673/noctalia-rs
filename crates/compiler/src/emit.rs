@@ -143,6 +143,8 @@ pub(crate) struct Body {
     pub uses_irem: bool,
     pub uses_unwrap: bool,
     pub uses_host_call: bool,
+    pub uses_query: bool,
+    pub uses_join: bool,
     pub uses_bool_or: bool,
     pub uses_replace: bool,
     pub uses_source: bool,
@@ -203,6 +205,8 @@ pub(crate) struct Emitter<'a> {
     uses_irem: bool,
     uses_unwrap: bool,
     uses_host_call: bool,
+    uses_query: bool,
+    uses_join: bool,
     uses_bool_or: bool,
     uses_replace: bool,
     uses_source: bool,
@@ -257,6 +261,8 @@ impl<'a> Emitter<'a> {
             uses_irem: false,
             uses_unwrap: false,
             uses_host_call: false,
+            uses_query: false,
+            uses_join: false,
             uses_bool_or: false,
             uses_replace: false,
             uses_source: false,
@@ -673,6 +679,8 @@ impl<'a> Emitter<'a> {
                 self.line("do");
             }
         } else if iife {
+            self.line("do");
+            self.indent = self.indent.saturating_add(1);
             self.line("(function()");
         } else {
             self.line("do");
@@ -745,6 +753,10 @@ impl<'a> Emitter<'a> {
         self.indent = self.indent.saturating_sub(1);
         if iife {
             self.line("end)()");
+            if temp.is_none() {
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+            }
         } else {
             self.line("end");
         }
@@ -816,6 +828,8 @@ impl<'a> Emitter<'a> {
             uses_irem: self.uses_irem,
             uses_unwrap: self.uses_unwrap,
             uses_host_call: self.uses_host_call,
+            uses_query: self.uses_query,
+            uses_join: self.uses_join,
             uses_bool_or: self.uses_bool_or,
             uses_replace: self.uses_replace,
             uses_source: self.uses_source,
@@ -1064,99 +1078,22 @@ impl<'a> Emitter<'a> {
         diverge: &Expr,
     ) -> Result<(), Error> {
         let (text, ty) = self.expr(init)?;
-        if ty.result {
-            let inner = match pattern {
-                Pat::TupleStruct(item)
-                    if item
-                        .path
-                        .segments
-                        .last()
-                        .is_some_and(|segment| segment.ident == "Ok") =>
-                {
-                    match item.elems.first() {
-                        Some(Pat::Ident(binding)) => {
-                            Some(binding.ident.to_string())
-                        }
-                        None if item.elems.is_empty() => None,
-                        _ => {
-                            return Err(Error::at(
-                                item.span(),
-                                "let-else patterns on Result must bind a plain identifier",
-                            ));
-                        }
-                    }
-                }
-                Pat::Path(path)
-                    if path
-                        .path
-                        .segments
-                        .last()
-                        .is_some_and(|segment| segment.ident == "Err") =>
-                {
-                    return Err(Error::at(
-                        pattern.span(),
-                        "let-else on `Result::Err` is not supported by the Luau compiler",
-                    ));
-                }
-                _ => {
-                    return Err(Error::at(
-                        pattern.span(),
-                        "let-else patterns on Result must be `Ok(name)`",
-                    ));
-                }
-            };
+        let value = self.temp();
+        let error = if ty.result {
             let error = self.temp();
-            if let Some(name) = inner {
-                self.line(&format!("local {name}, {error} = {text}"));
-                self.push(&name, Ty::new(ty.base));
-            } else {
-                self.line(&format!("local _, {error} = {text}"));
-            }
-            self.line(&format!("if {error} ~= nil then"));
-            self.indent = self.indent.saturating_add(1);
-            self.expr_stmt(diverge)?;
-            self.indent = self.indent.saturating_sub(1);
-            self.line("end");
-            return Ok(());
-        }
-        let (name, inner) = match pattern {
-            Pat::Ident(pattern) => (pattern.ident.to_string(), None),
-            Pat::TupleStruct(item)
-                if item
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|s| s.ident == "Some") =>
-            {
-                match item.elems.first() {
-                    Some(Pat::Ident(pattern)) => {
-                        (pattern.ident.to_string(), Some(true))
-                    }
-                    _ => {
-                        return Err(Error::at(
-                            item.span(),
-                            "let-else patterns must bind plain identifiers",
-                        ));
-                    }
-                }
-            }
-            _ => {
-                return Err(Error::at(
-                    pattern.span(),
-                    "let-else patterns must be plain identifiers or `Some(name)`",
-                ));
-            }
+            self.line(&format!("local {value}, {error} = {text}"));
+            Some(error)
+        } else {
+            self.line(&format!("local {value} = {text}"));
+            None
         };
-        self.line(&format!("local {name} = {text}"));
-        self.push(
-            &name,
-            if inner.is_some() {
-                Ty::opt(ty.base)
-            } else {
-                ty
-            },
-        );
-        self.line(&format!("if {name} == nil then"));
+        let (condition, bindings) =
+            self.pattern_match(&value, pattern, error.as_deref())?;
+        for (name, text) in bindings {
+            self.line(&format!("local {name} = {text}"));
+            self.push(&name, Ty::VALUE);
+        }
+        self.line(&format!("if not ({condition}) then"));
         self.indent = self.indent.saturating_add(1);
         self.expr_stmt(diverge)?;
         self.indent = self.indent.saturating_sub(1);
@@ -1181,7 +1118,10 @@ impl<'a> Emitter<'a> {
         }
         let mut values = Vec::new();
         for item in items {
-            values.push(self.expr(item)?.0);
+            let (text, _) = self.expr(item)?;
+            if !text.is_empty() {
+                values.push(text);
+            }
         }
         Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
     }
@@ -1258,10 +1198,22 @@ impl<'a> Emitter<'a> {
             Expr::Group(group) => self.expr_stmt(&group.expr),
             Expr::Tuple(tuple) if tuple.elems.is_empty() => Ok(()),
             _ => {
-                let (text, ty) = self.expr(expr)?;
+                let saved_statement = self.in_statement;
+                self.in_statement = true;
+                let result = self.expr(expr);
+                self.in_statement = saved_statement;
+                let (text, ty) = result?;
                 if ty.base == Base::Void {
                     if !text.is_empty() {
-                        self.line(&text);
+                        if text.starts_with('(') || text.starts_with('{') {
+                            self.line("do");
+                            self.indent = self.indent.saturating_add(1);
+                            self.line(&text);
+                            self.indent = self.indent.saturating_sub(1);
+                            self.line("end");
+                        } else {
+                            self.line(&text);
+                        }
                     }
                     self.emitted = true;
                     return Ok(());
@@ -1435,86 +1387,24 @@ impl<'a> Emitter<'a> {
 
     fn let_condition(&mut self, item: &syn::ExprLet) -> Result<String, Error> {
         let (text, ty) = self.expr(&item.expr)?;
-        if ty.result {
+        let value = self.temp();
+        let error = if ty.result {
             let error = self.temp();
-            match &*item.pat {
-                Pat::TupleStruct(binding)
-                    if binding
-                        .path
-                        .segments
-                        .last()
-                        .is_some_and(|segment| segment.ident == "Ok") =>
-                {
-                    match binding.elems.first() {
-                        Some(Pat::Ident(pattern)) => {
-                            let name = pattern.ident.to_string();
-                            self.line(&format!(
-                                "local {name}, {error} = {text}"
-                            ));
-                            self.push(&name, Ty::new(ty.base));
-                        }
-                        None if binding.elems.is_empty() => {
-                            self.line(&format!("local _, {error} = {text}"));
-                        }
-                        _ => {
-                            return Err(Error::at(
-                                binding.span(),
-                                "if let patterns on Result must bind plain identifiers",
-                            ));
-                        }
-                    }
-                    return Ok(format!("({error} == nil)"));
-                }
-                Pat::TupleStruct(binding)
-                    if binding
-                        .path
-                        .segments
-                        .last()
-                        .is_some_and(|segment| segment.ident == "Err") =>
-                {
-                    self.line(&format!("local _, {error} = {text}"));
-                    return Ok(format!("({error} ~= nil)"));
-                }
-                _ => {
-                    return Err(Error::at(
-                        item.pat.span(),
-                        "if let patterns on Result must be `Ok(name)` or `Err(_)`",
-                    ));
-                }
-            }
+            self.line(&format!("local {value}, {error} = {text}"));
+            Some(error)
+        } else {
+            self.line(&format!("local {value} = {text}"));
+            None
+        };
+        let (condition, bindings) =
+            self.pattern_match(&value, &item.pat, error.as_deref())?;
+        for (name, text) in bindings {
+            self.line(&format!("local {name} = {text}"));
+            self.push(&name, Ty::VALUE);
         }
-        match &*item.pat {
-            Pat::Ident(pattern) => {
-                let name = pattern.ident.to_string();
-                self.line(&format!("local {name} = {text}"));
-                self.push(&name, ty);
-                Ok(format!("({name} ~= nil)"))
-            }
-            Pat::TupleStruct(binding)
-                if binding
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|s| s.ident == "Some") =>
-            {
-                let Some(Pat::Ident(pattern)) = binding.elems.first() else {
-                    return Err(Error::at(
-                        binding.span(),
-                        "if let patterns must bind plain identifiers",
-                    ));
-                };
-                let name = pattern.ident.to_string();
-                self.line(&format!("local {name} = {text}"));
-                self.push(&name, Ty::opt(ty.base));
-                Ok(format!("({name} ~= nil)"))
-            }
-            Pat::Wild(_) => Ok(text),
-            other => Err(Error::at(
-                other.span(),
-                "if let patterns must be plain identifiers or `Some(name)`",
-            )),
-        }
+        Ok(condition)
     }
+
     fn write_if_chain(
         &mut self,
         chain: &[(&Expr, &syn::Block)],
@@ -1535,6 +1425,14 @@ impl<'a> Emitter<'a> {
         self.block_inner(block, tail)?;
         self.indent = self.indent.saturating_sub(1);
         if chain.len() > 1 {
+            if !simple_condition(chain[1].0) {
+                self.line("else");
+                self.indent = self.indent.saturating_add(1);
+                self.write_if_chain(&chain[1..], else_branch, tail, false)?;
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(());
+            }
             return self.write_if_chain(&chain[1..], else_branch, tail, true);
         }
         match else_branch {
@@ -1688,15 +1586,11 @@ impl<'a> Emitter<'a> {
         }
         for arm in &item.arms {
             let (pattern, guard) = split_guard(&arm.pat);
-            let (mut condition, bindings) = self.pattern_match(
+            let (condition, bindings) = self.pattern_match(
                 &scrutinee,
                 pattern,
                 result_error.as_deref(),
             )?;
-            if let Some(guard) = guard {
-                let (text, _) = self.expr(guard)?;
-                condition = format!("({condition}) and ({text})");
-            }
             let keyword = if opened { "elseif" } else { "if" };
             self.line(&format!("{keyword} {condition} then"));
             self.indent = self.indent.saturating_add(1);
@@ -1705,7 +1599,16 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("local {name} = {text}"));
                 self.push(&name, Ty::VALUE);
             }
+            if let Some(guard) = guard {
+                let (text, _) = self.expr(guard)?;
+                self.line(&format!("if {text} then"));
+                self.indent = self.indent.saturating_add(1);
+            }
             let result = self.arm_body(&arm.body, tail);
+            if guard.is_some() {
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+            }
             self.scopes.pop();
             result?;
             self.indent = self.indent.saturating_sub(1);
@@ -1883,7 +1786,7 @@ impl<'a> Emitter<'a> {
                 let mut conditions = Vec::new();
                 let mut bindings = Vec::new();
                 for (index, element) in tuple.elems.iter().enumerate() {
-                    let item = format!("{value}[{}]", index + 1);
+                    let item = format!("({value})[{}]", index + 1);
                     conditions.push(format!("({item} ~= nil)"));
                     if let Pat::Ident(pattern) = element {
                         bindings.push((pattern.ident.to_string(), item));
@@ -1898,6 +1801,18 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// The Luau literal for a constant used as a match pattern.
+    fn pattern_constant(&self, name: &str) -> Option<(String, Ty)> {
+        if name.chars().any(char::is_lowercase) {
+            return None;
+        }
+        if let Some(value) = self.constant(name) {
+            return Some(value);
+        }
+        let value = self.program.imported_constant(&self.module, name)?;
+        constant(value)
+    }
+
     fn nested_pattern(
         &self,
         value: &str,
@@ -1907,9 +1822,38 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), Error> {
         match pattern {
             Pat::Ident(pattern) => {
-                bindings.push((pattern.ident.to_string(), value.to_owned()));
+                let name = pattern.ident.to_string();
+                match self.pattern_constant(&name) {
+                    Some((text, _)) => {
+                        conditions.push(format!("({value} == {text})"));
+                    }
+                    None => bindings.push((name, value.to_owned())),
+                }
             }
             Pat::Wild(_) => {}
+            Pat::Or(or) => {
+                let mut alternatives = Vec::new();
+                let mut open = false;
+                for case in &or.cases {
+                    let mut case_conditions = Vec::new();
+                    let mut case_bindings = Vec::new();
+                    self.nested_pattern(
+                        value,
+                        case,
+                        &mut case_conditions,
+                        &mut case_bindings,
+                    )?;
+                    if case_conditions.is_empty() {
+                        open = true;
+                        continue;
+                    }
+                    alternatives
+                        .push(format!("({})", case_conditions.join(" and ")));
+                }
+                if !open {
+                    conditions.push(format!("({})", alternatives.join(" or ")));
+                }
+            }
             Pat::Paren(paren) => {
                 self.nested_pattern(value, &paren.pat, conditions, bindings)?;
             }
@@ -2184,6 +2128,12 @@ impl<'a> Emitter<'a> {
         let target =
             self.assign_target(strip_reference(left), &mut is_local)?;
         let (text, ty) = self.expr(right)?;
+        if text.is_empty() || ty.base == Base::Void {
+            if !text.is_empty() {
+                self.line(&text);
+            }
+            return Ok(());
+        }
         self.line(&format!("{target} {op} {text}"));
         if is_local && let Some(name) = path_ident(strip_reference(left)) {
             self.push(&name, ty);
@@ -2360,7 +2310,10 @@ impl<'a> Emitter<'a> {
             Expr::Array(array) => {
                 let mut values = Vec::new();
                 for item in &array.elems {
-                    values.push(self.expr(item)?.0);
+                    let (text, _) = self.expr(item)?;
+                    if !text.is_empty() {
+                        values.push(text);
+                    }
                 }
                 Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
             }
@@ -2568,6 +2521,19 @@ impl<'a> Emitter<'a> {
         }
         if let Some(segments) = path_segments(&path.path)
             && segments.iter().any(|name| name == "Value")
+            && let Some(name) = segments.last()
+            && matches!(
+                name.as_str(),
+                "String" | "Number" | "Bool" | "Array" | "Object"
+            )
+        {
+            return Ok((
+                "(function(__value) return __value end)".to_owned(),
+                Ty::VALUE,
+            ));
+        }
+        if let Some(segments) = path_segments(&path.path)
+            && segments.iter().any(|name| name == "Value")
             && let Some(lua_type) =
                 segments.last().and_then(|name| value_accessor(name))
         {
@@ -2623,6 +2589,84 @@ impl<'a> Emitter<'a> {
                     ),
                     Ty::VALUE,
                 ));
+            }
+        }
+        if let Some(segments) = path_segments(&path.path) {
+            let last = segments.last().map_or("", String::as_str);
+            let floats =
+                segments.iter().any(|name| name == "f64" || name == "f32");
+            match last {
+                "MAX" if floats => {
+                    return Ok(("math.huge".to_owned(), Ty::FLOAT));
+                }
+                "MIN" if floats => {
+                    return Ok(("(-math.huge)".to_owned(), Ty::FLOAT));
+                }
+                _ => {}
+            }
+            if let Some(lua_type) =
+                segments.last().and_then(|name| value_predicate(name))
+            {
+                return Ok((
+                    format!(
+                        "(function(__value) return type(__value) == \"{lua_type}\" end)"
+                    ),
+                    Ty::VALUE,
+                ));
+            }
+            if let Some((text, ty)) = constant(expr) {
+                return Ok((text, ty));
+            }
+            if last == "is_empty" {
+                return Ok((
+                    "(function(__value) return #__value == 0 end)".to_owned(),
+                    Ty::VALUE,
+                ));
+            }
+            if matches!(last, "new" | "default")
+                && segments.len() > 1
+                && container_default(&segments[segments.len() - 2]).is_some()
+            {
+                let literal = container_default(&segments[segments.len() - 2])
+                    .unwrap_or_default();
+                return Ok((
+                    format!("(function() return {literal} end)"),
+                    Ty::VALUE,
+                ));
+            }
+            if last == "default"
+                && segments.iter().any(|name| name == "Default")
+            {
+                return Ok((
+                    "(function() return {} end)".to_owned(),
+                    Ty::VALUE,
+                ));
+            }
+            if segments.len() >= 2
+                && let Some(value) =
+                    self.program.resolve_constant(&self.module, &segments)
+            {
+                if let Some((text, ty)) = constant(value) {
+                    return Ok((text, ty));
+                }
+                let value = (*value).clone();
+                let text = self.static_value(&value)?;
+                return Ok((text, Ty::VALUE));
+            }
+            if segments.len() >= 2
+                && let Some(name) = segments.last()
+                && let Some(value) = self.program.associated_const(
+                    &self.module,
+                    &segments[segments.len() - 2],
+                    name,
+                )
+            {
+                if let Some((text, ty)) = constant(value) {
+                    return Ok((text, ty));
+                }
+                let value = value.clone();
+                let text = self.static_value(&value)?;
+                return Ok((text, Ty::VALUE));
             }
         }
         let Some(name) = path.path.get_ident() else {
@@ -2783,7 +2827,11 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("if {lua} == nil then"));
                 self.indent = self.indent.saturating_add(1);
                 let (text, ty) = self.invoke_arg(closure, &[])?;
-                self.line(&format!("{lua} = {text}"));
+                if text.is_empty() || ty.base == Base::Void {
+                    self.line(&format!("{lua} = true"));
+                } else {
+                    self.line(&format!("{lua} = {text}"));
+                }
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 Ok((
@@ -2860,8 +2908,63 @@ impl<'a> Emitter<'a> {
         if let Expr::Closure(closure) = arg {
             return self.closure_value(closure, values);
         }
+        if let Some((text, ty)) = self.function_reference(arg, values)? {
+            return Ok((text, ty));
+        }
         let (text, ty) = self.expr(arg)?;
         Ok((format!("({text})({})", values.join(", ")), ty))
+    }
+
+    /// Inlines a crate function used as a callback value, such as
+    /// `map(lua_text)` or `unwrap_or_else(default_snapshot)`.
+    fn function_reference(
+        &mut self,
+        expr: &Expr,
+        values: &[String],
+    ) -> Result<OptionalValue, Error> {
+        let Expr::Path(path) = strip_reference(expr) else {
+            return Ok(None);
+        };
+        let Some(segments) = path_segments(&path.path) else {
+            return Ok(None);
+        };
+        let Some(resolved) = self.program.resolve(&self.module, &segments)
+        else {
+            return Ok(None);
+        };
+        let helper = Helper {
+            module: resolved.module.clone(),
+            name: segments.join("::"),
+            function: resolved.function.clone(),
+        };
+        let params = typed_args(&helper.function);
+        if params.len() != values.len() {
+            return Err(Error::at(
+                expr.span(),
+                format!(
+                    "`{}` takes {} arguments but {} were passed",
+                    helper.name,
+                    params.len(),
+                    values.len()
+                ),
+            ));
+        }
+        let mut bindings = Vec::new();
+        for ((pattern, _), value) in params.iter().zip(values) {
+            let Pat::Ident(pattern) = pattern else {
+                return Err(Error::at(
+                    expr.span(),
+                    "helper parameters must be plain identifiers",
+                ));
+            };
+            bindings.push(Binding::Local {
+                name: pattern.ident.to_string(),
+                text: value.clone(),
+                ty: Ty::VALUE,
+                container: StaticKind::Value,
+            });
+        }
+        self.inline_resolved(helper, Inline::Value, expr.span(), bindings)
     }
 
     fn combinator(
@@ -3041,6 +3144,86 @@ impl<'a> Emitter<'a> {
         }
         Ok(None)
     }
+    /// Iterator terminal calls that fold a collection into one value.
+    fn aggregate_method(
+        &mut self,
+        call: &ExprMethodCall,
+    ) -> Result<OptionalValue, Error> {
+        let method = call.method.to_string();
+        if !matches!(
+            method.as_str(),
+            "any" | "all" | "sum" | "count" | "for_each"
+        ) {
+            return Ok(None);
+        }
+        let args = call.args.iter().collect::<Vec<_>>();
+        let Some(closure) = args.first().copied() else {
+            if method == "count" {
+                let (receiver, _) = self.expr(&call.receiver)?;
+                return Ok(Some((format!("#{receiver}"), Ty::INT)));
+            }
+            return Ok(None);
+        };
+        let result = self.temp();
+        let initial = match method.as_str() {
+            "all" => "true",
+            "sum" | "count" => "0",
+            "any" => "false",
+            _ => "nil",
+        };
+        if method == "for_each" {
+            let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                let (text, _) = emitter.invoke_arg(
+                    closure,
+                    std::slice::from_ref(&value.to_owned()),
+                )?;
+                if !text.is_empty() {
+                    emitter.line(&text);
+                }
+                Ok(())
+            };
+            self.emit_iter(&call.receiver, &body)?;
+            return Ok(Some((String::new(), Ty::VOID)));
+        }
+        self.line(&format!("local {result} = {initial}"));
+        let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+            let (text, _) = emitter
+                .invoke_arg(closure, std::slice::from_ref(&value.to_owned()))?;
+            match method.as_str() {
+                "any" => {
+                    emitter.line(&format!("if {text} then"));
+                    emitter.indent = emitter.indent.saturating_add(1);
+                    emitter.line(&format!("{result} = true"));
+                    emitter.line("break");
+                    emitter.indent = emitter.indent.saturating_sub(1);
+                    emitter.line("end");
+                }
+                "all" => {
+                    emitter.line(&format!("if not ({text}) then"));
+                    emitter.indent = emitter.indent.saturating_add(1);
+                    emitter.line(&format!("{result} = false"));
+                    emitter.line("break");
+                    emitter.indent = emitter.indent.saturating_sub(1);
+                    emitter.line("end");
+                }
+                "sum" => {
+                    emitter.line(&format!("{result} = {result} + ({text})"));
+                }
+                _ => {
+                    emitter.line(&format!("{result} = {result} + 1"));
+                }
+            }
+            Ok(())
+        };
+        self.emit_iter(&call.receiver, &body)?;
+        let ty = match method.as_str() {
+            "any" | "all" => Ty::BOOL,
+            "count" => Ty::INT,
+            _ => Ty::FLOAT,
+        };
+        Ok(Some((result, ty)))
+    }
+
     fn collect_method(
         &mut self,
         method: &ExprMethodCall,
@@ -3287,6 +3470,9 @@ impl<'a> Emitter<'a> {
         {
             return Ok(value);
         }
+        if let Some(value) = self.aggregate_method(call)? {
+            return Ok(value);
+        }
         let method = call.method.to_string();
         let args = call.args.iter().collect::<Vec<_>>();
         if self.is_ctx_expr(&call.receiver) {
@@ -3309,6 +3495,11 @@ impl<'a> Emitter<'a> {
             }
         }
         let (receiver, ty) = self.expr(&call.receiver)?;
+        let receiver = if receiver.starts_with('{') {
+            format!("({receiver})")
+        } else {
+            receiver
+        };
         if let Some(value) =
             self.combinator(call, &method, &args, &receiver, ty)?
         {
@@ -3320,7 +3511,119 @@ impl<'a> Emitter<'a> {
             }
             "to_string" => Ok((format!("tostring({receiver})"), Ty::STR)),
             "into_owned" | "to_owned" | "clone" | "as_ref" | "as_deref"
-            | "cloned" | "into_inner" => Ok((receiver, ty)),
+            | "cloned" | "into_inner" | "into" | "as_mut" | "as_slice"
+            | "as_bytes" | "into_bytes" | "copied" | "peekable"
+            | "iter_mut" => Ok((receiver, ty)),
+            "first" => Ok((format!("({receiver}[1])"), Ty::OPT_VALUE)),
+            "as_object_mut" => Ok((
+                format!(
+                    "(type({receiver}) == \"table\" and {receiver} or nil)"
+                ),
+                Ty::OPT_VALUE,
+            )),
+            "push_str" => {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!("{receiver} = {receiver} .. ({value})"));
+                Ok((String::new(), Ty::VOID))
+            }
+            "pop" => Ok((format!("table.remove({receiver})"), Ty::OPT_VALUE)),
+            "push_back" => {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                Ok((format!("table.insert({receiver}, {value})"), Ty::VOID))
+            }
+            "find" if !matches!(args.first(), Some(Expr::Closure(_))) => {
+                let needle = self.expr(arg(&args, 0, call)?)?.0;
+                if ty.base != Base::Str {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "find() needs a string receiver",
+                    ));
+                }
+                Ok((
+                    format!(
+                        "(function() local __at = string.find({receiver}, {needle}, 1, true); if __at then return __at - 1 end end)()"
+                    ),
+                    Ty::OPT_INT,
+                ))
+            }
+            "is_nan" => Ok((format!("({receiver} ~= {receiver})"), Ty::BOOL)),
+            "div_euclid" => {
+                let other = self.expr(arg(&args, 0, call)?)?.0;
+                Ok((format!("math.floor({receiver} / {other})"), Ty::INT))
+            }
+            "round" => Ok((format!("math.round({receiver})"), Ty::FLOAT)),
+            "then_some" => {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                Ok((
+                    format!(
+                        "(function() if {receiver} then return {value} end end)()"
+                    ),
+                    Ty::OPT_VALUE,
+                ))
+            }
+            "is_none_or" => {
+                let closure = arg(&args, 0, call)?;
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result} = true"));
+                self.line(&format!("if {value} ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, _) =
+                    self.invoke_arg(closure, std::slice::from_ref(&value))?;
+                self.line(&format!("{result} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok((result, Ty::BOOL))
+            }
+            "or" if ty.optional => {
+                let other = self.expr(arg(&args, 0, call)?)?.0;
+                Ok((format!("({receiver} or {other})"), ty))
+            }
+            "trim_start" => Ok((
+                format!("string.gsub({receiver}, \"^%s+\", \"\")"),
+                Ty::STR,
+            )),
+            "trim_end" => Ok((
+                format!("string.gsub({receiver}, \"%s+$\", \"\")"),
+                Ty::STR,
+            )),
+            "strip_suffix" => {
+                let suffix = self.expr(arg(&args, 0, call)?)?.0;
+                let value = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                Ok((
+                    format!(
+                        "(string.sub({value}, -#{suffix}) == {suffix} and string.sub({value}, 1, #{value} - #{suffix}) or nil)"
+                    ),
+                    Ty::OPT_STR,
+                ))
+            }
+            "is_ascii_uppercase" => Ok((
+                format!("(string.find({receiver}, \"^%u+$\") ~= nil)"),
+                Ty::BOOL,
+            )),
+            "is_ascii_lowercase" => Ok((
+                format!("(string.find({receiver}, \"^%l+$\") ~= nil)"),
+                Ty::BOOL,
+            )),
+            "is_ascii_alphabetic" => Ok((
+                format!("(string.find({receiver}, \"^%a+$\") ~= nil)"),
+                Ty::BOOL,
+            )),
+            "is_ascii_alphanumeric" => Ok((
+                format!("(string.find({receiver}, \"^%w+$\") ~= nil)"),
+                Ty::BOOL,
+            )),
+            "is_ascii_digit" => Ok((
+                format!("(string.find({receiver}, \"^%d+$\") ~= nil)"),
+                Ty::BOOL,
+            )),
+            "is_ascii_whitespace" | "is_whitespace" => Ok((
+                format!("(string.find({receiver}, \"^%s+$\") ~= nil)"),
+                Ty::BOOL,
+            )),
+            "is_char_boundary" | "char_indices" => Ok((receiver, ty)),
             "to_string_lossy" | "display" => Ok((receiver, Ty::STR)),
             "as_str" => Ok((receiver, Ty::OPT_STR)),
             "as_i64" | "as_u64" => Ok((receiver, Ty::OPT_INT)),
@@ -3370,10 +3673,8 @@ impl<'a> Emitter<'a> {
                     ));
                 }
                 if ty.base != Base::Str {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "join() needs a list or a path string receiver",
-                    ));
+                    self.uses_join = true;
+                    return Ok((format!("join({receiver}, {part})"), Ty::STR));
                 }
                 let base = self.temp();
                 self.line(&format!("local {base} = {receiver}"));
@@ -3395,39 +3696,22 @@ impl<'a> Emitter<'a> {
                     Ty::OPT_STR,
                 ))
             }
-            "trim_matches" => {
+            "trim_matches" | "trim_start_matches" | "trim_end_matches" => {
                 let argument = arg(&args, 0, call)?;
-                let chars = match argument {
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Str(value),
-                        ..
-                    }) => value.value(),
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Char(value),
-                        ..
-                    }) => value.value().to_string(),
-                    _ => {
-                        return Err(Error::at(
-                            argument.span(),
-                            "expected a string or char literal argument",
-                        ));
-                    }
+                let pattern = self.char_class(argument, call)?;
+                let leading = quote(&format!("^{pattern}+"));
+                let trailing = quote(&format!("{pattern}+$"));
+                let trimmed =
+                    format!("string.gsub({receiver}, {leading}, \"\")");
+                if method == "trim_start_matches" {
+                    return Ok((trimmed, Ty::STR));
+                }
+                let base = if method == "trim_end_matches" {
+                    receiver.clone()
+                } else {
+                    trimmed
                 };
-                let class = chars
-                    .chars()
-                    .map(|character| match character {
-                        ']' => "\\]".to_owned(),
-                        '-' => "\\-".to_owned(),
-                        other => other.to_string(),
-                    })
-                    .collect::<String>();
-                let pattern = format!("[{class}]");
-                Ok((
-                    format!(
-                        "string.gsub(string.gsub({receiver}, \"^{pattern}+\", \"\"), \"{pattern}+$\", \"\")"
-                    ),
-                    Ty::STR,
-                ))
+                Ok((format!("string.gsub({base}, {trailing}, \"\")"), Ty::STR))
             }
             "to_ascii_uppercase" => {
                 Ok((format!("string.upper({receiver})"), Ty::STR))
@@ -3533,6 +3817,11 @@ impl<'a> Emitter<'a> {
                     ));
                     return Ok((removed, Ty::VALUE));
                 }
+                if key_ty.base != Base::Int {
+                    self.line(&format!("local {removed} = {receiver}[{key}]"));
+                    self.line(&format!("{receiver}[{key}] = nil"));
+                    return Ok((removed, Ty::OPT_VALUE));
+                }
                 Err(Error::at(
                     call.method.span(),
                     "remove() needs a list with an integer index or a map with the key",
@@ -3593,7 +3882,11 @@ impl<'a> Emitter<'a> {
                 };
                 self.line(&format!("if {receiver} == nil then"));
                 self.indent = self.indent.saturating_add(1);
-                self.line(&format!("{receiver} = {text}"));
+                if text.is_empty() || value_ty.base == Base::Void {
+                    self.line(&format!("{receiver} = true"));
+                } else {
+                    self.line(&format!("{receiver} = {text}"));
+                }
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 Ok((receiver, value_ty))
@@ -3639,17 +3932,16 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "unwrap_or_default" => {
-                let default =
-                    if (ty.result || ty.optional) && ty.base == Base::Value {
-                        "nil".to_owned()
-                    } else {
-                        ty.default_literal().ok_or_else(|| {
+                let default = if ty.base == Base::Value {
+                    "nil".to_owned()
+                } else {
+                    ty.default_literal().ok_or_else(|| {
                         Error::at(
                             call.span(),
                             "this type has no default in a compilable handler",
                         )
                     })?.to_owned()
-                    };
+                };
                 if ty.result {
                     let value = self.temp();
                     let error = self.temp();
@@ -3863,7 +4155,7 @@ impl<'a> Emitter<'a> {
                 Ok((format!("noctalia.tr({key}, {table})"), Ty::STR))
             }
             "file_exists" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("noctalia.fileExists({path})"), Ty::BOOL))
             }
             "command_exists" => {
@@ -3871,12 +4163,15 @@ impl<'a> Emitter<'a> {
                 Ok((format!("noctalia.commandExists({name})"), Ty::BOOL))
             }
             "read_file" => {
-                let path = self.string_arg(args, 0, call)?;
-                Ok((format!("noctalia.readFile({path})"), Ty::OPT_STR))
+                let path = self.path_arg(args, 0, call)?;
+                Ok((
+                    format!("noctalia.readFile({path})"),
+                    Ty::result(Base::Str),
+                ))
             }
             "write_file" => {
-                let path = self.string_arg(args, 0, call)?;
-                let contents = self.string_arg(args, 1, call)?;
+                let path = self.path_arg(args, 0, call)?;
+                let contents = self.path_arg(args, 1, call)?;
                 Ok((
                     format!("noctalia.writeFile({path}, {contents})"),
                     Ty::VOID,
@@ -3887,27 +4182,27 @@ impl<'a> Emitter<'a> {
                 Ok((format!("noctalia.getenv({key})"), Ty::OPT_STR))
             }
             "expand_path" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("noctalia.expandPath({path})"), Ty::STR))
             }
             "list_dir" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.listDir({path}))"), Ty::LIST))
             }
             "mkdir_all" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("noctalia.mkdirAll({path})"), Ty::VOID))
             }
             "remove_file" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("noctalia.removeFile({path})"), Ty::VOID))
             }
             "format_time" => {
-                let format = self.string_arg(args, 0, call)?;
+                let format = self.path_arg(args, 0, call)?;
                 Ok((format!("noctalia.formatTime({format})"), Ty::STR))
             }
             "format_time_at" => {
-                let format = self.string_arg(args, 0, call)?;
+                let format = self.path_arg(args, 0, call)?;
                 let seconds = match args.get(1) {
                     Some(argument) => {
                         let (text, _) = self.expr(argument)?;
@@ -3965,27 +4260,27 @@ impl<'a> Emitter<'a> {
                 Ok((text.to_owned(), Ty::BOOL))
             }
             "read_file_result" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.readFile({path}))"), Ty::VALUE))
             }
             "list_dir_result" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.listDir({path}))"), Ty::VALUE))
             }
             "load_font_result" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.loadFont({path}))"), Ty::VALUE))
             }
             "file_info_result" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.fileInfo({path}))"), Ty::VALUE))
             }
             "mkdir_all_result" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.mkdirAll({path}))"), Ty::VALUE))
             }
             "remove_file_result" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.removeFile({path}))"), Ty::VALUE))
             }
             "math_randomseed" => {
@@ -4007,13 +4302,58 @@ impl<'a> Emitter<'a> {
                     Ty::STR,
                 ))
             }
-            "run_async_start" | "run_stream_start" => {
-                Err(Error::at(
-                    call.method.span(),
-                    format!(
-                        "context method `{method}` needs a host callback id, which compiled Luau cannot allocate"
-                    ),
+            "query_value" | "query_bool" => {
+                let root = self.string_arg(args, 0, call)?;
+                let path = self.expr(arg(args, 1, call)?)?.0;
+                let values = self.expr(arg(args, 2, call)?)?.0;
+                self.uses_query = true;
+                let text = format!("host_query({root}, {path}, {values})");
+                if method == "query_bool" {
+                    return Ok((format!("({text} == true)"), Ty::BOOL));
+                }
+                Ok((text, Ty::VALUE))
+            }
+            "fuzzy_score" => {
+                let pattern = self.string_arg(args, 0, call)?;
+                let text = self.string_arg(args, 1, call)?;
+                Ok((
+                    format!("noctalia.fuzzyScore({pattern}, {text})"),
+                    Ty::OPT_FLOAT,
                 ))
+            }
+            "file_info" => {
+                let path = self.path_arg(args, 0, call)?;
+                Ok((format!("noctalia.fileInfo({path})"), Ty::VALUE))
+            }
+            "run_async_start" | "run_stream_start" | "http_start" => {
+                if !self.in_statement {
+                    return Err(Error::at(
+                        call.method.span(),
+                        format!(
+                            "context method `{method}` blocks in Rust to report acceptance; compiled Luau starts the call and returns true, so its result must be discarded"
+                        ),
+                    ));
+                }
+                let (request, _) = self.expr(arg(args, 0, call)?)?;
+                let callback = self
+                    .callback_marker(args, 1)?
+                    .unwrap_or_else(|| "nil".to_owned());
+                let head = match method {
+                    "run_async_start" => "noctalia.runAsync",
+                    "run_stream_start" => "noctalia.runStream",
+                    _ => "noctalia.http",
+                };
+                let line = if method == "run_async_start" {
+                    let timeout = match args.get(2) {
+                        Some(timeout) => self.option_value(timeout)?,
+                        None => "nil".to_owned(),
+                    };
+                    format!("{head}({request}, {callback}, {timeout})")
+                } else {
+                    format!("{head}({request}, {callback})")
+                };
+                self.line(&line);
+                Ok((String::new(), Ty::VOID))
             }
             other => Err(Error::at(
                 call.method.span(),
@@ -4082,6 +4422,160 @@ impl<'a> Emitter<'a> {
             ));
         }
         Ok(text)
+    }
+
+    /// The Lua character class for a Rust character set, such as a literal, a
+    /// `&[char]` constant, or a predicate over one character.
+    fn char_class(
+        &mut self,
+        expr: &Expr,
+        call: &ExprMethodCall,
+    ) -> Result<String, Error> {
+        let chars = self.char_set(expr)?.ok_or_else(|| {
+            Error::at(
+                call.method.span(),
+                "expected a string or char literal argument",
+            )
+        })?;
+        let class = chars
+            .chars()
+            .map(|character| match character {
+                ']' | '-' | '^' | '%' => format!("%{character}"),
+                other => other.to_string(),
+            })
+            .collect::<String>();
+        Ok(format!("[{class}]"))
+    }
+
+    /// Every character a predicate accepts, when it is a plain set.
+    fn char_set(&mut self, expr: &Expr) -> Result<Option<String>, Error> {
+        match strip_reference(expr) {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) => Ok(Some(value.value())),
+            Expr::Lit(ExprLit {
+                lit: Lit::Char(value),
+                ..
+            }) => Ok(Some(value.value().to_string())),
+            Expr::Lit(ExprLit {
+                lit: Lit::Byte(value),
+                ..
+            }) => Ok(Some((value.value() as char).to_string())),
+            Expr::Lit(ExprLit {
+                lit: Lit::ByteStr(value),
+                ..
+            }) => Ok(Some(
+                value.value().iter().map(|byte| *byte as char).collect(),
+            )),
+            Expr::Array(array) => {
+                let mut chars = String::new();
+                for item in &array.elems {
+                    match constant(item) {
+                        Some((text, _)) => chars.push_str(&unquote(&text)),
+                        None => return Ok(None),
+                    }
+                }
+                Ok(Some(chars))
+            }
+            Expr::Index(index) => self.char_set(&index.expr),
+            Expr::Closure(closure) => self.char_set_from_body(&closure.body),
+            Expr::Paren(paren) => self.char_set(&paren.expr),
+            Expr::Group(group) => self.char_set(&group.expr),
+            Expr::Path(path) => {
+                let Expr::Path(item) = strip_reference(expr) else {
+                    return Ok(None);
+                };
+                let Some(segments) = path_segments(&item.path) else {
+                    return Ok(None);
+                };
+                if path_segments(&path.path).is_some()
+                    && let Some(resolved) =
+                        self.program.resolve(&self.module, &segments)
+                {
+                    let body = resolved.function.block.clone();
+                    return self.char_set_from_body(&Expr::Block(
+                        syn::ExprBlock {
+                            attrs: Vec::new(),
+                            label: None,
+                            block: *body,
+                        },
+                    ));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn char_set_from_body(
+        &mut self,
+        body: &Expr,
+    ) -> Result<Option<String>, Error> {
+        match body {
+            Expr::Block(block) => match block.block.stmts.as_slice() {
+                [Stmt::Expr(expr, _)] => self.char_set_from_body(expr),
+                _ => Ok(None),
+            },
+            Expr::Return(ret) => match &ret.expr {
+                Some(expr) => self.char_set_from_body(expr),
+                None => Ok(None),
+            },
+            Expr::Paren(paren) => self.char_set_from_body(&paren.expr),
+            Expr::Group(group) => self.char_set_from_body(&group.expr),
+            Expr::Binary(binary) if matches!(binary.op, BinOp::Or(_)) => {
+                let mut chars = String::new();
+                for side in [&binary.left, &binary.right] {
+                    match self.char_set_from_body(side)? {
+                        Some(found) => chars.push_str(&found),
+                        None => return Ok(None),
+                    }
+                }
+                Ok(Some(chars))
+            }
+            Expr::Macro(mac) if macro_name(mac) == "matches" => {
+                let parsed: MatchesArgs = syn::parse2(mac.mac.tokens.clone())?;
+                let mut chars = String::new();
+                if !pattern_chars(&parsed.pat, &mut chars)? {
+                    return Ok(None);
+                }
+                Ok(Some(chars))
+            }
+            Expr::MethodCall(call)
+                if matches!(
+                    call.method.to_string().as_str(),
+                    "is_ascii_whitespace" | "is_whitespace"
+                ) =>
+            {
+                Ok(Some(" \t\n\r\u{0b}\u{0c}".to_owned()))
+            }
+            Expr::MethodCall(call)
+                if matches!(
+                    call.method.to_string().as_str(),
+                    "is_ascii_digit" | "is_digit"
+                ) =>
+            {
+                Ok(Some("0123456789".to_owned()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A path or format argument. Values of unknown type are coerced the same
+    /// way `Host` does, so a config field can be passed where a string is
+    /// expected.
+    fn path_arg(
+        &mut self,
+        args: &[&Expr],
+        index: usize,
+        call: &ExprMethodCall,
+    ) -> Result<String, Error> {
+        let value = arg(args, index, call)?;
+        let (text, ty) = self.expr(value)?;
+        if ty.base == Base::Str {
+            return Ok(text);
+        }
+        Ok(format!("tostring({text})"))
     }
 
     fn std_constructor(
@@ -4210,12 +4704,37 @@ impl<'a> Emitter<'a> {
             match name.as_str() {
                 "Some" => return self.expr(arg(&args, 0, call)?),
                 "drop" => {
-                    let text = self.expr(arg(&args, 0, call)?)?.0;
-                    return Ok((text, Ty::VOID));
+                    let _ = self.expr(arg(&args, 0, call)?)?;
+                    return Ok((String::new(), Ty::VOID));
                 }
                 "String::new" => return Ok(("\"\"".to_owned(), Ty::STR)),
+                "Default::default" => {
+                    return Ok(("{}".to_owned(), Ty::VALUE));
+                }
                 "Vec::new" | "VecDeque::new" => {
                     return Ok(("{}".to_owned(), Ty::LIST));
+                }
+                "Vec::with_capacity" | "VecDeque::with_capacity" => {
+                    return Ok(("{}".to_owned(), Ty::LIST));
+                }
+                "String::with_capacity" => {
+                    return Ok(("\"\"".to_owned(), Ty::STR));
+                }
+                "std::cmp::max" | "cmp::max" => {
+                    let left = self.expr(arg(&args, 0, call)?)?.0;
+                    let right = self.expr(arg(&args, 1, call)?)?.0;
+                    return Ok((
+                        format!("math.max({left}, {right})"),
+                        Ty::VALUE,
+                    ));
+                }
+                "std::cmp::min" | "cmp::min" => {
+                    let left = self.expr(arg(&args, 0, call)?)?.0;
+                    let right = self.expr(arg(&args, 1, call)?)?.0;
+                    return Ok((
+                        format!("math.min({left}, {right})"),
+                        Ty::VALUE,
+                    ));
                 }
                 "SystemTime::now" => {
                     return Ok(("noctalia.nowMs()".to_owned(), Ty::INT));
@@ -4245,14 +4764,19 @@ impl<'a> Emitter<'a> {
             if let Some(class) = name.strip_suffix("::default")
                 && class != "Default"
             {
-                let ty: Type = syn::parse_str(class).map_err(|error| {
+                let class = if class == "Self" {
+                    self.self_class.clone().unwrap_or_else(|| class.to_owned())
+                } else {
+                    class.to_owned()
+                };
+                let ty: Type = syn::parse_str(&class).map_err(|error| {
                     Error::at(
                         call.span(),
                         format!("invalid default type: {error}"),
                     )
                 })?;
                 if let Some((module, function)) =
-                    self.program.resolve_method(&self.module, class, "default")
+                    self.program.resolve_method(&self.module, &class, "default")
                 {
                     let helper = Helper {
                         module,
@@ -4292,6 +4816,12 @@ impl<'a> Emitter<'a> {
                     format!("tonumber({text}, {radix})"),
                     Ty::result(Base::Int),
                 ));
+            }
+            if let Some(variant) = qualified_variant(&name, "ui")
+                && let Some(builder) = ui_marker(variant)
+            {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((format!("{{ {builder} = {value} }}"), Ty::VALUE));
             }
             if let Some(value) = self.std_constructor(call, &args)? {
                 return Ok(value);
@@ -4420,6 +4950,35 @@ impl<'a> Emitter<'a> {
     }
 
     fn index(&mut self, index: &syn::ExprIndex) -> Result<(String, Ty), Error> {
+        if let Expr::Range(range) = strip_reference(&index.index) {
+            let (base, base_ty) = self.expr(&index.expr)?;
+            let start = match &range.start {
+                Some(start) => {
+                    let (text, _) = self.expr(strip_reference(start))?;
+                    format!("({text}) + 1")
+                }
+                None => "1".to_owned(),
+            };
+            let stop = match &range.end {
+                Some(end) => {
+                    let (text, _) = self.expr(strip_reference(end))?;
+                    text
+                }
+                None => {
+                    if base_ty.base != Base::Str {
+                        return Err(Error::at(
+                            range.span(),
+                            "open-ended slices need a string receiver",
+                        ));
+                    }
+                    format!("#{base}")
+                }
+            };
+            return Ok((
+                format!("string.sub({base}, {start}, {stop})"),
+                Ty::STR,
+            ));
+        }
         let (key, key_ty) = self.expr(&index.index)?;
         if is_config_expr(&index.expr) {
             return Ok((
@@ -4428,6 +4987,11 @@ impl<'a> Emitter<'a> {
             ));
         }
         let (base, _) = self.expr(&index.expr)?;
+        let base = if base.starts_with('{') {
+            format!("({base})")
+        } else {
+            base
+        };
         if key_ty.base == Base::Int {
             Ok((format!("{base}[({key}) + 1]"), Ty::OPT_VALUE))
         } else {
@@ -4520,6 +5084,30 @@ impl<'a> Emitter<'a> {
         Ok((text, Ty::VALUE))
     }
 
+    /// A closure body whose only statement is a call to a unit helper stays a
+    /// statement; anything else is an expression.
+    fn value_or_statement(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<(String, Ty), Error> {
+        if let Expr::Call(call) = expr
+            && !is_ok_call(call)
+            && !is_ops_push(self, call)
+            && let Some(helper) = self.helper(call)
+            && matches!(return_kind(&helper.function)?, Returns::Unit)
+        {
+            let bindings = self.bindings(&helper, call)?;
+            self.inline_resolved(
+                helper,
+                Inline::Statement,
+                call.span(),
+                bindings,
+            )?;
+            return Ok((String::new(), Ty::VOID));
+        }
+        self.expr(expr)
+    }
+
     fn closure_value(
         &mut self,
         closure: &syn::ExprClosure,
@@ -4566,13 +5154,13 @@ impl<'a> Emitter<'a> {
                         self.stmt(stmt)?;
                     }
                     match last {
-                        Stmt::Expr(expr, _) => self.expr(expr),
+                        Stmt::Expr(expr, _) => self.value_or_statement(expr),
                         _ => Ok(("nil".to_owned(), Ty::VALUE)),
                     }
                 }
                 None => Ok(("nil".to_owned(), Ty::VALUE)),
             },
-            body => self.expr(body),
+            body => self.value_or_statement(body),
         };
         self.local_statics.pop();
         self.scopes.pop();
@@ -4629,38 +5217,50 @@ impl<'a> Emitter<'a> {
                         pieces.push(quote(&text));
                         text.clear();
                     }
-                    if placeholder.contains(':') {
-                        return Err(Error::at(
-                            mac.span(),
-                            "format specifiers are not supported by the Luau compiler",
-                        ));
-                    }
-                    if placeholder.is_empty() {
+                    let (placeholder, spec) = match placeholder.split_once(':')
+                    {
+                        Some((name, spec)) => {
+                            (name.to_owned(), Some(spec.to_owned()))
+                        }
+                        None => (placeholder, None),
+                    };
+                    let (value, ty) = if placeholder.is_empty() {
                         let (_, expr) = positional.next().ok_or_else(|| {
                             Error::at(
                                 mac.span(),
                                 "format! has more placeholders than arguments",
                             )
                         })?;
-                        let (value, ty) = self.expr(expr)?;
-                        pieces.push(format_piece(value, ty));
+                        self.expr(expr)?
                     } else if let Some((_, expr)) = parsed
                         .arguments
                         .iter()
                         .find(|(key, _)| key.as_deref() == Some(&placeholder))
                     {
-                        let (value, ty) = self.expr(expr)?;
-                        pieces.push(format_piece(value, ty));
+                        self.expr(expr)?
+                    } else if let Some(ty) = self.lookup(&placeholder) {
+                        (placeholder.clone(), ty)
+                    } else if let Some((text, ty)) = self.constant(&placeholder)
+                    {
+                        (text, ty)
+                    } else if let Some(value) = self
+                        .program
+                        .imported_constant(&self.module, &placeholder)
+                        && let Some((text, ty)) = constant(value)
+                    {
+                        (text, ty)
                     } else {
-                        let ty = self.lookup(&placeholder).ok_or_else(|| {
-                            Error::at(
-                                mac.span(),
-                                format!(
-                                    "format! placeholder `{placeholder}` has no matching argument"
-                                ),
-                            )
-                        })?;
-                        pieces.push(format_piece(placeholder, ty));
+                        return Err(Error::at(
+                            mac.span(),
+                            format!(
+                                "format! placeholder `{placeholder}` has no matching argument"
+                            ),
+                        ));
+                    };
+                    match spec {
+                        Some(spec) => pieces
+                            .push(format_specifier(value, ty, &spec, mac)?),
+                        None => pieces.push(format_piece(value, ty)),
                     }
                 }
                 '}' => {
@@ -4723,7 +5323,10 @@ impl<'a> Emitter<'a> {
                 match name.as_str() {
                     "None" | "Null" => Ok(format!("({value} == nil)")),
                     "Some" => Ok(format!("({value} ~= nil)")),
-                    _ => Ok("true".to_owned()),
+                    _ => match self.pattern_constant(&name) {
+                        Some((text, _)) => Ok(format!("({value} == {text})")),
+                        None => Ok("true".to_owned()),
+                    },
                 }
             }
             Pat::Path(path) => {
@@ -5120,6 +5723,62 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// The host-callback marker for a callback-id argument, or `None` when the
+    /// argument is `None`. Compiled Luau names its callbacks, so the runtime
+    /// hands the payload back to the entry's `onHostCallback`.
+    fn callback_marker(
+        &mut self,
+        args: &[&Expr],
+        index: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(argument) = args.get(index) else {
+            return Ok(None);
+        };
+        let argument = strip_reference(argument);
+        if let Expr::Path(path) = argument
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "None")
+        {
+            return Ok(None);
+        }
+        let inner = match argument {
+            Expr::Call(inner)
+                if path_last_name(&inner.func).as_deref() == Some("Some") =>
+            {
+                arg(&inner.args.iter().collect::<Vec<_>>(), 0, inner)?
+            }
+            other => other,
+        };
+        let (text, _) = self.expr(inner)?;
+        Ok(Some(format!("{{ __host_callback = {text} }}")))
+    }
+
+    /// The value inside a `Some(...)` argument, or `nil` for `None`.
+    fn option_value(&mut self, argument: &Expr) -> Result<String, Error> {
+        let argument = strip_reference(argument);
+        if let Expr::Path(path) = argument
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "None")
+        {
+            return Ok("nil".to_owned());
+        }
+        let inner = match argument {
+            Expr::Call(inner)
+                if path_last_name(&inner.func).as_deref() == Some("Some") =>
+            {
+                arg(&inner.args.iter().collect::<Vec<_>>(), 0, inner)?
+            }
+            other => other,
+        };
+        Ok(self.expr(inner)?.0)
+    }
+
     fn op_call(&mut self, call: &ExprCall, name: &str) -> Result<(), Error> {
         let args = call.args.iter().collect::<Vec<_>>();
         match name {
@@ -5138,6 +5797,54 @@ impl<'a> Emitter<'a> {
                 self.line(&format!(
                     "state.watch({key}, {{ __host_callback = {id} }})"
                 ));
+            }
+            "run" => {
+                let command = self.expr(arg(&args, 0, call)?)?.0;
+                let callback = self.callback_marker(&args, 1)?;
+                let line = match callback {
+                    Some(marker) => {
+                        format!("noctalia.runAsync({command}, {marker})")
+                    }
+                    None => format!("noctalia.runAsync({command})"),
+                };
+                self.line(&line);
+            }
+            "run_with_timeout" => {
+                let command = self.expr(arg(&args, 0, call)?)?.0;
+                let callback = self
+                    .callback_marker(&args, 1)?
+                    .unwrap_or_else(|| "nil".to_owned());
+                let timeout = match args.get(2) {
+                    Some(timeout) => self.expr(strip_reference(timeout))?.0,
+                    None => "nil".to_owned(),
+                };
+                self.line(&format!(
+                    "noctalia.runAsync({command}, {callback}, {timeout})"
+                ));
+            }
+            "run_stream" => {
+                let command = self.expr(arg(&args, 0, call)?)?.0;
+                let callback =
+                    self.callback_marker(&args, 1)?.ok_or_else(|| {
+                        Error::at(
+                            call.span(),
+                            "op `run_stream` needs a callback id",
+                        )
+                    })?;
+                self.line(&format!(
+                    "noctalia.runStream({command}, {callback})"
+                ));
+            }
+            "http" => {
+                let request = self.expr(arg(&args, 0, call)?)?.0;
+                let callback = self.callback_marker(&args, 1)?;
+                let line = match callback {
+                    Some(marker) => {
+                        format!("noctalia.http({request}, {marker})")
+                    }
+                    None => format!("noctalia.http({request})"),
+                };
+                self.line(&line);
             }
             "set_interval" => {
                 let ms = self.expr(arg(&args, 0, call)?)?.0;
@@ -5256,7 +5963,8 @@ fn default_value(
         "bool" => Some("false"),
         "i64" | "u64" | "usize" | "u32" | "i32" | "f64" | "f32" => Some("0"),
         "Value" => Some("nil"),
-        "Vec" | "HashMap" | "BTreeMap" | "HashSet" | "BTreeSet" => Some("{}"),
+        "Vec" | "VecDeque" | "HashMap" | "BTreeMap" | "HashSet"
+        | "BTreeSet" | "Map" | "IndexMap" | "IndexSet" => Some("{}"),
         _ => None,
     };
     if let Some(literal) = literal {
@@ -5334,18 +6042,103 @@ fn json_parse_base(call: &ExprCall) -> Result<Base, Error> {
 }
 
 fn constant(expr: &Expr) -> Option<(String, Ty)> {
-    let Expr::Lit(literal) = expr else {
-        return None;
-    };
-    Some(match &literal.lit {
-        Lit::Str(value) => (quote(&value.value()), Ty::STR),
-        Lit::Int(value) => (value.base10_digits().to_owned(), Ty::INT),
-        Lit::Bool(value) => (
-            if value.value { "true" } else { "false" }.to_owned(),
-            Ty::BOOL,
-        ),
-        _ => return None,
-    })
+    match expr {
+        Expr::Lit(literal) => Some(match &literal.lit {
+            Lit::Str(value) => (quote(&value.value()), Ty::STR),
+            Lit::Char(value) => (quote(&value.value().to_string()), Ty::STR),
+            Lit::Byte(value) => (value.value().to_string(), Ty::INT),
+            Lit::ByteStr(value) => {
+                (quote(&String::from_utf8_lossy(&value.value())), Ty::STR)
+            }
+            Lit::Int(value) => (value.base10_digits().to_owned(), Ty::INT),
+            Lit::Float(value) => (value.base10_digits().to_owned(), Ty::FLOAT),
+            Lit::Bool(value) => (
+                if value.value { "true" } else { "false" }.to_owned(),
+                Ty::BOOL,
+            ),
+            _ => return None,
+        }),
+        Expr::Reference(reference) => constant(&reference.expr),
+        Expr::Paren(paren) => constant(&paren.expr),
+        Expr::Group(group) => constant(&group.expr),
+        Expr::Unary(unary) => {
+            let (text, ty) = constant(&unary.expr)?;
+            match unary.op {
+                UnOp::Neg(_) => Some((format!("(-{text})"), ty)),
+                UnOp::Deref(_) => Some((text, ty)),
+                UnOp::Not(_) => Some((format!("(not {text})"), Ty::BOOL)),
+                _ => None,
+            }
+        }
+        Expr::Array(array) => {
+            let mut values = Vec::new();
+            for item in &array.elems {
+                values.push(constant(item)?.0);
+            }
+            Some((format!("{{ {} }}", values.join(", ")), Ty::LIST))
+        }
+        Expr::Tuple(tuple) => {
+            let mut values = Vec::new();
+            for item in &tuple.elems {
+                values.push(constant(item)?.0);
+            }
+            Some((format!("{{ {} }}", values.join(", ")), Ty::LIST))
+        }
+        Expr::Path(path) => {
+            let segments = path_segments(&path.path)?;
+            let last = segments.last()?;
+            match last.as_str() {
+                "MAX" | "MIN"
+                    if segments.iter().any(|name| {
+                        matches!(
+                            name.as_str(),
+                            "i8" | "i16"
+                                | "i32"
+                                | "i64"
+                                | "i128"
+                                | "u8"
+                                | "u16"
+                                | "u32"
+                                | "u64"
+                                | "u128"
+                                | "usize"
+                                | "isize"
+                        )
+                    }) =>
+                {
+                    let value = if last == "MAX" {
+                        "9223372036854775807"
+                    } else {
+                        "(-9223372036854775808)"
+                    };
+                    Some((value.to_owned(), Ty::INT))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// JSON predicates used as callback values, such as `Value::is_object`.
+fn value_predicate(name: &str) -> Option<&'static str> {
+    match name {
+        "is_string" => Some("string"),
+        "is_number" | "is_i64" | "is_u64" | "is_f64" => Some("number"),
+        "is_boolean" => Some("boolean"),
+        "is_array" | "is_object" => Some("table"),
+        _ => None,
+    }
+}
+
+/// The empty value a container constructor returns when used as a callback.
+fn container_default(name: &str) -> Option<&'static str> {
+    match name {
+        "String" => Some("\"\""),
+        "Vec" | "VecDeque" | "HashMap" | "BTreeMap" | "HashSet"
+        | "BTreeSet" | "Map" | "IndexMap" | "IndexSet" => Some("{}"),
+        _ => None,
+    }
 }
 
 fn value_accessor(name: &str) -> Option<&'static str> {
@@ -5613,6 +6406,76 @@ fn compound_operator(operator: &BinOp) -> Option<&'static str> {
     }
 }
 
+/// One `{value:spec}` placeholder of a `format!` call.
+fn format_specifier(
+    value: String,
+    ty: Ty,
+    spec: &str,
+    mac: &ExprMacro,
+) -> Result<String, Error> {
+    let unsupported = || {
+        Error::at(
+            mac.span(),
+            format!(
+                "format specifier `{spec}` is not supported by the Luau compiler"
+            ),
+        )
+    };
+    if let Some(debug) = spec.strip_suffix('?') {
+        if !debug.is_empty() {
+            return Err(unsupported());
+        }
+        match ty.base {
+            Base::Value => return Ok(format!("json.encode({value})")),
+            Base::Int | Base::Float | Base::Bool => {
+                return Ok(format!("tostring({value})"));
+            }
+            _ => return Err(unsupported()),
+        }
+    }
+    let mut left = ty.base == Base::Str;
+    let mut rest = spec;
+    while let Some(first) = rest.chars().next() {
+        match first {
+            '<' => left = true,
+            '>' => left = false,
+            '+' => {}
+            _ => break,
+        }
+        rest = &rest[first.len_utf8()..];
+    }
+    if !rest
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == '.')
+    {
+        return Err(unsupported());
+    }
+    let mut format = String::from("%");
+    if left && ty.base == Base::Str {
+        format.push('-');
+    }
+    format.push_str(rest);
+    let conversion = match ty.base {
+        Base::Str => 's',
+        Base::Int => 'd',
+        Base::Float => {
+            if rest.contains('.') {
+                'f'
+            } else {
+                'd'
+            }
+        }
+        Base::Bool | Base::Value | Base::List | Base::Table | Base::Node => 's',
+        Base::Ops | Base::Context | Base::Void => return Err(unsupported()),
+    };
+    format.push(conversion);
+    let value = match ty.base {
+        Base::Str | Base::Int | Base::Float => value,
+        _ => format!("tostring({value})"),
+    };
+    Ok(format!("string.format({}, {value})", quote(&format)))
+}
+
 fn format_piece(value: String, ty: Ty) -> String {
     if ty.is_string() || ty.is_numeric() {
         value
@@ -5749,17 +6612,11 @@ fn qualified_variant<'a>(name: &'a str, root: &str) -> Option<&'a str> {
 fn unsupported_op(name: &str) -> Option<String> {
     let variant = qualified_variant(name, "Op")?;
     let message = match variant {
-        "run" | "run_with_timeout" => {
-            "op `run` needs a host callback id, which compiled Luau cannot allocate; use `Op::host_call(\"noctalia\", &[\"runAsync\"], ...)` instead"
-        }
-        "run_stream" => {
-            "op `run_stream` needs a host callback id, which compiled Luau cannot allocate"
-        }
-        "http" | "http_bytes" => {
-            "op `http` needs a host callback id, which compiled Luau cannot allocate; use `Op::host_call(\"noctalia\", &[\"http\"], ...)` instead"
+        "http_bytes" => {
+            "op `http_bytes` sends a raw byte body, which compiled Luau cannot build"
         }
         "query" => {
-            "op `query` needs a response path and callback id, which compiled Luau cannot allocate"
+            "op `query` needs a response path, which compiled Luau cannot allocate"
         }
         _ => return None,
     };
@@ -5782,6 +6639,10 @@ fn op_constructor(name: &str) -> Option<String> {
         "copy",
         "copy_with_mime",
         "open_path",
+        "run",
+        "run_with_timeout",
+        "run_stream",
+        "http",
     ];
     supported.contains(&variant).then(|| variant.to_owned())
 }
@@ -5796,6 +6657,15 @@ fn ui_constructor(name: &str) -> Option<&'static str> {
         "button" => Some("button"),
         "input" => Some("input"),
         "progress" => Some("progress"),
+        _ => None,
+    }
+}
+
+/// The marker key for `ui::call` and `ui::callback`.
+fn ui_marker(variant: &str) -> Option<&'static str> {
+    match variant {
+        "call" => Some("__call"),
+        "callback" => Some("__host_callback"),
         _ => None,
     }
 }
@@ -5941,6 +6811,21 @@ fn diverges(expr: &Expr) -> bool {
     }
 }
 
+/// A condition that never emits statements, so `else if` can become `elseif`.
+fn simple_condition(expr: &Expr) -> bool {
+    match strip_reference(expr) {
+        Expr::Lit(_) | Expr::Path(_) => true,
+        Expr::Paren(paren) => simple_condition(&paren.expr),
+        Expr::Group(group) => simple_condition(&group.expr),
+        Expr::Unary(unary) => simple_condition(&unary.expr),
+        Expr::Binary(binary) => {
+            simple_condition(&binary.left) && simple_condition(&binary.right)
+        }
+        Expr::Field(field) => simple_condition(&field.base),
+        _ => false,
+    }
+}
+
 fn if_chain(item: &syn::ExprIf) -> IfChain<'_> {
     let mut chain = Vec::new();
     let mut current = item;
@@ -5989,6 +6874,46 @@ fn pattern_strings(pattern: &Pat) -> Result<Option<Vec<String>>, Error> {
         }
         Pat::Paren(paren) => pattern_strings(&paren.pat),
         _ => Ok(None),
+    }
+}
+
+/// Every character an or-pattern of literals matches.
+fn pattern_chars(pattern: &Pat, out: &mut String) -> Result<bool, Error> {
+    match pattern {
+        Pat::Or(or) => {
+            for case in &or.cases {
+                if !pattern_chars(case, out)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Pat::Paren(paren) => pattern_chars(&paren.pat, out),
+        Pat::Lit(lit) => match constant(&Expr::Lit(lit.clone())) {
+            Some((text, _)) => {
+                out.push_str(&unquote(&text));
+                Ok(true)
+            }
+            None => Ok(false),
+        },
+        Pat::Path(path) => match path.path.segments.last() {
+            Some(segment) => match constant(&Expr::Path(syn::ExprPath {
+                attrs: Vec::new(),
+                qself: None,
+                path: syn::Path {
+                    leading_colon: None,
+                    segments: std::iter::once(segment.clone()).collect(),
+                },
+            })) {
+                Some((text, _)) => {
+                    out.push_str(&unquote(&text));
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            None => Ok(false),
+        },
+        _ => Ok(false),
     }
 }
 

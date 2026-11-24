@@ -400,3 +400,151 @@ fn default_branches_log_for_non_matching_events() {
         );
     }
 }
+
+fn every_op(ops: &[Op]) -> Vec<Value> {
+    ops.iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect()
+}
+
+fn all_ops(entry: &str, source: &str, ctx: &Context) -> Vec<Value> {
+    noctalia_rs_luau::dispatch(ctx, &[(entry, source)])
+        .expect("dispatch")
+        .iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect()
+}
+
+#[test]
+fn stream_callback_ops_match_the_native_handler() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    if ctx.event == "load" {
+        ops.push(Op::run_stream(json!(["tail", "-f"]), "stream"));
+        ops.push(Op::state_watch("key", "watch"));
+    }
+    if ctx.event == "host_callback" && ctx.payload_str("id").as_deref() == Some("stream") {
+        let line = ctx.payload_arg(0).and_then(Value::as_str).unwrap_or_default();
+        ops.push(Op::state("line", json!(line)));
+    }
+    Ok(ops)
+}
+"#;
+    let source =
+        compiled_source("stream_callback", handler, EntryKind::Service);
+    let load = context(
+        "stream_callback",
+        "load",
+        json!({ "source": "load" }),
+        json!({}),
+    );
+    let expected = every_op(&native_stream(&load));
+    let actual = all_ops("stream_callback", &source, &load);
+    assert_eq!(actual, expected);
+    assert_eq!(actual[0]["path"], json!(["runStream"]));
+
+    let callback = context(
+        "stream_callback",
+        "host_callback",
+        json!({ "id": "stream", "args": ["hello"] }),
+        json!({}),
+    );
+    let expected = every_op(&native_stream(&callback));
+    let actual = all_ops("stream_callback", &source, &callback);
+    assert_eq!(actual, expected);
+    assert_eq!(actual[0]["value"], "hello");
+}
+
+fn native_stream(ctx: &Context) -> Vec<Op> {
+    let mut ops = Vec::new();
+    if ctx.event == "load" {
+        ops.push(Op::run_stream(json!(["tail", "-f"]), "stream"));
+        ops.push(Op::state_watch("key", "watch"));
+    }
+    if ctx.event == "host_callback"
+        && ctx.payload_str("id").as_deref() == Some("stream")
+    {
+        let line = ctx
+            .payload_arg(0)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        ops.push(Op::state("line", json!(line)));
+    }
+    ops
+}
+
+fn luau_parses(source: &str) -> Result<(), String> {
+    mlua::Lua::new()
+        .load(source)
+        .into_function()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[test]
+fn statement_heavy_handlers_emit_parseable_luau() {
+    let handler = r#"
+const LEVEL_AUTO: &str = "auto";
+const LEVEL_ERROR: &str = "error";
+fn render(ctx: &Context, ops: &mut Vec<Op>) {
+    let label = ctx.payload_str("label").unwrap_or_default();
+    ops.push(Op::set_interval(1000));
+    let _ = label;
+}
+fn init(_ctx: &Context, ops: &mut Vec<Op>) {
+    if ops.is_empty() {
+        return;
+    }
+    ops.push(Op::log("init"));
+}
+fn checked(_ctx: &Context, ops: &mut Vec<Op>) -> bool {
+    if ops.is_empty() {
+        return true;
+    }
+    ops.push(Op::log("checked"));
+    false
+}
+static INIT: OnceLock<()> = OnceLock::new();
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let _ = INIT.get_or_init(|| init(ctx, &mut ops));
+    let level = ctx.payload_str("level").unwrap_or_default();
+    let text = match level.as_str() {
+        value if value == LEVEL_ERROR => "error".to_owned(),
+        value if matches!(value, LEVEL_AUTO | "manual") => "auto".to_owned(),
+        _ => "other".to_owned(),
+    };
+    if text.is_empty() || checked(ctx, &mut ops) {
+        return Ok(ops);
+    }
+    render(ctx, &mut ops);
+    let values = vec![Op::log(text.clone())];
+    ops.extend(values);
+    drop(ops);
+    Ok(vec![Op::log("done".to_owned())])
+}
+"#;
+    let source =
+        compiled_source("statement_heavy", handler, EntryKind::Service);
+    luau_parses(&source).unwrap_or_else(|error| panic!("{error}\n{source}"));
+}
+
+#[test]
+fn chained_conditions_emit_parseable_luau() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.is_load_event() {
+        Ok(vec![Op::log("load")])
+    } else if ctx.event == "render" {
+        Ok(vec![Op::log("render")])
+    } else if ctx.dark_mode() {
+        Ok(vec![Op::log("dark")])
+    } else {
+        Ok(Vec::new())
+    }
+}
+"#;
+    let source = compiled_source("chained", handler, EntryKind::Widget);
+    luau_parses(&source).unwrap_or_else(|error| panic!("{error}\n{source}"));
+}

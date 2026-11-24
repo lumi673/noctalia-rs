@@ -34,6 +34,7 @@ pub fn callback_for_event(event: &str) -> Option<&'static str> {
         "refresh" => Some("onRefresh"),
         "search" => Some("onSearch"),
         "search_change" => Some("onSearchChange"),
+        "host_callback" => Some("onHostCallback"),
         _ => None,
     }
 }

@@ -854,6 +854,33 @@ end)
 }
 
 #[test]
+fn named_host_callbacks_reach_the_script_handler() {
+    const SOURCE: &str = r#"
+function update()
+  noctalia.runStream({ "tail", "-f" }, { __host_callback = "watch" })
+end
+function onHostCallback(payload)
+  if payload.id == "watch" then
+    noctalia.log(payload.args[1])
+  end
+end
+"#;
+    let ctx = context(empty_fixture("update"));
+    let ops = dispatch(&ctx, &[("entry", SOURCE)]).expect("first dispatch");
+    let value = serde_json::to_value(&ops[0]).expect("serialize");
+    assert_eq!(value["path"], json!(["runStream"]));
+    assert_eq!(value["args"][1]["__host_callback"], "watch");
+
+    let mut callback = empty_fixture("host_callback");
+    callback.payload = json!({ "id": "watch", "args": ["line"] });
+    let ctx = context(callback);
+    let ops = dispatch(&ctx, &[("entry", SOURCE)]).expect("callback dispatch");
+    let log = serde_json::to_value(&ops[0]).expect("serialize");
+    assert_eq!(log["op"], "log");
+    assert_eq!(log["message"], "line");
+}
+
+#[test]
 fn launcher_rows_treat_an_empty_table_as_no_rows() {
     let values = run(r#"
 function update()

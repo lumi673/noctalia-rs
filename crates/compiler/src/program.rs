@@ -22,6 +22,7 @@ struct Unit {
     structs: HashMap<String, StructDef>,
     impls: HashMap<String, HashMap<String, ItemFn>>,
     constants: HashMap<String, Expr>,
+    associated: HashMap<String, HashMap<String, Expr>>,
     imports: HashMap<String, Vec<String>>,
     globs: Vec<Vec<String>>,
 }
@@ -35,6 +36,7 @@ impl Unit {
             structs: HashMap::new(),
             impls: HashMap::new(),
             constants: HashMap::new(),
+            associated: HashMap::new(),
             imports: HashMap::new(),
             globs: Vec::new(),
         }
@@ -250,8 +252,27 @@ impl Program {
         name: &str,
     ) -> Option<&Expr> {
         let unit = self.units.get(module)?;
-        let target = unit.imports.get(name)?;
-        self.resolve_constant(module, target)
+        if let Some(target) = unit.imports.get(name) {
+            return self.resolve_constant(module, target);
+        }
+        for glob in &unit.globs {
+            let mut expanded = glob.clone();
+            expanded.push(name.to_owned());
+            if let Some(value) = self.resolve_constant(module, &expanded) {
+                return Some(value);
+            }
+        }
+        let mut found = None;
+        for unit in self.units.values() {
+            let Some(value) = unit.constants.get(name) else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value);
+        }
+        found
     }
 
     /// Resolves a constant path such as `crate::common::STATE`.
@@ -494,6 +515,17 @@ fn collect(
             }
             Item::Impl(item_impl) => {
                 if let Some(name) = impl_name(&item_impl.self_ty) {
+                    for item in &item_impl.items {
+                        if let syn::ImplItem::Const(value) = item {
+                            unit.associated
+                                .entry(name.clone())
+                                .or_default()
+                                .insert(
+                                    value.ident.to_string(),
+                                    value.expr.clone(),
+                                );
+                        }
+                    }
                     let methods = unit.impls.entry(name).or_default();
                     for item in &item_impl.items {
                         if let syn::ImplItem::Fn(function) = item {
@@ -599,6 +631,38 @@ impl Program {
                 }
                 found = Some(def);
             }
+        }
+        found
+    }
+
+    /// Resolves an associated constant such as `State::EMPTY`.
+    pub(crate) fn associated_const(
+        &self,
+        module: &str,
+        class: &str,
+        name: &str,
+    ) -> Option<&Expr> {
+        if let Some(value) = self
+            .units
+            .get(module)
+            .and_then(|unit| unit.associated.get(class))
+            .and_then(|values| values.get(name))
+        {
+            return Some(value);
+        }
+        let mut found = None;
+        for unit in self.units.values() {
+            let Some(value) = unit
+                .associated
+                .get(class)
+                .and_then(|values| values.get(name))
+            else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value);
         }
         found
     }
