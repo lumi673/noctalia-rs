@@ -170,9 +170,12 @@ and the compiler covers config, payload, state, settings, `tr`, host reads,
 common ops, and constants. Errors name the module when they sit in an inlined
 helper.
 
-Recursive calls, arbitrary iterators, JSON parsing, callback-id ops, and Rust
-constructs with no clear Luau equivalent fail the build with `file:line:column`
-instead of being approximated.
+JSON parsing and `serde_json::Value`, nested assignments, common iterators,
+string and numeric methods, blocks and loops are translated. Callback-id ops,
+arbitrary trait iterators, dynamic dispatch, and Rust constructs with no clear
+Luau equivalent fail the build with `file:line:column` instead of being
+approximated. The compiler currently covers 77 of 1,067 entries in the
+community corpus; see `BASELINE.md` for the per-stage adoption table.
 
 
 Build and install:

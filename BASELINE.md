@@ -260,3 +260,44 @@ done
 | Samples | 300 per surface, 30 warmup, 3 rounds |
 | Percentiles | nearest rank |
 | Timer | `std::time::Instant` |
+
+## Compiler adoption after stage 3
+
+The compiler coverage scan compiles every entry in the 366-plugin community
+corpus from `/home/user/projects/community-plugins-rs`. It uses the same
+`noctalia_rs_compiler::compile` call the build uses, with the entry id, handler,
+kind and `<last id segment>.state`. A handler that fails still builds through
+the bridge in `auto` mode; this scan only measures how many entries can skip it.
+
+| Stage | Compiled entries | Adoption |
+| :-- | --: | --: |
+| single-file compiler | 8 / 1,067 | 0.75% |
+| stage 1, whole-crate helpers | 14 / 1,067 | 1.31% |
+| stage 2, closures and statics | 30 / 1,067 | 2.81% |
+| stage 3, JSON and broader syntax | 77 / 1,067 | 7.22% |
+
+After stage 3: widget 44/319, shortcut 28/80, service 2/265, desktop widget
+1/36, launcher provider 2/64, panel 0/299, layer 0/4. The largest remaining
+blockers are unresolved names (190), unsupported methods (168), unresolved
+calls (82), helpers that return no value (72), path expressions (46), nested
+match patterns (45), callback-id ops (30), and format specifiers (24). Each one
+fails the build with a position in strict mode.
+
+This is a measurement of compiler reach, not of the bridge path. The benchmark
+above still measures runtime performance. Three rounds of 300 samples after
+stage 3 measured compiled medians of 1.934 us, 10.204 us and 3.697 us against
+hand-written medians of 2.014 us, 17.007 us and 3.878 us. Median ratios were
+0.99x, 1.67x and 1.00x, so the small fixtures remain at parity within host
+noise and the UI tree keeps its advantage. `spool_dispatch` was 79 us in the
+median round.
+
+### Exact command
+
+```sh
+nix develop --command cargo run --release -p noctalia-bench --offline -- \
+  --samples 300 --warmup 30 --build-samples 1 --build-warmup 0 \
+  --report .tmp/stage3-round-1.json
+```
+
+The corpus is treated as read-only; the scan and its scratch files live in
+`.tmp` and are deleted after each run.
