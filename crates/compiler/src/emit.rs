@@ -134,6 +134,8 @@ pub(crate) fn payload_params(event: &str) -> &'static [PayloadParam] {
 pub(crate) struct Body {
     pub source: String,
     pub events: BTreeSet<String>,
+    pub negative_events: BTreeSet<String>,
+    pub uses_event: bool,
     pub uses_state: bool,
     pub uses_entry: bool,
     pub uses_payload: bool,
@@ -171,6 +173,8 @@ pub(crate) struct Emitter<'a> {
     indent: usize,
     scopes: Vec<HashMap<String, Ty>>,
     events: BTreeSet<String>,
+    negative_events: BTreeSet<String>,
+    uses_event: bool,
     bound_event: Option<String>,
     payload_params: &'static [PayloadParam],
     params: Vec<&'static str>,
@@ -222,6 +226,8 @@ impl<'a> Emitter<'a> {
             indent: 1,
             scopes: vec![HashMap::new()],
             events: BTreeSet::new(),
+            negative_events: BTreeSet::new(),
+            uses_event: false,
             bound_event,
             payload_params,
             params: Vec::new(),
@@ -796,6 +802,8 @@ impl<'a> Emitter<'a> {
         Body {
             source,
             events: self.events,
+            negative_events: self.negative_events,
+            uses_event: self.uses_event,
             uses_state: self.uses_state,
             uses_entry: self.uses_entry,
             uses_payload: self.uses_payload,
@@ -2200,8 +2208,9 @@ impl<'a> Emitter<'a> {
             return Ok((String::new(), Ty::VOID));
         }
         if matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_)) {
-            self.record_event(&binary.left, &binary.right);
-            self.record_event(&binary.right, &binary.left);
+            let negated = matches!(binary.op, BinOp::Ne(_));
+            self.record_event(&binary.left, &binary.right, negated);
+            self.record_event(&binary.right, &binary.left, negated);
         }
         let (left, left_ty) = self.expr(&binary.left)?;
         let (right, right_ty) = self.expr(&binary.right)?;
@@ -3303,7 +3312,10 @@ impl<'a> Emitter<'a> {
             return match member.as_str() {
                 "event" => Ok(match &self.bound_event {
                     Some(event) => (quote(event), Ty::STR),
-                    None => ("event".to_owned(), Ty::STR),
+                    None => {
+                        self.uses_event = true;
+                        ("event".to_owned(), Ty::STR)
+                    }
                 }),
                 "now_ms" => Ok(("noctalia.nowMs()".to_owned(), Ty::INT)),
                 "entry" => {
@@ -3778,7 +3790,7 @@ impl<'a> Emitter<'a> {
     fn record_pattern_events(&mut self, expr: &Expr, pattern: &Pat) {
         match pattern {
             Pat::Lit(literal) => {
-                self.record_event(expr, &Expr::Lit(literal.clone()))
+                self.record_event(expr, &Expr::Lit(literal.clone()), false)
             }
             Pat::Or(or) => {
                 for case in &or.cases {
@@ -3790,7 +3802,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn record_event(&mut self, event: &Expr, literal: &Expr) {
+    fn record_event(&mut self, event: &Expr, literal: &Expr, negated: bool) {
         if !self.is_event_expr(event) {
             return;
         }
@@ -3799,7 +3811,11 @@ impl<'a> Emitter<'a> {
             ..
         }) = literal
         {
-            self.events.insert(value.value());
+            if negated {
+                self.negative_events.insert(value.value());
+            } else {
+                self.events.insert(value.value());
+            }
         }
     }
 

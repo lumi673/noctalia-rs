@@ -353,3 +353,25 @@ pub fn handle(ctx: &Context) -> Result<Vec<Op>> {
     expected.extend(expected.clone());
     assert_eq!(ops("inlined", &compiled, &ctx), expected);
 }
+
+#[test]
+fn unconditional_handler_dispatches_the_real_event() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(ctx.event.to_owned())])
+}
+"#;
+    let source = compiled_source("runtime_event", handler, EntryKind::Widget);
+    let update = context("runtime_event", "render", json!({}), json!({}));
+    let click = context("runtime_event", "click", json!({}), json!({}));
+    noctalia_rs_luau::dispatch(&update, &[("runtime_event", &source)])
+        .expect("warm vm");
+    assert_eq!(
+        ops("runtime_event", &source, &update),
+        rust_ops(vec![Op::log("render")])
+    );
+    assert_eq!(
+        ops("runtime_event", &source, &click),
+        rust_ops(vec![Op::log("click")])
+    );
+}

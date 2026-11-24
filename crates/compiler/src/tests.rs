@@ -1962,3 +1962,43 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
             .contains("local __t4 = error(tostring(\"missing\"))")
     );
 }
+
+#[test]
+fn negated_event_keeps_the_other_callbacks() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event != "click" {
+        Ok(vec![Op::log("tick")])
+    } else {
+        Ok(Vec::new())
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    assert!(!compiled.source.contains("function onClick()"));
+    assert!(compiled.source.contains("function onHover(hovered)"));
+    assert!(compiled.source.contains("function update()"));
+    assert!(compiled.source.contains("noctalia.log(\"tick\")"));
+}
+
+#[test]
+fn unconditional_handler_reads_the_runtime_event() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(ctx.event.to_owned())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("local function body_events("));
+    assert!(compiled.source.contains("noctalia.log(event)"));
+    assert!(
+        compiled
+            .source
+            .contains("function onClick() body_events(\"click\") end")
+    );
+    assert!(compiled.source.contains("function update() body_"));
+}

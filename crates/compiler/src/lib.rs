@@ -285,11 +285,15 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         Emitter::new(context, None, options.strings, &[], &program, &module);
     discovery.constants();
     discovery.block(&function.block)?;
-    let events = discovery.finish().events;
+    let discovery_body = discovery.finish();
+    let events = discovery_body.events.clone();
+    let negatives = discovery_body.negative_events.clone();
+    let positive = events.difference(&negatives).cloned().collect::<Vec<_>>();
+    let fallback_needed = positive.is_empty();
 
     let update_event = options.kind.update_event().to_owned();
     let mut labels = vec![update_event.clone()];
-    for event in &events {
+    for event in &positive {
         if event != &update_event {
             labels.push(event.clone());
         }
@@ -336,14 +340,23 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         names.insert(label.clone(), name);
     }
 
+    let fallback_index = if fallback_needed && !discovery_body.is_empty {
+        let index = bodies.len();
+        bodies.push(Slot {
+            name: "body_events".to_owned(),
+            body: discovery_body,
+        });
+        Some(index)
+    } else {
+        None
+    };
     let slot = |label: &str| -> Option<&Slot> {
         names
             .get(label)
             .and_then(|name| bodies.iter().find(|slot| &slot.name == name))
     };
-    let unconditional = events.is_empty();
     let update = slot(&update_event).filter(|slot| !slot.body.is_empty);
-    let fallback = unconditional.then_some(update).flatten();
+    let fallback = fallback_index.map(|index| &bodies[index]);
     let watch_label = if options.kind == EntryKind::Launcher {
         "query"
     } else {
@@ -470,7 +483,15 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     }
 
     if let Some(slot) = update {
-        let args = call_args(&slot.body, &[], &[], Some("update"), None, false);
+        let args = call_args(
+            &slot.body,
+            &[],
+            &[],
+            Some("update"),
+            None,
+            false,
+            &update_event,
+        );
         let _ = writeln!(out, "function update() {}({args}) end", slot.name);
     } else {
         out.push_str("function update() end\n");
@@ -487,6 +508,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             None,
             Some("{ text = text }"),
             false,
+            "query",
         );
         let state_payload = call_args(
             &slot.body,
@@ -495,6 +517,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             Some("state"),
             Some("{ text = last_query, source = \"state\" }"),
             false,
+            "query",
         );
         let _ = writeln!(
             out,
@@ -510,6 +533,9 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     for callback in CALLBACKS {
         if callback.function == "onQuery" && options.kind == EntryKind::Launcher
         {
+            continue;
+        }
+        if negatives.contains(callback.event) {
             continue;
         }
         let Some(slot) = slot(callback.event)
@@ -532,6 +558,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             None,
             dynamic,
             callback.payload.is_empty(),
+            callback.event,
         );
         let _ = writeln!(
             out,
@@ -543,7 +570,15 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     if options.kind != EntryKind::Launcher
         && let Some(slot) = watch
     {
-        let args = call_args(&slot.body, &[], &[], Some("state"), None, false);
+        let args = call_args(
+            &slot.body,
+            &[],
+            &[],
+            Some("state"),
+            None,
+            false,
+            &update_event,
+        );
         let _ = writeln!(
             out,
             "state.watch(STATE_KEY, function() {}({args}) end)",
@@ -554,13 +589,21 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         out.push_str("panel.setWantsSecondTicks(true)\n");
     }
     if let Some(slot) = load {
-        let args = call_args(&slot.body, &[], &[], Some("load"), None, false);
+        let args = call_args(
+            &slot.body,
+            &[],
+            &[],
+            Some("load"),
+            None,
+            false,
+            load_label,
+        );
         let _ = writeln!(out, "{}({args})", slot.name);
     }
 
     Ok(Compiled {
         source: out,
-        events: events.into_iter().collect(),
+        events: positive,
     })
 }
 
@@ -587,6 +630,9 @@ fn body_params(body: &emit::Body) -> String {
     if body.uses_source {
         params.push("source");
     }
+    if body.uses_event {
+        params.push("event");
+    }
     params.join(", ")
 }
 
@@ -597,6 +643,7 @@ fn call_args(
     source: Option<&str>,
     dynamic: Option<&str>,
     empty: bool,
+    event: &str,
 ) -> String {
     let mut args = Vec::new();
     for ((_, body_param, _), value) in mapping.iter().zip(values) {
@@ -609,6 +656,9 @@ fn call_args(
     }
     if body.uses_source {
         args.push(source.map_or_else(|| "\"\"".to_owned(), quote));
+    }
+    if body.uses_event {
+        args.push(quote(event));
     }
     args.join(", ")
 }
