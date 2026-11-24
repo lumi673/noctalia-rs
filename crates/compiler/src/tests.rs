@@ -486,12 +486,9 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn rejects_constructs_outside_the_subset() {
     for handler in [
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.fuzzy_score(\"a\", \"b\"); Ok(vec![]) }",
-        "fn handler(ctx: &Context) -> Result<Vec<Op>> { if let Some(x) = ctx.state_value::<String>(\"x\") { let _ = x; } Ok(vec![]) }",
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { match ctx.event.as_str() { other => { let _ = other; Ok(Vec::new()) } } }",
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { while ctx.now_ms > 0 { } Ok(vec![]) }",
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = std::process::id(); Ok(vec![]) }",
-        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.config.get(\"a\"); Ok(vec![]) }",
-        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = matches!(ctx.event.as_str(), \"render\"); Ok(vec![]) }",
     ] {
         assert!(
             compile(&source(handler), &options("handler", EntryKind::Widget))
@@ -985,27 +982,32 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn rejects_early_returns_question_marks_and_closures_in_helpers() {
+fn supports_early_return_and_question_mark_in_helpers() {
     for helper in [
         "fn helper(ctx: &Context, ops: &mut Vec<Op>) { if ctx.now_ms > 0 { return; } ops.push(Op::log(\"x\")); }",
-        "fn helper(ctx: &Context, ops: &mut Vec<Op>) { let value = ctx.read_file(\"a\")?; let _ = value; }",
-        "fn helper(ctx: &Context, ops: &mut Vec<Op>) { let find = |a: i64| a; let _ = find(1); }",
-        "fn helper(ctx: &Context, ops: &mut Vec<Op>) { ops.push(Op::log(\"x\")); return; }",
+        "fn helper(ctx: &Context, ops: &mut Vec<Op>) { let value = ctx.config_str(\"message\")?; ops.push(Op::log(value)); }",
     ] {
         let handler = format!(
-            "{helper}\nfn widget(ctx: &Context) -> Result<Vec<Op>> {{\n    let mut ops = Vec::new();\n    helper(ctx, &mut ops);\n    Ok(ops)\n}}\n"
+            "{helper}\nfn widget(ctx: &Context) -> Result<Vec<Op>> {{\n    let mut ops = Vec::new();\n    if ctx.event == \"render\" {{ helper(ctx, &mut ops); }}\n    Ok(ops)\n}}\n"
         );
-        let error =
+        let compiled =
             compile(&source(&handler), &options("widget", EntryKind::Widget))
-                .expect_err("should bail");
-        assert!(
-            error.message.contains("return")
-                || error.message.contains("`?`")
-                || error.message.contains("closure"),
-            "{}",
-            error.message
-        );
+                .expect("compiles");
+        assert!(compiled.source.contains("(function()"));
+        assert!(compiled.source.contains("end)()"));
     }
+}
+
+#[test]
+fn compiles_closures_in_helpers() {
+    let helper = "fn helper(ctx: &Context, ops: &mut Vec<Op>) { let find = |a: i64| a; let _ = find(1); }";
+    let handler = format!(
+        "{helper}\nfn widget(ctx: &Context) -> Result<Vec<Op>> {{\n    let mut ops = Vec::new();\n    if ctx.event == \"render\" {{ helper(ctx, &mut ops); ops.push(Op::log(\"x\")); }}\n    Ok(ops)\n}}\n"
+    );
+    let compiled =
+        compile(&source(&handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("function(a)"));
 }
 
 #[test]
@@ -1068,7 +1070,7 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 use noctalia_rs::{Context, Op, Result};
 
 pub fn handle(_ctx: &Context) -> Result<Vec<Op>> {
-    let bad = _ctx.config.get("a");
+    let bad = std::process::id();
     let _ = bad;
     Ok(Vec::new())
 }
@@ -1371,4 +1373,522 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
             .source
             .contains("noctalia.formatTime(\"%H\", (0), (\"UTC\"))")
     );
+}
+
+#[test]
+fn wraps_early_returns_in_an_iife_inside_nested_loops() {
+    let handler = r#"
+fn helper(ops: &mut Vec<Op>) {
+    for index in 0..3 {
+        if index == 1 {
+            return;
+        }
+        ops.push(Op::log(format!("{}", index)));
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    helper(&mut ops);
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("(function()"));
+    assert!(compiled.source.contains("end)()"));
+    assert!(compiled.source.contains("for index = 0, (3) - 1 do"));
+}
+
+#[test]
+fn lowers_question_mark_on_options_and_results() {
+    let handler = r#"
+fn option(ctx: &Context, ops: &mut Vec<Op>) {
+    let value = ctx.config_str("message")?;
+    ops.push(Op::log(value));
+}
+fn result(ctx: &Context) -> Result<i64> { Ok(ctx.now_ms) }
+fn value(ctx: &Context, ops: &mut Vec<Op>) {
+    let now = result(ctx)?;
+    ops.push(Op::log(format!("{}", now)));
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    option(ctx, &mut ops);
+    value(ctx, &mut ops);
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("== nil then return end"));
+}
+
+#[test]
+fn compiles_once_guards_and_once_locks() {
+    let handler = r#"
+use std::sync::{Once, OnceLock};
+static VALUE: OnceLock<String> = OnceLock::new();
+static ONCE: Once = Once::new();
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let value = VALUE.get_or_init(|| "ready".to_owned());
+    ONCE.call_once(|| ops.push(Op::log("once")));
+    VALUE.set("later".to_owned());
+    ops.push(Op::log(value));
+    ops.push(Op::log(format!("{}", ctx.event.as_str())));
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("local __static_main__VALUE"));
+    assert!(
+        compiled
+            .source
+            .contains("if __static_main__VALUE == nil then")
+    );
+    assert!(compiled.source.contains("if not __static_main__ONCE then"));
+    assert!(compiled.source.contains("__static_main__ONCE = true"));
+}
+
+#[test]
+fn compiles_option_combinators_with_closures() {
+    let handler = r#"
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config_str("message").map(|text| text.to_uppercase());
+    let bool_value = ctx.config_str("message").and_then(Value::as_bool);
+    let kept = ctx.config_str("message").filter(|text| !text.is_empty());
+    let fallback = ctx.config_str("message").unwrap_or_else(|| "none".to_owned());
+    Ok(vec![Op::log(format!("{} {} {} {}", value.unwrap_or_default(), bool_value.unwrap_or(false), kept.unwrap_or_default(), fallback))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("~= nil then"));
+    assert!(compiled.source.contains("function(__value)"));
+    assert!(!compiled.source.contains("not text.is_empty"));
+}
+
+#[test]
+fn compiles_if_let_matches_and_tuple_bindings() {
+    let handler = r#"
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let (first, second) = ("a", "b");
+    if let Some(value) = ctx.config_str("message") {
+        if matches!(value.as_str(), Some(_)) {
+            return Ok(vec![Op::log(format!("{}{}", first, second))]);
+        }
+    }
+    let Some(fallback) = ctx.config_str("message") else {
+        return Ok(vec![Op::log("fallback")]);
+    };
+    Ok(vec![Op::log(fallback)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("local first, second ="));
+    assert!(compiled.source.contains("if (value ~= nil) then"));
+    assert!(!compiled.source.contains("if __static"));
+}
+
+#[test]
+fn bails_on_constructs_without_a_safe_translation() {
+    for handler in [
+        "fn widget(_ctx: &Context) -> Result<Vec<Op>> { Ok(vec![Op::run(json!(\"x\"), None)]) }",
+        "fn widget(_ctx: &Context) -> Result<Vec<Op>> { let value = serde_json::from_str::<serde_json::Value>(\"{}\")?; let _ = value; Ok(vec![]) }",
+        "fn widget(_ctx: &Context) -> Result<Vec<Op>> { other = 1; Ok(vec![]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("widget", EntryKind::Widget))
+                .expect_err("bail");
+        assert!(error.line > 0 && error.column > 0);
+        assert!(!error.message.is_empty());
+    }
+}
+
+#[test]
+fn covers_static_containers_and_atomic_operations() {
+    let handler = r#"
+use std::sync::{Once, OnceLock, Mutex, RwLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+static FLAG: Once = Once::new();
+static CELL: OnceLock<String> = OnceLock::new();
+static LOCK: Mutex<i64> = Mutex::new(1);
+static RW: RwLock<i64> = RwLock::new(2);
+static BOOL: AtomicBool = AtomicBool::new(false);
+static COUNT: AtomicU64 = AtomicU64::new(0);
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    FLAG.call_once(|| ops.push(Op::log("once")));
+    let value = CELL.get_or_init(|| "init".to_owned());
+    CELL.set("set".to_owned());
+    let _ = CELL.take();
+    let _ = LOCK.lock().unwrap();
+    let _ = RW.read().unwrap();
+    let _ = RW.write().unwrap();
+    BOOL.store(true, Ordering::SeqCst);
+    let _ = BOOL.load(Ordering::SeqCst);
+    let _ = COUNT.swap(1, Ordering::SeqCst);
+    let _ = COUNT.fetch_add(1, Ordering::SeqCst);
+    let _ = COUNT.fetch_sub(1, Ordering::SeqCst);
+    ops.push(Op::log(value));
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("__static_main__CELL"));
+}
+
+#[test]
+fn covers_impl_methods_and_struct_fields() {
+    let handler = r#"
+struct State { name: String, count: i64 }
+impl State {
+    fn new(ctx: &Context) -> State { State { name: ctx.config_str("message").unwrap_or_default().into_owned(), count: 0 } }
+    fn bump(&mut self, amount: i64) { self.count += amount; }
+    fn label(&self) -> String { self.name.clone() }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut state = State::new(ctx);
+    state.bump(2);
+    let label = state.label();
+    state.name = "changed".to_owned();
+    Ok(vec![Op::log(label)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("self.count += amount"));
+    assert!(compiled.source.contains("state.name ="));
+}
+
+#[test]
+fn covers_all_option_combinators() {
+    let handler = r#"
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let base = ctx.config_str("message");
+    let mapped = base.clone().map(|value| value.to_uppercase());
+    let chained = base.clone().and_then(Value::as_str);
+    let filtered = base.clone().filter(|value| !value.is_empty());
+    let some = base.clone().is_some_and(|value| value == "x");
+    let or = base.clone().map_or("default".to_owned(), |value| value);
+    let or_else = base.clone().map_or_else(|| "fallback".to_owned(), |value| value);
+    let fallback = base.clone().unwrap_or_else(|| "none".to_owned());
+    let alt = base.clone().or_else(|| Some("alt".to_owned()));
+    let result = base.clone().ok_or("missing");
+    let result2 = base.clone().ok_or_else(|| "missing");
+    Ok(vec![Op::log(format!("{} {} {} {} {} {} {} {} {} {}", mapped.unwrap_or(""), chained.unwrap_or(""), filtered.unwrap_or(""), some, or, or_else, fallback, alt.unwrap_or(""), result.unwrap_or(""), result2.unwrap_or("")))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("function(__value)"));
+}
+
+#[test]
+fn covers_match_and_matches_patterns() {
+    let handler = r#"
+enum Mode { Fast, Slow }
+fn classify(value: Option<&Value>, mode: &str) -> String {
+    match value {
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::String(text)) => text.trim().to_owned(),
+        Some(Value::Bool(flag)) => flag.to_string(),
+        Some(Value::Object(map)) => map.len().to_string(),
+        Some(Value::Array(items)) => items.len().to_string(),
+        None => "none".to_owned(),
+        Some(Value::Null) => "null".to_owned(),
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config_str("message").and_then(Value::as_str);
+    let label = classify(value, "Fast");
+    let known = matches!(label.as_str(), "Fast" | "Slow");
+    let object = matches!(label.as_str(), "" );
+    let mode = Mode::Fast;
+    let other = match mode { Mode::Fast => "f", Mode::Slow => "s" };
+    Ok(vec![Op::log(format!("{}{}{}{}", label, known, object, other))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("type("));
+}
+
+#[test]
+fn covers_expression_subset_additions() {
+    let handler = r#"
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let (first, _, third) = ("a", "b", "c");
+    let map = std::collections::HashMap::new();
+    let set = std::collections::BTreeSet::new();
+    let null = Value::Null;
+    let boolean = Value::Bool(true);
+    let number = Value::Number(1.0);
+    let tree = ui::node("box", json!({ "id": "root" }), vec![]);
+    let key = "message";
+    let from_config = ctx.config.get(key);
+    let indexed = ctx.config["message"];
+    let number_value = from_config.and_then(Value::as_f64).unwrap_or(0.0);
+    if let Some(text) = ctx.config_str("message") {
+        let wrapped = &text;
+        let value = *wrapped;
+        Ok(vec![Op::log(format!("{}{}{}{}{}{}{}{}", first, third, map.len(), set.len(), number, boolean, tree.kind, number_value + value.len() as f64))])
+    } else {
+        let Some(fallback) = indexed.and_then(Value::as_str) else {
+            return Ok(vec![Op::log("fallback")]);
+        };
+        Ok(vec![Op::log(fallback)])
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("noctalia.getConfig"));
+}
+
+#[test]
+fn covers_static_initializers_and_remaining_methods() {
+    let handler = r#"
+use std::cell::{Cell, RefCell};
+use std::sync::{LazyLock, Mutex, atomic::{AtomicBool, Ordering}};
+struct Config { enabled: bool, name: String }
+static CONFIG: Mutex<Config> = Mutex::new(Config { enabled: true, name: "ready" });
+static LAZY: LazyLock<String> = LazyLock::new(|| "lazy".to_owned());
+static CELL: Cell<i64> = Cell::new(1);
+static REF: RefCell<String> = RefCell::new("shared".to_owned());
+static FLAG: AtomicBool = AtomicBool::new(true);
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let value = LAZY.deref();
+    let cell = CELL.get();
+    let shared = REF.borrow();
+    let enabled = FLAG.load(Ordering::SeqCst);
+    let config = CONFIG.lock().unwrap();
+    let mut optional: Option<String> = None;
+    let inserted = optional.get_or_insert("inserted".to_owned());
+    let parsed = ctx.config_str("message").and_then(|text| text.parse::<f64>().ok());
+    let expected = ctx.config_str("message").expect("missing");
+    let map = std::collections::BTreeMap::new();
+    let set = std::collections::HashSet::new();
+    let list = std::collections::HashMap::new();
+    Ok(vec![Op::log(format!("{}{}{}{}{}{}{}{}{}{}{}", value, cell, shared, enabled, config.enabled, inserted, parsed.unwrap_or(0.0), expected, map.len(), set.len(), list.len()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("local __static_main__CONFIG"));
+}
+
+#[test]
+fn covers_local_statics_and_guard_helpers() {
+    let handler = r#"
+use std::sync::{Once, OnceLock};
+fn guard(ctx: &Context, ops: &mut Vec<Op>) {
+    static LOCAL_ONCE: Once = Once::new();
+    static LOCAL_VALUE: OnceLock<String> = OnceLock::new();
+    LOCAL_ONCE.call_once(|| ops.push(Op::log("local")));
+    let value = LOCAL_VALUE.get_or_init(|| ctx.tr("key", &[]));
+    ops.push(Op::log(value));
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    guard(ctx, &mut ops);
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("__local_"));
+}
+
+#[test]
+fn covers_more_match_variants_and_bails() {
+    let handler = r#"
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config_str("message").and_then(Value::as_str);
+    let label = match value {
+        Some("yes") => "on",
+        Some(_) => "other",
+        None => "off",
+    };
+    let tuple = match value { Some(text) => (text, 1), None => ("none", 0) };
+    let flag = matches!(value, Some(_) | None);
+    Ok(vec![Op::log(format!("{}{}{}{}", label, tuple.0, tuple.1, flag))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("tuple[1]"));
+}
+
+#[test]
+fn covers_additional_bail_and_expression_branches() {
+    for handler in [
+        "fn widget(ctx: &Context) -> Result<Vec<Op>> { let value = ctx.config_str(\"message\").map_err(|e| e); let _ = value; Ok(vec![]) }",
+        "fn widget(ctx: &Context) -> Result<Vec<Op>> { let value = ctx.config_str(\"message\").map(|a: i64, b: i64| a + b); let _ = value; Ok(vec![]) }",
+        "fn widget(ctx: &Context) -> Result<Vec<Op>> { static X: std::sync::OnceLock<String> = std::sync::OnceLock::new(); X.compare_exchange(1, 2); Ok(vec![]) }",
+        "fn widget(ctx: &Context) -> Result<Vec<Op>> { let f = |(a, b): (i64, i64)| a + b; let _ = f; Ok(vec![]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("widget", EntryKind::Widget))
+                .expect_err("bail");
+        assert!(!error.message.is_empty());
+    }
+    let handler = r#"
+struct State { count: i64 }
+impl State {
+    fn new() -> State { State { count: 1 } }
+    fn empty(&self) -> bool { self.count == 0 }
+}
+fn widget(_ctx: &Context) -> Result<Vec<Op>> {
+    let state = State::new();
+    let empty = state.empty();
+    let (a, b) = (1, 2);
+    if let value = Some(a) {
+        let Some(text) = Some("x") else { return Ok(vec![]); };
+        return Ok(vec![Op::log(format!("{}{}{}{}", empty, a, b, text))]);
+    }
+    Ok(vec![])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("local a, b ="));
+}
+
+#[test]
+fn emits_closures_as_lua_functions() {
+    let handler = r#"
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let double = |value: i64| value * 2;
+    let add = |left: i64, right: i64| { left + right };
+    let first = double(2);
+    let second = add(1, 2);
+    let ignored = |_value: i64| 0;
+    let third = ignored(1);
+    Ok(vec![Op::log(ctx.tr("key", &[("first", json!(first)), ("second", json!(second)), ("third", json!(third))]))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("function(value)"));
+    assert!(compiled.source.contains("function(left, right)"));
+    assert!(compiled.source.contains("double(2)"));
+}
+
+#[test]
+fn covers_remaining_expression_and_error_paths() {
+    let handler = r#"
+use std::sync::OnceLock;
+struct State { count: i64 }
+impl State {
+    fn new(value: i64) -> State { State { count: value } }
+    fn bump(&mut self, amount: i64, extra: i64) { self.count += amount + extra; }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let state = State::new(1);
+    let mut mutable = state;
+    mut_helper(&mut mutable, ctx);
+    let cell: OnceLock<String> = OnceLock::new();
+    let _ = cell.get();
+    let value = ctx.config.get("message");
+    let indexed = ctx.config["name"];
+    let object = value.and_then(Value::as_object);
+    let number = value.and_then(Value::as_f64);
+    let flag = matches!(value, Value::Null | Some(Value::Bool(false)));
+    let tuple = match value { Some(text) => (text.to_string(), 1), None => ("none".to_owned(), 0) };
+    let tree = ui::node("box", json!({}), vec![]);
+    Ok(vec![Op::log(format!("{}{}{}{}{}{}{}", mutable.count, object.is_some(), number.is_some(), flag, tuple.0, tuple.1, tree.kind))])
+}
+fn mut_helper(state: &mut State, _ctx: &Context) {
+    state.bump(1, 2);
+}
+"#;
+    for handler in [
+        "struct State { count: i64 } impl State { fn new() -> State { State { count: 1 } } } fn widget(_ctx: &Context) -> Result<Vec<Op>> { let s = State::new(2); let _ = s; Ok(vec![]) }",
+        "struct State { count: i64 } impl State { fn bump(&self, a: i64, b: i64) { let _ = (a, b); } } fn widget(_ctx: &Context) -> Result<Vec<Op>> { let s = State { count: 1 }; s.bump(1); Ok(vec![]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("widget", EntryKind::Widget))
+                .expect_err("bail");
+        assert!(error.line > 0);
+    }
+
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("noctalia.getConfig"));
+}
+
+#[test]
+fn covers_final_error_and_pattern_branches() {
+    let handler = r#"
+use std::sync::OnceLock;
+static READY: OnceLock<bool> = OnceLock::new();
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let ready = READY.is_completed();
+    let value = ctx.config_str("message");
+    let mapped = value.clone().map_or(1, |text| text.len() as i64);
+    let kept = value.clone().filter(|text| matches!(text.as_str(), "" | "x"));
+    Ok(vec![Op::log(format!("{}{}{}", ready, mapped, kept.unwrap_or_default()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("~= nil"));
+
+    for handler in [
+        "fn widget(ctx: &Context) -> Result<Vec<Op>> { while ctx.now_ms > 0 { } Ok(vec![]) }",
+        "fn widget(ctx: &Context) -> Result<Vec<Op>> { let value = ctx.config_str(\"message\").map(|a: i64, b: i64| a + b); let _ = value; Ok(vec![]) }",
+        "fn helper(ctx: &Context) -> String { let _ = ctx; } fn widget(ctx: &Context) -> Result<Vec<Op>> { let v = helper(ctx); Ok(vec![Op::log(v)]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("widget", EntryKind::Widget))
+                .expect_err("bail");
+        assert!(!error.message.is_empty());
+    }
+}
+
+#[test]
+fn covers_arithmetic_host_reads_and_pattern_edges() {
+    let handler = r#"
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let a = 10 - 3;
+    let b = 10 / 3;
+    let c = 10.0 / 3.0;
+    let d = 10 % 3;
+    let e = 10.0 % 3.0;
+    let now = ctx.host("now_ms").and_then(Value::as_i64).unwrap_or(0);
+    let dark = ctx.host("dark").and_then(Value::as_bool).unwrap_or(false);
+    let outputs = ctx.host("outputs").unwrap_or(json!([]));
+    let focused = ctx.host("focused_output_name").and_then(Value::as_str).unwrap_or("");
+    let key = "message";
+    let from_key = ctx.config.get(key);
+    let pair = match from_key { (first, second) => first, _ => "none" };
+    let closure = |text: &str| { let upper = text.to_uppercase(); upper };
+    let upper = closure("x");
+    Ok(vec![Op::log(format!("{}{}{}{}{}{}{}{}{}{}", a, b, c, d, e, now, dark, outputs, focused, pair.len() + upper.len()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("noctalia.nowMs()"));
 }

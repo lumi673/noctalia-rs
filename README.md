@@ -150,13 +150,30 @@ NOCTALIA_RS_COMPILE=strict cargo build --release
 
 Valid values are `strict`, `auto`, and `off`. An invalid value stops the build.
 
-The compiler resolves calls through `crate::`, `self::`, `super::`, plain module
-paths, and simple `use` aliases. It inlines helpers it can translate, folds
-event checks at compile time, and covers events, config, payload, state,
-settings, `tr`, host reads, common ops, constants, and plain Rust control flow.
-Recursive calls, early `return`s, `?`, closures, and helpers that mutate through
-other references are not translated. Errors name the module when they sit in an
-inlined helper.
+The compiler reads the whole crate. It resolves calls through `crate::`,
+`self::`, `super::`, plain module paths, and simple `use` aliases. Helpers it
+can translate are inlined: a `&Context` and `&mut Vec<Op>` helper at statement
+position, a value helper in an expression, and a handler that delegates to
+another module. Helpers with early `return`s or `?` run inside a Luau function
+so those operators return from the helper, including inside nested loops.
+`Option` `?` skips on nil. `Err(...)` raises `error(...)` at the point it is
+constructed, so `?` on a `Result` needs no extra check.
+
+Closures become Luau functions, including `map`, `and_then`, `filter`,
+`is_some_and`, `unwrap_or_else`, `get_or_init`, and `call_once`. `Once`,
+`OnceLock`, `LazyLock`, `Mutex`, `RwLock`, and atomics map to Lua locals. Those
+locals live for one compiled script, not for the process, so a static shared by
+several Rust entries becomes one value per entry. Simple structs, impl methods,
+tuple bindings, `if let`, `let-else`, `matches!`, and pattern matches over
+`Option` and `Value` also compile. Event checks are folded at compile time,
+and the compiler covers config, payload, state, settings, `tr`, host reads,
+common ops, and constants. Errors name the module when they sit in an inlined
+helper.
+
+Recursive calls, arbitrary iterators, JSON parsing, callback-id ops, and Rust
+constructs with no clear Luau equivalent fail the build with `file:line:column`
+instead of being approximated.
+
 
 Build and install:
 

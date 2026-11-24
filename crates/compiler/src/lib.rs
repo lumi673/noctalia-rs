@@ -388,6 +388,15 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     if uses_entry {
         let _ = writeln!(out, "local ENTRY = {}", quote(options.entry));
     }
+    let mut statics = std::collections::BTreeMap::new();
+    for slot in &bodies {
+        for (name, init) in &slot.body.statics {
+            statics.insert(name.clone(), init.clone());
+        }
+    }
+    for name in statics.keys() {
+        let _ = writeln!(out, "local {name}");
+    }
     if hoists {
         out.push_str("local PAYLOAD_EMPTY = {}\n");
         out.push_str("local PAYLOAD_UPDATE = { source = \"update\" }\n");
@@ -436,6 +445,9 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "  return pcall(target, table.unpack(args))\n",
             "end\n",
         ));
+    }
+    for (name, init) in &statics {
+        let _ = writeln!(out, "{name} = {init}");
     }
     if !out.ends_with("\n\n") {
         out.push('\n');
@@ -549,7 +561,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     })
 }
 
-fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     let mut out = String::new();
     for character in value.chars() {
         if character.is_ascii_alphanumeric() || character == '_' {

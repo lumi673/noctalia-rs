@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -9,7 +9,7 @@ use syn::{
 };
 
 use crate::program::{Program, typed_args};
-use crate::{Error, is_context, is_identifier, quote};
+use crate::{Error, is_context, is_identifier, quote, sanitize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Base {
@@ -30,6 +30,7 @@ enum Base {
 struct Ty {
     base: Base,
     optional: bool,
+    result: bool,
 }
 
 impl Ty {
@@ -37,6 +38,7 @@ impl Ty {
         Self {
             base,
             optional: false,
+            result: false,
         }
     }
 
@@ -44,6 +46,15 @@ impl Ty {
         Self {
             base,
             optional: true,
+            result: false,
+        }
+    }
+
+    const fn result(base: Base) -> Self {
+        Self {
+            base,
+            optional: false,
+            result: true,
         }
     }
 
@@ -92,6 +103,10 @@ pub(crate) type PayloadParam = (&'static str, &'static str, &'static str);
 
 type Constant = (String, Ty);
 type Constants = HashMap<String, Constant>;
+type LocalStatics = Vec<HashMap<String, (String, StaticKind)>>;
+type PatternBindings = Vec<(String, String)>;
+type OptionalValue = Option<(String, Ty)>;
+type OptionalStatic = Option<(String, StaticKind)>;
 type Inlined = Option<(String, Ty)>;
 
 /// Payload keys that map directly to a callback parameter, so the generated
@@ -130,6 +145,24 @@ pub(crate) struct Body {
     pub uses_source: bool,
     pub params: Vec<&'static str>,
     pub is_empty: bool,
+    pub statics: Vec<(String, String)>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StaticKind {
+    Once,
+    OnceLock,
+    Lazy,
+    Mutex,
+    RwLock,
+    Atomic,
+    Value,
+}
+
+#[derive(Clone, Debug)]
+struct StaticDef {
+    name: String,
+    kind: StaticKind,
+    init: String,
 }
 
 pub(crate) struct Emitter<'a> {
@@ -149,6 +182,14 @@ pub(crate) struct Emitter<'a> {
     home: String,
     inline_stack: Vec<String>,
     inline_budget: usize,
+    statics: BTreeMap<String, StaticDef>,
+    local_statics: LocalStatics,
+    classes: HashMap<String, String>,
+    self_class: Option<String>,
+    pending_class: Option<String>,
+    value_helper: bool,
+    in_statement: bool,
+    containers: HashMap<String, StaticKind>,
     tail_target: Option<String>,
     uses_state: bool,
     uses_payload: bool,
@@ -192,6 +233,14 @@ impl<'a> Emitter<'a> {
             home: module.to_owned(),
             inline_stack: Vec::new(),
             inline_budget: MAX_INLINE_CALLS,
+            statics: BTreeMap::new(),
+            local_statics: Vec::new(),
+            classes: HashMap::new(),
+            self_class: None,
+            pending_class: None,
+            value_helper: false,
+            in_statement: false,
+            containers: HashMap::new(),
             tail_target: None,
             uses_state: false,
             uses_payload: false,
@@ -212,6 +261,108 @@ impl<'a> Emitter<'a> {
             if let Some(entry) = constant(value) {
                 self.constants.insert(name.to_owned(), entry);
             }
+        }
+    }
+
+    fn register_static(
+        &mut self,
+        module: &str,
+        name: &str,
+    ) -> Result<StaticDef, Error> {
+        let key = format!("{module}::{name}");
+        if let Some(def) = self.statics.get(&key) {
+            return Ok(def.clone());
+        }
+        let item = self
+            .program
+            .resolve_static(module, &[name.to_owned()])
+            .map(|(_, item)| item.clone())
+            .ok_or_else(|| {
+                Error::at(
+                    proc_macro2::Span::call_site(),
+                    format!("unknown static `{name}` in a compilable handler"),
+                )
+            })?;
+        let kind = static_kind(&item.ty);
+        let init = self.static_init(&item.expr, kind)?;
+        let lua_name = format!("__static_{}", sanitize(&key));
+        let def = StaticDef {
+            name: lua_name,
+            kind,
+            init,
+        };
+        self.statics.insert(key, def.clone());
+        Ok(def)
+    }
+
+    fn static_init(
+        &mut self,
+        expr: &Expr,
+        kind: StaticKind,
+    ) -> Result<String, Error> {
+        if let Some((text, _)) = constant(expr) {
+            return Ok(text);
+        }
+        if let Expr::Path(path) = expr
+            && path_segments(&path.path).is_some_and(|parts| {
+                parts.last().is_some_and(|name| name == "Null")
+                    && parts.iter().any(|name| name == "Value")
+            })
+        {
+            return Ok("nil".to_owned());
+        }
+        if let Expr::Call(call) = expr
+            && let Some(name) = path_last_name(&call.func)
+        {
+            let variant = name.rsplit("::").next().unwrap_or(&name);
+            match (variant, kind) {
+                ("new", StaticKind::Once) => return Ok("false".to_owned()),
+                ("new", StaticKind::OnceLock | StaticKind::Lazy) => {
+                    return Ok("nil".to_owned());
+                }
+                ("new", StaticKind::Mutex | StaticKind::RwLock) => {
+                    let inner =
+                        arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
+                    return self.static_value(inner);
+                }
+                ("new", StaticKind::Atomic) => {
+                    let inner =
+                        arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
+                    return self.static_value(inner);
+                }
+                _ => {}
+            }
+        }
+        if let Expr::Struct(item) = expr {
+            let mut fields = Vec::new();
+            for field in &item.fields {
+                let syn::Member::Named(name) = &field.member else {
+                    return Err(Error::at(
+                        field.member.span(),
+                        "tuple structs are not supported in static initializers",
+                    ));
+                };
+                let value = self.static_value(&field.expr)?;
+                fields
+                    .push(format!("{} = {value}", lua_key(&name.to_string())));
+            }
+            return Ok(format!("{{ {} }}", fields.join(", ")));
+        }
+        self.static_value(expr)
+    }
+
+    fn static_value(&mut self, expr: &Expr) -> Result<String, Error> {
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        self.indent = 0;
+        let result = self.expr(expr);
+        let lines = std::mem::replace(&mut self.out, saved_out);
+        self.indent = saved_indent;
+        let (text, _) = result?;
+        if lines.trim().is_empty() {
+            Ok(text)
+        } else {
+            Ok(format!("(function()\n{lines}  return {text}\nend)()"))
         }
     }
 
@@ -255,11 +406,11 @@ impl<'a> Emitter<'a> {
         helper: &Helper,
         mode: Inline,
         returns: Returns,
-        call: &ExprCall,
-    ) -> Result<(), Error> {
+        span: &proc_macro2::Span,
+    ) -> Result<BodyCheck, Error> {
         if self.inline_stack.len() >= MAX_INLINE_DEPTH {
             return Err(Error::at(
-                call.span(),
+                *span,
                 format!(
                     "inlining `{}` exceeds the depth limit of {MAX_INLINE_DEPTH}",
                     helper.name
@@ -268,7 +419,7 @@ impl<'a> Emitter<'a> {
         }
         if self.inline_budget == 0 {
             return Err(Error::at(
-                call.span(),
+                *span,
                 format!(
                     "inlining `{}` exceeds the limit of {MAX_INLINE_CALLS} calls per body",
                     helper.name
@@ -278,7 +429,7 @@ impl<'a> Emitter<'a> {
         let key = format!("{}::{}", helper.module, helper.name);
         if self.inline_stack.contains(&key) {
             return Err(Error::at(
-                call.span(),
+                *span,
                 format!("recursive helper `{}` cannot be inlined", helper.name),
             ));
         }
@@ -289,7 +440,7 @@ impl<'a> Emitter<'a> {
             | (Inline::Ops, Returns::VecOps) => {}
             (Inline::Value, Returns::Ops) => {
                 return Err(Error::at(
-                    call.span(),
+                    *span,
                     format!(
                         "helper `{}` returns `Result<Vec<Op>>` and can only be called in tail position",
                         helper.name
@@ -299,7 +450,7 @@ impl<'a> Emitter<'a> {
             (Inline::Value, Returns::VecOps)
             | (Inline::Tail, Returns::VecOps) => {
                 return Err(Error::at(
-                    call.span(),
+                    *span,
                     format!(
                         "helper `{}` returns `Vec<Op>` and can only be used inside `Ok(...)`",
                         helper.name
@@ -308,7 +459,7 @@ impl<'a> Emitter<'a> {
             }
             (_, Returns::Ops) => {
                 return Err(Error::at(
-                    call.span(),
+                    *span,
                     format!(
                         "helper `{}` returns `Result<Vec<Op>>` and must be called in tail position",
                         helper.name
@@ -317,7 +468,7 @@ impl<'a> Emitter<'a> {
             }
             (Inline::Ops, Returns::Unit | Returns::Value(_)) => {
                 return Err(Error::at(
-                    call.span(),
+                    *span,
                     format!(
                         "helper `{}` does not build a `Vec<Op>`",
                         helper.name
@@ -326,13 +477,13 @@ impl<'a> Emitter<'a> {
             }
             (Inline::Value, Returns::Unit) => {
                 return Err(Error::at(
-                    call.span(),
+                    *span,
                     format!("helper `{}` returns no value", helper.name),
                 ));
             }
             (Inline::Statement, Returns::Value(_) | Returns::VecOps) => {
                 return Err(Error::at(
-                    call.span(),
+                    *span,
                     format!(
                         "helper `{}` returns a value and must be used in an expression",
                         helper.name
@@ -362,63 +513,100 @@ impl<'a> Emitter<'a> {
         }
         let mut bindings = Vec::new();
         for ((pattern, ty), argument) in params.iter().zip(call.args.iter()) {
-            let Pat::Ident(pattern) = pattern else {
-                return Err(Error::at(
-                    ty.span(),
-                    "helper parameters must be plain identifiers",
-                ));
-            };
-            let name = pattern.ident.to_string();
-            if is_context(ty) {
-                if !self.is_ctx_expr(strip_reference(argument)) {
-                    return Err(Error::at(
-                        argument.span(),
-                        format!(
-                            "argument for `{name}` must be the context passed to the caller"
-                        ),
-                    ));
-                }
-                bindings.push(Binding::Context(name));
-                continue;
-            }
-            if is_ops_vec(ty) {
-                let Expr::Path(path) = strip_reference(argument) else {
-                    return Err(Error::at(
-                        argument.span(),
-                        "expected a local `Vec<Op>` for this argument",
-                    ));
-                };
-                let Some(ident) = path.path.get_ident() else {
-                    return Err(Error::at(
-                        argument.span(),
-                        "expected a local `Vec<Op>` for this argument",
-                    ));
-                };
-                if self.lookup(&ident.to_string()) != Some(Ty::OPS) {
-                    return Err(Error::at(
-                        argument.span(),
-                        "expected a local `Vec<Op>` for this argument",
-                    ));
-                }
-                bindings.push(Binding::Ops(name));
-                continue;
-            }
-            if let Type::Reference(reference) = ty
-                && reference.mutability.is_some()
-            {
-                return Err(Error::at(
-                    ty.span(),
-                    "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
-                ));
-            }
-            let (text, value) = self.expr(argument)?;
-            bindings.push(Binding::Local {
-                name,
-                text,
-                ty: value,
-            });
+            bindings.push(self.binding(pattern, ty, argument)?);
         }
         Ok(bindings)
+    }
+
+    fn binding(
+        &mut self,
+        pattern: &Pat,
+        ty: &Type,
+        argument: &Expr,
+    ) -> Result<Binding, Error> {
+        let Pat::Ident(pattern) = pattern else {
+            return Err(Error::at(
+                ty.span(),
+                "helper parameters must be plain identifiers",
+            ));
+        };
+        let name = pattern.ident.to_string();
+        if is_context(ty) {
+            if !self.is_ctx_expr(strip_reference(argument)) {
+                return Err(Error::at(
+                    argument.span(),
+                    format!(
+                        "argument for `{name}` must be the context passed to the caller"
+                    ),
+                ));
+            }
+            return Ok(Binding::Context(name));
+        }
+        if is_ops_vec(ty) {
+            let Expr::Path(path) = strip_reference(argument) else {
+                return Err(Error::at(
+                    argument.span(),
+                    "expected a local `Vec<Op>` for this argument",
+                ));
+            };
+            let Some(ident) = path.path.get_ident() else {
+                return Err(Error::at(
+                    argument.span(),
+                    "expected a local `Vec<Op>` for this argument",
+                ));
+            };
+            if self.lookup(&ident.to_string()) != Some(Ty::OPS) {
+                return Err(Error::at(
+                    argument.span(),
+                    "expected a local `Vec<Op>` for this argument",
+                ));
+            }
+            return Ok(Binding::Ops(name));
+        }
+        if let Type::Reference(reference) = ty
+            && reference.mutability.is_some()
+        {
+            let base = type_text(ty);
+            if !matches!(
+                base.as_str(),
+                "String"
+                    | "str"
+                    | "Vec"
+                    | "HashMap"
+                    | "BTreeMap"
+                    | "Value"
+                    | "Op"
+                    | "Context"
+                    | "Path"
+                    | "PathBuf"
+            ) {
+                let (text, value) = self.expr(argument)?;
+                return Ok(Binding::Local {
+                    name,
+                    text,
+                    ty: value,
+                    container: StaticKind::Value,
+                });
+            }
+            return Err(Error::at(
+                ty.span(),
+                "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
+            ));
+        }
+        let (text, value) = self.expr(argument)?;
+        let kind = static_kind(ty);
+        if kind != StaticKind::Value
+            && let Expr::Path(path) = strip_reference(argument)
+            && let Some(name) = path.path.get_ident()
+        {
+            self.containers.insert(name.to_string(), kind);
+        }
+        Ok(Binding::Local {
+            name,
+            text,
+            ty: value,
+            container: kind,
+        })
     }
 
     fn inline_call(
@@ -429,10 +617,20 @@ impl<'a> Emitter<'a> {
         let Some(helper) = self.helper(call) else {
             return Ok(None);
         };
-        let returns = return_kind(&helper.function)?;
-        self.check_inline(&helper, mode, returns, call)?;
         let bindings = self.bindings(&helper, call)?;
-        let value = self.inline(&helper, bindings, mode, returns)?;
+        self.inline_resolved(helper, mode, call.span(), bindings)
+    }
+
+    fn inline_resolved(
+        &mut self,
+        helper: Helper,
+        mode: Inline,
+        span: proc_macro2::Span,
+        bindings: Vec<Binding>,
+    ) -> Result<Inlined, Error> {
+        let returns = return_kind(&helper.function)?;
+        let check = self.check_inline(&helper, mode, returns, &span)?;
+        let value = self.inline(&helper, bindings, mode, returns, check)?;
         Ok(Some(value))
     }
 
@@ -458,30 +656,56 @@ impl<'a> Emitter<'a> {
         bindings: Vec<Binding>,
         mode: Inline,
         returns: Returns,
+        check: BodyCheck,
     ) -> Result<(String, Ty), Error> {
+        let iife = check.needs_iife;
+        let saved_class = self.self_class.clone();
         let temp = (mode == Inline::Value).then(|| self.temp());
         if let Some(name) = &temp {
-            self.line(&format!("local {name}"));
+            if iife {
+                self.line(&format!("local {name}"));
+                self.line(&format!("{name} = (function()"));
+            } else {
+                self.line(&format!("local {name}"));
+                self.line("do");
+            }
+        } else if iife {
+            self.line("(function()");
+        } else {
+            self.line("do");
         }
-        self.line("do");
         self.indent = self.indent.saturating_add(1);
         self.scopes.push(HashMap::new());
+        self.local_statics.push(HashMap::new());
         let saved_module =
             std::mem::replace(&mut self.module, helper.module.clone());
         let scope = self.module_constants(&helper.module);
         self.constant_scopes.push(scope);
         let saved_target = self.tail_target.clone();
-        self.tail_target = temp.clone();
+        self.tail_target = if iife { None } else { temp.clone() };
         for binding in bindings {
             match binding {
                 Binding::Context(name) => self.push(&name, Ty::CONTEXT),
                 Binding::Ops(name) => self.push(&name, Ty::OPS),
-                Binding::Local { name, text, ty } => {
+                Binding::Local {
+                    name,
+                    text,
+                    ty,
+                    container,
+                } => {
                     self.line(&format!("local {name} = {text}"));
+                    if container != StaticKind::Value {
+                        self.containers.insert(name.clone(), container);
+                    }
+                    if let Some(class) = self.pending_class.take() {
+                        self.classes.insert(name.clone(), class);
+                    }
                     self.push(&name, ty);
                 }
             }
         }
+        let saved_value_helper = self.value_helper;
+        self.value_helper = mode == Inline::Value;
         let key = format!("{}::{}", helper.module, helper.name);
         self.inline_stack.push(key);
         self.inline_budget = self.inline_budget.saturating_sub(1);
@@ -508,12 +732,19 @@ impl<'a> Emitter<'a> {
                 .map(|()| (String::new(), Ty::VOID)),
         };
         self.inline_stack.pop();
+        self.value_helper = saved_value_helper;
+        self.self_class = saved_class;
         self.tail_target = saved_target;
         self.constant_scopes.pop();
         self.module = saved_module;
         self.scopes.pop();
+        self.local_statics.pop();
         self.indent = self.indent.saturating_sub(1);
-        self.line("end");
+        if iife {
+            self.line("end)()");
+        } else {
+            self.line("end");
+        }
         let foreign = helper.module != self.home;
         result.map_err(|error| {
             if foreign {
@@ -526,7 +757,9 @@ impl<'a> Emitter<'a> {
 
     pub(crate) fn block(&mut self, block: &syn::Block) -> Result<(), Error> {
         self.scopes.push(HashMap::new());
+        self.local_statics.push(HashMap::new());
         let result = self.block_inner(block, true);
+        self.local_statics.pop();
         self.scopes.pop();
         result
     }
@@ -579,6 +812,11 @@ impl<'a> Emitter<'a> {
                 .map(|(_, body_param, _)| *body_param)
                 .collect(),
             is_empty: !self.emitted,
+            statics: self
+                .statics
+                .values()
+                .map(|def| (def.name.clone(), def.init.clone()))
+                .collect(),
         }
     }
 
@@ -606,6 +844,7 @@ impl<'a> Emitter<'a> {
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), Error> {
         match stmt {
             Stmt::Local(local) => self.local(local),
+            Stmt::Item(syn::Item::Static(item)) => self.local_static(item),
             Stmt::Expr(expr, _) if diverges(expr) => {
                 self.line("do");
                 self.indent = self.indent.saturating_add(1);
@@ -637,7 +876,22 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         match expr {
-            Expr::Call(call) if is_ok_call(call) => self.ok_tail(&call.args),
+            Expr::Call(call) if is_ok_call(call) => {
+                if self.value_helper {
+                    let value = call.args.first().ok_or_else(|| {
+                        Error::at(call.span(), "Ok() needs a value")
+                    })?;
+                    let (text, _) = self.expr(value)?;
+                    if let Some(target) = self.tail_target.clone() {
+                        self.line(&format!("{target} = {text}"));
+                    } else {
+                        self.line(&format!("return {text}"));
+                    }
+                    Ok(())
+                } else {
+                    self.ok_tail(&call.args)
+                }
+            }
             Expr::If(item) => self.if_stmt(item, true),
             Expr::Match(item) => self.match_stmt(item, true),
             Expr::Return(item) => self.ret(item.expr.as_deref()),
@@ -646,7 +900,11 @@ impl<'a> Emitter<'a> {
             Expr::Group(group) => self.tail_expr(&group.expr),
             Expr::Tuple(tuple) if tuple.elems.is_empty() => Ok(()),
             _ => {
-                let (text, ty) = self.expr(expr)?;
+                let saved_statement = self.in_statement;
+                self.in_statement = true;
+                let result = self.expr(expr);
+                self.in_statement = saved_statement;
+                let (text, ty) = result?;
                 if ty.base != Base::Void {
                     if let Some(target) = self.tail_target.clone() {
                         self.line(&format!("{target} = {text}"));
@@ -664,6 +922,51 @@ impl<'a> Emitter<'a> {
             Pat::Type(typed) => (&*typed.pat, Some(&*typed.ty)),
             other => (other, None),
         };
+        if let Some(init) = &local.init
+            && let Some((_, diverge)) = &init.diverge
+        {
+            return self.let_else(pattern, &init.expr, diverge);
+        }
+        if let Pat::Tuple(tuple) = pattern {
+            let (text, _) = self.expr(
+                local.init.as_ref().map(|i| &*i.expr).ok_or_else(|| {
+                    Error::at(
+                        local.span(),
+                        "tuple binding needs an initializer",
+                    )
+                })?,
+            )?;
+            let mut names = Vec::new();
+            for element in &tuple.elems {
+                match element {
+                    Pat::Ident(pattern) => {
+                        let name = pattern.ident.to_string();
+                        self.push(&name, Ty::VALUE);
+                        names.push(name);
+                    }
+                    Pat::Wild(_) => names.push("_".to_owned()),
+                    other => {
+                        return Err(Error::at(
+                            other.span(),
+                            "tuple bindings must be plain identifiers",
+                        ));
+                    }
+                }
+            }
+            let temp = self.temp();
+            self.line(&format!("local {temp} = {text}"));
+            let values = names
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("{temp}[{}]", index + 1))
+                .collect::<Vec<_>>();
+            self.line(&format!(
+                "local {} = {}",
+                names.join(", "),
+                values.join(", ")
+            ));
+            return Ok(());
+        }
         let name = match pattern {
             Pat::Ident(pattern) => pattern.ident.to_string(),
             Pat::Wild(_) => "_".to_owned(),
@@ -676,6 +979,11 @@ impl<'a> Emitter<'a> {
         };
         let Some(init) = &local.init else {
             let ty = hint.map_or(Ty::VALUE, type_hint);
+            if let Some(kind) = hint.map(static_kind)
+                && kind != StaticKind::Value
+            {
+                self.containers.insert(name.clone(), kind);
+            }
             self.push(&name, ty);
             self.line(&format!("local {name} = nil"));
             return Ok(());
@@ -706,7 +1014,78 @@ impl<'a> Emitter<'a> {
         }
         let (text, ty) = self.expr(&init.expr)?;
         self.line(&format!("local {name} = {text}"));
+        if let Some(kind) = hint.map(static_kind)
+            && kind != StaticKind::Value
+        {
+            self.containers.insert(name.clone(), kind);
+        }
+        if let Some(class) = self.pending_class.take() {
+            self.classes.insert(name.clone(), class);
+        }
         self.push(&name, ty);
+        Ok(())
+    }
+
+    fn let_else(
+        &mut self,
+        pattern: &Pat,
+        init: &Expr,
+        diverge: &Expr,
+    ) -> Result<(), Error> {
+        let (name, inner) = match pattern {
+            Pat::Ident(pattern) => (pattern.ident.to_string(), None),
+            Pat::TupleStruct(item)
+                if item
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "Some") =>
+            {
+                match item.elems.first() {
+                    Some(Pat::Ident(pattern)) => {
+                        (pattern.ident.to_string(), Some(true))
+                    }
+                    _ => {
+                        return Err(Error::at(
+                            item.span(),
+                            "let-else patterns must bind plain identifiers",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::at(
+                    pattern.span(),
+                    "let-else patterns must be plain identifiers or `Some(name)`",
+                ));
+            }
+        };
+        let (text, ty) = self.expr(init)?;
+        self.line(&format!("local {name} = {text}"));
+        self.push(
+            &name,
+            if inner.is_some() {
+                Ty::opt(ty.base)
+            } else {
+                ty
+            },
+        );
+        self.line(&format!("if {name} == nil then"));
+        self.indent = self.indent.saturating_add(1);
+        self.expr_stmt(diverge)?;
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        Ok(())
+    }
+
+    fn local_static(&mut self, item: &syn::ItemStatic) -> Result<(), Error> {
+        let kind = static_kind(&item.ty);
+        let init = self.static_init(&item.expr, kind)?;
+        let name = format!("__local_{}", self.temp().trim_start_matches("__t"));
+        self.line(&format!("local {name} = {init}"));
+        if let Some(scope) = self.local_statics.last_mut() {
+            scope.insert(item.ident.to_string(), (name, kind));
+        }
         Ok(())
     }
 
@@ -746,7 +1125,9 @@ impl<'a> Emitter<'a> {
                 self.line("do");
                 self.indent = self.indent.saturating_add(1);
                 self.scopes.push(HashMap::new());
+                self.local_statics.push(HashMap::new());
                 let result = self.block_inner(&block.block, false);
+                self.local_statics.pop();
                 self.scopes.pop();
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
@@ -764,7 +1145,9 @@ impl<'a> Emitter<'a> {
             Expr::Tuple(tuple) if tuple.elems.is_empty() => Ok(()),
             _ => {
                 let (text, ty) = self.expr(expr)?;
-                if ty.base == Base::Void {
+                if ty.base == Base::Void
+                    || (matches!(expr, Expr::MethodCall(_)) && !text.is_empty())
+                {
                     if !text.is_empty() {
                         self.line(&text);
                     }
@@ -832,9 +1215,20 @@ impl<'a> Emitter<'a> {
             && let Some(helper) = self.helper(call)
             && matches!(return_kind(&helper.function)?, Returns::VecOps)
         {
-            self.check_inline(&helper, Inline::Ops, Returns::VecOps, call)?;
+            let check = self.check_inline(
+                &helper,
+                Inline::Ops,
+                Returns::VecOps,
+                &call.span(),
+            )?;
             let bindings = self.bindings(&helper, call)?;
-            self.inline(&helper, bindings, Inline::Ops, Returns::VecOps)?;
+            self.inline(
+                &helper,
+                bindings,
+                Inline::Ops,
+                Returns::VecOps,
+                check,
+            )?;
             if emit_return {
                 self.line("return");
             }
@@ -921,6 +1315,40 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    fn let_condition(&mut self, item: &syn::ExprLet) -> Result<String, Error> {
+        let (text, ty) = self.expr(&item.expr)?;
+        match &*item.pat {
+            Pat::Ident(pattern) => {
+                let name = pattern.ident.to_string();
+                self.line(&format!("local {name} = {text}"));
+                self.push(&name, ty);
+                Ok(format!("({name} ~= nil)"))
+            }
+            Pat::TupleStruct(binding)
+                if binding
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == "Some") =>
+            {
+                let Some(Pat::Ident(pattern)) = binding.elems.first() else {
+                    return Err(Error::at(
+                        binding.span(),
+                        "if let patterns must bind plain identifiers",
+                    ));
+                };
+                let name = pattern.ident.to_string();
+                self.line(&format!("local {name} = {text}"));
+                self.push(&name, Ty::opt(ty.base));
+                Ok(format!("({name} ~= nil)"))
+            }
+            Pat::Wild(_) => Ok(text),
+            other => Err(Error::at(
+                other.span(),
+                "if let patterns must be plain identifiers or `Some(name)`",
+            )),
+        }
+    }
     fn write_if_chain(
         &mut self,
         chain: &[(&Expr, &syn::Block)],
@@ -931,7 +1359,10 @@ impl<'a> Emitter<'a> {
         let Some((condition, block)) = chain.first().copied() else {
             return self.emit_else(else_branch, tail);
         };
-        let (condition, _) = self.expr(condition)?;
+        let (condition, _) = match condition {
+            Expr::Let(item) => (self.let_condition(item)?, Ty::BOOL),
+            _ => self.expr(condition)?,
+        };
         let keyword = if elseif { "elseif" } else { "if" };
         self.line(&format!("{keyword} {condition} then"));
         self.indent = self.indent.saturating_add(1);
@@ -1071,28 +1502,19 @@ impl<'a> Emitter<'a> {
         let (scrutinee, _) = self.expr(&item.expr)?;
         let event_match = self.is_event_expr(&item.expr);
         let mut opened = false;
-        for arm in &item.arms {
-            let (pattern, guard) = split_guard(&arm.pat);
-            let patterns = pattern_strings(pattern)?;
-            let mut condition = if let Some(patterns) = &patterns {
-                if event_match {
+        if event_match {
+            for arm in &item.arms {
+                if let Some(patterns) = pattern_strings(&arm.pat)? {
                     for pattern in patterns {
-                        self.events.insert(pattern.clone());
+                        self.events.insert(pattern);
                     }
                 }
-                patterns
-                    .iter()
-                    .map(|pattern| format!("{scrutinee} == {}", quote(pattern)))
-                    .collect::<Vec<_>>()
-                    .join(" or ")
-            } else if is_wild(pattern) {
-                "true".to_owned()
-            } else {
-                return Err(Error::at(
-                    arm.pat.span(),
-                    "only string literal, wildcard and guarded match patterns are supported by the Luau compiler",
-                ));
-            };
+            }
+        }
+        for arm in &item.arms {
+            let (pattern, guard) = split_guard(&arm.pat);
+            let (mut condition, bindings) =
+                self.pattern_match(&scrutinee, pattern)?;
             if let Some(guard) = guard {
                 let (text, _) = self.expr(guard)?;
                 condition = format!("({condition}) and ({text})");
@@ -1100,7 +1522,14 @@ impl<'a> Emitter<'a> {
             let keyword = if opened { "elseif" } else { "if" };
             self.line(&format!("{keyword} {condition} then"));
             self.indent = self.indent.saturating_add(1);
-            self.arm_body(&arm.body, tail)?;
+            self.scopes.push(HashMap::new());
+            for (name, text) in bindings {
+                self.line(&format!("local {name} = {text}"));
+                self.push(&name, Ty::VALUE);
+            }
+            let result = self.arm_body(&arm.body, tail);
+            self.scopes.pop();
+            result?;
             self.indent = self.indent.saturating_sub(1);
             opened = true;
         }
@@ -1110,6 +1539,239 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    fn pattern_match(
+        &self,
+        value: &str,
+        pattern: &Pat,
+    ) -> Result<(String, PatternBindings), Error> {
+        match pattern {
+            Pat::Wild(_) => Ok(("true".to_owned(), Vec::new())),
+            Pat::Paren(paren) => self.pattern_match(value, &paren.pat),
+            Pat::Lit(lit) => {
+                let literal = Expr::Lit(lit.clone());
+                let (text, _) = constant(&literal).ok_or_else(|| {
+                    Error::at(lit.span(), "unsupported match literal")
+                })?;
+                Ok((format!("({value} == {text})"), Vec::new()))
+            }
+            Pat::Or(or) => {
+                let mut conditions = Vec::new();
+                let mut bindings = Vec::new();
+                for case in &or.cases {
+                    let (condition, case_bindings) =
+                        self.pattern_match(value, case)?;
+                    conditions.push(condition);
+                    if bindings.is_empty() {
+                        bindings = case_bindings;
+                    }
+                }
+                Ok((format!("({})", conditions.join(" or ")), bindings))
+            }
+            Pat::Ident(pattern) => {
+                let name = pattern.ident.to_string();
+                match name.as_str() {
+                    "None" | "Null" => {
+                        Ok((format!("({value} == nil)"), Vec::new()))
+                    }
+                    _ => {
+                        Ok(("true".to_owned(), vec![(name, value.to_owned())]))
+                    }
+                }
+            }
+            Pat::Path(path) => {
+                let name = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                match name.as_str() {
+                    "None" | "Null" => {
+                        Ok((format!("({value} == nil)"), Vec::new()))
+                    }
+                    "Some" => Ok((format!("({value} ~= nil)"), Vec::new())),
+                    _ => {
+                        let segments = path
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>();
+                        if let Some(variant) =
+                            self.program.enum_variant(&self.module, &segments)
+                        {
+                            return Ok((
+                                format!("({value} == {})", quote(&variant)),
+                                Vec::new(),
+                            ));
+                        }
+                        Err(Error::at(
+                            path.span(),
+                            format!(
+                                "match pattern `{name}` is not supported by the Luau compiler"
+                            ),
+                        ))
+                    }
+                }
+            }
+            Pat::TupleStruct(item) => {
+                let name = item
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                let mut conditions = Vec::new();
+                let mut bindings = Vec::new();
+                match name.as_str() {
+                    "Some" => conditions.push(format!("({value} ~= nil)")),
+                    "Null" | "None" => {
+                        conditions.push(format!("({value} == nil)"))
+                    }
+                    "Bool" | "String" | "Number" | "Object" | "Array" => {
+                        let lua_type = match name.as_str() {
+                            "Bool" => "boolean",
+                            "String" => "string",
+                            "Number" => "number",
+                            _ => "table",
+                        };
+                        conditions
+                            .push(format!("(type({value}) == \"{lua_type}\")"));
+                    }
+                    _ => {
+                        return Err(Error::at(
+                            item.span(),
+                            format!(
+                                "match pattern `{name}` is not supported by the Luau compiler"
+                            ),
+                        ));
+                    }
+                }
+                for element in &item.elems {
+                    self.nested_pattern(
+                        value,
+                        element,
+                        &mut conditions,
+                        &mut bindings,
+                    )?;
+                }
+                Ok((format!("({})", conditions.join(" and ")), bindings))
+            }
+            Pat::Tuple(tuple) => {
+                let mut conditions = Vec::new();
+                let mut bindings = Vec::new();
+                for (index, element) in tuple.elems.iter().enumerate() {
+                    let item = format!("{value}[{}]", index + 1);
+                    conditions.push(format!("({item} ~= nil)"));
+                    if let Pat::Ident(pattern) = element {
+                        bindings.push((pattern.ident.to_string(), item));
+                    }
+                }
+                Ok((format!("({})", conditions.join(" and ")), bindings))
+            }
+            _ => Err(Error::at(
+                pattern.span(),
+                "match pattern is not supported by the Luau compiler",
+            )),
+        }
+    }
+
+    fn nested_pattern(
+        &self,
+        value: &str,
+        pattern: &Pat,
+        conditions: &mut Vec<String>,
+        bindings: &mut PatternBindings,
+    ) -> Result<(), Error> {
+        match pattern {
+            Pat::Ident(pattern) => {
+                bindings.push((pattern.ident.to_string(), value.to_owned()));
+            }
+            Pat::Wild(_) => {}
+            Pat::Paren(paren) => {
+                self.nested_pattern(value, &paren.pat, conditions, bindings)?;
+            }
+            Pat::Reference(reference) => {
+                self.nested_pattern(
+                    value,
+                    &reference.pat,
+                    conditions,
+                    bindings,
+                )?;
+            }
+            Pat::Lit(lit) => {
+                let literal = Expr::Lit(lit.clone());
+                let (text, _) = constant(&literal).ok_or_else(|| {
+                    Error::at(lit.span(), "unsupported match literal")
+                })?;
+                conditions.push(format!("({value} == {text})"));
+            }
+            Pat::Path(path) => {
+                let name = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                match name.as_str() {
+                    "None" | "Null" => {
+                        conditions.push(format!("({value} == nil)"))
+                    }
+                    "Some" => conditions.push(format!("({value} ~= nil)")),
+                    _ => {
+                        return Err(Error::at(
+                            path.span(),
+                            format!(
+                                "match pattern `{name}` is not supported by the Luau compiler"
+                            ),
+                        ));
+                    }
+                }
+            }
+            Pat::TupleStruct(item) => {
+                let name = item
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                match name.as_str() {
+                    "Some" => conditions.push(format!("({value} ~= nil)")),
+                    "None" | "Null" => {
+                        conditions.push(format!("({value} == nil)"))
+                    }
+                    "Bool" | "String" | "Number" | "Object" | "Array" => {
+                        let lua_type = match name.as_str() {
+                            "Bool" => "boolean",
+                            "String" => "string",
+                            "Number" => "number",
+                            _ => "table",
+                        };
+                        conditions
+                            .push(format!("(type({value}) == \"{lua_type}\")"));
+                    }
+                    _ => {
+                        return Err(Error::at(
+                            item.span(),
+                            format!(
+                                "match pattern `{name}` is not supported by the Luau compiler"
+                            ),
+                        ));
+                    }
+                }
+                for element in &item.elems {
+                    self.nested_pattern(value, element, conditions, bindings)?;
+                }
+            }
+            _ => {
+                return Err(Error::at(
+                    pattern.span(),
+                    "nested match patterns are not supported by the Luau compiler",
+                ));
+            }
+        }
+        Ok(())
+    }
     fn inline_arm(&mut self, body: &Expr, tail: bool) -> Result<(), Error> {
         if tail {
             return self.arm_body(body, true);
@@ -1187,22 +1849,67 @@ impl<'a> Emitter<'a> {
         right: &Expr,
         op: &str,
     ) -> Result<(), Error> {
-        let Expr::Path(path) = strip_reference(left) else {
+        let target = match strip_reference(left) {
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .map(|ident| ident.to_string())
+                .ok_or_else(|| {
+                    Error::at(
+                        left.span(),
+                        "only assignments to local variables are supported",
+                    )
+                })?,
+            Expr::Field(field) => {
+                let Expr::Path(base) = strip_reference(&field.base) else {
+                    return Err(Error::at(
+                        left.span(),
+                        "only assignments to local variables and struct fields are supported",
+                    ));
+                };
+                let syn::Member::Named(member) = &field.member else {
+                    return Err(Error::at(
+                        left.span(),
+                        "tuple field assignment is not supported",
+                    ));
+                };
+                let base = base
+                    .path
+                    .get_ident()
+                    .ok_or_else(|| {
+                        Error::at(
+                            left.span(),
+                            "only assignments to local variables and struct fields are supported",
+                        )
+                    })?
+                    .to_string();
+                format!("{base}.{}", lua_key(&member.to_string()))
+            }
+            _ => {
+                return Err(Error::at(
+                    left.span(),
+                    "only assignments to local variables are supported",
+                ));
+            }
+        };
+        if matches!(strip_reference(left), Expr::Path(_))
+            && self.lookup(&target).is_none()
+            && self
+                .program
+                .resolve_static(&self.module, std::slice::from_ref(&target))
+                .is_none()
+            && !self.containers.contains_key(&target)
+        {
             return Err(Error::at(
                 left.span(),
-                "only assignments to local variables are supported",
+                format!("assignment to undeclared local `{target}`"),
             ));
-        };
-        let Some(name) = path.path.get_ident() else {
-            return Err(Error::at(
-                left.span(),
-                "only assignments to local variables are supported",
-            ));
-        };
-        let name = name.to_string();
+        }
         let (text, ty) = self.expr(right)?;
-        self.line(&format!("{name} {op} {text}"));
-        self.push(&name, ty);
+        self.line(&format!("{target} {op} {text}"));
+        if matches!(strip_reference(left), Expr::Path(_)) {
+            self.push(&target, ty);
+        }
         Ok(())
     }
 
@@ -1221,10 +1928,22 @@ impl<'a> Emitter<'a> {
             Expr::Macro(mac) => self.macro_expr(mac),
             Expr::Index(index) => self.index(index),
             Expr::Cast(cast) => self.cast(cast),
-            Expr::Struct(_) => {
-                self.op_expr(expr)?;
-                Ok((String::new(), Ty::VOID))
+            Expr::Try(item) => self.try_expr(&item.expr),
+            Expr::Closure(item) => self.closure(item),
+            Expr::Match(item) => {
+                let saved_out = std::mem::take(&mut self.out);
+                let saved_indent = self.indent;
+                let saved_target = self.tail_target.clone();
+                self.indent = 0;
+                self.tail_target = None;
+                let result = self.match_stmt(item, true);
+                let body = std::mem::replace(&mut self.out, saved_out);
+                self.indent = saved_indent;
+                self.tail_target = saved_target;
+                result?;
+                Ok((format!("(function()\n{body}end)()"), Ty::VALUE))
             }
+            Expr::Struct(item) => self.struct_expr(item),
             Expr::If(item) => {
                 let (chain, else_branch) = if_chain(item);
                 if chain
@@ -1274,11 +1993,56 @@ impl<'a> Emitter<'a> {
             Expr::Tuple(tuple) if tuple.elems.is_empty() => {
                 Ok(("nil".to_owned(), Ty::VOID))
             }
+            Expr::Tuple(tuple) => {
+                let mut values = Vec::new();
+                for element in &tuple.elems {
+                    values.push(self.expr(element)?.0);
+                }
+                Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
+            }
             other => Err(Error::at(
                 other.span(),
                 "unsupported expression in a compilable handler",
             )),
         }
+    }
+
+    fn struct_expr(
+        &mut self,
+        item: &syn::ExprStruct,
+    ) -> Result<(String, Ty), Error> {
+        let segments = item
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>();
+        if segments
+            .get(segments.len().saturating_sub(2))
+            .is_some_and(|name| name == "Op")
+        {
+            self.op_expr(&Expr::Struct(item.clone()))?;
+            return Ok((String::new(), Ty::VOID));
+        }
+        let class = segments.last().cloned().unwrap_or_default();
+        let class = if class == "Self" {
+            self.self_class.clone().unwrap_or(class)
+        } else {
+            class
+        };
+        let mut fields = Vec::new();
+        for field in &item.fields {
+            let syn::Member::Named(name) = &field.member else {
+                return Err(Error::at(
+                    field.member.span(),
+                    "tuple structs are not supported by the Luau compiler",
+                ));
+            };
+            let value = self.expr(&field.expr)?.0;
+            fields.push(format!("{} = {value}", lua_key(&name.to_string())));
+        }
+        self.pending_class = Some(class);
+        Ok((format!("{{ {} }}", fields.join(", ")), Ty::VALUE))
     }
 
     fn temp(&mut self) -> String {
@@ -1328,6 +2092,59 @@ impl<'a> Emitter<'a> {
         {
             return Ok((text, ty));
         }
+        if let Some(segments) = path_segments(&path.path)
+            && segments.last().is_some_and(|name| name == "from")
+            && segments.iter().any(|name| name == "PathBuf")
+        {
+            return Ok((
+                "(function(__value) return __value end)".to_owned(),
+                Ty::VALUE,
+            ));
+        }
+        if let Some(segments) = path_segments(&path.path)
+            && segments.last().is_some_and(|name| name == "Null")
+            && segments.iter().any(|name| name == "Value")
+        {
+            return Ok(("nil".to_owned(), Ty::VALUE));
+        }
+        if let Some(segments) = path_segments(&path.path)
+            && let Some(variant) =
+                self.program.enum_variant(&self.module, &segments)
+        {
+            return Ok((quote(&variant), Ty::STR));
+        }
+        if let Some(segments) = path_segments(&path.path)
+            && let Some(name) = segments.last()
+        {
+            if let Some((lua, _)) = self
+                .local_statics
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+            {
+                return Ok((lua.clone(), Ty::VALUE));
+            }
+            let resolved = self
+                .program
+                .resolve_static(&self.module, &segments)
+                .map(|(module, _)| module);
+            if let Some(module) = resolved {
+                let def = self.register_static(&module, name)?;
+                return Ok((def.name, Ty::VALUE));
+            }
+        }
+        if let Some(segments) = path_segments(&path.path)
+            && segments.len() == 2
+            && segments[0] == "Value"
+            && let Some(lua_type) = value_accessor(&segments[1])
+        {
+            return Ok((
+                format!(
+                    "(function(__value) if type(__value) == \"{lua_type}\" then return __value end end)"
+                ),
+                Ty::VALUE,
+            ));
+        }
         let Some(name) = path.path.get_ident() else {
             return Err(Error::at(expr.span(), "unsupported path expression"));
         };
@@ -1372,6 +2189,7 @@ impl<'a> Emitter<'a> {
         match unary.op {
             UnOp::Not(_) => Ok((format!("(not {text})"), Ty::BOOL)),
             UnOp::Neg(_) => Ok((format!("(-{text})"), ty)),
+            UnOp::Deref(_) => Ok((text, ty)),
             other => Err(Error::at(other.span(), "unsupported unary operator")),
         }
     }
@@ -1425,13 +2243,366 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn static_receiver(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<OptionalStatic, Error> {
+        let Expr::Path(path) = strip_reference(expr) else {
+            return Ok(None);
+        };
+        let Some(segments) = path_segments(&path.path) else {
+            return Ok(None);
+        };
+        let Some(name) = segments.last() else {
+            return Ok(None);
+        };
+        if let Some((lua, kind)) = self
+            .local_statics
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+        {
+            return Ok(Some((lua.clone(), *kind)));
+        }
+        if let Some(kind) = self.containers.get(name) {
+            return Ok(Some((name.clone(), *kind)));
+        }
+        let Some((module, _)) =
+            self.program.resolve_static(&self.module, &segments)
+        else {
+            return Ok(None);
+        };
+        let def = self.register_static(&module, name)?;
+        Ok(Some((def.name, def.kind)))
+    }
+
+    fn static_method(
+        &mut self,
+        lua: &str,
+        kind: StaticKind,
+        call: &ExprMethodCall,
+        args: &[&Expr],
+    ) -> Result<(String, Ty), Error> {
+        match call.method.to_string().as_str() {
+            "call_once" => {
+                let closure = arg(args, 0, call)?;
+                self.line(&format!("if not {lua} then"));
+                self.indent = self.indent.saturating_add(1);
+                self.line(&format!("{lua} = true"));
+                let (text, _) = self.invoke_arg(closure, &[])?;
+                if !text.is_empty() {
+                    self.line(&text);
+                }
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok((String::new(), Ty::VOID))
+            }
+            "get_or_init" | "get_or_try_init" => {
+                let closure = arg(args, 0, call)?;
+                self.line(&format!("if {lua} == nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, ty) = self.invoke_arg(closure, &[])?;
+                self.line(&format!("{lua} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok((
+                    lua.to_owned(),
+                    Ty {
+                        result: false,
+                        ..ty
+                    },
+                ))
+            }
+            "set" => {
+                let value = arg(args, 0, call)?;
+                let (text, _) = self.expr(value)?;
+                let previous = self.temp();
+                self.line(&format!("local {previous} = ({lua} ~= nil)"));
+                self.line(&format!(
+                    "if not {previous} then {lua} = {text} end"
+                ));
+                if self.in_statement {
+                    Ok((String::new(), Ty::VOID))
+                } else {
+                    Ok((previous, Ty::BOOL))
+                }
+            }
+            "take" => {
+                self.line(&format!("local __taken = {lua}"));
+                self.line(&format!("{lua} = nil"));
+                Ok(("__taken".to_owned(), Ty::VALUE))
+            }
+            "lock" | "read" | "write" => {
+                Ok((lua.to_owned(), Ty::result(Base::Value)))
+            }
+            "get" | "get_mut" | "load" | "deref" | "borrow" | "borrow_mut" => {
+                Ok((lua.to_owned(), Ty::VALUE))
+            }
+            "store" | "swap" => {
+                let value = arg(args, 0, call)?;
+                let (text, _) = self.expr(value)?;
+                let previous = self.temp();
+                self.line(&format!("local {previous} = {lua}"));
+                self.line(&format!("{lua} = {text}"));
+                Ok((previous, Ty::VALUE))
+            }
+            "fetch_add" | "fetch_sub" => {
+                let value = arg(args, 0, call)?;
+                let (text, _) = self.expr(value)?;
+                let previous = self.temp();
+                self.line(&format!("local {previous} = {lua}"));
+                let operator =
+                    if call.method == "fetch_add" { "+" } else { "-" };
+                self.line(&format!("{lua} = {previous} {operator} {text}"));
+                Ok((previous, Ty::INT))
+            }
+            "is_completed" | "is_finished" => {
+                Ok((format!("({lua} ~= nil)"), Ty::BOOL))
+            }
+            _ => {
+                let _ = kind;
+                Err(Error::at(
+                    call.method.span(),
+                    format!(
+                        "method `{}` on a static is not supported by the Luau compiler",
+                        call.method
+                    ),
+                ))
+            }
+        }
+    }
+    fn invoke_arg(
+        &mut self,
+        arg: &Expr,
+        values: &[String],
+    ) -> Result<(String, Ty), Error> {
+        if let Expr::Closure(closure) = arg {
+            return self.closure_value(closure, values);
+        }
+        let (text, ty) = self.expr(arg)?;
+        Ok((format!("({text})({})", values.join(", ")), ty))
+    }
+
+    fn combinator(
+        &mut self,
+        call: &ExprMethodCall,
+        method: &str,
+        args: &[&Expr],
+        receiver: &str,
+        ty: Ty,
+    ) -> Result<OptionalValue, Error> {
+        match method {
+            "lock" | "read" | "write" => {
+                return Ok(Some((receiver.to_owned(), Ty::result(ty.base))));
+            }
+            "map_err" if ty.result => {
+                return Ok(Some((receiver.to_owned(), ty)));
+            }
+            "unwrap_or_else" if ty.result => {
+                return Ok(Some((
+                    receiver.to_owned(),
+                    Ty {
+                        result: false,
+                        ..ty
+                    },
+                )));
+            }
+            "map" | "and_then" => {
+                let closure = arg(args, 0, call)?;
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result}"));
+                self.line(&format!("if {value} ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, value_ty) =
+                    self.invoke_arg(closure, std::slice::from_ref(&value))?;
+                self.line(&format!("{result} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((
+                    result,
+                    Ty {
+                        optional: true,
+                        ..value_ty
+                    },
+                )));
+            }
+            "filter" => {
+                let closure = arg(args, 0, call)?;
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result}"));
+                self.line(&format!("if {value} ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, _) =
+                    self.invoke_arg(closure, std::slice::from_ref(&value))?;
+                self.line(&format!("if {text} then {result} = {value} end"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((result, Ty::opt(ty.base))));
+            }
+            "is_some_and" => {
+                let closure = arg(args, 0, call)?;
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result} = false"));
+                self.line(&format!("if {value} ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, _) =
+                    self.invoke_arg(closure, std::slice::from_ref(&value))?;
+                self.line(&format!("{result} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((result, Ty::BOOL)));
+            }
+            "map_or" | "map_or_else" => {
+                let default = arg(args, 0, call)?;
+                let closure = arg(args, 1, call)?;
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                let (fallback, fallback_ty) = self.invoke_arg(default, &[])?;
+                self.line(&format!("local {result} = {fallback}"));
+                self.line(&format!("if {value} ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, value_ty) =
+                    self.invoke_arg(closure, std::slice::from_ref(&value))?;
+                self.line(&format!("{result} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((result, wider(fallback_ty, value_ty))));
+            }
+            "unwrap_or_else" | "or_else" => {
+                let closure = arg(args, 0, call)?;
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result} = {value}"));
+                self.line(&format!("if {value} == nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, fallback_ty) = self.invoke_arg(closure, &[])?;
+                self.line(&format!("{result} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((result, wider(ty, fallback_ty))));
+            }
+            "ok_or" | "ok_or_else" => {
+                let message = arg(args, 0, call)?;
+                let value = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                let (error, _) = self.invoke_arg(message, &[])?;
+                self.line(&format!(
+                    "if {value} == nil then error(tostring({error})) end"
+                ));
+                return Ok(Some((
+                    value,
+                    Ty {
+                        result: false,
+                        ..ty
+                    },
+                )));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+    fn class_of_receiver(&self, expr: &Expr) -> Option<String> {
+        let Expr::Path(path) = strip_reference(expr) else {
+            return None;
+        };
+        let name = path.path.get_ident()?.to_string();
+        self.classes.get(&name).cloned()
+    }
+
+    fn method_call(
+        &mut self,
+        call: &ExprMethodCall,
+        receiver: &str,
+        class: &str,
+    ) -> Result<OptionalValue, Error> {
+        let Some((module, function)) = self.program.resolve_method(
+            &self.module,
+            class,
+            &call.method.to_string(),
+        ) else {
+            return Ok(None);
+        };
+        let function = function.clone();
+        let helper = Helper {
+            module,
+            name: format!("{class}::{}", call.method),
+            function,
+        };
+        let returns = return_kind(&helper.function)?;
+        let mode = match returns {
+            Returns::Value(_) => Inline::Value,
+            Returns::Unit => Inline::Statement,
+            Returns::Ops | Returns::VecOps => {
+                return Err(Error::at(
+                    call.span(),
+                    "methods returning ops are not supported in expression position",
+                ));
+            }
+        };
+        let mut bindings = vec![Binding::Local {
+            name: "self".to_owned(),
+            text: receiver.to_owned(),
+            ty: Ty::VALUE,
+            container: StaticKind::Value,
+        }];
+        let args = call.args.iter().collect::<Vec<_>>();
+        let params = typed_args(&helper.function);
+        if params.len() != args.len() {
+            return Err(Error::at(
+                call.span(),
+                format!(
+                    "`{class}::{}` takes {} arguments but {} were passed",
+                    call.method,
+                    params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        for ((pattern, ty), argument) in params.iter().zip(args.iter()) {
+            bindings.push(self.binding(pattern, ty, argument)?);
+        }
+        self.self_class = Some(class.to_owned());
+        let result = self.inline_resolved(helper, mode, call.span(), bindings);
+        self.self_class = None;
+        result
+    }
+
     fn method(&mut self, call: &ExprMethodCall) -> Result<(String, Ty), Error> {
         let method = call.method.to_string();
         let args = call.args.iter().collect::<Vec<_>>();
         if self.is_ctx_expr(&call.receiver) {
             return self.context_method(call, &method, &args);
         }
+        if is_config_expr(&call.receiver) && method == "get" {
+            let (key, _) = self.expr(arg(&args, 0, call)?)?;
+            return Ok((
+                self.coerced_string(format!("noctalia.getConfig({key})"), true),
+                Ty::OPT_VALUE,
+            ));
+        }
+        if let Some((lua, kind)) = self.static_receiver(&call.receiver)? {
+            return self.static_method(&lua, kind, call, &args);
+        }
+        if let Some(class) = self.class_of_receiver(&call.receiver) {
+            let receiver = self.expr(&call.receiver)?.0;
+            if let Some(value) = self.method_call(call, &receiver, &class)? {
+                return Ok(value);
+            }
+        }
         let (receiver, ty) = self.expr(&call.receiver)?;
+        if let Some(value) =
+            self.combinator(call, &method, &args, &receiver, ty)?
+        {
+            return Ok(value);
+        }
         match method.as_str() {
             "to_string" => Ok((format!("tostring({receiver})"), Ty::STR)),
             "into_owned" | "to_owned" | "clone" | "as_ref" | "as_deref"
@@ -1444,6 +2615,55 @@ impl<'a> Emitter<'a> {
             "as_array" => Ok((receiver, Ty::OPT_LIST)),
             "is_some" => Ok((format!("({receiver} ~= nil)"), Ty::BOOL)),
             "is_none" => Ok((format!("({receiver} == nil)"), Ty::BOOL)),
+            "is_ok" => Ok((format!("({receiver} ~= nil)"), Ty::BOOL)),
+            "is_err" => Ok((format!("({receiver} == nil)"), Ty::BOOL)),
+            "is_null" => Ok((format!("({receiver} == nil)"), Ty::BOOL)),
+            "is_object" | "is_array" => {
+                Ok((format!("(type({receiver}) == \"table\")"), Ty::BOOL))
+            }
+            "is_string" => {
+                Ok((format!("(type({receiver}) == \"string\")"), Ty::BOOL))
+            }
+            "is_number" => {
+                Ok((format!("(type({receiver}) == \"number\")"), Ty::BOOL))
+            }
+            "is_boolean" => {
+                Ok((format!("(type({receiver}) == \"boolean\")"), Ty::BOOL))
+            }
+            "expect" => {
+                let (message, _) = self.expr(arg(&args, 0, call)?)?;
+                let value = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!(
+                    "if {value} == nil then error(tostring({message})) end"
+                ));
+                Ok((value, Ty::new(ty.base)))
+            }
+            "parse" => {
+                let ty = turbofish_type(call.turbofish.as_ref());
+                Ok((receiver, ty))
+            }
+            "ok" => Ok((
+                receiver,
+                Ty {
+                    optional: true,
+                    ..ty
+                },
+            )),
+            "get_or_insert" | "get_or_insert_with" => {
+                let value = arg(&args, 0, call)?;
+                let (text, value_ty) = if method == "get_or_insert" {
+                    self.expr(value)?
+                } else {
+                    self.invoke_arg(value, &[])?
+                };
+                self.line(&format!("if {receiver} == nil then"));
+                self.indent = self.indent.saturating_add(1);
+                self.line(&format!("{receiver} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok((receiver, value_ty))
+            }
             "unwrap" => {
                 self.uses_unwrap = true;
                 Ok((format!("unwrap({receiver})"), Ty::new(ty.base)))
@@ -1835,17 +3055,139 @@ impl<'a> Emitter<'a> {
         Ok(text)
     }
 
+    fn std_constructor(
+        &mut self,
+        call: &ExprCall,
+        args: &[&Expr],
+    ) -> Result<OptionalValue, Error> {
+        let Some(name) = path_last_name(&call.func) else {
+            return Ok(None);
+        };
+        let parts = name.split("::").collect::<Vec<_>>();
+        let variant = if parts.last().is_some_and(|part| *part == "new") {
+            parts
+                .get(parts.len().saturating_sub(2))
+                .copied()
+                .unwrap_or("new")
+        } else {
+            parts.last().copied().unwrap_or("")
+        };
+        match variant {
+            "HashMap" | "BTreeMap" | "HashSet" | "BTreeSet" | "Map" => {
+                Ok(Some(("{}".to_owned(), Ty::LIST)))
+            }
+            "Bool" | "String" | "Number" => {
+                let inner = arg(args, 0, call)?;
+                self.expr(inner).map(Some)
+            }
+            "Mutex" | "RwLock" | "Cell" | "RefCell" => {
+                let inner = arg(args, 0, call)?;
+                let (text, ty) = self.expr(inner)?;
+                if variant == "Mutex" || variant == "RwLock" {
+                    if let Some(class) = self.pending_class.take() {
+                        self.classes.insert(text.clone(), class);
+                    }
+                    return Ok(Some((text, Ty::result(Base::Value))));
+                }
+                Ok(Some((text, ty)))
+            }
+            "OnceLock" | "LazyLock" => Ok(Some(("nil".to_owned(), Ty::VALUE))),
+            "node" if name.contains("ui::") => {
+                let kind = self.expr(arg(args, 0, call)?)?.0;
+                let props = self.expr(arg(args, 1, call)?)?.0;
+                let children = self.expr(arg(args, 2, call)?)?.0;
+                Ok(Some((
+                    format!(
+                        "{{ kind = {kind}, props = {props}, children = {children} }}"
+                    ),
+                    Ty::NODE,
+                )))
+            }
+            "Some" => self.expr(arg(args, 0, call)?).map(Some),
+            "Ok" => self.expr(arg(args, 0, call)?).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn associated_call(
+        &mut self,
+        call: &ExprCall,
+        args: &[&Expr],
+    ) -> Result<OptionalValue, Error> {
+        let Expr::Path(path) = &*call.func else {
+            return Ok(None);
+        };
+        let Some(segments) = path_segments(&path.path) else {
+            return Ok(None);
+        };
+        if segments.len() < 2 {
+            return Ok(None);
+        }
+        let method = segments.last().map_or("", String::as_str);
+        let class = segments[segments.len() - 2].as_str();
+        let Some((module, function)) =
+            self.program.resolve_method(&self.module, class, method)
+        else {
+            return Ok(None);
+        };
+        let function = function.clone();
+        let helper = Helper {
+            module,
+            name: format!("{class}::{method}"),
+            function,
+        };
+        let mut bindings = Vec::new();
+        let params = typed_args(&helper.function);
+        if params.len() != args.len() {
+            return Err(Error::at(
+                call.span(),
+                format!(
+                    "`{class}::{method}` takes {} arguments but {} were passed",
+                    params.len(),
+                    args.len()
+                ),
+            ));
+        }
+        for ((pattern, ty), argument) in params.iter().zip(args.iter()) {
+            bindings.push(self.binding(pattern, ty, argument)?);
+        }
+        self.self_class = Some(class.to_owned());
+        let result =
+            self.inline_resolved(helper, Inline::Value, call.span(), bindings);
+        self.self_class = None;
+        result
+    }
+
     fn call(&mut self, call: &ExprCall) -> Result<(String, Ty), Error> {
         if let Some(name) = path_last_name(&call.func) {
             let args = call.args.iter().collect::<Vec<_>>();
+            if !name.contains("::")
+                && self.lookup(&name).is_some()
+                && !self.is_ctx_expr(&call.func)
+            {
+                let mut values = Vec::new();
+                for argument in &args {
+                    values.push(self.expr(argument)?.0);
+                }
+                return Ok((
+                    format!("{name}({})", values.join(", ")),
+                    Ty::VALUE,
+                ));
+            }
             match name.as_str() {
                 "Some" => return self.expr(arg(&args, 0, call)?),
                 "String::new" => return Ok(("\"\"".to_owned(), Ty::STR)),
                 "Vec::new" => return Ok(("{}".to_owned(), Ty::LIST)),
                 _ => {}
             }
+            if let Some(value) = self.std_constructor(call, &args)? {
+                return Ok(value);
+            }
             if let Some(kind) = ui_constructor(&name) {
                 return self.ui_node(call, kind);
+            }
+            if let Some(value) = self.associated_call(call, &args)? {
+                return Ok(value);
             }
             if let Some(op) = op_constructor(&name) {
                 self.op_call(call, &op)?;
@@ -1906,17 +3248,18 @@ impl<'a> Emitter<'a> {
 
     fn field(
         &mut self,
-        expr: &Expr,
+        _expr: &Expr,
         field: &syn::ExprField,
     ) -> Result<(String, Ty), Error> {
-        let Member::Named(name) = &field.member else {
-            return Err(Error::at(
-                expr.span(),
-                "tuple field access is not supported",
-            ));
+        let member = match &field.member {
+            Member::Named(name) => name.to_string(),
+            Member::Unnamed(index) => {
+                let (base, _) = self.expr(&field.base)?;
+                return Ok((format!("{base}[{}]", index.index + 1), Ty::VALUE));
+            }
         };
         if self.is_ctx_expr(&field.base) {
-            return match name.to_string().as_str() {
+            return match member.as_str() {
                 "event" => Ok(match &self.bound_event {
                     Some(event) => (quote(event), Ty::STR),
                     None => ("event".to_owned(), Ty::STR),
@@ -1940,6 +3283,7 @@ impl<'a> Emitter<'a> {
                         .to_owned(),
                     Ty::STR,
                 )),
+                "config" => Ok(("noctalia".to_owned(), Ty::VALUE)),
                 other => Err(Error::at(
                     field.member.span(),
                     format!(
@@ -1950,14 +3294,24 @@ impl<'a> Emitter<'a> {
         }
         let (base, _) = self.expr(&field.base)?;
         Ok((
-            format!("{base}[{}]", lua_key(&name.to_string())),
+            if is_identifier(&member) {
+                format!("{base}.{member}")
+            } else {
+                format!("{base}[{}]", quote(&member))
+            },
             Ty::OPT_VALUE,
         ))
     }
 
     fn index(&mut self, index: &syn::ExprIndex) -> Result<(String, Ty), Error> {
-        let (base, _) = self.expr(&index.expr)?;
         let (key, key_ty) = self.expr(&index.index)?;
+        if is_config_expr(&index.expr) {
+            return Ok((
+                self.coerced_string(format!("noctalia.getConfig({key})"), true),
+                Ty::OPT_VALUE,
+            ));
+        }
+        let (base, _) = self.expr(&index.expr)?;
         if key_ty.base == Base::Int {
             Ok((format!("{base}[({key}) + 1]"), Ty::OPT_VALUE))
         } else {
@@ -1970,9 +3324,141 @@ impl<'a> Emitter<'a> {
         Ok((text, type_hint(&cast.ty)))
     }
 
+    fn try_expr(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
+        let (text, ty) = self.expr(expr)?;
+        let name = self.temp();
+        self.line(&format!("local {name} = {text}"));
+        if ty.optional {
+            self.line(&format!("if {name} == nil then return end"));
+        }
+        Ok((
+            name,
+            Ty {
+                optional: false,
+                result: false,
+                ..ty
+            },
+        ))
+    }
+
+    fn closure(
+        &mut self,
+        closure: &syn::ExprClosure,
+    ) -> Result<(String, Ty), Error> {
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        let saved_target = self.tail_target.clone();
+        self.indent = 0;
+        self.tail_target = None;
+        self.scopes.push(HashMap::new());
+        self.local_statics.push(HashMap::new());
+        let mut params = Vec::new();
+        for input in &closure.inputs {
+            let input = match input {
+                Pat::Type(typed) => &*typed.pat,
+                other => other,
+            };
+            match input {
+                syn::Pat::Ident(pattern) => {
+                    let name = pattern.ident.to_string();
+                    self.push(&name, Ty::VALUE);
+                    params.push(name);
+                }
+                syn::Pat::Wild(_) => params.push("_".to_owned()),
+                other => {
+                    self.local_statics.pop();
+                    self.scopes.pop();
+                    self.out = saved_out;
+                    self.indent = saved_indent;
+                    self.tail_target = saved_target;
+                    return Err(Error::at(
+                        other.span(),
+                        "closure parameters must be plain identifiers",
+                    ));
+                }
+            }
+        }
+        self.out
+            .push_str(&format!("function({})\n", params.join(", ")));
+        self.indent = 1;
+        let result = match &*closure.body {
+            Expr::Block(block) => self.block_inner(&block.block, true),
+            body => self.tail_expr(body),
+        };
+        self.indent = 0;
+        self.line("end");
+        let text = std::mem::replace(&mut self.out, saved_out);
+        self.local_statics.pop();
+        self.scopes.pop();
+        self.indent = saved_indent;
+        self.tail_target = saved_target;
+        result?;
+        Ok((text, Ty::VALUE))
+    }
+
+    fn closure_value(
+        &mut self,
+        closure: &syn::ExprClosure,
+        args: &[String],
+    ) -> Result<(String, Ty), Error> {
+        if closure.inputs.len() != args.len() {
+            return Err(Error::at(
+                closure.span(),
+                format!(
+                    "closure takes {} arguments but {} were passed",
+                    closure.inputs.len(),
+                    args.len()
+                ),
+            ));
+        }
+        self.scopes.push(HashMap::new());
+        self.local_statics.push(HashMap::new());
+        for (input, value) in closure.inputs.iter().zip(args) {
+            let input = match input {
+                Pat::Type(typed) => &*typed.pat,
+                other => other,
+            };
+            match input {
+                syn::Pat::Ident(pattern) => {
+                    let name = pattern.ident.to_string();
+                    self.line(&format!("local {name} = {value}"));
+                    self.push(&name, Ty::VALUE);
+                }
+                syn::Pat::Wild(_) => {}
+                other => {
+                    self.local_statics.pop();
+                    self.scopes.pop();
+                    return Err(Error::at(
+                        other.span(),
+                        "closure parameters must be plain identifiers",
+                    ));
+                }
+            }
+        }
+        let result = match &*closure.body {
+            Expr::Block(block) => match block.block.stmts.split_last() {
+                Some((last, rest)) => {
+                    for stmt in rest {
+                        self.stmt(stmt)?;
+                    }
+                    match last {
+                        Stmt::Expr(expr, _) => self.expr(expr),
+                        _ => Ok(("nil".to_owned(), Ty::VALUE)),
+                    }
+                }
+                None => Ok(("nil".to_owned(), Ty::VALUE)),
+            },
+            body => self.expr(body),
+        };
+        self.local_statics.pop();
+        self.scopes.pop();
+        result
+    }
+
     fn macro_expr(&mut self, mac: &ExprMacro) -> Result<(String, Ty), Error> {
         match macro_name(mac).as_str() {
             "format" => self.format(mac),
+            "matches" => self.matches_macro(mac),
             "json" => self.json(mac),
             "vec" => {
                 let items = parse_vec(mac)?;
@@ -2074,6 +3560,136 @@ impl<'a> Emitter<'a> {
     fn json(&mut self, mac: &ExprMacro) -> Result<(String, Ty), Error> {
         let node: JsonNode = syn::parse2(mac.mac.tokens.clone())?;
         self.json_node(&node)
+    }
+    fn matches_macro(
+        &mut self,
+        mac: &ExprMacro,
+    ) -> Result<(String, Ty), Error> {
+        let parsed: MatchesArgs = syn::parse2(mac.mac.tokens.clone())?;
+        let (expr, _) = self.expr(&parsed.expr)?;
+        let condition = self.pattern_condition(&expr, &parsed.pat)?;
+        Ok((format!("({condition})"), Ty::BOOL))
+    }
+
+    fn pattern_condition(
+        &self,
+        value: &str,
+        pattern: &Pat,
+    ) -> Result<String, Error> {
+        match pattern {
+            Pat::Wild(_) => Ok("true".to_owned()),
+            Pat::Lit(lit) => {
+                let literal = Expr::Lit(lit.clone());
+                let (text, _) = constant(&literal).ok_or_else(|| {
+                    Error::at(lit.span(), "unsupported matches! literal")
+                })?;
+                Ok(format!("({value} == {text})"))
+            }
+            Pat::Or(or) => {
+                let mut parts = Vec::new();
+                for case in &or.cases {
+                    parts.push(self.pattern_condition(value, case)?);
+                }
+                Ok(format!("({})", parts.join(" or ")))
+            }
+            Pat::Paren(paren) => self.pattern_condition(value, &paren.pat),
+            Pat::Ident(pattern) => {
+                let name = pattern.ident.to_string();
+                match name.as_str() {
+                    "None" | "Null" => Ok(format!("({value} == nil)")),
+                    "Some" => Ok(format!("({value} ~= nil)")),
+                    _ => Ok("true".to_owned()),
+                }
+            }
+            Pat::Path(path) => {
+                let name = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                match name.as_str() {
+                    "None" | "Null" => Ok(format!("({value} == nil)")),
+                    "Some" => Ok(format!("({value} ~= nil)")),
+                    _ => {
+                        let segments = path
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>();
+                        if let Some(variant) =
+                            self.program.enum_variant(&self.module, &segments)
+                        {
+                            return Ok(format!(
+                                "({value} == {})",
+                                quote(&variant)
+                            ));
+                        }
+                        Err(Error::at(
+                            path.span(),
+                            format!(
+                                "matches! pattern `{name}` is not supported by the Luau compiler"
+                            ),
+                        ))
+                    }
+                }
+            }
+            Pat::TupleStruct(item) => {
+                let name = item
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                match name.as_str() {
+                    "Some" => {
+                        let mut conditions = vec![format!("({value} ~= nil)")];
+                        let mut bindings = Vec::new();
+                        for inner in &item.elems {
+                            self.nested_pattern(
+                                value,
+                                inner,
+                                &mut conditions,
+                                &mut bindings,
+                            )?;
+                        }
+                        Ok(format!("({})", conditions.join(" and ")))
+                    }
+                    "Null" => Ok(format!("({value} == nil)")),
+                    "Bool" | "String" | "Number" | "Object" | "Array" => {
+                        let lua_type = match name.as_str() {
+                            "Bool" => "boolean",
+                            "String" => "string",
+                            "Number" => "number",
+                            _ => "table",
+                        };
+                        let mut conditions =
+                            vec![format!("(type({value}) == \"{lua_type}\")")];
+                        let mut bindings = Vec::new();
+                        for inner in &item.elems {
+                            self.nested_pattern(
+                                value,
+                                inner,
+                                &mut conditions,
+                                &mut bindings,
+                            )?;
+                        }
+                        Ok(format!("({})", conditions.join(" and ")))
+                    }
+                    _ => Err(Error::at(
+                        item.span(),
+                        format!(
+                            "matches! pattern `{name}` is not supported by the Luau compiler"
+                        ),
+                    )),
+                }
+            }
+            _ => Err(Error::at(
+                pattern.span(),
+                "matches! pattern is not supported by the Luau compiler",
+            )),
+        }
     }
 
     fn json_node(&mut self, node: &JsonNode) -> Result<(String, Ty), Error> {
@@ -2438,6 +4054,13 @@ impl<'a> Emitter<'a> {
     }
 }
 
+fn is_config_expr(expr: &Expr) -> bool {
+    let Expr::Field(field) = strip_reference(expr) else {
+        return false;
+    };
+    matches!(&field.member, Member::Named(name) if name == "config")
+        && matches!(&*field.base, Expr::Path(_))
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Inline {
     Tail,
@@ -2463,7 +4086,12 @@ struct Helper {
 enum Binding {
     Context(String),
     Ops(String),
-    Local { name: String, text: String, ty: Ty },
+    Local {
+        name: String,
+        text: String,
+        ty: Ty,
+        container: StaticKind,
+    },
 }
 
 fn constant(expr: &Expr) -> Option<(String, Ty)> {
@@ -2479,6 +4107,16 @@ fn constant(expr: &Expr) -> Option<(String, Ty)> {
         ),
         _ => return None,
     })
+}
+
+fn value_accessor(name: &str) -> Option<&'static str> {
+    match name {
+        "as_str" => Some("string"),
+        "as_bool" => Some("boolean"),
+        "as_i64" | "as_u64" | "as_f64" => Some("number"),
+        "as_array" | "as_object" => Some("table"),
+        _ => None,
+    }
 }
 
 fn path_segments(path: &syn::Path) -> Option<Vec<String>> {
@@ -2512,6 +4150,10 @@ fn generic_arg(ty: &Type) -> Option<&Type> {
     Some(inner)
 }
 
+fn is_generic(ty: &Type, name: &str) -> bool {
+    matches!(ty, Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == name))
+}
+
 fn is_result(ty: &Type) -> bool {
     matches!(ty, Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Result"))
 }
@@ -2543,10 +4185,8 @@ fn return_kind(function: &ItemFn) -> Result<Returns, Error> {
     if is_result(ty) {
         return match generic_arg(ty) {
             Some(inner) if is_ops_vec(inner) => Ok(Returns::Ops),
-            _ => Err(Error::at(
-                ty.span(),
-                "inlined helpers may only return `Result<Vec<Op>>`",
-            )),
+            Some(inner) => Ok(Returns::Value(type_hint(inner))),
+            None => Ok(Returns::Value(Ty::VALUE)),
         };
     }
     if is_ops_vec(ty) {
@@ -2564,7 +4204,6 @@ struct Scan {
     try_span: Option<proc_macro2::Span>,
     closure_span: Option<proc_macro2::Span>,
 }
-
 impl Scan {
     fn block(&mut self, block: &syn::Block) {
         for stmt in &block.stmts {
@@ -2577,6 +4216,9 @@ impl Scan {
             Stmt::Local(local) => {
                 if let Some(init) = &local.init {
                     self.expr(&init.expr);
+                    if let Some((_, diverge)) = &init.diverge {
+                        self.expr(diverge);
+                    }
                 }
             }
             Stmt::Expr(expr, _) => self.expr(expr),
@@ -2683,46 +4325,30 @@ impl Scan {
     }
 }
 
-fn check_body(function: &ItemFn, mode: Inline) -> Result<(), Error> {
-    let block = &function.block;
-    for (index, stmt) in block.stmts.iter().enumerate() {
-        let last = index.saturating_add(1) == block.stmts.len();
-        let mut scan = Scan::default();
-        scan.stmt(stmt);
-        if let Some(span) = scan.try_span {
-            return Err(Error::at(
-                span,
-                "the `?` operator is not supported inside an inlined helper",
-            ));
-        }
-        if let Some(span) = scan.closure_span {
-            return Err(Error::at(
-                span,
-                "closures cannot be inlined into Luau",
-            ));
-        }
-        if let Some(span) = scan.return_span {
-            let tail_return =
-                last && matches!(stmt, Stmt::Expr(Expr::Return(_), _));
-            if !(tail_return
-                && !matches!(mode, Inline::Statement | Inline::Ops))
-            {
-                return Err(Error::at(
-                    span,
-                    "early `return` inside an inlined helper is not supported",
-                ));
-            }
-        }
-    }
+#[derive(Clone, Copy, Debug, Default)]
+struct BodyCheck {
+    needs_iife: bool,
+}
+
+fn check_body(function: &ItemFn, mode: Inline) -> Result<BodyCheck, Error> {
+    let mut scan = Scan::default();
+    scan.block(&function.block);
+    let tail_return = matches!(
+        function.block.stmts.last(),
+        Some(Stmt::Expr(Expr::Return(_), _))
+    );
+    let needs_iife = (scan.return_span.is_some()
+        && !(tail_return && !matches!(mode, Inline::Statement | Inline::Ops)))
+        || scan.try_span.is_some();
     if mode == Inline::Value
-        && !matches!(block.stmts.last(), Some(Stmt::Expr(_, _)))
+        && !matches!(function.block.stmts.last(), Some(Stmt::Expr(_, _)))
     {
         return Err(Error::at(
             function.sig.ident.span(),
             "a value helper must end in an expression",
         ));
     }
-    Ok(())
+    Ok(BodyCheck { needs_iife })
 }
 
 fn compare_operator(operator: &BinOp) -> Option<&'static str> {
@@ -2776,6 +4402,20 @@ fn wider(left: Ty, right: Ty) -> Ty {
 
 fn type_hint(ty: &Type) -> Ty {
     let text = type_text(ty);
+    if is_generic(ty, "Option") {
+        let Some(inner) = generic_arg(ty) else {
+            return Ty::OPT_VALUE;
+        };
+        let mut value = type_hint(inner);
+        if value.base == Base::Ops {
+            return Ty::LIST;
+        }
+        value.optional = true;
+        return value;
+    }
+    if is_generic(ty, "Result") {
+        return generic_arg(ty).map_or(Ty::VALUE, type_hint);
+    }
     if text.contains("String") || text == "str" {
         Ty::STR
     } else if text == "bool" {
@@ -2945,6 +4585,18 @@ fn is_ok_call(call: &ExprCall) -> bool {
     path_last_name(&call.func).as_deref() == Some("Ok")
 }
 
+fn static_kind(ty: &syn::Type) -> StaticKind {
+    let text = type_text(ty);
+    match text.as_str() {
+        "Once" => StaticKind::Once,
+        "OnceLock" => StaticKind::OnceLock,
+        "LazyLock" => StaticKind::Lazy,
+        "Mutex" => StaticKind::Mutex,
+        "RwLock" => StaticKind::RwLock,
+        _ if text.starts_with("Atomic") => StaticKind::Atomic,
+        _ => StaticKind::Value,
+    }
+}
 fn is_err_call(call: &ExprCall) -> bool {
     path_last_name(&call.func).as_deref() == Some("Err")
 }
@@ -3088,6 +4740,19 @@ fn parse_vec(mac: &ExprMacro) -> Result<Vec<Expr>, Error> {
     Ok(list.into_iter().collect())
 }
 
+struct MatchesArgs {
+    expr: Expr,
+    pat: Pat,
+}
+
+impl Parse for MatchesArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let expr: Expr = input.parse()?;
+        let _: Token![,] = input.parse()?;
+        let pat: Pat = Pat::parse_multi(input)?;
+        Ok(Self { expr, pat })
+    }
+}
 struct FormatArgs {
     literal: String,
     arguments: Vec<(Option<String>, Expr)>,

@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 
-use syn::{Expr, Item, ItemFn, Pat, UseTree};
-
 use crate::{Error, Module};
+use syn::{Expr, Item, ItemFn, ItemStatic, Pat, Type, UseTree};
 
 /// A module path and the function found at that path.
 pub(crate) struct Resolved<'a> {
@@ -12,6 +11,9 @@ pub(crate) struct Resolved<'a> {
 
 struct Unit {
     functions: HashMap<String, ItemFn>,
+    statics: HashMap<String, ItemStatic>,
+    enums: HashMap<String, Vec<String>>,
+    impls: HashMap<String, HashMap<String, ItemFn>>,
     constants: HashMap<String, Expr>,
     imports: HashMap<String, Vec<String>>,
     globs: Vec<Vec<String>>,
@@ -21,6 +23,9 @@ impl Unit {
     fn new() -> Self {
         Self {
             functions: HashMap::new(),
+            statics: HashMap::new(),
+            enums: HashMap::new(),
+            impls: HashMap::new(),
             constants: HashMap::new(),
             imports: HashMap::new(),
             globs: Vec::new(),
@@ -300,6 +305,101 @@ impl Program {
     }
 }
 
+impl Program {
+    pub(crate) fn resolve_method(
+        &self,
+        module: &str,
+        class: &str,
+        name: &str,
+    ) -> Option<(String, &ItemFn)> {
+        let mut found = Vec::new();
+        for (path, unit) in &self.units {
+            if let Some(function) =
+                unit.impls.get(class).and_then(|methods| methods.get(name))
+            {
+                found.push((path, function));
+            }
+        }
+        if let Some(index) =
+            found.iter().position(|(path, _)| path.as_str() == module)
+        {
+            return Some((found[index].0.clone(), found[index].1));
+        }
+        match found.as_slice() {
+            [(path, function)] => Some(((*path).to_owned(), *function)),
+            _ => None,
+        }
+    }
+}
+
+impl Program {
+    pub(crate) fn resolve_static(
+        &self,
+        module: &str,
+        segments: &[String],
+    ) -> Option<(String, &ItemStatic)> {
+        self.static_in(module, segments, 0)
+    }
+
+    fn static_in(
+        &self,
+        module: &str,
+        segments: &[String],
+        depth: usize,
+    ) -> Option<(String, &ItemStatic)> {
+        if depth > 32 {
+            return None;
+        }
+        let (first, rest) = segments.split_first()?;
+        match first.as_str() {
+            "crate" => self.static_from(&self.root.clone(), rest, depth),
+            "self" => self.static_from(module, rest, depth),
+            "super" => {
+                let parent = self.parent(module)?;
+                self.static_in(&parent, rest, depth.saturating_add(1))
+            }
+            _ => self.static_from(module, segments, depth).or_else(|| {
+                (module != self.root)
+                    .then(|| {
+                        self.static_from(&self.root.clone(), segments, depth)
+                    })
+                    .flatten()
+            }),
+        }
+    }
+
+    fn static_from(
+        &self,
+        module: &str,
+        segments: &[String],
+        depth: usize,
+    ) -> Option<(String, &ItemStatic)> {
+        if depth > 32 {
+            return None;
+        }
+        let (first, rest) = segments.split_first()?;
+        if rest.is_empty() {
+            let unit = self.units.get(module)?;
+            if let Some(item) = unit.statics.get(first) {
+                return Some((module.to_owned(), item));
+            }
+            if let Some(target) = unit.imports.get(first) {
+                return self.static_in(module, target, depth.saturating_add(1));
+            }
+            return None;
+        }
+        let child = self.child(module, first);
+        if self.units.contains_key(&child) {
+            return self.static_from(&child, rest, depth.saturating_add(1));
+        }
+        let unit = self.units.get(module)?;
+        let target = unit.imports.get(first)?;
+        let mut expanded = target.clone();
+        expanded.extend_from_slice(rest);
+        self.static_in(module, &expanded, depth.saturating_add(1))
+    }
+}
+
 fn normalize(path: &str) -> String {
     let trimmed = path.trim().trim_start_matches("crate::");
     let trimmed = trimmed.trim_end_matches("::");
@@ -342,6 +442,37 @@ fn collect(
                         format!("{module}::{name}")
                     };
                     collect(&mut nested, &path, false, inner);
+                }
+            }
+            Item::Static(item_static) => {
+                unit.statics
+                    .insert(item_static.ident.to_string(), item_static.clone());
+            }
+            Item::Enum(item_enum) => {
+                let variants = item_enum
+                    .variants
+                    .iter()
+                    .map(|variant| variant.ident.to_string())
+                    .collect();
+                unit.enums.insert(item_enum.ident.to_string(), variants);
+            }
+            Item::Impl(item_impl) => {
+                if let Some(name) = impl_name(&item_impl.self_ty) {
+                    let methods = unit.impls.entry(name).or_default();
+                    for item in &item_impl.items {
+                        if let syn::ImplItem::Fn(function) = item {
+                            methods.insert(
+                                function.sig.ident.to_string(),
+                                ItemFn {
+                                    attrs: function.attrs.clone(),
+                                    modifiers: syn::FnModifiers::default(),
+                                    vis: function.vis.clone(),
+                                    sig: function.sig.clone(),
+                                    block: Box::new(function.block.clone()),
+                                },
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -399,4 +530,47 @@ pub(crate) fn typed_args(function: &ItemFn) -> Vec<(&Pat, &syn::Type)> {
             Some((&*typed.pat, &*typed.ty))
         })
         .collect()
+}
+
+fn impl_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        Type::Reference(reference) => impl_name(&reference.elem),
+        Type::Paren(paren) => impl_name(&paren.elem),
+        Type::Group(group) => impl_name(&group.elem),
+        _ => None,
+    }
+}
+
+impl Program {
+    pub(crate) fn enum_variant(
+        &self,
+        module: &str,
+        segments: &[String],
+    ) -> Option<String> {
+        let unit = self.units.get(module)?;
+        for (name, variants) in &unit.enums {
+            if segments.iter().any(|part| part == name)
+                && let Some(variant) = segments.last()
+                && variants.contains(variant)
+            {
+                return Some(variant.clone());
+            }
+        }
+        for unit in self.units.values() {
+            for (name, variants) in &unit.enums {
+                if segments.iter().any(|part| part == name)
+                    && let Some(variant) = segments.last()
+                    && variants.contains(variant)
+                {
+                    return Some(variant.clone());
+                }
+            }
+        }
+        None
+    }
 }
