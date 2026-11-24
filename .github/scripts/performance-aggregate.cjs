@@ -40,6 +40,12 @@ const WORKLOADS = {
   plugin_mihomo_control_rust: ['normalize a proxy server store in Rust', 4],
   plugin_file_search_luau: ['sort disk usage slices with the file-search Luau module', 0.2],
   plugin_file_search_rust: ['sort disk usage slices with the file-search Rust module', 0.1],
+  generated_hello_bar_compiled: ['render a compiled hello bar Luau entry', 0.1],
+  generated_hello_bar_handwritten: ['render a hand-written hello bar Luau entry', 0.1],
+  generated_ui_panel_compiled: ['render a compiled UI panel Luau entry', 0.1],
+  generated_ui_panel_handwritten: ['render a hand-written UI panel Luau entry', 0.1],
+  generated_event_compiled: ['run a compiled service event Luau entry', 0.1],
+  generated_event_handwritten: ['run a hand-written service event Luau entry', 0.1],
   codegen_generate: ['generate a plugin from a manifest', 10],
   build_incremental_release: ['build the generated fixture after one source change', 120000],
 }
