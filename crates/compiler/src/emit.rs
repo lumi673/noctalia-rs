@@ -256,7 +256,12 @@ impl Emitter {
             uses_host_call: self.uses_host_call,
             uses_bool_or: self.uses_bool_or,
             uses_source: self.uses_source,
-            params: self.params.clone(),
+            params: self
+                .payload_params
+                .iter()
+                .filter(|(_, body_param, _)| self.params.contains(body_param))
+                .map(|(_, body_param, _)| *body_param)
+                .collect(),
             is_empty: !self.emitted,
         }
     }
@@ -313,6 +318,7 @@ impl Emitter {
             Expr::Call(call) if is_ok_call(call) => self.ok_tail(&call.args),
             Expr::If(item) => self.if_stmt(item, true),
             Expr::Match(item) => self.match_stmt(item, true),
+            Expr::Return(item) => self.ret(item.expr.as_deref()),
             Expr::Block(block) => self.block(&block.block),
             Expr::Paren(paren) => self.tail_expr(&paren.expr),
             Expr::Group(group) => self.tail_expr(&group.expr),
@@ -406,10 +412,12 @@ impl Emitter {
             Expr::Block(block) => {
                 self.line("do");
                 self.indent = self.indent.saturating_add(1);
-                self.block_inner(&block.block, false)?;
+                self.scopes.push(HashMap::new());
+                let result = self.block_inner(&block.block, false);
+                self.scopes.pop();
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
-                Ok(())
+                result
             }
             Expr::Struct(_) => self.op_expr(expr),
             Expr::Macro(mac) if macro_name(mac) == "vec" => {
@@ -1310,11 +1318,11 @@ impl Emitter {
         self.line(&format!("local {name} = {value}"));
         if allow_bool {
             format!(
-                "((type({name}) == \"string\" and {name}) or ((type({name}) == \"number\" or type({name}) == \"boolean\") and tostring({name})))"
+                "((type({name}) == \"string\" and {name}) or ((type({name}) == \"number\" or type({name}) == \"boolean\") and tostring({name})) or nil)"
             )
         } else {
             format!(
-                "((type({name}) == \"string\" and {name}) or (type({name}) == \"number\" and tostring({name})))"
+                "((type({name}) == \"string\" and {name}) or (type({name}) == \"number\" and tostring({name})) or nil)"
             )
         }
     }

@@ -187,13 +187,13 @@ Speedup is `hand-written / compiled`, so 1.0 is parity. Times are microseconds.
 | generated\_ui\_panel | 9.698 | 16.521 | 1.70x | 1.91 / 1.70 / 1.70 | 945 / 637 |
 | generated\_event | 3.627 | 3.617 | 1.00x | 1.00 / 1.00 / 1.00 | 425 / 447 |
 
-All three clear parity at the median over three rounds. `generated_ui_panel` is
-the largest win: the compiler emits `{ kind = "row", props = ..., children = ... }`
-tables directly, while hand-written Luau calls the `ui.row` constructor for
-every node. The two small fixtures sit on the same roughly 2 us dispatch floor,
-so their ratios move with host load. The per-round spread on `generated_hello_bar`
-shows that: 0.97 to 1.09 with the same binaries. `generated_event` is 0.3% under
-parity over the three medians, which is inside that noise.
+The UI tree clears parity consistently. The two small fixtures sit on the same
+roughly 2 us dispatch floor, so their ratios move with host load: repeat runs of
+the same binaries measured 0.97 to 1.09 for `generated_hello_bar` and 0.97 to
+1.00 for `generated_event`. Treat those two as parity within measurement noise
+rather than a guaranteed win. `generated_ui_panel` is the real gain: the
+compiler emits `{ kind = "row", props = ..., children = ... }` tables directly,
+while hand-written Luau calls the `ui.row` constructor for every node.
 
 The 3x target is not measured against hand-written Luau. Both sides pay the
 same dispatch floor, so 3x is not reachable there. It is measured against the

@@ -650,3 +650,66 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         );
     }
 }
+
+#[test]
+fn orders_mapped_payload_params_like_the_callback() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    match ctx.event.as_str() {
+        "ipc" => {
+            let payload = ctx.payload_str("payload").unwrap_or_default();
+            let event = ctx.payload_str("event").unwrap_or_default();
+            Ok(vec![Op::log(format!("{event}={payload}"))])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled
+            .source
+            .contains("local function body_ipc(arg_event, arg_payload)")
+    );
+    assert!(compiled.source.contains(
+        "function onIpc(event, payload) body_ipc(event, payload) end"
+    ));
+}
+
+#[test]
+fn accepts_a_tail_return() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        return Ok(vec![Op::log("tick")]);
+    } else {
+        return Ok(Vec::new());
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled
+            .source
+            .contains("function update() body_update() end")
+    );
+    assert!(compiled.source.contains("noctalia.log(\"tick\")"));
+}
+
+#[test]
+fn coerces_unmapped_payload_scalars_to_nil() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let missing = ctx.payload_str("hovered").is_none();
+    Ok(vec![Op::BarVisible { visible: missing }])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("or nil) == nil)"));
+}

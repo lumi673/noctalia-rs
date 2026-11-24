@@ -126,9 +126,9 @@ to Luau and embeds it, so the entry runs without the helper process and spool
 IPC. The handler keeps the signature
 `fn handler(ctx: &Context) -> Result<Vec<Op>>`.
 
-Compiled entries match hand-written Luau on the benchmark fixtures and beat it
-on UI trees, where the compiler emits node tables directly instead of calling
-`ui.*` constructors. The 3x target is measured against the bridge path: a spool
+Compiled entries sit at parity with hand-written Luau on the small benchmark
+fixtures and beat it on UI trees, where the compiler emits node tables directly
+instead of calling `ui.*` constructors. The 3x target is measured against the bridge path: a spool
 round trip is about 1.13 ms, compiled renders are about 2 us to 10 us.
 
 The compiler specializes each handler per event. Event comparisons and match
