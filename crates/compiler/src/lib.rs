@@ -263,9 +263,11 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let events = discovery.finish().events;
 
     let update_event = options.kind.update_event().to_owned();
-    let mut labels = events.iter().cloned().collect::<Vec<_>>();
-    if !labels.iter().any(|label| label == &update_event) {
-        labels.push(update_event.clone());
+    let mut labels = vec![update_event.clone()];
+    for event in &events {
+        if event != &update_event {
+            labels.push(event.clone());
+        }
     }
     if matches!(options.kind, EntryKind::Service | EntryKind::Shortcut)
         && !labels.iter().any(|label| label == "load")
@@ -393,7 +395,9 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "end\n",
         ));
     }
-    out.push('\n');
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
 
     for slot in &bodies {
         if slot.body.is_empty {
