@@ -1259,19 +1259,21 @@ impl<'a> Emitter<'a> {
             Expr::Tuple(tuple) if tuple.elems.is_empty() => Ok(()),
             _ => {
                 let (text, ty) = self.expr(expr)?;
-                if ty.base == Base::Void
-                    || (matches!(expr, Expr::MethodCall(_)) && !text.is_empty())
-                {
+                if ty.base == Base::Void {
                     if !text.is_empty() {
                         self.line(&text);
                     }
-                    Ok(())
-                } else {
-                    Err(Error::at(
-                        expr.span(),
-                        "this expression has no effect and is not a supported op",
-                    ))
+                    self.emitted = true;
+                    return Ok(());
                 }
+                if matches!(expr, Expr::MethodCall(_)) {
+                    self.emitted = true;
+                    return Ok(());
+                }
+                Err(Error::at(
+                    expr.span(),
+                    "this expression has no effect and is not a supported op",
+                ))
             }
         }
     }
@@ -2086,15 +2088,55 @@ impl<'a> Emitter<'a> {
             ));
         }
         let (text, ty) = self.expr(iterable)?;
-        if ty.base != Base::List && ty.base != Base::Value {
+        if ty.base != Base::List
+            && ty.base != Base::Value
+            && ty.base != Base::Table
+        {
             return Err(Error::at(
                 item.expr.span(),
-                "only ranges and list values can be looped over",
+                "only ranges, list and map values can be looped over",
             ));
         }
         let source = self.temp();
-        let index = self.temp();
         self.line(&format!("local {source} = {text}"));
+        if ty.base == Base::Table {
+            if enumerate {
+                return Err(Error::at(
+                    item.pat.span(),
+                    "`enumerate()` needs a list, not a map",
+                ));
+            }
+            let names = bindings
+                .iter()
+                .map(|name| name.clone().unwrap_or_else(|| "_".to_owned()))
+                .collect::<Vec<_>>();
+            let head = match names.as_slice() {
+                [name] => format!("_, {name}"),
+                [first, second] => format!("{first}, {second}"),
+                _ => {
+                    return Err(Error::at(
+                        item.pat.span(),
+                        "map loops take one or two bindings",
+                    ));
+                }
+            };
+            for name in bindings.iter().flatten() {
+                self.push(name, Ty::VALUE);
+            }
+            self.line(&format!("for {head} in pairs({source}) do"));
+            self.indent = self.indent.saturating_add(1);
+            self.statement_block(&item.body)?;
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            return Ok(());
+        }
+        if bindings.len() > 1 && ty.base == Base::Value {
+            return Err(Error::at(
+                item.pat.span(),
+                "tuple loop bindings need a list of tuples",
+            ));
+        }
+        let index = self.temp();
         self.line(&format!("local {index} = {source}.__next or 1"));
         self.line(&format!("for {index} = {index}, #{source} do"));
         self.indent = self.indent.saturating_add(1);
@@ -3027,6 +3069,7 @@ impl<'a> Emitter<'a> {
             Expr::Group(group) => return self.emit_iter(&group.expr, body),
             Expr::MethodCall(call) => match call.method.to_string().as_str() {
                 "map" | "filter_map" => {
+                    let skip_nil = call.method == "filter_map";
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
@@ -3039,7 +3082,17 @@ impl<'a> Emitter<'a> {
                         if text.is_empty() {
                             return Ok(());
                         }
-                        body(emitter, &format!("({text})"))
+                        if !skip_nil {
+                            return body(emitter, &format!("({text})"));
+                        }
+                        let mapped = emitter.temp();
+                        emitter.line(&format!("local {mapped} = ({text})"));
+                        emitter.line(&format!("if {mapped} ~= nil then"));
+                        emitter.indent = emitter.indent.saturating_add(1);
+                        body(emitter, &mapped)?;
+                        emitter.indent = emitter.indent.saturating_sub(1);
+                        emitter.line("end");
+                        Ok(())
                     };
                     return self.emit_iter(&call.receiver, &inner);
                 }
@@ -3069,56 +3122,44 @@ impl<'a> Emitter<'a> {
                     return self.emit_table(
                         &format!("string.split({text}, {separator})"),
                         false,
+                        false,
                         body,
                     );
                 }
                 "split_whitespace" => {
                     let (text, _) = self.expr(&call.receiver)?;
-                    let filtered = |emitter: &mut Self,
-                                    value: &str|
-                     -> Result<(), Error> {
-                        emitter.line(&format!("if {value} ~= \"\" then"));
-                        emitter.indent = emitter.indent.saturating_add(1);
-                        body(emitter, value)?;
-                        emitter.indent = emitter.indent.saturating_sub(1);
-                        emitter.line("end");
-                        Ok(())
-                    };
-                    return self.emit_table(
-                        &format!("string.split({text}, \" \")"),
-                        false,
-                        &filtered,
-                    );
+                    let words = self.whitespace_split(&text);
+                    return self.emit_table(&words, false, false, body);
                 }
                 "chars" | "bytes" => {
                     let (text, _) = self.expr(&call.receiver)?;
                     return self.emit_table(
                         &format!("string.split({text}, \"\")"),
                         false,
+                        false,
                         body,
                     );
                 }
                 "lines" => {
                     let (text, _) = self.expr(&call.receiver)?;
-                    return self.emit_table(
-                        &format!("string.split({text}, \"\\n\")"),
-                        false,
-                        body,
-                    );
+                    let lines = self.split_lines(&text);
+                    return self.emit_table(&lines, false, false, body);
                 }
                 "iter" | "into_iter" | "values" => {
-                    let (source, _) = self.expr(&call.receiver)?;
-                    return self.emit_table(&source, false, body);
+                    let (source, ty) = self.expr(&call.receiver)?;
+                    let map = ty.base == Base::Table;
+                    return self.emit_table(&source, false, map, body);
                 }
                 "keys" => {
-                    let (source, _) = self.expr(&call.receiver)?;
-                    return self.emit_table(&source, true, body);
+                    let (source, ty) = self.expr(&call.receiver)?;
+                    let map = ty.base == Base::Table;
+                    return self.emit_table(&source, true, map, body);
                 }
                 _ => {}
             },
             other => {
                 let (source, _) = self.expr(other)?;
-                return self.emit_table(&source, false, body);
+                return self.emit_table(&source, false, false, body);
             }
         }
         Err(Error::at(
@@ -3135,16 +3176,43 @@ impl<'a> Emitter<'a> {
         &mut self,
         source: &str,
         keys: bool,
+        map: bool,
         body: &dyn Fn(&mut Self, &str) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let item = self.temp();
-        let iterator = if keys { "pairs" } else { "ipairs" };
-        self.line(&format!("for _, {item} in {iterator}({source}) do"));
+        if map {
+            if keys {
+                self.line(&format!("for {item} in pairs({source}) do"));
+            } else {
+                self.line(&format!("for _, {item} in pairs({source}) do"));
+            }
+            self.indent = self.indent.saturating_add(1);
+            let result = body(self, &item);
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            return result;
+        }
+        let table = self.temp();
+        let index = self.temp();
+        self.line(&format!("local {table} = {source}"));
+        self.line(&format!("for {index} = {table}.__next or 1, #{table} do"));
         self.indent = self.indent.saturating_add(1);
-        let result = body(self, &item);
+        let result = body(self, &format!("{table}[{index}]"));
         self.indent = self.indent.saturating_sub(1);
         self.line("end");
         result
+    }
+
+    fn whitespace_split(&self, text: &str) -> String {
+        format!(
+            "(function() local __words = {{}}; for __word in string.gmatch({text}, \"%S+\") do __words[#__words + 1] = __word end; __words.__next = 1; return __words end)()"
+        )
+    }
+
+    fn split_lines(&self, text: &str) -> String {
+        format!(
+            "(function() local __text = string.gsub({text}, \"\\r\\n\", \"\\n\"); if #__text == 0 then return {{}} end; local __lines = string.split(__text, \"\\n\"); if string.sub(__text, -1) == \"\\n\" then table.remove(__lines) end; __lines.__next = 1; return __lines end)()"
+        )
     }
 
     fn class_of_receiver(&self, expr: &Expr) -> Option<String> {
@@ -3294,9 +3362,21 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "join" if args.len() == 1 => {
+                let part = self.expr(arg(&args, 0, call)?)?.0;
+                if ty.base == Base::List {
+                    return Ok((
+                        format!("table.concat({receiver}, {part})"),
+                        Ty::STR,
+                    ));
+                }
+                if ty.base != Base::Str {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "join() needs a list or a path string receiver",
+                    ));
+                }
                 let base = self.temp();
                 self.line(&format!("local {base} = {receiver}"));
-                let part = self.expr(arg(&args, 0, call)?)?.0;
                 Ok((
                     format!(
                         "({base} .. ((string.sub({base}, -1) == \"/\") and \"\" or \"/\") .. {part})"
@@ -3388,7 +3468,7 @@ impl<'a> Emitter<'a> {
                 Ok((format!("math.floor({receiver} / 1000)"), Ty::INT))
             }
             "as_nanos" => Ok((format!("({receiver} * 1000000)"), Ty::INT)),
-            "iter" | "into_iter" | "values" => Ok((receiver, Ty::LIST)),
+            "iter" | "into_iter" | "values" => Ok((receiver, ty)),
             "split" => {
                 let delimiter = self.expr(arg(&args, 0, call)?)?.0;
                 Ok((
@@ -3398,12 +3478,9 @@ impl<'a> Emitter<'a> {
                     Ty::LIST,
                 ))
             }
-            "split_whitespace" => Ok((
-                format!(
-                    "(function() local __parts = string.split({receiver}, \" \"); __parts.__next = 1; return __parts end)()"
-                ),
-                Ty::LIST,
-            )),
+            "split_whitespace" => {
+                Ok((self.whitespace_split(&receiver), Ty::LIST))
+            }
             "next" => {
                 let value = self.temp();
                 self.line(&format!(
@@ -3415,11 +3492,10 @@ impl<'a> Emitter<'a> {
                 Ok((value, Ty::opt(ty.base)))
             }
             "as_os_str" | "to_str" | "to_vec" => Ok((receiver, Ty::VALUE)),
-            "bytes" | "chars" | "lines" => {
-                let separator =
-                    if method == "lines" { "\"\\n\"" } else { "\"\"" };
-                Ok((format!("string.split({receiver}, {separator})"), Ty::LIST))
+            "bytes" | "chars" => {
+                Ok((format!("string.split({receiver}, \"\")"), Ty::LIST))
             }
+            "lines" => Ok((self.split_lines(&receiver), Ty::LIST)),
             "clear" => {
                 self.line(&format!("table.clear({receiver})"));
                 Ok((String::new(), Ty::VOID))
@@ -3432,7 +3508,9 @@ impl<'a> Emitter<'a> {
             "insert" if args.len() == 2 => {
                 let key = self.expr(arg(&args, 0, call)?)?.0;
                 let value = self.expr(arg(&args, 1, call)?)?.0;
-                if key.chars().all(|character| character.is_ascii_digit()) {
+                if ty.base != Base::Table
+                    && key.chars().all(|character| character.is_ascii_digit())
+                {
                     self.line(&format!(
                         "table.insert({receiver}, ({key}) + 1, {value})"
                     ));
@@ -3442,9 +3520,23 @@ impl<'a> Emitter<'a> {
                 Ok((String::new(), Ty::VOID))
             }
             "remove" if args.len() == 1 => {
-                let key = self.expr(arg(&args, 0, call)?)?.0;
-                self.line(&format!("{receiver}[{key}] = nil"));
-                Ok((String::new(), Ty::VOID))
+                let (key, key_ty) = self.expr(arg(&args, 0, call)?)?;
+                let removed = self.temp();
+                if ty.base == Base::Table {
+                    self.line(&format!("local {removed} = {receiver}[{key}]"));
+                    self.line(&format!("{receiver}[{key}] = nil"));
+                    return Ok((removed, Ty::OPT_VALUE));
+                }
+                if ty.base == Base::List && key_ty.base == Base::Int {
+                    self.line(&format!(
+                        "local {removed} = table.remove({receiver}, ({key}) + 1)"
+                    ));
+                    return Ok((removed, Ty::VALUE));
+                }
+                Err(Error::at(
+                    call.method.span(),
+                    "remove() needs a list with an integer index or a map with the key",
+                ))
             }
             "is_object" | "is_array" => {
                 Ok((format!("(type({receiver}) == \"table\")"), Ty::BOOL))
@@ -3575,7 +3667,7 @@ impl<'a> Emitter<'a> {
             "is_empty" => Ok((format!("(#{receiver} == 0)"), Ty::BOOL)),
             "get" => {
                 let (key, key_ty) = self.expr(arg(&args, 0, call)?)?;
-                if key_ty.base == Base::Int {
+                if ty.base != Base::Table && key_ty.base == Base::Int {
                     Ok((format!("{receiver}[({key}) + 1]"), Ty::OPT_VALUE))
                 } else {
                     Ok((format!("{receiver}[{key}]"), Ty::OPT_VALUE))
@@ -3907,9 +3999,13 @@ impl<'a> Emitter<'a> {
             }
             "trp" => {
                 let key = self.string_arg(args, 0, call)?;
-                let params = arg(args, 1, call)?;
+                let count = self.expr(arg(args, 1, call)?)?.0;
+                let params = arg(args, 2, call)?;
                 let table = self.tr_params(strip_reference(params))?;
-                Ok((format!("noctalia.trp({key}, {table})"), Ty::STR))
+                Ok((
+                    format!("noctalia.trp({key}, {count}, {table})"),
+                    Ty::STR,
+                ))
             }
             "run_async_start" | "run_stream_start" => {
                 Err(Error::at(
@@ -4006,9 +4102,10 @@ impl<'a> Emitter<'a> {
             parts.last().copied().unwrap_or("")
         };
         match variant {
-            "HashMap" | "BTreeMap" | "HashSet" | "BTreeSet" | "Map" => {
-                Ok(Some(("{}".to_owned(), Ty::LIST)))
+            "HashMap" | "BTreeMap" | "Map" => {
+                Ok(Some(("{}".to_owned(), Ty::TABLE)))
             }
+            "HashSet" | "BTreeSet" => Ok(Some(("{}".to_owned(), Ty::LIST))),
             "Bool" | "String" | "Number"
                 if name.starts_with("String::")
                     || name.starts_with("bool::") =>
@@ -4143,10 +4240,7 @@ impl<'a> Emitter<'a> {
             }
             if name == "env::var" || name == "std::env::var" {
                 let key = self.expr(arg(&args, 0, call)?)?.0;
-                return Ok((
-                    format!("noctalia.getenv({key})"),
-                    Ty::result(Base::Str),
-                ));
+                return Ok((format!("noctalia.getenv({key})"), Ty::OPT_STR));
             }
             if let Some(class) = name.strip_suffix("::default")
                 && class != "Default"
@@ -5209,7 +5303,8 @@ fn json_base_for_type(ty: &Type) -> Result<Base, Error> {
         "bool" => Base::Bool,
         "i64" | "u64" | "usize" | "u32" | "i32" => Base::Int,
         "f64" | "f32" => Base::Float,
-        "Vec" | "HashMap" | "BTreeMap" | "Map" => Base::List,
+        "Vec" => Base::List,
+        "HashMap" | "BTreeMap" | "Map" => Base::Table,
         _ => {
             return Err(Error::at(
                 ty.span(),
@@ -5566,6 +5661,11 @@ fn type_hint(ty: &Type) -> Ty {
         Ty::BOOL
     } else if text.starts_with("Vec") || text.starts_with("Option<Vec") {
         Ty::LIST
+    } else if text.starts_with("HashMap")
+        || text.starts_with("BTreeMap")
+        || text.starts_with("Map")
+    {
+        Ty::TABLE
     } else if matches!(text.as_str(), "i64" | "u64" | "usize" | "u32" | "i32") {
         Ty::INT
     } else if matches!(text.as_str(), "f64" | "f32") {
