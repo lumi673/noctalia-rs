@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "noctalia-rs-compiler"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "syn 3.0.10",
