@@ -493,3 +493,51 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     );
     assert!(compiled.source.contains("noctalia.setUpdateInterval(5000)"));
 }
+
+#[test]
+fn hoists_constant_payload_tables_only_when_safe() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    match ctx.event.as_str() {
+        "activate" => {
+            let id = ctx.payload_str("id").unwrap_or_default();
+            Ok(vec![Op::log(id)])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled
+            .source
+            .contains("local PAYLOAD_UPDATE = { source = \"update\" }")
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local PAYLOAD_LOAD = { source = \"load\" }")
+    );
+    assert!(compiled.source.contains("local PAYLOAD_EMPTY = {}"));
+    assert!(compiled.source.contains(
+        "function update() body(\"update\", PAYLOAD_UPDATE, \"update\") end"
+    ));
+    assert!(compiled.source.contains(
+        "function onActivate(id) body(\"activate\", { id = id }, \"\") end"
+    ));
+
+    let escaping = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::state("payload", ctx.payload.clone())])
+}
+"#;
+    let compiled =
+        compile(&source(escaping), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(!compiled.source.contains("PAYLOAD_UPDATE"));
+    assert!(compiled
+        .source
+        .contains("function update() body(\"update\", { source = \"update\" }, \"update\") end"));
+}

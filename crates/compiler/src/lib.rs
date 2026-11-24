@@ -261,6 +261,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     emitter.constants(&file.items);
     emitter.block(&function.block)?;
     let body = emitter.finish();
+    let callbacks_use_payload = body.uses_payload;
+    let hoisted_payloads = callbacks_use_payload && !body.payload_escapes;
 
     let mut out = String::new();
     out.push_str("--!nonstrict\n");
@@ -273,6 +275,16 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     }
     if body.uses_entry {
         let _ = writeln!(out, "local ENTRY = {}", quote(options.entry));
+    }
+    if hoisted_payloads {
+        out.push_str("local PAYLOAD_EMPTY = {}\n");
+        out.push_str("local PAYLOAD_UPDATE = { source = \"update\" }\n");
+        if options.kind.watches_state() {
+            out.push_str("local PAYLOAD_STATE = { source = \"state\" }\n");
+        }
+        if options.kind.renders_on_load() {
+            out.push_str("local PAYLOAD_LOAD = { source = \"load\" }\n");
+        }
     }
     if body.uses_irem {
         out.push_str(concat!(
@@ -318,8 +330,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     out.push_str(&body.source);
     out.push_str("end\n\n");
 
-    let callbacks_use_payload = body.uses_payload;
-    let update_payload = payload("update", callbacks_use_payload);
+    let update_payload =
+        payload("update", callbacks_use_payload, hoisted_payloads);
     let _ = writeln!(
         out,
         "function update() body({}, {update_payload}, \"update\") end",
@@ -344,8 +356,15 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         if !body.events.iter().any(|event| event == callback.event) {
             continue;
         }
-        let argument = if callbacks_use_payload && !callback.payload.is_empty()
-        {
+        let argument = if callback.payload.is_empty() {
+            if hoisted_payloads {
+                "PAYLOAD_EMPTY"
+            } else if callbacks_use_payload {
+                "{}"
+            } else {
+                "nil"
+            }
+        } else if callbacks_use_payload {
             callback.payload
         } else {
             "nil"
@@ -371,7 +390,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "noctalia.state.watch(STATE_KEY, function() if last_query then body(\"query\", {state_payload}, \"state\") end end)"
         );
     } else if options.kind.watches_state() {
-        let state_payload = payload("state", callbacks_use_payload);
+        let state_payload =
+            payload("state", callbacks_use_payload, hoisted_payloads);
         let _ = writeln!(
             out,
             "noctalia.state.watch(STATE_KEY, function() body({}, {state_payload}, \"state\") end)",
@@ -390,7 +410,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             | EntryKind::Layer => options.kind.update_event(),
             EntryKind::Launcher => options.kind.update_event(),
         };
-        let load_payload = payload("load", callbacks_use_payload);
+        let load_payload =
+            payload("load", callbacks_use_payload, hoisted_payloads);
         let _ =
             writeln!(out, "body({}, {load_payload}, \"load\")", quote(event));
     }
@@ -401,12 +422,22 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     })
 }
 
-fn payload(source: &str, used: bool) -> String {
-    if used {
-        format!("{{ source = {} }}", quote(source))
-    } else {
-        "nil".to_owned()
+fn payload(source: &str, used: bool, hoisted: bool) -> String {
+    if !used {
+        return "nil".to_owned();
     }
+    if hoisted {
+        return format!(
+            "PAYLOAD_{}",
+            match source {
+                "update" => "UPDATE",
+                "state" => "STATE",
+                "load" => "LOAD",
+                other => other,
+            }
+        );
+    }
+    format!("{{ source = {} }}", quote(source))
 }
 
 fn find_handler<'a>(

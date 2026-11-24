@@ -88,6 +88,7 @@ pub(crate) struct Body {
     pub uses_state: bool,
     pub uses_entry: bool,
     pub uses_payload: bool,
+    pub payload_escapes: bool,
     pub uses_irem: bool,
     pub uses_unwrap: bool,
     pub uses_host_call: bool,
@@ -103,6 +104,7 @@ pub(crate) struct Emitter {
     constants: HashMap<String, (String, Ty)>,
     uses_state: bool,
     uses_payload: bool,
+    payload_escapes: bool,
     uses_entry: bool,
     uses_irem: bool,
     uses_unwrap: bool,
@@ -122,6 +124,7 @@ impl Emitter {
             constants: HashMap::new(),
             uses_state: false,
             uses_payload: false,
+            payload_escapes: false,
             uses_entry: false,
             uses_irem: false,
             uses_unwrap: false,
@@ -204,6 +207,7 @@ impl Emitter {
             uses_state: self.uses_state,
             uses_entry: self.uses_entry,
             uses_payload: self.uses_payload,
+            payload_escapes: self.payload_escapes,
             uses_irem: self.uses_irem,
             uses_unwrap: self.uses_unwrap,
             uses_host_call: self.uses_host_call,
@@ -1156,6 +1160,7 @@ impl Emitter {
                 }
                 "payload" => {
                     self.uses_payload = true;
+                    self.payload_escapes = true;
                     Ok(("payload".to_owned(), Ty::VALUE))
                 }
                 "state" => {
