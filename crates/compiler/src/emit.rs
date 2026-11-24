@@ -1052,6 +1052,14 @@ impl<'a> Emitter<'a> {
             self.push(&name, ty);
             return Ok(());
         }
+        if is_default_call(&init.expr) {
+            let hint =
+                hint.ok_or_else(|| bare_default_error(init.expr.span()))?;
+            let text = default_value(self, hint, init.expr.span())?;
+            self.line(&format!("local {name} = {text}"));
+            self.push(&name, type_hint(hint));
+            return Ok(());
+        }
         let (text, mut ty) = self.expr(&init.expr)?;
         if ty.result
             && let Some(hint) = hint
@@ -2593,16 +2601,12 @@ impl<'a> Emitter<'a> {
         }
         if let Some(segments) = path_segments(&path.path) {
             let last = segments.last().map_or("", String::as_str);
-            let floats =
-                segments.iter().any(|name| name == "f64" || name == "f32");
-            match last {
-                "MAX" if floats => {
-                    return Ok(("math.huge".to_owned(), Ty::FLOAT));
-                }
-                "MIN" if floats => {
-                    return Ok(("(-math.huge)".to_owned(), Ty::FLOAT));
-                }
-                _ => {}
+            if let Some(kind) = segments
+                .iter()
+                .find(|name| name.as_str() == "f64" || name.as_str() == "f32")
+                && let Some(value) = float_bound(kind.as_str(), last)
+            {
+                return Ok((value.to_owned(), Ty::FLOAT));
             }
             if let Some(lua_type) =
                 segments.last().and_then(|name| value_predicate(name))
@@ -2915,6 +2919,18 @@ impl<'a> Emitter<'a> {
         Ok((format!("({text})({})", values.join(", ")), ty))
     }
 
+    /// A `unwrap_or_else` fallback, which may be `Default::default` itself.
+    fn fallback(&mut self, expr: &Expr, ty: Ty) -> Result<(String, Ty), Error> {
+        if is_default_path(expr) {
+            let ty = Ty::new(ty.base);
+            let literal = ty
+                .default_literal()
+                .ok_or_else(|| bare_default_error(expr.span()))?;
+            return Ok((literal.to_owned(), ty));
+        }
+        self.invoke_arg(expr, &[])
+    }
+
     /// Inlines a crate function used as a callback value, such as
     /// `map(lua_text)` or `unwrap_or_else(default_snapshot)`.
     fn function_reference(
@@ -3098,7 +3114,7 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("local {result} = {value}"));
                 self.line(&format!("if {value} == nil then"));
                 self.indent = self.indent.saturating_add(1);
-                let (text, fallback_ty) = self.invoke_arg(closure, &[])?;
+                let (text, fallback_ty) = self.fallback(closure, ty)?;
                 self.line(&format!("{result} = {text}"));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
@@ -3554,9 +3570,11 @@ impl<'a> Emitter<'a> {
             "round" => Ok((format!("math.round({receiver})"), Ty::FLOAT)),
             "then_some" => {
                 let value = self.expr(arg(&args, 0, call)?)?.0;
+                let stored = self.temp();
+                self.line(&format!("local {stored} = {value}"));
                 Ok((
                     format!(
-                        "(function() if {receiver} then return {value} end end)()"
+                        "(function() if {receiver} then return {stored} end end)()"
                     ),
                     Ty::OPT_VALUE,
                 ))
@@ -3578,7 +3596,14 @@ impl<'a> Emitter<'a> {
             }
             "or" if ty.optional => {
                 let other = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((format!("({receiver} or {other})"), ty))
+                let value = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                Ok((
+                    format!(
+                        "(function() if {value} ~= nil then return {value} end return {other} end)()"
+                    ),
+                    ty,
+                ))
             }
             "trim_start" => Ok((
                 format!("string.gsub({receiver}, \"^%s+\", \"\")"),
@@ -3623,7 +3648,12 @@ impl<'a> Emitter<'a> {
                 format!("(string.find({receiver}, \"^%s+$\") ~= nil)"),
                 Ty::BOOL,
             )),
-            "is_char_boundary" | "char_indices" => Ok((receiver, ty)),
+            "is_char_boundary" | "char_indices" => Err(Error::at(
+                call.method.span(),
+                format!(
+                    "`{method}` has no Luau equivalent and is not supported by the Luau compiler"
+                ),
+            )),
             "to_string_lossy" | "display" => Ok((receiver, Ty::STR)),
             "as_str" => Ok((receiver, Ty::OPT_STR)),
             "as_i64" | "as_u64" => Ok((receiver, Ty::OPT_INT)),
@@ -4709,7 +4739,7 @@ impl<'a> Emitter<'a> {
                 }
                 "String::new" => return Ok(("\"\"".to_owned(), Ty::STR)),
                 "Default::default" => {
-                    return Ok(("{}".to_owned(), Ty::VALUE));
+                    return Err(bare_default_error(call.span()));
                 }
                 "Vec::new" | "VecDeque::new" => {
                     return Ok(("{}".to_owned(), Ty::LIST));
@@ -4952,6 +4982,12 @@ impl<'a> Emitter<'a> {
     fn index(&mut self, index: &syn::ExprIndex) -> Result<(String, Ty), Error> {
         if let Expr::Range(range) = strip_reference(&index.index) {
             let (base, base_ty) = self.expr(&index.expr)?;
+            if base_ty.base != Base::Str {
+                return Err(Error::at(
+                    range.span(),
+                    "range indexes need a string receiver, and this one is not a string",
+                ));
+            }
             let start = match &range.start {
                 Some(start) => {
                     let (text, _) = self.expr(strip_reference(start))?;
@@ -4964,15 +5000,7 @@ impl<'a> Emitter<'a> {
                     let (text, _) = self.expr(strip_reference(end))?;
                     text
                 }
-                None => {
-                    if base_ty.base != Base::Str {
-                        return Err(Error::at(
-                            range.span(),
-                            "open-ended slices need a string receiver",
-                        ));
-                    }
-                    format!("#{base}")
-                }
+                None => format!("#{base}"),
             };
             return Ok((
                 format!("string.sub({base}, {start}, {stop})"),
@@ -6088,29 +6116,10 @@ fn constant(expr: &Expr) -> Option<(String, Ty)> {
             let segments = path_segments(&path.path)?;
             let last = segments.last()?;
             match last.as_str() {
-                "MAX" | "MIN"
-                    if segments.iter().any(|name| {
-                        matches!(
-                            name.as_str(),
-                            "i8" | "i16"
-                                | "i32"
-                                | "i64"
-                                | "i128"
-                                | "u8"
-                                | "u16"
-                                | "u32"
-                                | "u64"
-                                | "u128"
-                                | "usize"
-                                | "isize"
-                        )
-                    }) =>
-                {
-                    let value = if last == "MAX" {
-                        "9223372036854775807"
-                    } else {
-                        "(-9223372036854775808)"
-                    };
+                "MAX" | "MIN" => {
+                    let value = segments.iter().find_map(|name| {
+                        integer_bound(name.as_str(), last == "MAX")
+                    })?;
                     Some((value.to_owned(), Ty::INT))
                 }
                 _ => None,
@@ -6118,6 +6127,40 @@ fn constant(expr: &Expr) -> Option<(String, Ty)> {
         }
         _ => None,
     }
+}
+
+/// The exact `MAX`/`MIN` bound of an integer type.
+fn integer_bound(kind: &str, max: bool) -> Option<&'static str> {
+    Some(match (kind, max) {
+        ("i8", true) => "127",
+        ("i8", false) => "(-128)",
+        ("i16", true) => "32767",
+        ("i16", false) => "(-32768)",
+        ("i32", true) => "2147483647",
+        ("i32", false) => "(-2147483648)",
+        ("i64" | "isize", true) => "9223372036854775807",
+        ("i64" | "isize", false) => "(-9223372036854775808)",
+        ("i128", true) => "170141183460469231731687303715884105727",
+        ("i128", false) => "(-170141183460469231731687303715884105728)",
+        ("u8", true) => "255",
+        ("u16", true) => "65535",
+        ("u32", true) => "4294967295",
+        ("u64" | "usize", true) => "18446744073709551615",
+        ("u128", true) => "340282366920938463463374607431768211455",
+        ("u8" | "u16" | "u32" | "u64" | "u128" | "usize", false) => "0",
+        _ => return None,
+    })
+}
+
+/// The finite `MAX`/`MIN` bound of a float type.
+fn float_bound(kind: &str, bound: &str) -> Option<&'static str> {
+    Some(match (kind, bound) {
+        ("f64", "MAX") => "1.7976931348623157e308",
+        ("f64", "MIN") => "(-1.7976931348623157e308)",
+        ("f32", "MAX") => "3.4028234663852886e38",
+        ("f32", "MIN") => "(-3.4028234663852886e38)",
+        _ => return None,
+    })
 }
 
 /// JSON predicates used as callback values, such as `Value::is_object`.
@@ -6426,20 +6469,26 @@ fn format_specifier(
             return Err(unsupported());
         }
         match ty.base {
-            Base::Value => return Ok(format!("json.encode({value})")),
             Base::Int | Base::Float | Base::Bool => {
                 return Ok(format!("tostring({value})"));
+            }
+            Base::Value => {
+                return Err(Error::at(
+                    mac.span(),
+                    "`{:?}` on a JSON value has no Luau equivalent: Rust prints `String(\"x\")` and `Number(1)`",
+                ));
             }
             _ => return Err(unsupported()),
         }
     }
     let mut left = ty.base == Base::Str;
+    let mut plus = false;
     let mut rest = spec;
     while let Some(first) = rest.chars().next() {
         match first {
             '<' => left = true,
             '>' => left = false,
-            '+' => {}
+            '+' => plus = true,
             _ => break,
         }
         rest = &rest[first.len_utf8()..];
@@ -6450,8 +6499,14 @@ fn format_specifier(
     {
         return Err(unsupported());
     }
+    if plus && !ty.is_numeric() {
+        return Err(unsupported());
+    }
     let mut format = String::from("%");
-    if left && ty.base == Base::Str {
+    if plus {
+        format.push('+');
+    }
+    if left {
         format.push('-');
     }
     format.push_str(rest);
@@ -6685,6 +6740,30 @@ fn path_last_name(expr: &Expr) -> Option<String> {
     } else {
         Some(segments.join("::"))
     }
+}
+
+/// `Default::default` passed as a callback, so the type comes from the caller.
+fn is_default_path(expr: &Expr) -> bool {
+    matches!(expr, Expr::Path(_))
+        && path_last_name(expr).as_deref() == Some("Default::default")
+}
+
+/// `Default::default()` called without a type the emitter can read.
+fn is_default_call(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Call(call)
+            if call.args.is_empty()
+                && path_last_name(&call.func).as_deref()
+                    == Some("Default::default")
+    )
+}
+
+fn bare_default_error(span: proc_macro2::Span) -> Error {
+    Error::at(
+        span,
+        "`Default::default()` needs a known type annotation to pick its literal",
+    )
 }
 
 fn macro_name(mac: &ExprMacro) -> String {

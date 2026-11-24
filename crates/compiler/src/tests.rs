@@ -3467,7 +3467,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let owned: String = text.clone().into();
     let sized = bytes.len();
     let pushed = pushed_value(text);
-    Ok(vec![Op::log(format!("{first}{popped}{found}{nan}{quotient}{rounded}{chosen:?}{flag}{upper}{alnum}{digit}{space}{started}{ended}{suffix}{sized}{pushed}"))])
+    Ok(vec![Op::log(format!("{first}{popped}{found}{nan}{quotient}{rounded}{chosen}{flag}{upper}{alnum}{digit}{space}{started}{ended}{suffix}{sized}{pushed}"))])
 }
 fn pushed_value(text: String) -> String {
     let mut buffer = String::new();
@@ -3485,7 +3485,11 @@ fn pushed_value(text: String) -> String {
         "{source}"
     );
     assert!(source.contains("math.floor(7.0 / 2.0)"), "{source}");
-    assert!(source.contains("json.encode(chosen)"), "{source}");
+    assert!(
+        source.contains("~= nil then return")
+            && source.contains("tostring(chosen)"),
+        "{source}"
+    );
 }
 
 #[test]
@@ -3532,11 +3536,10 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn compiles_debug_and_alignment_specifiers() {
     let handler = r#"
-fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    let value = ctx.config.get("value").cloned().unwrap_or(Value::Null);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let count = 7;
     let label = "hi";
-    Ok(vec![Op::log(format!("{value:?} {count:?} {label:<4} {label:^4}"))])
+    Ok(vec![Op::log(format!("{count:?} {label:<4} {label:^4}"))])
 }
 "#;
     let error =
@@ -3549,11 +3552,10 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     );
 
     let simple = r#"
-fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    let value = ctx.config.get("value").cloned().unwrap_or(Value::Null);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let count = 7;
     let label = "hi";
-    Ok(vec![Op::log(format!("{value:?} {count:?} {label:<4}"))])
+    Ok(vec![Op::log(format!("{count:?} {label:<4}"))])
 }
 "#;
     let compiled =
@@ -3561,6 +3563,11 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(
         compiled.source.contains("string.format(\"%-4s\", label)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("tostring(count)"),
         "{}",
         compiled.source
     );
@@ -3591,20 +3598,21 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let list = ctx.config.get("list").and_then(Value::as_array).cloned();
     let owned = list.clone().map_or(Vec::new(), Vec::as_slice);
     let fresh = list.clone().unwrap_or_else(Map::new);
-    let default = list.clone().unwrap_or_else(Default::default);
+    let default = list.clone().unwrap_or_else(Vec::new);
     let empty = list.clone().is_some_and(Vec::is_empty);
     let bounded = ctx.config.get("n").and_then(Value::as_f64).unwrap_or(i64::MAX as f64);
     let endless = f64::MAX;
     let lowest = i64::MIN;
     let minimal = f64::MIN;
-    Ok(vec![Op::log(format!("{owned:?}{fresh}{default}{empty}{bounded}{endless}{lowest}{minimal}"))])
+    Ok(vec![Op::log(format!("{owned}{fresh}{default}{empty}{bounded}{endless}{lowest}{minimal}"))])
 }
 "#;
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     let source = &compiled.source;
-    assert!(source.contains("math.huge"), "{source}");
+    assert!(!source.contains("math.huge"), "{source}");
+    assert!(source.contains("1.7976931348623157e308"), "{source}");
     assert!(source.contains("9223372036854775807"), "{source}");
 }
 
@@ -3621,7 +3629,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect_err("bails");
     assert!(
-        error.message.contains("open-ended slices"),
+        error.message.contains("string receiver"),
         "{}",
         error.message
     );
@@ -3674,4 +3682,236 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(compiled.source.contains("if not ("), "{}", compiled.source);
+}
+
+#[test]
+fn compiles_exact_integer_and_float_bounds() {
+    let bounds = [
+        ("i8::MAX", "127"),
+        ("i8::MIN", "(-128)"),
+        ("i16::MAX", "32767"),
+        ("i16::MIN", "(-32768)"),
+        ("i32::MAX", "2147483647"),
+        ("i32::MIN", "(-2147483648)"),
+        ("i64::MAX", "9223372036854775807"),
+        ("i64::MIN", "(-9223372036854775808)"),
+        ("i128::MAX", "170141183460469231731687303715884105727"),
+        ("u8::MAX", "255"),
+        ("u16::MAX", "65535"),
+        ("u32::MAX", "4294967295"),
+        ("u64::MAX", "18446744073709551615"),
+        ("u128::MAX", "340282366920938463463374607431768211455"),
+        ("usize::MAX", "18446744073709551615"),
+        ("isize::MAX", "9223372036854775807"),
+        ("u8::MIN", "0"),
+        ("usize::MIN", "0"),
+        ("f64::MAX", "1.7976931348623157e308"),
+        ("f64::MIN", "(-1.7976931348623157e308)"),
+        ("f32::MAX", "3.4028234663852886e38"),
+        ("f32::MIN", "(-3.4028234663852886e38)"),
+    ];
+    for (path, expected) in bounds {
+        let handler = format!(
+            r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {{
+    Ok(vec![Op::log(format!("{{}}", {path}))])
+}}
+"#
+        );
+        let compiled =
+            compile(&source(&handler), &options("handler", EntryKind::Service))
+                .expect("compiles");
+        assert!(
+            compiled.source.contains(expected),
+            "{path} should emit {expected}: {}",
+            compiled.source
+        );
+        assert!(
+            !compiled.source.contains("math.huge"),
+            "{path}: {}",
+            compiled.source
+        );
+    }
+}
+
+#[test]
+fn compiles_typed_defaults_from_the_type_hint() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let name: String = Default::default();
+    let count: u32 = Default::default();
+    let flag: bool = Default::default();
+    let items: Vec<Value> = Default::default();
+    Ok(vec![Op::log(format!("{name}{count}{flag}{items}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let emitted = &compiled.source;
+    assert!(emitted.contains("local name = \"\""), "{emitted}");
+    assert!(emitted.contains("local count = 0"), "{emitted}");
+    assert!(emitted.contains("local flag = false"), "{emitted}");
+    assert!(emitted.contains("local items = {}"), "{emitted}");
+
+    let untyped = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let unknown = Default::default();
+    Ok(vec![Op::log(format!("{unknown}"))])
+}
+"#;
+    let error =
+        compile(&source(untyped), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error.message.contains("needs a known type annotation"),
+        "{}",
+        error.message
+    );
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn bails_on_debug_specifiers_for_json_values() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config.get("value").cloned();
+    Ok(vec![Op::log(format!("{value:?}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("String(\"x\")"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn compiles_sign_and_alignment_specifiers_for_numbers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let count = 7;
+    Ok(vec![Op::log(format!("{count:+} {count:<5} {count:>5}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let emitted = &compiled.source;
+    assert!(
+        emitted.contains("string.format(\"%+d\", count)"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("string.format(\"%-5d\", count)"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("string.format(\"%5d\", count)"),
+        "{emitted}"
+    );
+
+    let signed = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let label = "hi";
+    Ok(vec![Op::log(format!("{label:+}"))])
+}
+"#;
+    let error =
+        compile(&source(signed), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error.message.contains("format specifier"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn compiles_option_or_with_an_explicit_nil_check() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = ctx.config.get("flag").and_then(Value::as_bool);
+    let chosen = flag.or(Some(false));
+    Ok(vec![Op::log(format!("{chosen}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    assert!(!source.contains("(flag or "), "{source}");
+    assert!(source.contains("~= nil then return"), "{source}");
+    assert!(source.contains("return false end)()"), "{source}");
+}
+
+#[test]
+fn bails_on_char_boundary_and_char_indices() {
+    let boundary = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.payload_str("text").unwrap_or_default();
+    let inside = text.is_char_boundary(1);
+    Ok(vec![Op::log(format!("{inside}"))])
+}
+"#;
+    let error =
+        compile(&source(boundary), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error.message.contains("is_char_boundary"),
+        "{}",
+        error.message
+    );
+
+    let indices = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.payload_str("text").unwrap_or_default();
+    for (at, ch) in text.char_indices() {
+        let _ = (at, ch);
+    }
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(indices), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("char_indices"), "{}", error.message);
+}
+
+#[test]
+fn bails_on_list_range_indexes() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let list = ctx.config.get("list").and_then(Value::as_array).cloned().unwrap_or_default();
+    let part = &list[1..3];
+    Ok(vec![Op::log(format!("{part}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error.message.contains("string receiver"),
+        "{}",
+        error.message
+    );
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn compiles_then_some_with_an_eager_value() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let ready = true;
+    let picked = ready.then_some("yes".to_owned());
+    Ok(vec![Op::log(format!("{picked}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let source = &compiled.source;
+    let value = source.find("local __t1 = \"yes\"").expect("value temp");
+    let condition = source.find("if ready then return __t1").expect("guard");
+    assert!(value < condition, "{source}");
 }
