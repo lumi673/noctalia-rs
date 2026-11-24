@@ -387,6 +387,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let uses_unwrap = bodies.iter().any(|slot| slot.body.uses_unwrap);
     let uses_host_call = bodies.iter().any(|slot| slot.body.uses_host_call);
     let uses_bool_or = bodies.iter().any(|slot| slot.body.uses_bool_or);
+    let uses_replace = bodies.iter().any(|slot| slot.body.uses_replace);
     let hoists = bodies
         .iter()
         .any(|slot| slot.body.uses_payload && !slot.body.payload_escapes);
@@ -443,6 +444,23 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "local function bool_or(value, default)\n",
             "  if type(value) == \"boolean\" then return value end\n",
             "  return default\n",
+            "end\n",
+        ));
+    }
+    if uses_replace {
+        out.push_str(concat!(
+            "local function replace_all(text, from, to)\n",
+            "  if from == \"\" then return text end\n",
+            "  local parts, start = {}, 1\n",
+            "  while true do\n",
+            "    local found = string.find(text, from, start, true)\n",
+            "    if not found then break end\n",
+            "    parts[#parts + 1] = string.sub(text, start, found - 1)\n",
+            "    parts[#parts + 1] = to\n",
+            "    start = found + #from\n",
+            "  end\n",
+            "  parts[#parts + 1] = string.sub(text, start)\n",
+            "  return table.concat(parts)\n",
             "end\n",
         ));
     }

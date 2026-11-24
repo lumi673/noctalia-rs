@@ -9,10 +9,17 @@ pub(crate) struct Resolved<'a> {
     pub function: &'a ItemFn,
 }
 
+#[derive(Clone)]
+pub(crate) struct StructDef {
+    pub fields: Vec<(String, Type)>,
+    pub derives_default: bool,
+}
+
 struct Unit {
     functions: HashMap<String, ItemFn>,
     statics: HashMap<String, ItemStatic>,
     enums: HashMap<String, Vec<String>>,
+    structs: HashMap<String, StructDef>,
     impls: HashMap<String, HashMap<String, ItemFn>>,
     constants: HashMap<String, Expr>,
     imports: HashMap<String, Vec<String>>,
@@ -25,6 +32,7 @@ impl Unit {
             functions: HashMap::new(),
             statics: HashMap::new(),
             enums: HashMap::new(),
+            structs: HashMap::new(),
             impls: HashMap::new(),
             constants: HashMap::new(),
             imports: HashMap::new(),
@@ -448,6 +456,33 @@ fn collect(
                 unit.statics
                     .insert(item_static.ident.to_string(), item_static.clone());
             }
+            Item::Struct(item_struct) => {
+                if let syn::Fields::Named(fields) = &item_struct.fields {
+                    let derives_default = item_struct.attrs.iter().any(|attr| {
+                        let syn::Meta::List(list) = &attr.meta else {
+                            return false;
+                        };
+                        list.path.is_ident("derive")
+                            && list.tokens.to_string().contains("Default")
+                    });
+                    let fields = fields
+                        .named
+                        .iter()
+                        .filter_map(|field| {
+                            field.ident.as_ref().map(|name| {
+                                (name.to_string(), field.ty.clone())
+                            })
+                        })
+                        .collect();
+                    unit.structs.insert(
+                        item_struct.ident.to_string(),
+                        StructDef {
+                            fields,
+                            derives_default,
+                        },
+                    );
+                }
+            }
             Item::Enum(item_enum) => {
                 let variants = item_enum
                     .variants
@@ -547,6 +582,26 @@ fn impl_name(ty: &Type) -> Option<String> {
 }
 
 impl Program {
+    pub(crate) fn struct_def(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Option<&StructDef> {
+        if let Some(def) = self.units.get(module)?.structs.get(name) {
+            return Some(def);
+        }
+        let mut found = None;
+        for unit in self.units.values() {
+            if let Some(def) = unit.structs.get(name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(def);
+            }
+        }
+        found
+    }
+
     pub(crate) fn enum_variant(
         &self,
         module: &str,

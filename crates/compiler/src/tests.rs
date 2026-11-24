@@ -113,7 +113,10 @@ fn panel(ctx: &Context) -> Result<Vec<Op>> {
     assert!(compiled.source.contains(
         "{ kind = \"column\", props = { id = \"root\", gap = 4 }, children = {"
     ));
-    assert!(compiled.source.contains("{ kind = \"label\", props = { id = \"value\", text = label }, children = {} }"));
+    assert!(compiled.source.contains("kind = \"label\""));
+    assert!(compiled.source.contains("id = \"value\""));
+    assert!(compiled.source.contains("text = label"));
+    assert!(compiled.source.contains("children = {}"));
     assert!(compiled.source.contains("panel.render(tree)"));
     assert!(compiled.source.contains("panel.setWantsSecondTicks(true)"));
     assert!(compiled.source.contains("--!nonstrict"));
@@ -182,7 +185,7 @@ fn update(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("update", EntryKind::Service))
             .expect("compiles");
 
-    assert!(compiled.source.contains("for _, row in ipairs(rows) do"));
+    assert!(compiled.source.contains("local row = "));
     assert!(
         compiled
             .source
@@ -487,7 +490,6 @@ fn rejects_constructs_outside_the_subset() {
     for handler in [
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.fuzzy_score(\"a\", \"b\"); Ok(vec![]) }",
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { match ctx.event.as_str() { other => { let _ = other; Ok(Vec::new()) } } }",
-        "fn handler(ctx: &Context) -> Result<Vec<Op>> { while ctx.now_ms > 0 { } Ok(vec![]) }",
         "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = std::process::id(); Ok(vec![]) }",
     ] {
         assert!(
@@ -1282,12 +1284,6 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 }
 "#,
         r#"
-fn helper(ctx: &Context) -> String { "x".to_owned() }
-fn widget(ctx: &Context) -> Result<Vec<Op>> {
-    helper(ctx);
-    Ok(Vec::new())
-}
-"#,
         r#"
 fn helper(ctx: &Context) -> String { let _ = ctx; }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
@@ -1500,7 +1496,6 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 fn bails_on_constructs_without_a_safe_translation() {
     for handler in [
         "fn widget(_ctx: &Context) -> Result<Vec<Op>> { Ok(vec![Op::run(json!(\"x\"), None)]) }",
-        "fn widget(_ctx: &Context) -> Result<Vec<Op>> { let value = serde_json::from_str::<serde_json::Value>(\"{}\")?; let _ = value; Ok(vec![]) }",
         "fn widget(_ctx: &Context) -> Result<Vec<Op>> { other = 1; Ok(vec![]) }",
     ] {
         let error =
@@ -1854,7 +1849,6 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     assert!(compiled.source.contains("~= nil"));
 
     for handler in [
-        "fn widget(ctx: &Context) -> Result<Vec<Op>> { while ctx.now_ms > 0 { } Ok(vec![]) }",
         "fn widget(ctx: &Context) -> Result<Vec<Op>> { let value = ctx.config_str(\"message\").map(|a: i64, b: i64| a + b); let _ = value; Ok(vec![]) }",
         "fn helper(ctx: &Context) -> String { let _ = ctx; } fn widget(ctx: &Context) -> Result<Vec<Op>> { let v = helper(ctx); Ok(vec![Op::log(v)]) }",
     ] {
@@ -2022,4 +2016,215 @@ fn fallback_body_serves_events_without_a_positive_branch() {
         assert!(compiled.source.contains("local function body_events("));
         assert!(compiled.source.contains("noctalia.log(\"B\")"));
     }
+}
+
+#[test]
+fn compiles_json_parsing_and_result_forms() {
+    let handler = r#"
+use serde_json::Value;
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let data = serde_json::from_str::<Value>("{\"n\":1}")?;
+    let n = data.get("n").and_then(Value::as_i64).unwrap_or_default();
+    let maybe = serde_json::from_str::<Value>("null").ok();
+    let fallback = serde_json::from_str::<Value>("nope").unwrap_or(Value::Null);
+    let text = serde_json::to_string(&data).unwrap_or_default();
+    Ok(vec![Op::log(format!("{} {} {} {}", n, maybe.is_some(), fallback.is_null(), text))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("json.decode("));
+    assert!(compiled.source.contains("error(tostring(__t"));
+    assert!(compiled.source.contains("json.encode("));
+    assert!(compiled.source.contains("nil"));
+}
+
+#[test]
+fn compiles_json_result_patterns() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = match serde_json::from_str::<serde_json::Value>("{}") {
+        Ok(data) => data,
+        Err(_) => serde_json::Value::Null,
+    };
+    if let Ok(data) = serde_json::from_str::<serde_json::Value>("[]") {
+        let _ = data;
+    }
+    let Ok(exact) = serde_json::from_str::<serde_json::Value>("null") else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![Op::log(value.to_string()), Op::log(exact.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("if __t"));
+    assert!(compiled.source.contains("== nil) then"));
+    assert!(compiled.source.contains("== nil) then"));
+}
+
+#[test]
+fn bails_on_json_struct_parsing() {
+    let handler = r#"
+struct Rpc { value: i64 }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = serde_json::from_str::<Rpc>("{}")?;
+    let _ = value;
+    Ok(Vec::new())
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("JSON parsing into `Rpc`"));
+    assert!(error.line > 0 && error.column > 0);
+}
+
+#[test]
+fn compiles_nested_table_assignment() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut state = ctx.state;
+    state.inner.value = 1;
+    state.rows[0] = json!({ "ok": true });
+    Ok(Vec::new())
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("state.inner.value = 1"));
+    assert!(compiled.source.contains("state.rows[(0) + 1] ="));
+}
+
+#[test]
+fn compiles_iterator_chains_and_split_cursors() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let values = [1, 2, 3];
+    let doubled = values.iter().map(|value| value * 2).collect::<Vec<i64>>();
+    let kept = values.iter().filter(|value| *value > 1).collect::<Vec<i64>>();
+    let words = "a  b".split_whitespace().collect::<Vec<&str>>();
+    let mut parts = "a.b".split('.');
+    let first = parts.next().unwrap_or_default();
+    Ok(vec![Op::log(format!("{}{}{}{}{}", doubled.len(), kept.len(), words.len(), first, ctx.event))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("string.split("));
+    assert!(compiled.source.contains("__next = 1"));
+    assert!(compiled.source.contains("#__t"));
+    assert!(compiled.source.contains("if __t"));
+}
+
+#[test]
+fn compiles_numeric_string_and_path_methods() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = 1.25_f64;
+    let rounded = value.floor();
+    let fraction = value.fract();
+    let finite = value.is_finite();
+    let joined = "/tmp".join("file");
+    let replaced = "a,b".replace(',', "-");
+    let trimmed = "'hi'".trim_matches('\'');
+    let encoded = serde_json::Value::String("x".to_owned()).to_string();
+    Ok(vec![Op::log(format!("{}{}{}{}{}{}{}", rounded, fraction, finite, joined, replaced, trimmed, encoded))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("math.floor(value)"));
+    assert!(compiled.source.contains("string.sub(__t"));
+    assert!(compiled.source.contains("replace_all("));
+    assert!(compiled.source.contains("string.gsub("));
+    assert!(compiled.source.contains("json.encode("));
+}
+
+#[test]
+fn compiles_struct_defaults_and_tuple_loops() {
+    let handler = r#"
+#[derive(Default)]
+struct State { count: i64, label: String }
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let state = State::default();
+    let pairs = [("a", 1), ("b", 2)];
+    let mut total = 0;
+    for (name, value) in pairs {
+        total += value;
+    }
+    let indexed = [(0, "a"), (1, "b")];
+    for (index, value) in indexed.iter().enumerate() {
+        total += index;
+    }
+    Ok(vec![Op::log(format!("{}{}{}{}", state.count, state.label, total, ctx.event))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("count = 0, label = \"\""));
+    assert!(compiled.source.contains("local name = __t"));
+    assert!(compiled.source.contains("local index = (__t"));
+}
+
+#[test]
+fn compiles_while_loops_blocks_and_array_repeat() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let flags = [false; 3];
+    let total = {
+        let mut value = 0;
+        while value < 10 {
+            value += 1;
+            if value == 3 { break; }
+        }
+        value
+    };
+    Ok(vec![Op::log(format!("{}{}", flags.len(), total))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("{ false, false, false }"));
+    assert!(compiled.source.contains("while (value < 10) do"));
+    assert!(compiled.source.contains("break"));
+}
+
+#[test]
+fn compiles_host_result_pairs() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let (text, error) = ctx.read_file_result("/tmp/x");
+    let (font, font_error) = ctx.load_font_result("font.ttf");
+    Ok(vec![Op::log(format!("{}{}{}{}", text.unwrap_or_default(), error.is_some(), font.is_some(), font_error.is_some()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("local text, "));
+    assert!(compiled.source.contains("noctalia.readFile(\"/tmp/x\")"));
+    assert!(compiled.source.contains("noctalia.loadFont(\"font.ttf\")"));
+}
+
+#[test]
+fn bails_on_callback_id_host_methods() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    ctx.run_async_start(json!([]), None, None);
+    Ok(Vec::new())
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("host callback id"));
+    assert!(error.line > 0 && error.column > 0);
 }

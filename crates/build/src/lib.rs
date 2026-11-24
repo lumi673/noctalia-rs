@@ -361,6 +361,39 @@ fn safe_relative_path(value: &str, label: &str) -> Result<PathBuf, BoxError> {
     }
 }
 
+/// Inlines literal `include_str!` files into the source handed to the compiler.
+///
+/// The compiler only sees source strings, so it cannot resolve those paths itself.
+fn resolve_includes(source: &str, file: &Path) -> Result<String, BoxError> {
+    const NEEDLE: &str = "include_str!(\"";
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(index) = rest.find(NEEDLE) {
+        out.push_str(&rest[..index]);
+        let after = &rest[index + NEEDLE.len()..];
+        let Some(end) = after.find('"') else {
+            let before = &source[..source.len() - rest.len() + index];
+            let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let column = before.rfind('\n').map_or(before.len() + 1, |at| before.len() - at);
+            return Err(format!(
+                "{}:{line}:{column}: unterminated include_str! path",
+                file.display()
+            )
+            .into());
+        };
+        let path = &after[..end];
+        let target = file.parent().unwrap_or_else(|| Path::new(".")).join(path);
+        let text = fs::read_to_string(&target).map_err(|error| {
+            format!("{}: include_str!({path}): {error}", file.display())
+        })?;
+        out.push_str(&format!("{text:?}"));
+        let remaining = &after[end + 1..];
+        rest = remaining.strip_prefix(')').unwrap_or(remaining);
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 fn reserved_asset_path(value: &str) -> bool {
     value == "plugin.toml"
         || value == "lib"
@@ -1171,17 +1204,26 @@ fn compile_entry(
         );
         return compile_failure(context.mode, context.warnings, id, rendered);
     };
+    let module_sources = site
+        .modules
+        .iter()
+        .map(|file| {
+            resolve_includes(&file.source, &context.source.join(&file.file))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let owned = site
         .modules
         .iter()
-        .map(|file| compiler::Module {
+        .zip(&module_sources)
+        .map(|(file, source)| compiler::Module {
             path: &file.module,
-            source: &file.source,
+            source,
         })
         .collect::<Vec<_>>();
+    let source = resolve_includes(&site.source, &context.source.join(&site.file))?;
     let display = site.file.to_string_lossy();
     let result = compiler::compile(
-        &site.source,
+        &source,
         &compiler::Options {
             handler,
             entry: id,
