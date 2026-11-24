@@ -33,6 +33,8 @@ fn compiled_source(entry: &str, handler: &str, kind: EntryKind) -> String {
             state_key: "hello.state",
             kind,
             strings: &["message"],
+            module: "main",
+            modules: &[],
         },
     )
     .expect("compile")
@@ -293,4 +295,61 @@ fn native_launcher(ctx: &Context) -> Vec<Op> {
             vec![Op::log(source)]
         }
     }
+}
+
+#[test]
+fn inlined_module_helpers_match_the_native_handler() {
+    let source = r#"
+mod widget;
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    widget::handle(ctx)
+}
+"#;
+    let widget = r#"
+use noctalia_rs::{Context, Op, Result};
+
+fn ensure(ctx: &Context, ops: &mut Vec<Op>) {
+    if ctx.event == "render" {
+        ops.push(Op::BarText { text: ctx.config_str("message").unwrap_or_default().into_owned() });
+    }
+}
+
+fn label(ctx: &Context) -> String {
+    format!("event={}", ctx.event)
+}
+
+pub fn handle(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    ensure(ctx, &mut ops);
+    ops.push(Op::log(label(ctx)));
+    Ok(ops)
+}
+"#;
+    let modules = [noctalia_rs_compiler::Module {
+        path: "widget",
+        source: widget,
+    }];
+    let compiled = compile(
+        source,
+        &Options {
+            handler: "handler",
+            entry: "inlined",
+            state_key: "hello.state",
+            kind: EntryKind::Widget,
+            strings: &["message"],
+            module: "main",
+            modules: &modules,
+        },
+    )
+    .expect("compile")
+    .source;
+    let ctx = context("inlined", "render", json!({}), json!({}));
+    let mut expected = rust_ops(vec![
+        Op::BarText {
+            text: "Hello".to_owned(),
+        },
+        Op::log("event=render"),
+    ]);
+    expected.extend(expected.clone());
+    assert_eq!(ops("inlined", &compiled, &ctx), expected);
 }

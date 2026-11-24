@@ -4,11 +4,12 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    BinOp, Expr, ExprBinary, ExprCall, ExprLit, ExprMacro, ExprMethodCall, Lit,
-    Member, Pat, Stmt, Token, Type, UnOp,
+    BinOp, Expr, ExprBinary, ExprCall, ExprLit, ExprMacro, ExprMethodCall,
+    ItemFn, Lit, Member, Pat, PathArguments, Stmt, Token, Type, UnOp,
 };
 
-use crate::{Error, is_identifier, quote};
+use crate::program::{Program, typed_args};
+use crate::{Error, is_context, is_identifier, quote};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Base {
@@ -21,6 +22,7 @@ enum Base {
     Node,
     Table,
     Ops,
+    Context,
     Void,
 }
 
@@ -60,6 +62,7 @@ impl Ty {
     const NODE: Self = Self::new(Base::Node);
     const TABLE: Self = Self::new(Base::Table);
     const OPS: Self = Self::new(Base::Ops);
+    const CONTEXT: Self = Self::new(Base::Context);
     const VOID: Self = Self::new(Base::Void);
 
     const fn is_numeric(self) -> bool {
@@ -76,12 +79,20 @@ impl Ty {
             Base::Int | Base::Float => Some("0"),
             Base::Bool => Some("false"),
             Base::List | Base::Table => Some("{}"),
-            Base::Value | Base::Node | Base::Ops | Base::Void => None,
+            Base::Value
+            | Base::Node
+            | Base::Ops
+            | Base::Context
+            | Base::Void => None,
         }
     }
 }
 
 pub(crate) type PayloadParam = (&'static str, &'static str, &'static str);
+
+type Constant = (String, Ty);
+type Constants = HashMap<String, Constant>;
+type Inlined = Option<(String, Ty)>;
 
 /// Payload keys that map directly to a callback parameter, so the generated
 /// body can take the argument instead of building and reading a payload table.
@@ -121,7 +132,7 @@ pub(crate) struct Body {
     pub is_empty: bool,
 }
 
-pub(crate) struct Emitter {
+pub(crate) struct Emitter<'a> {
     ctx: String,
     out: String,
     indent: usize,
@@ -131,7 +142,14 @@ pub(crate) struct Emitter {
     payload_params: &'static [PayloadParam],
     params: Vec<&'static str>,
     strings: Vec<String>,
-    constants: HashMap<String, (String, Ty)>,
+    constants: Constants,
+    constant_scopes: Vec<Constants>,
+    program: &'a Program,
+    module: String,
+    home: String,
+    inline_stack: Vec<String>,
+    inline_budget: usize,
+    tail_target: Option<String>,
     uses_state: bool,
     uses_payload: bool,
     payload_escapes: bool,
@@ -145,12 +163,17 @@ pub(crate) struct Emitter {
     temp: usize,
 }
 
-impl Emitter {
+const MAX_INLINE_DEPTH: usize = 8;
+const MAX_INLINE_CALLS: usize = 200;
+
+impl<'a> Emitter<'a> {
     pub(crate) fn new(
         ctx: &syn::Ident,
         bound_event: Option<String>,
         strings: &[&str],
         payload_params: &'static [PayloadParam],
+        program: &'a Program,
+        module: &str,
     ) -> Self {
         Self {
             ctx: ctx.to_string(),
@@ -163,6 +186,13 @@ impl Emitter {
             params: Vec::new(),
             strings: strings.iter().map(|key| (*key).to_owned()).collect(),
             constants: HashMap::new(),
+            constant_scopes: Vec::new(),
+            program,
+            module: module.to_owned(),
+            home: module.to_owned(),
+            inline_stack: Vec::new(),
+            inline_budget: MAX_INLINE_CALLS,
+            tail_target: None,
             uses_state: false,
             uses_payload: false,
             payload_escapes: false,
@@ -177,35 +207,321 @@ impl Emitter {
         }
     }
 
-    pub(crate) fn constants(&mut self, items: &[syn::Item]) {
-        for item in items {
-            match item {
-                syn::Item::Const(item_const) => {
-                    let Expr::Lit(literal) = &*item_const.expr else {
-                        continue;
-                    };
-                    let value = match &literal.lit {
-                        Lit::Str(value) => (quote(&value.value()), Ty::STR),
-                        Lit::Int(value) => {
-                            (value.base10_digits().to_owned(), Ty::INT)
-                        }
-                        Lit::Bool(value) => (
-                            if value.value { "true" } else { "false" }
-                                .to_owned(),
-                            Ty::BOOL,
-                        ),
-                        _ => continue,
-                    };
-                    self.constants.insert(item_const.ident.to_string(), value);
-                }
-                syn::Item::Mod(module) => {
-                    if let Some((_, items)) = &module.content {
-                        self.constants(items);
-                    }
-                }
-                _ => {}
+    pub(crate) fn constants(&mut self) {
+        for (name, value) in self.program.constants(&self.module) {
+            if let Some(entry) = constant(value) {
+                self.constants.insert(name.to_owned(), entry);
             }
         }
+    }
+
+    fn constant(&self, name: &str) -> Option<Constant> {
+        if let Some(value) = self.constants.get(name) {
+            return Some(value.clone());
+        }
+        for scope in self.constant_scopes.iter().rev() {
+            if let Some(value) = scope.get(name) {
+                return Some(value.clone());
+            }
+        }
+        None
+    }
+
+    fn module_constants(&self, module: &str) -> Constants {
+        let mut scope = HashMap::new();
+        for (name, value) in self.program.constants(module) {
+            if let Some(entry) = constant(value) {
+                scope.insert(name.to_owned(), entry);
+            }
+        }
+        scope
+    }
+
+    fn helper(&self, call: &ExprCall) -> Option<Helper> {
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let segments = path_segments(&path.path)?;
+        let resolved = self.program.resolve(&self.module, &segments)?;
+        Some(Helper {
+            module: resolved.module.clone(),
+            function: resolved.function.clone(),
+            name: segments.join("::"),
+        })
+    }
+
+    fn check_inline(
+        &self,
+        helper: &Helper,
+        mode: Inline,
+        returns: Returns,
+        call: &ExprCall,
+    ) -> Result<(), Error> {
+        if self.inline_stack.len() >= MAX_INLINE_DEPTH {
+            return Err(Error::at(
+                call.span(),
+                format!(
+                    "inlining `{}` exceeds the depth limit of {MAX_INLINE_DEPTH}",
+                    helper.name
+                ),
+            ));
+        }
+        if self.inline_budget == 0 {
+            return Err(Error::at(
+                call.span(),
+                format!(
+                    "inlining `{}` exceeds the limit of {MAX_INLINE_CALLS} calls per body",
+                    helper.name
+                ),
+            ));
+        }
+        let key = format!("{}::{}", helper.module, helper.name);
+        if self.inline_stack.contains(&key) {
+            return Err(Error::at(
+                call.span(),
+                format!("recursive helper `{}` cannot be inlined", helper.name),
+            ));
+        }
+        match (mode, returns) {
+            (Inline::Tail | Inline::Value, Returns::Value(_))
+            | (Inline::Tail, Returns::Ops | Returns::Unit) => {}
+            (Inline::Statement, Returns::Unit)
+            | (Inline::Ops, Returns::VecOps) => {}
+            (Inline::Value, Returns::Ops) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!(
+                        "helper `{}` returns `Result<Vec<Op>>` and can only be called in tail position",
+                        helper.name
+                    ),
+                ));
+            }
+            (Inline::Value, Returns::VecOps)
+            | (Inline::Tail, Returns::VecOps) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!(
+                        "helper `{}` returns `Vec<Op>` and can only be used inside `Ok(...)`",
+                        helper.name
+                    ),
+                ));
+            }
+            (_, Returns::Ops) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!(
+                        "helper `{}` returns `Result<Vec<Op>>` and must be called in tail position",
+                        helper.name
+                    ),
+                ));
+            }
+            (Inline::Ops, Returns::Unit | Returns::Value(_)) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!(
+                        "helper `{}` does not build a `Vec<Op>`",
+                        helper.name
+                    ),
+                ));
+            }
+            (Inline::Value, Returns::Unit) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!("helper `{}` returns no value", helper.name),
+                ));
+            }
+            (Inline::Statement, Returns::Value(_) | Returns::VecOps) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!(
+                        "helper `{}` returns a value and must be used in an expression",
+                        helper.name
+                    ),
+                ));
+            }
+        }
+        check_body(&helper.function, mode)
+    }
+
+    fn bindings(
+        &mut self,
+        helper: &Helper,
+        call: &ExprCall,
+    ) -> Result<Vec<Binding>, Error> {
+        let params = typed_args(&helper.function);
+        if params.len() != call.args.len() {
+            return Err(Error::at(
+                call.span(),
+                format!(
+                    "helper `{}` takes {} arguments but {} were passed",
+                    helper.name,
+                    params.len(),
+                    call.args.len()
+                ),
+            ));
+        }
+        let mut bindings = Vec::new();
+        for ((pattern, ty), argument) in params.iter().zip(call.args.iter()) {
+            let Pat::Ident(pattern) = pattern else {
+                return Err(Error::at(
+                    ty.span(),
+                    "helper parameters must be plain identifiers",
+                ));
+            };
+            let name = pattern.ident.to_string();
+            if is_context(ty) {
+                if !self.is_ctx_expr(strip_reference(argument)) {
+                    return Err(Error::at(
+                        argument.span(),
+                        format!(
+                            "argument for `{name}` must be the context passed to the caller"
+                        ),
+                    ));
+                }
+                bindings.push(Binding::Context(name));
+                continue;
+            }
+            if is_ops_vec(ty) {
+                let Expr::Path(path) = strip_reference(argument) else {
+                    return Err(Error::at(
+                        argument.span(),
+                        "expected a local `Vec<Op>` for this argument",
+                    ));
+                };
+                let Some(ident) = path.path.get_ident() else {
+                    return Err(Error::at(
+                        argument.span(),
+                        "expected a local `Vec<Op>` for this argument",
+                    ));
+                };
+                if self.lookup(&ident.to_string()) != Some(Ty::OPS) {
+                    return Err(Error::at(
+                        argument.span(),
+                        "expected a local `Vec<Op>` for this argument",
+                    ));
+                }
+                bindings.push(Binding::Ops(name));
+                continue;
+            }
+            if let Type::Reference(reference) = ty
+                && reference.mutability.is_some()
+            {
+                return Err(Error::at(
+                    ty.span(),
+                    "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
+                ));
+            }
+            let (text, value) = self.expr(argument)?;
+            bindings.push(Binding::Local {
+                name,
+                text,
+                ty: value,
+            });
+        }
+        Ok(bindings)
+    }
+
+    fn inline_call(
+        &mut self,
+        call: &ExprCall,
+        mode: Inline,
+    ) -> Result<Inlined, Error> {
+        let Some(helper) = self.helper(call) else {
+            return Ok(None);
+        };
+        let returns = return_kind(&helper.function)?;
+        self.check_inline(&helper, mode, returns, call)?;
+        let bindings = self.bindings(&helper, call)?;
+        let value = self.inline(&helper, bindings, mode, returns)?;
+        Ok(Some(value))
+    }
+
+    fn ops_body(&mut self, block: &syn::Block) -> Result<(), Error> {
+        let Some((last, rest)) = block.stmts.split_last() else {
+            return Ok(());
+        };
+        for stmt in rest {
+            self.stmt(stmt)?;
+        }
+        if let Stmt::Expr(Expr::Path(path), _) = last
+            && let Some(ident) = path.path.get_ident()
+            && self.lookup(&ident.to_string()) == Some(Ty::OPS)
+        {
+            return Ok(());
+        }
+        self.stmt(last)
+    }
+
+    fn inline(
+        &mut self,
+        helper: &Helper,
+        bindings: Vec<Binding>,
+        mode: Inline,
+        returns: Returns,
+    ) -> Result<(String, Ty), Error> {
+        let temp = (mode == Inline::Value).then(|| self.temp());
+        if let Some(name) = &temp {
+            self.line(&format!("local {name}"));
+        }
+        self.line("do");
+        self.indent = self.indent.saturating_add(1);
+        self.scopes.push(HashMap::new());
+        let saved_module =
+            std::mem::replace(&mut self.module, helper.module.clone());
+        let scope = self.module_constants(&helper.module);
+        self.constant_scopes.push(scope);
+        let saved_target = self.tail_target.clone();
+        self.tail_target = temp.clone();
+        for binding in bindings {
+            match binding {
+                Binding::Context(name) => self.push(&name, Ty::CONTEXT),
+                Binding::Ops(name) => self.push(&name, Ty::OPS),
+                Binding::Local { name, text, ty } => {
+                    self.line(&format!("local {name} = {text}"));
+                    self.push(&name, ty);
+                }
+            }
+        }
+        let key = format!("{}::{}", helper.module, helper.name);
+        self.inline_stack.push(key);
+        self.inline_budget = self.inline_budget.saturating_sub(1);
+        let result = match mode {
+            Inline::Value => {
+                self.block_inner(&helper.function.block, true).map(|()| {
+                    (
+                        temp.clone().unwrap_or_default(),
+                        match returns {
+                            Returns::Value(ty) => ty,
+                            _ => Ty::VALUE,
+                        },
+                    )
+                })
+            }
+            Inline::Tail => self
+                .block_inner(&helper.function.block, true)
+                .map(|()| (String::new(), Ty::VOID)),
+            Inline::Statement => self
+                .block_inner(&helper.function.block, false)
+                .map(|()| (String::new(), Ty::VOID)),
+            Inline::Ops => self
+                .ops_body(&helper.function.block)
+                .map(|()| (String::new(), Ty::VOID)),
+        };
+        self.inline_stack.pop();
+        self.tail_target = saved_target;
+        self.constant_scopes.pop();
+        self.module = saved_module;
+        self.scopes.pop();
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        let foreign = helper.module != self.home;
+        result.map_err(|error| {
+            if foreign {
+                error.with_file(&helper.module)
+            } else {
+                error
+            }
+        })
     }
 
     pub(crate) fn block(&mut self, block: &syn::Block) -> Result<(), Error> {
@@ -314,6 +630,12 @@ impl Emitter {
     }
 
     fn tail_expr(&mut self, expr: &Expr) -> Result<(), Error> {
+        if let Expr::Call(call) = expr
+            && !is_ok_call(call)
+            && self.inline_call(call, Inline::Tail)?.is_some()
+        {
+            return Ok(());
+        }
         match expr {
             Expr::Call(call) if is_ok_call(call) => self.ok_tail(&call.args),
             Expr::If(item) => self.if_stmt(item, true),
@@ -326,7 +648,11 @@ impl Emitter {
             _ => {
                 let (text, ty) = self.expr(expr)?;
                 if ty.base != Base::Void {
-                    self.line(&format!("return {text}"));
+                    if let Some(target) = self.tail_target.clone() {
+                        self.line(&format!("{target} = {text}"));
+                    } else {
+                        self.line(&format!("return {text}"));
+                    }
                 }
                 Ok(())
             }
@@ -396,6 +722,13 @@ impl Emitter {
     }
 
     fn expr_stmt(&mut self, expr: &Expr) -> Result<(), Error> {
+        if let Expr::Call(call) = expr
+            && !is_ok_call(call)
+            && !is_ops_push(call)
+            && self.inline_call(call, Inline::Statement)?.is_some()
+        {
+            return Ok(());
+        }
         match expr {
             Expr::Call(call) if is_ok_call(call) => self.ok_tail(&call.args),
             Expr::Call(call) if is_ops_push(call) => {
@@ -447,7 +780,11 @@ impl Emitter {
     }
     fn ret(&mut self, expr: Option<&Expr>) -> Result<(), Error> {
         let Some(expr) = expr else {
-            self.line("return");
+            if let Some(target) = self.tail_target.clone() {
+                self.line(&format!("{target} = nil"));
+            } else {
+                self.line("return");
+            }
             return Ok(());
         };
         if let Expr::Call(call) = expr {
@@ -464,7 +801,11 @@ impl Emitter {
             }
         }
         let (text, _) = self.expr(expr)?;
-        self.line(&format!("return {text}"));
+        if let Some(target) = self.tail_target.clone() {
+            self.line(&format!("{target} = {text}"));
+        } else {
+            self.line(&format!("return {text}"));
+        }
         Ok(())
     }
 
@@ -487,6 +828,18 @@ impl Emitter {
         let value = args.first().ok_or_else(|| {
             Error::at(proc_macro2::Span::call_site(), "Ok() needs a value")
         })?;
+        if let Expr::Call(call) = value
+            && let Some(helper) = self.helper(call)
+            && matches!(return_kind(&helper.function)?, Returns::VecOps)
+        {
+            self.check_inline(&helper, Inline::Ops, Returns::VecOps, call)?;
+            let bindings = self.bindings(&helper, call)?;
+            self.inline(&helper, bindings, Inline::Ops, Returns::VecOps)?;
+            if emit_return {
+                self.line("return");
+            }
+            return Ok(());
+        }
         if let Expr::Call(call) = value
             && is_vec_new(call)
         {
@@ -688,7 +1041,10 @@ impl Emitter {
         item: &syn::ExprMatch,
         tail: bool,
     ) -> Result<(), Error> {
-        if let Some(bound) = self.bound_event.clone()
+        let guarded =
+            item.arms.iter().any(|arm| matches!(arm.pat, Pat::Guard(_)));
+        if !guarded
+            && let Some(bound) = self.bound_event.clone()
             && self.is_event_expr(&item.expr)
         {
             for arm in &item.arms {
@@ -699,10 +1055,15 @@ impl Emitter {
                         return self.inline_arm(&arm.body, tail);
                     }
                     Some(_) => {}
-                    None if matches!(arm.pat, Pat::Wild(_)) => {
+                    None if is_wild(&arm.pat) => {
                         return self.inline_arm(&arm.body, tail);
                     }
-                    None => {}
+                    None => {
+                        return Err(Error::at(
+                            arm.pat.span(),
+                            "only string literal, wildcard and guarded match patterns are supported by the Luau compiler",
+                        ));
+                    }
                 }
             }
             return Ok(());
@@ -711,32 +1072,31 @@ impl Emitter {
         let event_match = self.is_event_expr(&item.expr);
         let mut opened = false;
         for arm in &item.arms {
-            let patterns = pattern_strings(&arm.pat)?;
-            let Some(patterns) = patterns else {
-                if !matches!(arm.pat, Pat::Wild(_)) {
-                    return Err(Error::at(
-                        arm.pat.span(),
-                        "only string or wildcard match patterns are supported",
-                    ));
+            let (pattern, guard) = split_guard(&arm.pat);
+            let patterns = pattern_strings(pattern)?;
+            let mut condition = if let Some(patterns) = &patterns {
+                if event_match {
+                    for pattern in patterns {
+                        self.events.insert(pattern.clone());
+                    }
                 }
-                if opened {
-                    self.line("else");
-                }
-                self.indent = self.indent.saturating_add(1);
-                self.arm_body(&arm.body, tail)?;
-                self.indent = self.indent.saturating_sub(1);
-                continue;
+                patterns
+                    .iter()
+                    .map(|pattern| format!("{scrutinee} == {}", quote(pattern)))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            } else if is_wild(pattern) {
+                "true".to_owned()
+            } else {
+                return Err(Error::at(
+                    arm.pat.span(),
+                    "only string literal, wildcard and guarded match patterns are supported by the Luau compiler",
+                ));
             };
-            if event_match {
-                for pattern in &patterns {
-                    self.events.insert(pattern.clone());
-                }
+            if let Some(guard) = guard {
+                let (text, _) = self.expr(guard)?;
+                condition = format!("({condition}) and ({text})");
             }
-            let condition = patterns
-                .iter()
-                .map(|pattern| format!("{scrutinee} == {}", quote(pattern)))
-                .collect::<Vec<_>>()
-                .join(" or ");
             let keyword = if opened { "elseif" } else { "if" };
             self.line(&format!("{keyword} {condition} then"));
             self.indent = self.indent.saturating_add(1);
@@ -959,6 +1319,15 @@ impl Emitter {
         expr: &Expr,
         path: &syn::ExprPath,
     ) -> Result<(String, Ty), Error> {
+        if path.qself.is_none()
+            && path.path.segments.len() > 1
+            && let Some(segments) = path_segments(&path.path)
+            && let Some(value) =
+                self.program.resolve_constant(&self.module, &segments)
+            && let Some((text, ty)) = constant(value)
+        {
+            return Ok((text, ty));
+        }
         let Some(name) = path.path.get_ident() else {
             return Err(Error::at(expr.span(), "unsupported path expression"));
         };
@@ -975,11 +1344,22 @@ impl Emitter {
                 "the context must be accessed through a supported field or method",
             ));
         }
+        if self.lookup(&name) == Some(Ty::CONTEXT) {
+            return Err(Error::at(
+                expr.span(),
+                "the context can only be passed to an inlined helper",
+            ));
+        }
         if let Some(ty) = self.lookup(&name) {
             return Ok((name, ty));
         }
-        if let Some((value, ty)) = self.constants.get(&name) {
-            return Ok((value.clone(), *ty));
+        if let Some((value, ty)) = self.constant(&name) {
+            return Ok((value, ty));
+        }
+        if let Some(value) = self.program.imported_constant(&self.module, &name)
+            && let Some((text, ty)) = constant(value)
+        {
+            return Ok((text, ty));
         }
         Err(Error::at(
             expr.span(),
@@ -1054,9 +1434,9 @@ impl Emitter {
         let (receiver, ty) = self.expr(&call.receiver)?;
         match method.as_str() {
             "to_string" => Ok((format!("tostring({receiver})"), Ty::STR)),
-            "into_owned" | "to_owned" | "clone" | "as_ref" => {
-                Ok((receiver, ty))
-            }
+            "into_owned" | "to_owned" | "clone" | "as_ref" | "as_deref"
+            | "cloned" => Ok((receiver, ty)),
+            "to_string_lossy" | "display" => Ok((receiver, Ty::STR)),
             "as_str" => Ok((receiver, Ty::OPT_STR)),
             "as_i64" | "as_u64" => Ok((receiver, Ty::OPT_INT)),
             "as_f64" => Ok((receiver, Ty::OPT_FLOAT)),
@@ -1119,6 +1499,14 @@ impl Emitter {
             }
             "push" if ty.base == Base::Ops => {
                 self.op_expr(arg(&args, 0, call)?)?;
+                Ok((String::new(), Ty::VOID))
+            }
+            "extend" => {
+                let (value, _) = self.expr(arg(&args, 0, call)?)?;
+                let item = self.temp();
+                self.line(&format!(
+                    "for _, {item} in ipairs({value}) do {receiver}[#({receiver}) + 1] = {item} end"
+                ));
                 Ok((String::new(), Ty::VOID))
             }
             "push" => {
@@ -1276,6 +1664,80 @@ impl Emitter {
                 let table = self.tr_params(params)?;
                 Ok((format!("noctalia.tr({key}, {table})"), Ty::STR))
             }
+            "file_exists" => {
+                let path = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.fileExists({path})"), Ty::BOOL))
+            }
+            "command_exists" => {
+                let name = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.commandExists({name})"), Ty::BOOL))
+            }
+            "read_file" => {
+                let path = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.readFile({path})"), Ty::OPT_STR))
+            }
+            "write_file" => {
+                let path = self.string_arg(args, 0, call)?;
+                let contents = self.string_arg(args, 1, call)?;
+                Ok((
+                    format!("noctalia.writeFile({path}, {contents})"),
+                    Ty::VOID,
+                ))
+            }
+            "env" => {
+                let key = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.getenv({key})"), Ty::OPT_STR))
+            }
+            "expand_path" => {
+                let path = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.expandPath({path})"), Ty::STR))
+            }
+            "list_dir" => {
+                let path = self.string_arg(args, 0, call)?;
+                Ok((format!("(noctalia.listDir({path}))"), Ty::LIST))
+            }
+            "mkdir_all" => {
+                let path = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.mkdirAll({path})"), Ty::VOID))
+            }
+            "remove_file" => {
+                let path = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.removeFile({path})"), Ty::VOID))
+            }
+            "format_time" => {
+                let format = self.string_arg(args, 0, call)?;
+                Ok((format!("noctalia.formatTime({format})"), Ty::STR))
+            }
+            "format_time_at" => {
+                let format = self.string_arg(args, 0, call)?;
+                let seconds = match args.get(1) {
+                    Some(argument) => {
+                        let (text, _) = self.expr(argument)?;
+                        format!("({text})")
+                    }
+                    None => "nil".to_owned(),
+                };
+                let timezone = match args.get(2) {
+                    Some(argument) => {
+                        let (text, _) = self.expr(argument)?;
+                        format!("({text})")
+                    }
+                    None => "nil".to_owned(),
+                };
+                Ok((
+                    format!(
+                        "noctalia.formatTime({format}, {seconds}, {timezone})"
+                    ),
+                    Ty::STR,
+                ))
+            }
+            "plugin_data_dir_result" => Ok((
+                "(noctalia.pluginDataDir())".to_owned(),
+                Ty::OPT_STR,
+            )),
+            "plugin_dir_result" => {
+                Ok(("(noctalia.pluginDir())".to_owned(), Ty::OPT_STR))
+            }
             "os_clock" => Ok(("os.clock()".to_owned(), Ty::FLOAT)),
             "os_time" => Ok(("os.time()".to_owned(), Ty::INT)),
             "math_random" => Ok(("math.random()".to_owned(), Ty::FLOAT)),
@@ -1389,10 +1851,19 @@ impl Emitter {
                 self.op_call(call, &op)?;
                 return Ok((String::new(), Ty::VOID));
             }
+            if let Some(op) = unsupported_op(&name) {
+                return Err(Error::at(call.span(), op));
+            }
         }
+        if let Some(value) = self.inline_call(call, Inline::Value)? {
+            return Ok(value);
+        }
+        let label = path_last_name(&call.func).unwrap_or_default();
         Err(Error::at(
             call.span(),
-            "only ops, ui constructors and a small set of std calls are supported",
+            format!(
+                "call to `{label}` is not supported by the Luau compiler: no function in the crate matches, and only ops, ui constructors and a small set of std calls are supported"
+            ),
         ))
     }
 
@@ -1660,7 +2131,13 @@ impl Emitter {
     }
 
     fn is_ctx_expr(&self, expr: &Expr) -> bool {
-        matches!(expr, Expr::Path(path) if path.path.is_ident(&self.ctx))
+        let Expr::Path(path) = expr else {
+            return false;
+        };
+        path.path.get_ident().is_some_and(|ident| {
+            let name = ident.to_string();
+            name == self.ctx || self.lookup(&name) == Some(Ty::CONTEXT)
+        })
     }
 
     fn is_event_expr(&self, expr: &Expr) -> bool {
@@ -1708,6 +2185,9 @@ impl Emitter {
                     name.rsplit("::").next().unwrap_or(&name).to_owned();
                 if op_constructor(&name).is_some() {
                     return self.op_call(call, &variant);
+                }
+                if let Some(message) = unsupported_op(&name) {
+                    return Err(Error::at(call.span(), message));
                 }
                 Err(Error::at(call.span(), "expected an Op constructor"))
             }
@@ -1958,6 +2438,293 @@ impl Emitter {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Inline {
+    Tail,
+    Statement,
+    Value,
+    Ops,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Returns {
+    Ops,
+    VecOps,
+    Unit,
+    Value(Ty),
+}
+
+struct Helper {
+    module: String,
+    function: ItemFn,
+    name: String,
+}
+
+enum Binding {
+    Context(String),
+    Ops(String),
+    Local { name: String, text: String, ty: Ty },
+}
+
+fn constant(expr: &Expr) -> Option<(String, Ty)> {
+    let Expr::Lit(literal) = expr else {
+        return None;
+    };
+    Some(match &literal.lit {
+        Lit::Str(value) => (quote(&value.value()), Ty::STR),
+        Lit::Int(value) => (value.base10_digits().to_owned(), Ty::INT),
+        Lit::Bool(value) => (
+            if value.value { "true" } else { "false" }.to_owned(),
+            Ty::BOOL,
+        ),
+        _ => return None,
+    })
+}
+
+fn path_segments(path: &syn::Path) -> Option<Vec<String>> {
+    if path.leading_colon.is_some()
+        || path
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment.arguments, PathArguments::None))
+    {
+        return None;
+    }
+    Some(
+        path.segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect(),
+    )
+}
+
+fn generic_arg(ty: &Type) -> Option<&Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    let syn::GenericArgument::Type(inner) = arguments.args.first()? else {
+        return None;
+    };
+    Some(inner)
+}
+
+fn is_result(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Result"))
+}
+
+fn is_ops_vec(ty: &Type) -> bool {
+    let ty = match ty {
+        Type::Reference(reference) => &*reference.elem,
+        other => other,
+    };
+    let Type::Path(path) = ty else {
+        return false;
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Vec" {
+        return false;
+    }
+    generic_arg(ty).is_some_and(|inner| {
+        matches!(inner, Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Op"))
+    })
+}
+
+fn return_kind(function: &ItemFn) -> Result<Returns, Error> {
+    let ty = match &function.sig.output {
+        syn::ReturnType::Default => return Ok(Returns::Unit),
+        syn::ReturnType::Type(_, ty) => &**ty,
+    };
+    if is_result(ty) {
+        return match generic_arg(ty) {
+            Some(inner) if is_ops_vec(inner) => Ok(Returns::Ops),
+            _ => Err(Error::at(
+                ty.span(),
+                "inlined helpers may only return `Result<Vec<Op>>`",
+            )),
+        };
+    }
+    if is_ops_vec(ty) {
+        return Ok(Returns::VecOps);
+    }
+    if matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty()) {
+        return Ok(Returns::Unit);
+    }
+    Ok(Returns::Value(type_hint(ty)))
+}
+
+#[derive(Default)]
+struct Scan {
+    return_span: Option<proc_macro2::Span>,
+    try_span: Option<proc_macro2::Span>,
+    closure_span: Option<proc_macro2::Span>,
+}
+
+impl Scan {
+    fn block(&mut self, block: &syn::Block) {
+        for stmt in &block.stmts {
+            self.stmt(stmt);
+        }
+    }
+
+    fn stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    self.expr(&init.expr);
+                }
+            }
+            Stmt::Expr(expr, _) => self.expr(expr),
+            _ => {}
+        }
+    }
+
+    fn expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Return(item) => {
+                if self.return_span.is_none() {
+                    self.return_span = Some(item.span());
+                }
+                if let Some(value) = &item.expr {
+                    self.expr(value);
+                }
+            }
+            Expr::Try(item) => {
+                if self.try_span.is_none() {
+                    self.try_span = Some(item.span());
+                }
+                self.expr(&item.expr);
+            }
+            Expr::Closure(item) => {
+                if self.closure_span.is_none() {
+                    self.closure_span = Some(item.span());
+                }
+                self.expr(&item.body);
+            }
+            Expr::Block(item) => self.block(&item.block),
+            Expr::If(item) => {
+                self.expr(&item.cond);
+                self.block(&item.then_branch);
+                if let Some((_, branch)) = &item.else_branch {
+                    self.expr(branch);
+                }
+            }
+            Expr::Match(item) => {
+                self.expr(&item.expr);
+                for arm in &item.arms {
+                    if let Pat::Guard(guard) = &arm.pat {
+                        self.expr(&guard.guard);
+                    }
+                    self.expr(&arm.body);
+                }
+            }
+            Expr::ForLoop(item) => {
+                self.expr(&item.expr);
+                self.block(&item.body);
+            }
+            Expr::While(item) => {
+                self.expr(&item.cond);
+                self.block(&item.body);
+            }
+            Expr::Loop(item) => self.block(&item.body),
+            Expr::Let(item) => self.expr(&item.expr),
+            Expr::Binary(item) => {
+                self.expr(&item.left);
+                self.expr(&item.right);
+            }
+            Expr::Unary(item) => self.expr(&item.expr),
+            Expr::Paren(item) => self.expr(&item.expr),
+            Expr::Group(item) => self.expr(&item.expr),
+            Expr::Reference(item) => self.expr(&item.expr),
+            Expr::Assign(item) => {
+                self.expr(&item.left);
+                self.expr(&item.right);
+            }
+            Expr::Cast(item) => self.expr(&item.expr),
+            Expr::Field(item) => self.expr(&item.base),
+            Expr::Index(item) => {
+                self.expr(&item.expr);
+                self.expr(&item.index);
+            }
+            Expr::MethodCall(item) => {
+                self.expr(&item.receiver);
+                for argument in &item.args {
+                    self.expr(argument);
+                }
+            }
+            Expr::Call(item) => {
+                self.expr(&item.func);
+                for argument in &item.args {
+                    self.expr(argument);
+                }
+            }
+            Expr::Array(item) => {
+                for element in &item.elems {
+                    self.expr(element);
+                }
+            }
+            Expr::Tuple(item) => {
+                for element in &item.elems {
+                    self.expr(element);
+                }
+            }
+            Expr::Struct(item) => {
+                for field in &item.fields {
+                    self.expr(&field.expr);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_body(function: &ItemFn, mode: Inline) -> Result<(), Error> {
+    let block = &function.block;
+    for (index, stmt) in block.stmts.iter().enumerate() {
+        let last = index.saturating_add(1) == block.stmts.len();
+        let mut scan = Scan::default();
+        scan.stmt(stmt);
+        if let Some(span) = scan.try_span {
+            return Err(Error::at(
+                span,
+                "the `?` operator is not supported inside an inlined helper",
+            ));
+        }
+        if let Some(span) = scan.closure_span {
+            return Err(Error::at(
+                span,
+                "closures cannot be inlined into Luau",
+            ));
+        }
+        if let Some(span) = scan.return_span {
+            let tail_return =
+                last && matches!(stmt, Stmt::Expr(Expr::Return(_), _));
+            if !(tail_return
+                && !matches!(mode, Inline::Statement | Inline::Ops))
+            {
+                return Err(Error::at(
+                    span,
+                    "early `return` inside an inlined helper is not supported",
+                ));
+            }
+        }
+    }
+    if mode == Inline::Value
+        && !matches!(block.stmts.last(), Some(Stmt::Expr(_, _)))
+    {
+        return Err(Error::at(
+            function.sig.ident.span(),
+            "a value helper must end in an expression",
+        ));
+    }
+    Ok(())
+}
+
 fn compare_operator(operator: &BinOp) -> Option<&'static str> {
     match operator {
         BinOp::Eq(_) => Some("=="),
@@ -2093,6 +2860,26 @@ fn qualified_variant<'a>(name: &'a str, root: &str) -> Option<&'a str> {
     let mut parts = name.rsplit("::");
     let variant = parts.next()?;
     (parts.next()? == root).then_some(variant)
+}
+
+fn unsupported_op(name: &str) -> Option<String> {
+    let variant = qualified_variant(name, "Op")?;
+    let message = match variant {
+        "run" | "run_with_timeout" => {
+            "op `run` needs a host callback id, which compiled Luau cannot allocate; use `Op::host_call(\"noctalia\", &[\"runAsync\"], ...)` instead"
+        }
+        "run_stream" => {
+            "op `run_stream` needs a host callback id, which compiled Luau cannot allocate"
+        }
+        "http" | "http_bytes" => {
+            "op `http` needs a host callback id, which compiled Luau cannot allocate; use `Op::host_call(\"noctalia\", &[\"http\"], ...)` instead"
+        }
+        "query" => {
+            "op `query` needs a response path and callback id, which compiled Luau cannot allocate"
+        }
+        _ => return None,
+    };
+    Some(message.to_owned())
 }
 
 fn op_constructor(name: &str) -> Option<String> {
@@ -2255,7 +3042,22 @@ fn if_chain(item: &syn::ExprIf) -> IfChain<'_> {
     }
 }
 
+fn split_guard(pattern: &Pat) -> (&Pat, Option<&Expr>) {
+    match pattern {
+        Pat::Guard(guard) => (&guard.pat, Some(&guard.guard)),
+        other => (other, None),
+    }
+}
+
+fn is_wild(pattern: &Pat) -> bool {
+    matches!(pattern, Pat::Wild(_))
+}
+
 fn pattern_strings(pattern: &Pat) -> Result<Option<Vec<String>>, Error> {
+    let pattern = match pattern {
+        Pat::Guard(guard) => &*guard.pat,
+        other => other,
+    };
     match pattern {
         Pat::Lit(literal) => {
             let Lit::Str(value) = &literal.lit else {

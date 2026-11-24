@@ -7,6 +7,8 @@ pub struct Error {
     pub message: String,
     pub line: usize,
     pub column: usize,
+    /// Module path the position belongs to, when it is not the compiled file.
+    pub file: Option<String>,
 }
 
 impl Error {
@@ -16,6 +18,7 @@ impl Error {
             message: message.into(),
             line: start.line,
             column: start.column.saturating_add(1),
+            file: None,
         }
     }
 
@@ -24,11 +27,18 @@ impl Error {
             message: message.into(),
             line: 0,
             column: 0,
+            file: None,
         }
+    }
+
+    pub(crate) fn with_file(mut self, module: &str) -> Self {
+        self.file = Some(module.to_owned());
+        self
     }
 
     #[must_use]
     pub fn render(&self, file: &str) -> String {
+        let file = self.file.as_deref().unwrap_or(file);
         if self.line == 0 {
             format!("{file}: {}", self.message)
         } else {

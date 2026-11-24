@@ -131,13 +131,25 @@ fixtures and beat it on UI trees, where the compiler emits node tables directly
 instead of calling `ui.*` constructors. The 3x target is measured against the bridge path: a spool
 round trip is about 1.13 ms, compiled renders are about 2 us to 10 us.
 
+The compiler reads the whole crate, not just the file named by `luau`. It walks
+the module tree from `src/main.rs` or `src/lib.rs`, follows `mod` declarations
+and `#[path]` attributes, and resolves calls through `crate::`, `self::`,
+`super::`, plain module paths, and simple `use` aliases. Helpers it can
+translate are inlined: a `&Context` and `&mut Vec<Op>` helper at statement
+position, a value helper in an expression, and a handler that delegates to
+another module. Recursive calls, early `return`s, the `?` operator, closures,
+and helpers that mutate through any other reference fail the build instead of
+being mistranslated.
+
 The compiler specializes each handler per event. Event comparisons and match
 arms are folded at compile time, callbacks that emit nothing are dropped, and
 `format!` becomes string concatenation. It covers events, config, payload,
-state, settings, `tr`, host reads, the common ops, `const` strings and integers,
+state, settings, `tr`, host reads such as `file_exists`, `read_file`,
+`format_time`, and `list_dir`, the common ops, `const` strings and integers,
 and plain Rust control flow, arithmetic, and string work. Anything outside that
-subset fails the build with `file:line:column`. Omit `luau` and the entry keeps
-the generated stub that forwards every callback to the Rust helper.
+subset fails the build with `file:line:column`, naming the module when the
+error sits in an inlined helper. Omit `luau` and the entry keeps the generated
+stub that forwards every callback to the Rust helper.
 
 Build and install:
 

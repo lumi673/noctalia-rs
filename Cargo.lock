@@ -395,6 +395,7 @@ name = "noctalia-rs-build"
 version = "0.2.1"
 dependencies = [
  "noctalia-rs-compiler",
+ "syn 3.0.10",
  "toml",
 ]
 

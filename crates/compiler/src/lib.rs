@@ -1,14 +1,16 @@
 mod emit;
 mod error;
+mod program;
 
 use std::fmt::Write as _;
 
 use syn::spanned::Spanned;
-use syn::{FnArg, Item, Pat, Type};
+use syn::{FnArg, Pat, Type};
 
 pub use error::Error;
 
 use emit::Emitter;
+use program::Program;
 
 /// The callback table mirrored by `noctalia_rs::codegen::CALLBACKS`.
 ///
@@ -234,6 +236,15 @@ impl EntryKind {
     }
 }
 
+/// One extra source file in the crate, at its Rust module path.
+///
+/// `path` is `main`, `widget`, `common::util` or `common` for a `mod.rs`.
+#[derive(Clone, Copy, Debug)]
+pub struct Module<'a> {
+    pub path: &'a str,
+    pub source: &'a str,
+}
+
 pub struct Options<'a> {
     pub handler: &'a str,
     pub entry: &'a str,
@@ -242,6 +253,14 @@ pub struct Options<'a> {
     /// Config keys declared as strings in the manifest. `config_str` on these
     /// keys needs no runtime coercion.
     pub strings: &'a [&'a str],
+    /// Module path of `source`, such as `main` or `widget`.
+    ///
+    /// An empty `modules` list keeps the single-file behavior: helpers defined
+    /// in `source` are inlined and nothing else is visible. `module` names the
+    /// file that receives helper errors.
+    pub module: &'a str,
+    /// The rest of the crate, so calls into sibling modules can be inlined.
+    pub modules: &'a [Module<'a>],
 }
 
 #[derive(Clone, Debug)]
@@ -256,12 +275,15 @@ pub struct Compiled {
 /// `Result<Vec<Op>>`. Constructs outside the supported subset are reported as
 /// errors with their source position instead of being translated silently.
 pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
-    let file = syn::parse_file(source)?;
-    let function = find_handler(&file, options.handler)?;
+    let program = Program::new(options.module, source, options.modules)?;
+    let handler = program.handler(options.module, options.handler)?;
+    let module = handler.module.to_owned();
+    let function = handler.function;
     let context = context_name(function)?;
 
-    let mut discovery = Emitter::new(context, None, options.strings, &[]);
-    discovery.constants(&file.items);
+    let mut discovery =
+        Emitter::new(context, None, options.strings, &[], &program, &module);
+    discovery.constants();
     discovery.block(&function.block)?;
     let events = discovery.finish().events;
 
@@ -291,8 +313,10 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             Some(label.clone()),
             options.strings,
             emit::payload_params(label),
+            &program,
+            &module,
         );
-        emitter.constants(&file.items);
+        emitter.constants();
         emitter.block(&function.block)?;
         let body = emitter.finish();
         let existing = bodies
@@ -604,43 +628,6 @@ fn wrapper_payload(
     }
 }
 
-fn find_handler<'a>(
-    file: &'a syn::File,
-    name: &str,
-) -> Result<&'a syn::ItemFn, Error> {
-    let mut found = Vec::new();
-    search_items(&file.items, name, &mut found);
-    match found.as_slice() {
-        [] => Err(Error::plain(format!(
-            "no function named `{name}` in the source file"
-        ))),
-        [function] => Ok(*function),
-        _ => Err(Error::plain(format!(
-            "handler `{name}` is defined more than once in the source file"
-        ))),
-    }
-}
-
-fn search_items<'a>(
-    items: &'a [Item],
-    name: &str,
-    found: &mut Vec<&'a syn::ItemFn>,
-) {
-    for item in items {
-        match item {
-            Item::Fn(function) if function.sig.ident == name => {
-                found.push(function);
-            }
-            Item::Mod(module) => {
-                if let Some((_, items)) = &module.content {
-                    search_items(items, name, found);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 fn context_name(function: &syn::ItemFn) -> Result<&syn::Ident, Error> {
     let mut typed = function.sig.inputs.iter().filter_map(|arg| {
         let FnArg::Typed(arg) = arg else {
@@ -675,7 +662,7 @@ fn context_name(function: &syn::ItemFn) -> Result<&syn::Ident, Error> {
     Ok(&pattern.ident)
 }
 
-fn is_context(ty: &Type) -> bool {
+pub(crate) fn is_context(ty: &Type) -> bool {
     let Type::Reference(reference) = ty else {
         return false;
     };

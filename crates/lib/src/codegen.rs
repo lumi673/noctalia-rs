@@ -1141,6 +1141,8 @@ mod tests {
                     state_key: "template.state",
                     kind: compiled_kind,
                     strings: &["message"],
+                    module: "main",
+                    modules: &[],
                 },
             )
             .expect("compile");

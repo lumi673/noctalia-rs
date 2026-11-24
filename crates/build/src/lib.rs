@@ -800,6 +800,164 @@ fn state_key(root: &toml::Table) -> Result<String, BoxError> {
     Ok(format!("{last}.state"))
 }
 
+struct ModuleFile {
+    module: String,
+    file: PathBuf,
+    source: String,
+}
+
+/// Module path from a file path, used when the file is not reachable from
+/// `src/main.rs` (a standalone `luau` file, for example).
+fn module_path(relative: &Path) -> Option<String> {
+    let relative = relative.strip_prefix("src").ok()?;
+    let mut parts = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let file = parts.pop()?;
+    let stem = file.strip_suffix(".rs")?;
+    if stem == "main" || stem == "lib" {
+        if parts.is_empty() {
+            return Some("main".to_owned());
+        }
+        return Some(parts.join("::"));
+    }
+    if stem != "mod" {
+        parts.push(stem.to_owned());
+    }
+    Some(parts.join("::"))
+}
+
+fn walk_sources(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<ModuleFile>,
+) -> Result<(), BoxError> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    let mut entries = entries.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::path);
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_sources(root, &path, out)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Some(module) = module_path(relative) else {
+            continue;
+        };
+        let source = fs::read_to_string(&path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        out.push(ModuleFile {
+            module,
+            file: path,
+            source,
+        });
+    }
+    Ok(())
+}
+
+/// Reads the crate's module tree from `src/main.rs` or `src/lib.rs`, following
+/// `mod` declarations and `#[path]` attributes.
+fn crate_modules(root: &Path) -> Result<Vec<ModuleFile>, BoxError> {
+    let main = root.join("src/main.rs");
+    let lib = root.join("src/lib.rs");
+    let mut modules = Vec::new();
+    if main.is_file() {
+        module_files(&main, "main", true, &mut modules)?;
+    } else if lib.is_file() {
+        module_files(&lib, "main", true, &mut modules)?;
+    }
+    Ok(modules)
+}
+
+fn module_files(
+    file: &Path,
+    module: &str,
+    is_root: bool,
+    out: &mut Vec<ModuleFile>,
+) -> Result<(), BoxError> {
+    let source = fs::read_to_string(file)
+        .map_err(|error| format!("read {}: {error}", file.display()))?;
+    let parsed = syn::parse_file(&source)
+        .map_err(|error| format!("parse {}: {error}", file.display()))?;
+    out.push(ModuleFile {
+        module: module.to_owned(),
+        file: file.to_path_buf(),
+        source,
+    });
+    let parent = file.parent().unwrap_or_else(|| Path::new("."));
+    let stem = file.file_stem().and_then(|value| value.to_str());
+    let directory = match stem {
+        Some("main" | "lib" | "mod") => parent.to_path_buf(),
+        Some(name) => parent.join(name),
+        None => parent.to_path_buf(),
+    };
+    module_tree(&directory, module, is_root, &parsed.items, out)
+}
+
+fn module_tree(
+    directory: &Path,
+    module: &str,
+    is_root: bool,
+    items: &[syn::Item],
+    out: &mut Vec<ModuleFile>,
+) -> Result<(), BoxError> {
+    for item in items {
+        let syn::Item::Mod(item_mod) = item else {
+            continue;
+        };
+        let name = item_mod.ident.to_string();
+        let child = if is_root {
+            name.clone()
+        } else {
+            format!("{module}::{name}")
+        };
+        if let Some((_, inner)) = &item_mod.content {
+            module_tree(&directory.join(&name), &child, false, inner, out)?;
+            continue;
+        }
+        let attribute = item_mod.attrs.iter().find_map(|attr| {
+            if !attr.path().is_ident("path") {
+                return None;
+            }
+            let syn::Meta::NameValue(value) = &attr.meta else {
+                return None;
+            };
+            let syn::Expr::Lit(literal) = &value.value else {
+                return None;
+            };
+            let syn::Lit::Str(path) = &literal.lit else {
+                return None;
+            };
+            Some(path.value())
+        });
+        let candidate = match attribute {
+            Some(path) => directory.join(path),
+            None => {
+                let file = directory.join(format!("{name}.rs"));
+                let mod_file = directory.join(&name).join("mod.rs");
+                if file.is_file() {
+                    file
+                } else if mod_file.is_file() {
+                    mod_file
+                } else {
+                    continue;
+                }
+            }
+        };
+        module_files(&candidate, &child, false, out)?;
+    }
+    Ok(())
+}
+
 /// Compiles the handler in `luau` when the entry opts in, writing the script
 /// next to `generated.rs` and returning the constant that holds it.
 fn compile_entry(
@@ -816,6 +974,27 @@ fn compile_entry(
     let relative = safe_relative_path(text(value, "luau")?, "luau")?;
     let source = fs::read_to_string(context.source.join(&relative))
         .map_err(|error| format!("read {}: {error}", relative.display()))?;
+    let target = context.source.join(&relative);
+    let mut files = crate_modules(context.source)?;
+    let module = if let Some(found) =
+        files.iter().find(|file| file.file == target)
+    {
+        found.module.clone()
+    } else {
+        files.clear();
+        walk_sources(context.source, &context.source.join("src"), &mut files)?;
+        module_path(&relative).ok_or_else(|| {
+            format!("luau file must live in src/: {}", relative.display())
+        })?
+    };
+    let owned = files
+        .iter()
+        .filter(|file| file.module != module)
+        .map(|file| compiler::Module {
+            path: &file.module,
+            source: &file.source,
+        })
+        .collect::<Vec<_>>();
     let compiled = compiler::compile(
         &source,
         &compiler::Options {
@@ -824,6 +1003,8 @@ fn compile_entry(
             state_key: context.state_key,
             kind: compiler_kind(kind)?,
             strings: context.strings,
+            module: &module,
+            modules: &owned,
         },
     )
     .map_err(|error| error.render(&relative.to_string_lossy()))?;
