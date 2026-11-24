@@ -1,0 +1,113 @@
+name: Release
+
+# Publishes the crates to crates.io. Needs a crates.io API token with publish
+# rights, stored as the CARGO_REGISTRY_TOKEN repository secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version component to bump
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+# Dependencies first: macros and build generate for lib, lib for luau.
+env:
+  CRATES: noctalia-rs-build noctalia-rs-macros noctalia-rs noctalia-rs-luau
+  INDEX_URL: https://crates.io/api/v1/crates
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bump version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "Set CARGO_REGISTRY_TOKEN to a crates.io API token." >&2
+            exit 1
+          fi
+          version="$(node .github/scripts/version.cjs next "$BUMP")"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "Tag v$version already exists, refusing to release." >&2
+            exit 1
+          fi
+          node .github/scripts/version.cjs set "$version"
+          cargo update --workspace
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): $VERSION"
+
+      # Published before pushing, so a failed upload leaves main untouched and
+      # the run can simply be repeated: versions already on crates.io are skipped.
+      - name: Publish
+        run: |
+          set -euo pipefail
+          echo "### $VERSION" >> "$GITHUB_STEP_SUMMARY"
+          for crate in $CRATES; do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H 'User-Agent: noctalia-rs-release' "$INDEX_URL/$crate/$VERSION")"
+            if [ "$status" = "200" ]; then
+              echo "$crate $VERSION already published, skipping" | tee -a "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            if [ "$status" != "404" ]; then
+              echo "crates.io answered $status for $crate $VERSION" >&2
+              exit 1
+            fi
+            attempt=1
+            while :; do
+              if output="$(cargo publish -p "$crate" 2>&1)"; then
+                printf '%s\n' "$output"
+                break
+              fi
+              printf '%s\n' "$output" >&2
+              # A dependency published moments ago reaches the index with a lag.
+              if [ "$attempt" -ge 5 ] || ! grep -qE 'failed to select a version|no matching package' <<< "$output"; then
+                echo "Publishing $crate failed." >&2
+                exit 1
+              fi
+              sleep $((attempt * 15))
+              attempt=$((attempt + 1))
+            done
+            echo "$crate $VERSION published" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          git tag -a "v$VERSION" -m "$VERSION"
+          # Atomic, so a rejected ref leaves main at the previous release.
+          git push --atomic origin "HEAD:main" "v$VERSION"
