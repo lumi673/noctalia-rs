@@ -185,23 +185,22 @@ it when the host is noisy.
 
 | Workload | Compiled medians r1/r2/r3 | Hand medians r1/r2/r3 | Speedups r1/r2/r3 | Median speedup | Source bytes compiled / hand-written |
 | :-- | :-- | :-- | :-- | --: | :-- |
-| generated\_hello\_bar | 3.797 / 2.665 / 2.775 | 7.424 / 2.625 / 2.875 | 0.96 / 0.98 / 1.04 | 0.98x | 548 / 467 |
-| generated\_ui\_panel | 14.893 / 23.579 / 14.553 | 35.056 / 29.595 / 26.014 | 1.72 / 1.26 / 1.79 | 1.72x | 945 / 637 |
-| generated\_event | 5.365 / 6.793 / 5.140 | 5.491 / 5.350 / 5.160 | 1.02 / 0.79 / 1.00 | 1.00x | 425 / 447 |
+| generated\_hello\_bar | 1.934 / 1.894 / 1.893 | 2.054 / 2.004 / 1.953 | 1.01 / 1.01 / 0.98 | 1.01x | 2405 / 467 |
+| generated\_ui\_panel | 9.889 / 10.008 / 9.969 | 17.021 / 16.551 / 16.390 | 1.72 / 1.65 / 1.64 | 1.64x | 2938 / 637 |
+| generated\_event | 3.637 / 3.702 / 3.606 | 3.651 / 4.348 / 4.078 | 1.00 / 0.98 / 0.99 | 0.99x | 3174 / 447 |
 
-The UI tree clears parity in every round. The two small fixtures sit on the same
-roughly 2 us dispatch floor, so their ratios move with host load. Round 2 was
-noisy on this host: the hand-written panel median rose from about 17 us to
-29.6 us, and `generated_event` dropped to 0.79x. Treat those two as parity
-within measurement noise, not a guaranteed win. `generated_ui_panel` is the real
-gain: the compiler emits `{ kind = "row", props = ..., children = ... }` tables
-directly, while hand-written Luau calls the `ui.row` constructor for every node.
+The UI tree clears parity in every round. The two small fixtures sit on the
+same roughly 2 us dispatch floor, so their ratios move with host load. Treat
+`generated_hello_bar` and `generated_event` as parity within measurement noise.
+The compiled scripts carry every callback a host may invoke, so they are larger
+than the hand-written mirrors here; the win on UI trees comes from emitting
+node tables directly instead of calling `ui.row` and `ui.label`.
 
 The 3x target is not measured against hand-written Luau. Both sides pay the
 same dispatch floor, so 3x is not reachable there. It is measured against the
 bridge path this replaces. This run includes the idle helper CPU change from
-`main`, so `spool_dispatch` is 168 / 124 / 126 us across the three rounds, with
-a median of 126 us. Compiled renders are 2.8 us to 14.9 us, or 8x to 45x faster
+`main`, so `spool_dispatch` is 77 / 77 / 80 us across the three rounds, with a
+median of 77 us. Compiled renders are 1.9 us to 10.0 us, or 8x to 41x faster
 than the bridge.
 
 ### Correctness fixes behind this run
@@ -224,7 +223,9 @@ fixes:
 ### Template output
 
 The same release build emitted the template before and after opting both
-entries into `luau = "src/main.rs"`.
+entries into `luau = "src/main.rs"`. Compiled entries now declare every host
+callback, which is why the generated script is close in size to the bridge stub
+even though it has no helper or IPC.
 
 | File | Bridge stub | Compiled |
 | :-- | --: | --: |
@@ -247,7 +248,7 @@ done
 
 | Field | Value |
 | :-- | :-- |
-| Timestamp | 2026-11-24T14:20:00Z |
+| Timestamp | 2026-11-24T17:05:00Z |
 | OS | Linux 7.3.5 x86\_64 |
 | CPU | AMD Ryzen 7 8845HS w/ Radeon 780M Graphics |
 | Logical CPUs | 16 |

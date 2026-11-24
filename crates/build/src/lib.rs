@@ -920,9 +920,9 @@ fn crate_modules(root: &Path) -> Result<Vec<ModuleFile>, BoxError> {
     let lib = root.join("src/lib.rs");
     let mut modules = Vec::new();
     if main.is_file() {
-        module_files(&main, "main", true, &mut modules)?;
+        module_files(&main, "main", true, false, &mut modules)?;
     } else if lib.is_file() {
-        module_files(&lib, "main", true, &mut modules)?;
+        module_files(&lib, "main", true, false, &mut modules)?;
     }
     Ok(modules)
 }
@@ -931,6 +931,7 @@ fn module_files(
     file: &Path,
     module: &str,
     is_root: bool,
+    explicit_path: bool,
     out: &mut Vec<ModuleFile>,
 ) -> Result<(), BoxError> {
     let source = fs::read_to_string(file)
@@ -945,9 +946,9 @@ fn module_files(
     let parent = file.parent().unwrap_or_else(|| Path::new("."));
     let stem = file.file_stem().and_then(|value| value.to_str());
     let directory = match stem {
-        Some("main" | "lib" | "mod") => parent.to_path_buf(),
+        Some("main" | "lib" | "mod") | None => parent.to_path_buf(),
+        Some(_) if explicit_path => parent.to_path_buf(),
         Some(name) => parent.join(name),
-        None => parent.to_path_buf(),
     };
     module_tree(&directory, parent, module, is_root, &parsed.items, out)
 }
@@ -990,6 +991,7 @@ fn module_tree(
             };
             Some(path.value())
         });
+        let explicit = attribute.is_some();
         let candidate = match attribute {
             Some(path) => declaring.join(path),
             None => {
@@ -1004,7 +1006,7 @@ fn module_tree(
                 }
             }
         };
-        module_files(&candidate, &child, false, out)?;
+        module_files(&candidate, &child, false, explicit, out)?;
     }
     Ok(())
 }
@@ -1898,6 +1900,29 @@ mod tests {
 
         assert!(!generated.contains(".with_luau("));
         assert!(warnings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn crate_modules_resolves_children_of_a_path_loaded_module()
+    -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("noctalia-path-child-{nanos}"));
+        fs::create_dir_all(dir.join("src/custom"))?;
+        fs::write(
+            dir.join("src/main.rs"),
+            "#[path = \"custom/thing.rs\"]\nmod handlers;\nfn main() {}\n",
+        )?;
+        fs::write(dir.join("src/custom/thing.rs"), "mod child;\n")?;
+        fs::write(dir.join("src/custom/child.rs"), "pub const X: u32 = 1;\n")?;
+
+        let modules = crate_modules(&dir)?;
+        fs::remove_dir_all(&dir)?;
+
+        assert!(modules.iter().any(|item| item.module == "handlers"));
+        assert!(modules.iter().any(|item| item.module == "handlers::child"
+            && item.file.ends_with("child.rs")));
         Ok(())
     }
 

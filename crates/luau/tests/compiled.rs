@@ -96,7 +96,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     );
     assert_eq!(actual, expected);
     assert!(
-        source.len() < 900,
+        source.len() < 3_000,
         "compiled source is {} bytes",
         source.len()
     );
@@ -374,4 +374,30 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         ops("runtime_event", &source, &click),
         rust_ops(vec![Op::log("click")])
     );
+}
+
+#[test]
+fn default_branches_log_for_non_matching_events() {
+    for (name, condition) in [
+        ("positive_default", "ctx.event == \"click\""),
+        ("negative_default", "ctx.event != \"click\""),
+    ] {
+        let handler = format!(
+            "fn handler(ctx: &Context) -> Result<Vec<Op>> {{\n    if {condition} {{\n        Ok(vec![Op::log(\"A\")])\n    }} else {{\n        Ok(vec![Op::log(\"B\")])\n    }}\n}}\n"
+        );
+        let source = compiled_source(name, &handler, EntryKind::Widget);
+        let click_ctx = context(name, "click", json!({}), json!({}));
+        noctalia_rs_luau::dispatch(&click_ctx, &[(name, &source)])
+            .expect("warm vm");
+        let hover_ctx = context(name, "hover", json!({}), json!({}));
+        let hover = ops(name, &source, &hover_ctx);
+        let click = ops(name, &source, &click_ctx);
+        let first = if condition.contains("!=") { "A" } else { "B" };
+        assert_eq!(hover, rust_ops(vec![Op::log(first)]), "{name} hover");
+        assert_eq!(
+            click,
+            rust_ops(vec![Op::log(if first == "A" { "B" } else { "A" })]),
+            "{name} click"
+        );
+    }
 }

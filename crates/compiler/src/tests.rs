@@ -49,7 +49,7 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     assert!(!compiled.source.contains("bridge."));
     assert_eq!(compiled.events, vec!["click", "render"]);
     assert!(
-        compiled.source.len() < 1_500,
+        compiled.source.len() < 3_000,
         "hello world should stay small: {} bytes",
         compiled.source.len()
     );
@@ -559,7 +559,6 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
-    assert!(!compiled.source.contains("PAYLOAD_"));
     assert!(compiled.source.contains("function update() end"));
     assert!(
         compiled
@@ -1977,7 +1976,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Widget))
             .expect("compiles");
-    assert!(!compiled.source.contains("function onClick()"));
+    assert!(compiled.source.contains("function onClick()"));
     assert!(compiled.source.contains("function onHover(hovered)"));
     assert!(compiled.source.contains("function update()"));
     assert!(compiled.source.contains("noctalia.log(\"tick\")"));
@@ -2001,4 +2000,26 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
             .contains("function onClick() body_events(\"click\") end")
     );
     assert!(compiled.source.contains("function update() body_"));
+}
+
+#[test]
+fn fallback_body_serves_events_without_a_positive_branch() {
+    for condition in ["ctx.event == \"click\"", "ctx.event != \"click\""] {
+        let handler = format!(
+            "fn handler(ctx: &Context) -> Result<Vec<Op>> {{\n    if {condition} {{\n        Ok(vec![Op::log(\"A\")])\n    }} else {{\n        Ok(vec![Op::log(\"B\")])\n    }}\n}}\n"
+        );
+        let compiled =
+            compile(&source(&handler), &options("handler", EntryKind::Widget))
+                .expect("compiles");
+        for callback in crate::CALLBACKS {
+            let expected = format!("function {}(", callback.function);
+            assert!(
+                compiled.source.contains(&expected),
+                "{condition} missing {}",
+                callback.function
+            );
+        }
+        assert!(compiled.source.contains("local function body_events("));
+        assert!(compiled.source.contains("noctalia.log(\"B\")"));
+    }
 }

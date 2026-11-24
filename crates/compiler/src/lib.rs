@@ -289,7 +289,6 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let events = discovery_body.events.clone();
     let negatives = discovery_body.negative_events.clone();
     let positive = events.difference(&negatives).cloned().collect::<Vec<_>>();
-    let fallback_needed = positive.is_empty();
 
     let update_event = options.kind.update_event().to_owned();
     let mut labels = vec![update_event.clone()];
@@ -340,7 +339,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         names.insert(label.clone(), name);
     }
 
-    let fallback_index = if fallback_needed && !discovery_body.is_empty {
+    let fallback_index = if !discovery_body.is_empty {
         let index = bodies.len();
         bodies.push(Slot {
             name: "body_events".to_owned(),
@@ -533,9 +532,6 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     for callback in CALLBACKS {
         if callback.function == "onQuery" && options.kind == EntryKind::Launcher
         {
-            continue;
-        }
-        if negatives.contains(callback.event) {
             continue;
         }
         let Some(slot) = slot(callback.event)

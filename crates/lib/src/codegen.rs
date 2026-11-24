@@ -1181,7 +1181,7 @@ mod tests {
         for (name, script) in [("widget", &widget), ("service", &service)] {
             assert!(!script.contains("require"), "{name} requires a module");
             assert!(!script.contains("bridge."), "{name} calls the bridge");
-            assert!(script.len() < 2048, "{name} is {} bytes", script.len());
+            assert!(script.len() < 3_000, "{name} is {} bytes", script.len());
         }
     }
 }
