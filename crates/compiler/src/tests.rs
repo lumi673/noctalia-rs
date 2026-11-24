@@ -1892,3 +1892,73 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(compiled.source.contains("noctalia.nowMs()"));
 }
+
+#[test]
+fn unconditional_handler_emits_every_callback() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let _ = ctx.now_ms;
+    Ok(vec![Op::log("tick")])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    for callback in crate::CALLBACKS {
+        let expected = format!("function {}(", callback.function);
+        assert!(
+            compiled.source.contains(&expected),
+            "missing {}",
+            callback.function
+        );
+    }
+    assert!(compiled.events.is_empty());
+    assert!(compiled.source.contains("noctalia.log(\"tick\")"));
+}
+
+#[test]
+fn matches_macro_records_event_callbacks() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if matches!(ctx.event.as_str(), "click") {
+        Ok(vec![Op::log("click")])
+    } else {
+        Ok(Vec::new())
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("function onClick()"));
+    assert_eq!(compiled.events, vec!["click"]);
+}
+
+#[test]
+fn lazy_fallback_closures_stay_inside_the_nil_branch() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.state_value::<String>("value").map_or_else(
+        || "fallback".to_owned(),
+        |text| text,
+    );
+    let _ = ctx.state_value::<String>("other").ok_or_else(|| "missing");
+    Ok(vec![Op::log(value)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled
+            .source
+            .contains("local __t1 = plugin_state[\"value\"]")
+    );
+    assert!(compiled.source.contains("if __t1 == nil then"));
+    assert!(compiled.source.contains("if __t3 == nil then"));
+    assert!(
+        !compiled
+            .source
+            .contains("local __t4 = error(tostring(\"missing\"))")
+    );
+}

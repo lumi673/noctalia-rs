@@ -112,6 +112,7 @@ pub fn generate() -> Result<(), BoxError> {
     let manifest = Path::new("noctalia.toml");
     let out = std::env::var("OUT_DIR")?;
     println!("cargo:rerun-if-changed=noctalia.toml");
+    println!("cargo:rerun-if-env-changed=NOCTALIA_RS_COMPILE");
     watch_tree(Path::new("."))?;
     generate_to(manifest, Path::new(&out))
 }

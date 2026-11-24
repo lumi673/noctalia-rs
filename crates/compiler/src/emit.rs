@@ -2199,7 +2199,7 @@ impl<'a> Emitter<'a> {
             self.assign(&binary.left, &binary.right, operator)?;
             return Ok((String::new(), Ty::VOID));
         }
-        if matches!(binary.op, BinOp::Eq(_)) {
+        if matches!(binary.op, BinOp::Eq(_) | BinOp::Ne(_)) {
             self.record_event(&binary.left, &binary.right);
             self.record_event(&binary.right, &binary.left);
         }
@@ -2458,15 +2458,36 @@ impl<'a> Emitter<'a> {
                 self.line("end");
                 return Ok(Some((result, Ty::BOOL)));
             }
-            "map_or" | "map_or_else" => {
+            "map_or" => {
                 let default = arg(args, 0, call)?;
                 let closure = arg(args, 1, call)?;
                 let value = self.temp();
                 let result = self.temp();
                 self.line(&format!("local {value} = {receiver}"));
-                let (fallback, fallback_ty) = self.invoke_arg(default, &[])?;
+                let (fallback, fallback_ty) = self.expr(default)?;
                 self.line(&format!("local {result} = {fallback}"));
                 self.line(&format!("if {value} ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, value_ty) =
+                    self.invoke_arg(closure, std::slice::from_ref(&value))?;
+                self.line(&format!("{result} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((result, wider(fallback_ty, value_ty))));
+            }
+            "map_or_else" => {
+                let default = arg(args, 0, call)?;
+                let closure = arg(args, 1, call)?;
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result}"));
+                self.line(&format!("if {value} == nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (fallback, fallback_ty) = self.invoke_arg(default, &[])?;
+                self.line(&format!("{result} = {fallback}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("else");
                 self.indent = self.indent.saturating_add(1);
                 let (text, value_ty) =
                     self.invoke_arg(closure, std::slice::from_ref(&value))?;
@@ -2489,14 +2510,34 @@ impl<'a> Emitter<'a> {
                 self.line("end");
                 return Ok(Some((result, wider(ty, fallback_ty))));
             }
-            "ok_or" | "ok_or_else" => {
+            "ok_or" => {
                 let message = arg(args, 0, call)?;
                 let value = self.temp();
                 self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("if {value} == nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (error, _) = self.expr(message)?;
+                self.line(&format!("error(tostring({error}))"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((
+                    value,
+                    Ty {
+                        result: false,
+                        ..ty
+                    },
+                )));
+            }
+            "ok_or_else" => {
+                let message = arg(args, 0, call)?;
+                let value = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("if {value} == nil then"));
+                self.indent = self.indent.saturating_add(1);
                 let (error, _) = self.invoke_arg(message, &[])?;
-                self.line(&format!(
-                    "if {value} == nil then error(tostring({error})) end"
-                ));
+                self.line(&format!("error(tostring({error}))"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
                 return Ok(Some((
                     value,
                     Ty {
@@ -3566,6 +3607,7 @@ impl<'a> Emitter<'a> {
         mac: &ExprMacro,
     ) -> Result<(String, Ty), Error> {
         let parsed: MatchesArgs = syn::parse2(mac.mac.tokens.clone())?;
+        self.record_pattern_events(&parsed.expr, &parsed.pat);
         let (expr, _) = self.expr(&parsed.expr)?;
         let condition = self.pattern_condition(&expr, &parsed.pat)?;
         Ok((format!("({condition})"), Ty::BOOL))
@@ -3730,6 +3772,21 @@ impl<'a> Emitter<'a> {
                 }
                 self.expr(expr)
             }
+        }
+    }
+
+    fn record_pattern_events(&mut self, expr: &Expr, pattern: &Pat) {
+        match pattern {
+            Pat::Lit(literal) => {
+                self.record_event(expr, &Expr::Lit(literal.clone()))
+            }
+            Pat::Or(or) => {
+                for case in &or.cases {
+                    self.record_pattern_events(expr, case);
+                }
+            }
+            Pat::Paren(paren) => self.record_pattern_events(expr, &paren.pat),
+            _ => {}
         }
     }
 

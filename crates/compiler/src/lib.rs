@@ -341,7 +341,9 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             .get(label)
             .and_then(|name| bodies.iter().find(|slot| &slot.name == name))
     };
+    let unconditional = events.is_empty();
     let update = slot(&update_event).filter(|slot| !slot.body.is_empty);
+    let fallback = unconditional.then_some(update).flatten();
     let watch_label = if options.kind == EntryKind::Launcher {
         "query"
     } else {
@@ -350,7 +352,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let watch = options
         .kind
         .watches_state()
-        .then(|| slot(watch_label))
+        .then(|| slot(watch_label).or(fallback))
         .flatten()
         .filter(|slot| !slot.body.is_empty);
     let load_label =
@@ -510,8 +512,9 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         {
             continue;
         }
-        let Some(slot) =
-            slot(callback.event).filter(|slot| !slot.body.is_empty)
+        let Some(slot) = slot(callback.event)
+            .or(fallback)
+            .filter(|slot| !slot.body.is_empty)
         else {
             continue;
         };
