@@ -178,27 +178,31 @@ compared before timing, including the startup render and the measured event,
 and must match after filtering startup `host_call` ops that the Rust handler
 does not perform.
 
-Run three rounds of 300 samples and use the median of the three medians.
-Speedup is `hand-written / compiled`, so 1.0 is parity. Times are microseconds.
+Run three rounds of 300 samples. Speedup is `hand-written / compiled`, so 1.0
+is parity. Times are microseconds. The ratio column is the median of the three
+round ratios, so it does not always equal the quotient of the two medians below
+it when the host is noisy.
 
-| Workload | Compiled median | Hand-written median | Speedup | Ratios, rounds 1-3 | Source bytes compiled / hand-written |
-| :-- | --: | --: | --: | :-- | :-- |
-| generated\_hello\_bar | 1.913 | 1.934 | 1.01x | 0.97 / 1.09 / 1.02 | 548 / 467 |
-| generated\_ui\_panel | 9.698 | 16.521 | 1.70x | 1.91 / 1.70 / 1.70 | 945 / 637 |
-| generated\_event | 3.627 | 3.617 | 1.00x | 1.00 / 1.00 / 1.00 | 425 / 447 |
+| Workload | Compiled medians r1/r2/r3 | Hand medians r1/r2/r3 | Speedups r1/r2/r3 | Median speedup | Source bytes compiled / hand-written |
+| :-- | :-- | :-- | :-- | --: | :-- |
+| generated\_hello\_bar | 3.797 / 2.665 / 2.775 | 7.424 / 2.625 / 2.875 | 0.96 / 0.98 / 1.04 | 0.98x | 548 / 467 |
+| generated\_ui\_panel | 14.893 / 23.579 / 14.553 | 35.056 / 29.595 / 26.014 | 1.72 / 1.26 / 1.79 | 1.72x | 945 / 637 |
+| generated\_event | 5.365 / 6.793 / 5.140 | 5.491 / 5.350 / 5.160 | 1.02 / 0.79 / 1.00 | 1.00x | 425 / 447 |
 
-The UI tree clears parity consistently. The two small fixtures sit on the same
-roughly 2 us dispatch floor, so their ratios move with host load: repeat runs of
-the same binaries measured 0.97 to 1.09 for `generated_hello_bar` and 0.97 to
-1.00 for `generated_event`. Treat those two as parity within measurement noise
-rather than a guaranteed win. `generated_ui_panel` is the real gain: the
-compiler emits `{ kind = "row", props = ..., children = ... }` tables directly,
-while hand-written Luau calls the `ui.row` constructor for every node.
+The UI tree clears parity in every round. The two small fixtures sit on the same
+roughly 2 us dispatch floor, so their ratios move with host load. Round 2 was
+noisy on this host: the hand-written panel median rose from about 17 us to
+29.6 us, and `generated_event` dropped to 0.79x. Treat those two as parity
+within measurement noise, not a guaranteed win. `generated_ui_panel` is the real
+gain: the compiler emits `{ kind = "row", props = ..., children = ... }` tables
+directly, while hand-written Luau calls the `ui.row` constructor for every node.
 
 The 3x target is not measured against hand-written Luau. Both sides pay the
 same dispatch floor, so 3x is not reachable there. It is measured against the
-bridge path this replaces: `spool_dispatch` is 1,134 us in the median round,
-against 1.9 us to 9.7 us for compiled renders, or 117x to 596x.
+bridge path this replaces. This run includes the idle helper CPU change from
+`main`, so `spool_dispatch` is 168 / 124 / 126 us across the three rounds, with
+a median of 126 us. Compiled renders are 2.8 us to 14.9 us, or 8x to 45x faster
+than the bridge.
 
 ### Correctness fixes behind this run
 
@@ -243,7 +247,7 @@ done
 
 | Field | Value |
 | :-- | :-- |
-| Timestamp | 2026-11-24T05:05:00Z |
+| Timestamp | 2026-11-24T14:20:00Z |
 | OS | Linux 7.3.5 x86\_64 |
 | CPU | AMD Ryzen 7 8845HS w/ Radeon 780M Graphics |
 | Logical CPUs | 16 |
