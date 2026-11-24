@@ -257,26 +257,94 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let function = find_handler(&file, options.handler)?;
     let context = context_name(function)?;
 
-    let mut emitter = Emitter::new(context);
-    emitter.constants(&file.items);
-    emitter.block(&function.block)?;
-    let body = emitter.finish();
-    let callbacks_use_payload = body.uses_payload;
-    let hoisted_payloads = callbacks_use_payload && !body.payload_escapes;
+    let mut discovery = Emitter::new(context, None);
+    discovery.constants(&file.items);
+    discovery.block(&function.block)?;
+    let events = discovery.finish().events;
+
+    let update_event = options.kind.update_event().to_owned();
+    let mut labels = events.iter().cloned().collect::<Vec<_>>();
+    if !labels.iter().any(|label| label == &update_event) {
+        labels.push(update_event.clone());
+    }
+    if matches!(options.kind, EntryKind::Service | EntryKind::Shortcut)
+        && !labels.iter().any(|label| label == "load")
+    {
+        labels.push("load".to_owned());
+    }
+
+    struct Slot {
+        name: String,
+        body: emit::Body,
+    }
+
+    let mut bodies: Vec<Slot> = Vec::new();
+    let mut names = std::collections::BTreeMap::new();
+    for label in &labels {
+        let mut emitter = Emitter::new(context, Some(label.clone()));
+        emitter.constants(&file.items);
+        emitter.block(&function.block)?;
+        let body = emitter.finish();
+        let existing = bodies
+            .iter()
+            .find(|slot| slot.body.source == body.source)
+            .map(|slot| slot.name.clone());
+        let name = if let Some(name) = existing {
+            name
+        } else {
+            let name = format!("body_{}", sanitize(label));
+            bodies.push(Slot {
+                name: name.clone(),
+                body,
+            });
+            name
+        };
+        names.insert(label.clone(), name);
+    }
+
+    let slot = |label: &str| -> Option<&Slot> {
+        names
+            .get(label)
+            .and_then(|name| bodies.iter().find(|slot| &slot.name == name))
+    };
+    let update = slot(&update_event).filter(|slot| !slot.body.is_empty);
+    let watch = options
+        .kind
+        .watches_state()
+        .then(|| slot(&update_event))
+        .flatten()
+        .filter(|slot| !slot.body.is_empty);
+    let load_label =
+        if matches!(options.kind, EntryKind::Service | EntryKind::Shortcut) {
+            "load"
+        } else {
+            update_event.as_str()
+        };
+    let load = slot(load_label).filter(|slot| !slot.body.is_empty);
+
+    let uses_state =
+        bodies.iter().any(|slot| slot.body.uses_state) || watch.is_some();
+    let uses_entry = bodies.iter().any(|slot| slot.body.uses_entry);
+    let uses_irem = bodies.iter().any(|slot| slot.body.uses_irem);
+    let uses_unwrap = bodies.iter().any(|slot| slot.body.uses_unwrap);
+    let uses_host_call = bodies.iter().any(|slot| slot.body.uses_host_call);
+    let uses_bool_or = bodies.iter().any(|slot| slot.body.uses_bool_or);
+    let hoists = bodies
+        .iter()
+        .any(|slot| slot.body.uses_payload && !slot.body.payload_escapes);
 
     let mut out = String::new();
     out.push_str("--!nonstrict\n");
     out.push_str(
         "-- Generated from Rust by noctalia-rs. Edit the Rust handler instead.\n\n",
     );
-    let needs_state_key = body.uses_state || options.kind.watches_state();
-    if needs_state_key {
+    if uses_state {
         let _ = writeln!(out, "local STATE_KEY = {}", quote(options.state_key));
     }
-    if body.uses_entry {
+    if uses_entry {
         let _ = writeln!(out, "local ENTRY = {}", quote(options.entry));
     }
-    if hoisted_payloads {
+    if hoists {
         out.push_str("local PAYLOAD_EMPTY = {}\n");
         out.push_str("local PAYLOAD_UPDATE = { source = \"update\" }\n");
         if options.kind.watches_state() {
@@ -286,7 +354,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             out.push_str("local PAYLOAD_LOAD = { source = \"load\" }\n");
         }
     }
-    if body.uses_irem {
+    if uses_irem {
         out.push_str(concat!(
             "local function irem(a, b)\n",
             "  local r = a % b\n",
@@ -295,7 +363,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "end\n",
         ));
     }
-    if body.uses_unwrap {
+    if uses_unwrap {
         out.push_str(concat!(
             "local function unwrap(value)\n",
             "  if value == nil then error(\"called unwrap on nil\") end\n",
@@ -303,7 +371,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "end\n",
         ));
     }
-    if body.uses_bool_or {
+    if uses_bool_or {
         out.push_str(concat!(
             "local function bool_or(value, default)\n",
             "  if value == nil then return default end\n",
@@ -311,7 +379,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "end\n",
         ));
     }
-    if body.uses_host_call {
+    if uses_host_call {
         out.push_str(concat!(
             "local ROOTS = { noctalia = noctalia, barWidget = barWidget, desktopWidget = desktopWidget, shortcut = shortcut, panel = panel, launcher = launcher, layer = layer, ui = ui }\n",
             "local function host_call(root, path, args)\n",
@@ -326,26 +394,42 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         ));
     }
     out.push('\n');
-    out.push_str("local function body(event, payload, source)\n");
-    out.push_str(&body.source);
-    out.push_str("end\n\n");
 
-    let update_payload =
-        payload("update", callbacks_use_payload, hoisted_payloads);
-    let _ = writeln!(
-        out,
-        "function update() body({}, {update_payload}, \"update\") end",
-        quote(options.kind.update_event())
-    );
-    if options.kind == EntryKind::Launcher {
-        let query_payload = if callbacks_use_payload {
-            "{ text = text }"
-        } else {
-            "nil"
-        };
+    for slot in &bodies {
+        if slot.body.is_empty {
+            continue;
+        }
+        let _ = writeln!(out, "local function {}(payload, source)", slot.name);
+        out.push_str(&slot.body.source);
+        out.push_str("end\n\n");
+    }
+
+    if let Some(slot) = update {
+        let payload = wrapper_payload(&slot.body, "update", None, false);
         let _ = writeln!(
             out,
-            "local last_query = nil\nfunction onQuery(text) last_query = text; body(\"query\", {query_payload}, \"\") end"
+            "function update() {}({payload}, \"update\") end",
+            slot.name
+        );
+    } else {
+        out.push_str("function update() end\n");
+    }
+
+    if options.kind == EntryKind::Launcher
+        && let Some(slot) = slot("query").filter(|slot| !slot.body.is_empty)
+    {
+        let payload =
+            wrapper_payload(&slot.body, "", Some("{ text = text }"), false);
+        let state_payload = wrapper_payload(&slot.body, "state", None, false);
+        let _ = writeln!(
+            out,
+            "local last_query = nil\nfunction onQuery(text) last_query = text; {}({payload}, \"\") end",
+            slot.name
+        );
+        let _ = writeln!(
+            out,
+            "noctalia.state.watch(STATE_KEY, function() if last_query then {}({state_payload}, \"state\") end end)",
+            slot.name
         );
     }
     for callback in CALLBACKS {
@@ -353,91 +437,93 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         {
             continue;
         }
-        if !body.events.iter().any(|event| event == callback.event) {
+        let Some(slot) =
+            slot(callback.event).filter(|slot| !slot.body.is_empty)
+        else {
             continue;
-        }
-        let argument = if callback.payload.is_empty() {
-            if hoisted_payloads {
-                "PAYLOAD_EMPTY"
-            } else if callbacks_use_payload {
-                "{}"
-            } else {
-                "nil"
-            }
-        } else if callbacks_use_payload {
-            callback.payload
-        } else {
-            "nil"
         };
+        let dynamic =
+            (!callback.payload.is_empty()).then_some(callback.payload);
+        let payload = wrapper_payload(
+            &slot.body,
+            "",
+            dynamic,
+            callback.payload.is_empty(),
+        );
         let _ = writeln!(
             out,
-            "function {}({}) body({}, {argument}, \"\") end",
-            callback.function,
-            callback.params,
-            quote(callback.event)
+            "function {}({}) {}({payload}, \"\") end",
+            callback.function, callback.params, slot.name
         );
     }
     out.push('\n');
-
-    if options.kind == EntryKind::Launcher {
-        let state_payload = if callbacks_use_payload {
-            "{ text = last_query }"
-        } else {
-            "nil"
-        };
+    if options.kind != EntryKind::Launcher
+        && let Some(slot) = watch
+    {
+        let payload = wrapper_payload(&slot.body, "state", None, false);
         let _ = writeln!(
             out,
-            "noctalia.state.watch(STATE_KEY, function() if last_query then body(\"query\", {state_payload}, \"state\") end end)"
-        );
-    } else if options.kind.watches_state() {
-        let state_payload =
-            payload("state", callbacks_use_payload, hoisted_payloads);
-        let _ = writeln!(
-            out,
-            "noctalia.state.watch(STATE_KEY, function() body({}, {state_payload}, \"state\") end)",
-            quote(options.kind.update_event())
+            "noctalia.state.watch(STATE_KEY, function() {}({payload}, \"state\") end)",
+            slot.name
         );
     }
     if options.kind == EntryKind::Panel {
         out.push_str("panel.setWantsSecondTicks(true)\n");
     }
-    if options.kind.renders_on_load() {
-        let event = match options.kind {
-            EntryKind::Service | EntryKind::Shortcut => "load",
-            EntryKind::Widget
-            | EntryKind::DesktopWidget
-            | EntryKind::Panel
-            | EntryKind::Layer => options.kind.update_event(),
-            EntryKind::Launcher => options.kind.update_event(),
-        };
-        let load_payload =
-            payload("load", callbacks_use_payload, hoisted_payloads);
-        let _ =
-            writeln!(out, "body({}, {load_payload}, \"load\")", quote(event));
+    if let Some(slot) = load {
+        let payload = wrapper_payload(&slot.body, "load", None, false);
+        let _ = writeln!(out, "{}({payload}, \"load\")", slot.name);
     }
 
     Ok(Compiled {
         source: out,
-        events: body.events.into_iter().collect(),
+        events: events.into_iter().collect(),
     })
 }
 
-fn payload(source: &str, used: bool, hoisted: bool) -> String {
-    if !used {
+fn sanitize(value: &str) -> String {
+    let mut out = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            out.push(character);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("body");
+    }
+    out
+}
+
+fn wrapper_payload(
+    body: &emit::Body,
+    source: &str,
+    dynamic: Option<&str>,
+    empty: bool,
+) -> String {
+    if !body.uses_payload {
         return "nil".to_owned();
     }
-    if hoisted {
-        return format!(
-            "PAYLOAD_{}",
-            match source {
-                "update" => "UPDATE",
-                "state" => "STATE",
-                "load" => "LOAD",
-                other => other,
-            }
-        );
+    if let Some(table) = dynamic {
+        return table.to_owned();
     }
-    format!("{{ source = {} }}", quote(source))
+    if empty {
+        return if body.payload_escapes {
+            "{}".to_owned()
+        } else {
+            "PAYLOAD_EMPTY".to_owned()
+        };
+    }
+    if body.payload_escapes {
+        return format!("{{ source = {} }}", quote(source));
+    }
+    match source {
+        "update" => "PAYLOAD_UPDATE".to_owned(),
+        "state" => "PAYLOAD_STATE".to_owned(),
+        "load" => "PAYLOAD_LOAD".to_owned(),
+        _ => "PAYLOAD_EMPTY".to_owned(),
+    }
 }
 
 fn find_handler<'a>(

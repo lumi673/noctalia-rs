@@ -93,6 +93,7 @@ pub(crate) struct Body {
     pub uses_unwrap: bool,
     pub uses_host_call: bool,
     pub uses_bool_or: bool,
+    pub is_empty: bool,
 }
 
 pub(crate) struct Emitter {
@@ -101,6 +102,7 @@ pub(crate) struct Emitter {
     indent: usize,
     scopes: Vec<HashMap<String, Ty>>,
     events: BTreeSet<String>,
+    bound_event: Option<String>,
     constants: HashMap<String, (String, Ty)>,
     uses_state: bool,
     uses_payload: bool,
@@ -110,17 +112,19 @@ pub(crate) struct Emitter {
     uses_unwrap: bool,
     uses_host_call: bool,
     uses_bool_or: bool,
+    emitted: bool,
     temp: usize,
 }
 
 impl Emitter {
-    pub(crate) fn new(ctx: &syn::Ident) -> Self {
+    pub(crate) fn new(ctx: &syn::Ident, bound_event: Option<String>) -> Self {
         Self {
             ctx: ctx.to_string(),
             out: String::new(),
             indent: 1,
             scopes: vec![HashMap::new()],
             events: BTreeSet::new(),
+            bound_event,
             constants: HashMap::new(),
             uses_state: false,
             uses_payload: false,
@@ -130,6 +134,7 @@ impl Emitter {
             uses_unwrap: false,
             uses_host_call: false,
             uses_bool_or: false,
+            emitted: false,
             temp: 0,
         }
     }
@@ -212,6 +217,7 @@ impl Emitter {
             uses_unwrap: self.uses_unwrap,
             uses_host_call: self.uses_host_call,
             uses_bool_or: self.uses_bool_or,
+            is_empty: !self.emitted,
         }
     }
 
@@ -432,65 +438,57 @@ impl Emitter {
     }
 
     fn if_stmt(&mut self, item: &syn::ExprIf, tail: bool) -> Result<(), Error> {
-        let else_branch = item.else_branch.as_ref().map(|(_, expr)| &**expr);
-        self.write_if(&item.cond, &item.then_branch, else_branch, tail)
+        let (chain, else_branch) = if_chain(item);
+        if chain
+            .iter()
+            .all(|(condition, _)| self.const_bool(condition).is_some())
+        {
+            for (condition, block) in &chain {
+                if self.const_bool(condition) == Some(true) {
+                    return self.block_inner(block, tail);
+                }
+            }
+            return self.emit_else(else_branch, tail);
+        }
+        self.write_if_chain(&chain, else_branch, tail, false)
     }
 
-    fn write_if(
+    fn emit_else(
         &mut self,
-        condition: &Expr,
-        then_branch: &syn::Block,
         else_branch: Option<&Expr>,
         tail: bool,
     ) -> Result<(), Error> {
-        let (condition, _) = self.expr(condition)?;
-        self.line(&format!("if {condition} then"));
-        self.indent = self.indent.saturating_add(1);
-        self.block_inner(then_branch, tail)?;
-        self.indent = self.indent.saturating_sub(1);
-        let Some(else_branch) = else_branch else {
-            self.line("end");
-            return Ok(());
-        };
         match else_branch {
-            Expr::If(nested) => {
-                self.write_elseif(nested, tail)?;
-            }
-            Expr::Block(block) => {
-                self.line("else");
-                self.indent = self.indent.saturating_add(1);
-                self.block_inner(&block.block, tail)?;
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-            }
-            other => {
-                return Err(Error::at(
-                    other.span(),
-                    "only `else` and `else if` are supported",
-                ));
-            }
+            None => Ok(()),
+            Some(Expr::Block(block)) => self.block_inner(&block.block, tail),
+            Some(other) => Err(Error::at(
+                other.span(),
+                "only `else` and `else if` are supported",
+            )),
         }
-        Ok(())
     }
 
-    fn write_elseif(
+    fn write_if_chain(
         &mut self,
-        item: &syn::ExprIf,
+        chain: &[(&Expr, &syn::Block)],
+        else_branch: Option<&Expr>,
         tail: bool,
+        elseif: bool,
     ) -> Result<(), Error> {
-        let (condition, _) = self.expr(&item.cond)?;
-        self.line(&format!("elseif {condition} then"));
-        self.indent = self.indent.saturating_add(1);
-        self.block_inner(&item.then_branch, tail)?;
-        self.indent = self.indent.saturating_sub(1);
-        let else_branch = item.else_branch.as_ref().map(|(_, expr)| &**expr);
-        let Some(else_branch) = else_branch else {
-            self.line("end");
-            return Ok(());
+        let Some((condition, block)) = chain.first().copied() else {
+            return self.emit_else(else_branch, tail);
         };
+        let (condition, _) = self.expr(condition)?;
+        let keyword = if elseif { "elseif" } else { "if" };
+        self.line(&format!("{keyword} {condition} then"));
+        self.indent = self.indent.saturating_add(1);
+        self.block_inner(block, tail)?;
+        self.indent = self.indent.saturating_sub(1);
+        if chain.len() > 1 {
+            return self.write_if_chain(&chain[1..], else_branch, tail, true);
+        }
         match else_branch {
-            Expr::If(nested) => self.write_elseif(nested, tail),
-            Expr::Block(block) => {
+            Some(Expr::Block(block)) => {
                 self.line("else");
                 self.indent = self.indent.saturating_add(1);
                 self.block_inner(&block.block, tail)?;
@@ -498,10 +496,90 @@ impl Emitter {
                 self.line("end");
                 Ok(())
             }
-            other => Err(Error::at(
+            None => {
+                self.line("end");
+                Ok(())
+            }
+            Some(other) => Err(Error::at(
                 other.span(),
                 "only `else` and `else if` are supported",
             )),
+        }
+    }
+
+    fn const_bool(&self, expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::Lit(ExprLit {
+                lit: Lit::Bool(value),
+                ..
+            }) => Some(value.value),
+            Expr::Paren(paren) => self.const_bool(&paren.expr),
+            Expr::Group(group) => self.const_bool(&group.expr),
+            Expr::Reference(reference) => self.const_bool(&reference.expr),
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Not(_)) => {
+                self.const_bool(&unary.expr).map(|value| !value)
+            }
+            Expr::Binary(binary) => {
+                if matches!(binary.op, BinOp::And(_)) {
+                    return Some(
+                        self.const_bool(&binary.left)?
+                            && self.const_bool(&binary.right)?,
+                    );
+                }
+                if matches!(binary.op, BinOp::Or(_)) {
+                    return Some(
+                        self.const_bool(&binary.left)?
+                            || self.const_bool(&binary.right)?,
+                    );
+                }
+                let negate = matches!(binary.op, BinOp::Ne(_));
+                if !negate && !matches!(binary.op, BinOp::Eq(_)) {
+                    return None;
+                }
+                let left = self.const_literal(&binary.left);
+                let right = self.const_literal(&binary.right);
+                let value = match (
+                    self.is_event_expr(&binary.left),
+                    self.is_event_expr(&binary.right),
+                ) {
+                    (true, false) => {
+                        self.bound_event.as_deref()? == right?.as_str()
+                    }
+                    (false, true) => {
+                        self.bound_event.as_deref()? == left?.as_str()
+                    }
+                    (false, false) => left? == right?,
+                    (true, true) => return None,
+                };
+                Some(if negate { !value } else { value })
+            }
+            Expr::MethodCall(call) if call.method == "is_load_event" => {
+                match self.bound_event.as_deref() {
+                    Some("load") => Some(true),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn const_literal(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) => Some(value.value()),
+            Expr::Lit(ExprLit {
+                lit: Lit::Int(value),
+                ..
+            }) => Some(value.base10_digits().to_owned()),
+            Expr::Lit(ExprLit {
+                lit: Lit::Bool(value),
+                ..
+            }) => Some(if value.value { "true" } else { "false" }.to_owned()),
+            Expr::Paren(paren) => self.const_literal(&paren.expr),
+            Expr::Group(group) => self.const_literal(&group.expr),
+            _ => None,
         }
     }
 
@@ -510,6 +588,25 @@ impl Emitter {
         item: &syn::ExprMatch,
         tail: bool,
     ) -> Result<(), Error> {
+        if let Some(bound) = self.bound_event.clone()
+            && self.is_event_expr(&item.expr)
+        {
+            for arm in &item.arms {
+                match pattern_strings(&arm.pat)? {
+                    Some(patterns)
+                        if patterns.iter().any(|pattern| pattern == &bound) =>
+                    {
+                        return self.arm_body(&arm.body, tail);
+                    }
+                    Some(_) => {}
+                    None if matches!(arm.pat, Pat::Wild(_)) => {
+                        return self.arm_body(&arm.body, tail);
+                    }
+                    None => {}
+                }
+            }
+            return Ok(());
+        }
         let (scrutinee, _) = self.expr(&item.expr)?;
         let event_match = self.is_event_expr(&item.expr);
         let mut opened = false;
@@ -657,6 +754,23 @@ impl Emitter {
                 Ok((String::new(), Ty::VOID))
             }
             Expr::If(item) => {
+                let (chain, else_branch) = if_chain(item);
+                if chain
+                    .iter()
+                    .all(|(condition, _)| self.const_bool(condition).is_some())
+                {
+                    for (condition, block) in &chain {
+                        if self.const_bool(condition) == Some(true) {
+                            return self.block_value(block);
+                        }
+                    }
+                    return match else_branch {
+                        Some(Expr::Block(block)) => {
+                            self.block_value(&block.block)
+                        }
+                        _ => Ok(("nil".to_owned(), Ty::VALUE)),
+                    };
+                }
                 let name = self.temp();
                 self.line(&format!("local {name}"));
                 let (condition, _) = self.expr(&item.cond)?;
@@ -1020,10 +1134,14 @@ impl Emitter {
                 ))
             }
             "render_source" => Ok(("source".to_owned(), Ty::STR)),
-            "is_load_event" => Ok((
-                "(event == \"load\" or source == \"load\")".to_owned(),
-                Ty::BOOL,
-            )),
+            "is_load_event" => {
+                let text = match self.bound_event.as_deref() {
+                    Some("load") => "true",
+                    Some(_) => "(source == \"load\")",
+                    None => "(event == \"load\" or source == \"load\")",
+                };
+                Ok((text.to_owned(), Ty::BOOL))
+            }
             other => Err(Error::at(
                 call.method.span(),
                 format!(
@@ -1152,7 +1270,10 @@ impl Emitter {
         };
         if self.is_ctx_expr(&field.base) {
             return match name.to_string().as_str() {
-                "event" => Ok(("event".to_owned(), Ty::STR)),
+                "event" => Ok(match &self.bound_event {
+                    Some(event) => (quote(event), Ty::STR),
+                    None => ("event".to_owned(), Ty::STR),
+                }),
                 "now_ms" => Ok(("noctalia.nowMs()".to_owned(), Ty::INT)),
                 "entry" => {
                     self.uses_entry = true;
@@ -1382,6 +1503,7 @@ impl Emitter {
     }
 
     fn op_expr(&mut self, expr: &Expr) -> Result<(), Error> {
+        self.emitted = true;
         match expr {
             Expr::Struct(item) => {
                 let name = item
@@ -1848,6 +1970,21 @@ fn strip_reference(expr: &Expr) -> &Expr {
         Expr::Paren(paren) => strip_reference(&paren.expr),
         Expr::Group(group) => strip_reference(&group.expr),
         other => other,
+    }
+}
+
+type IfChain<'a> = (Vec<(&'a Expr, &'a syn::Block)>, Option<&'a Expr>);
+
+fn if_chain(item: &syn::ExprIf) -> IfChain<'_> {
+    let mut chain = Vec::new();
+    let mut current = item;
+    loop {
+        chain.push((&*current.cond, &current.then_branch));
+        let next = current.else_branch.as_ref().map(|(_, expr)| &**expr);
+        match next {
+            Some(Expr::If(nested)) => current = nested,
+            other => return (chain, other),
+        }
     }
 }
 

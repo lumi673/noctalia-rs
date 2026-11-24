@@ -33,18 +33,16 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
 
-    assert!(
-        compiled.source.contains(
-            "if ((event == \"render\") or (event == \"click\")) then"
-        )
-    );
+    assert!(compiled.source.contains("local function body_"));
+    assert!(compiled.source.contains("function update() body_"));
+    assert!(compiled.source.contains(", \"update\") end"));
     assert!(
         compiled.source.contains(
             "local message = (noctalia.getConfig(\"message\") or \"\")"
         )
     );
     assert!(compiled.source.contains("barWidget.setText(message)"));
-    assert!(compiled.source.contains("function onClick()"));
+    assert!(compiled.source.contains("function onClick() body_"));
     assert!(!compiled.source.contains("require("));
     assert!(!compiled.source.contains("bridge."));
     assert_eq!(compiled.events, vec!["click", "render"]);
@@ -77,7 +75,7 @@ fn service(ctx: &Context) -> Result<Vec<Op>> {
             "local name = (noctalia.getConfig(\"name\") or \"bench\")"
         )
     );
-    assert!(compiled.source.contains("body(\"load\""));
+    assert!(!compiled.source.contains("body_load"));
     assert!(!compiled.source.contains("noctalia.state.watch(STATE_KEY"));
 }
 
@@ -140,19 +138,21 @@ fn launcher(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("launcher", EntryKind::Launcher))
             .expect("compiles");
 
+    assert!(compiled.source.contains("local function body_"));
+    assert!(compiled.source.contains("launcher.setResults(text, {})"));
+    assert!(compiled.source.contains("noctalia.log(id)"));
+    assert!(compiled.source.contains("function update() end"));
     assert!(
         compiled
             .source
-            .contains("if event == \"query\" or event == \"search\" then")
+            .contains("function onQuery(text) last_query = text; body_query(")
     );
+    assert!(compiled.source.contains("function onSearch(text) body_"));
     assert!(
         compiled
             .source
-            .contains("elseif event == \"activate\" then")
+            .contains("function onActivate(id) body_activate(")
     );
-    assert!(compiled.source.contains("function onQuery(text)"));
-    assert!(compiled.source.contains("function onSearch(text)"));
-    assert!(compiled.source.contains("function onActivate(id)"));
     assert!(compiled.source.contains("launcher.setResults(text, {})"));
     assert!(compiled.source.contains("last_query"));
     assert_eq!(compiled.events, vec!["activate", "query", "search"]);
@@ -510,22 +510,11 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
-    assert!(
-        compiled
-            .source
-            .contains("local PAYLOAD_UPDATE = { source = \"update\" }")
-    );
-    assert!(
-        compiled
-            .source
-            .contains("local PAYLOAD_LOAD = { source = \"load\" }")
-    );
     assert!(compiled.source.contains("local PAYLOAD_EMPTY = {}"));
+    assert!(!compiled.source.contains("PAYLOAD_STATE"));
+    assert!(compiled.source.contains("function update() end"));
     assert!(compiled.source.contains(
-        "function update() body(\"update\", PAYLOAD_UPDATE, \"update\") end"
-    ));
-    assert!(compiled.source.contains(
-        "function onActivate(id) body(\"activate\", { id = id }, \"\") end"
+        "function onActivate(id) body_activate({ id = id }, \"\") end"
     ));
 
     let escaping = r#"
@@ -537,7 +526,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(escaping), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(!compiled.source.contains("PAYLOAD_UPDATE"));
-    assert!(compiled
-        .source
-        .contains("function update() body(\"update\", { source = \"update\" }, \"update\") end"));
+    assert!(compiled.source.contains(
+        "function update() body_update({ source = \"update\" }, \"update\") end"
+    ));
 }

@@ -1334,7 +1334,7 @@ mod tests {
 
         let message = result.expect_err("compile error").to_string();
         assert!(message.contains("src/handler.rs:4:"), "{message}");
-        assert!(message.contains("expected an Op constructor"), "{message}");
+        assert!(message.contains("op `Nope` is not supported"), "{message}");
         Ok(())
     }
 
