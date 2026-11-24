@@ -15,7 +15,7 @@ a plugin computes.
 ## Features
 
 - `noctalia.toml` as the source of truth for metadata, settings, and entries
-- Optional compiled Luau entries with no helper process or spool IPC
+- Compiled Luau entries by default, with bridge fallback in `auto` mode
 - Version taken from `Cargo.toml` through `CARGO_PKG_VERSION`
 - No Nix requirement; Nix packaging stays optional
 - All Noctalia setting types and entry kinds
@@ -39,7 +39,7 @@ serde_json = "1.0"
 noctalia-rs-build = "0.2"
 ```
 
-For entries that keep their logic in `.luau` files, add `noctalia-rs-luau = "0.2"` to `[dependencies]`. Rust handlers do not need it.
+For Rust handlers, the dependency, `build.rs`, and `noctalia.toml` shown below are enough. Entries with a hand-written `.luau` script and no `handler` also need `noctalia-rs-luau = "0.2"` in `[dependencies]`.
 Package names and Rust library names now match. Plugin code imports `noctalia_rs::`, and `build.rs` calls `noctalia_rs_build::generate()`.
 
 Add `build.rs`:
@@ -77,8 +77,8 @@ entry = "service.luau"
 handler = "service"
 ```
 
-Each entry names a handler function in your crate. The generated plugin takes
-its version from `Cargo.toml`.
+Each entry names a handler function in your crate. The build finds that function
+in the crate source. The generated plugin takes its version from `Cargo.toml`.
 
 Declare non-code files with `assets`. Shared Luau modules go in `luau_sources`. Entries without `handler` embed the script named in `entry` automatically. Only declared files are copied into the plugin directory.
 
@@ -109,47 +109,54 @@ fn main() -> ExitCode {
 }
 ```
 
-## Compiled Luau entries
+## Compile modes
 
-Add `luau` to an entry to compile its handler into a self-contained Luau script:
+`compile` selects how Rust handlers become Luau entries. It defaults to `auto`:
+
+```toml
+compile = "auto"
+```
+
+`auto` compiles each handler it finds and emits a pure-Luau script on success.
+A handler the compiler cannot translate keeps the bridge stub, and the build
+prints one `cargo:warning` with the entry id and `file:line:column: reason`.
+`strict` fails the build on the first failure and emits no bridge. It also
+rejects entries without a handler. `off` skips the compiler and bridges every
+entry.
+
+The handler signature is `fn handler(ctx: &Context) -> Result<Vec<Op>>`. The
+build walks the module tree from `src/main.rs` or `src/lib.rs`, follows `mod`
+declarations and `#[path]`, and finds the function named by `handler`. No extra
+manifest key is needed:
 
 ```toml
 [[widget]]
 id = "widget"
 entry = "widget.luau"
 handler = "widget"
-luau = "src/main.rs"
 ```
 
-The value is the Rust file holding the handler. The build translates the handler
-to Luau and embeds it, so the entry runs without the helper process and spool
-IPC. The handler keeps the signature
-`fn handler(ctx: &Context) -> Result<Vec<Op>>`.
+Use `luau` only when the function lives in a file outside that module tree:
 
-Compiled entries sit at parity with hand-written Luau on the small benchmark
-fixtures and beat it on UI trees, where the compiler emits node tables directly
-instead of calling `ui.*` constructors. The 3x target is measured against the bridge path: a spool
-round trip is about 1.13 ms, compiled renders are about 2 us to 10 us.
+```toml
+luau = "src/widget_handler.rs"
+```
 
-The compiler reads the whole crate, not just the file named by `luau`. It walks
-the module tree from `src/main.rs` or `src/lib.rs`, follows `mod` declarations
-and `#[path]` attributes, and resolves calls through `crate::`, `self::`,
-`super::`, plain module paths, and simple `use` aliases. Helpers it can
-translate are inlined: a `&Context` and `&mut Vec<Op>` helper at statement
-position, a value helper in an expression, and a handler that delegates to
-another module. Recursive calls, early `return`s, the `?` operator, closures,
-and helpers that mutate through any other reference fail the build instead of
-being mistranslated.
+`NOCTALIA_RS_COMPILE` overrides the manifest so CI can gate a whole workspace:
 
-The compiler specializes each handler per event. Event comparisons and match
-arms are folded at compile time, callbacks that emit nothing are dropped, and
-`format!` becomes string concatenation. It covers events, config, payload,
-state, settings, `tr`, host reads such as `file_exists`, `read_file`,
-`format_time`, and `list_dir`, the common ops, `const` strings and integers,
-and plain Rust control flow, arithmetic, and string work. Anything outside that
-subset fails the build with `file:line:column`, naming the module when the
-error sits in an inlined helper. Omit `luau` and the entry keeps the generated
-stub that forwards every callback to the Rust helper.
+```sh
+NOCTALIA_RS_COMPILE=strict cargo build --release
+```
+
+Valid values are `strict`, `auto`, and `off`. An invalid value stops the build.
+
+The compiler resolves calls through `crate::`, `self::`, `super::`, plain module
+paths, and simple `use` aliases. It inlines helpers it can translate, folds
+event checks at compile time, and covers events, config, payload, state,
+settings, `tr`, host reads, common ops, constants, and plain Rust control flow.
+Recursive calls, early `return`s, `?`, closures, and helpers that mutate through
+other references are not translated. Errors name the module when they sit in an
+inlined helper.
 
 Build and install:
 

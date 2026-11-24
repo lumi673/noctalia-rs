@@ -1062,6 +1062,26 @@ mod tests {
         Entry::new((id.to_owned(), kind, Vec::new()), handler)
             .with_luau(source.to_owned())
     }
+    fn is_build_only_key(line: &str) -> bool {
+        let Some((key, _)) = line.split_once('=') else {
+            return false;
+        };
+        matches!(key.trim(), "compile" | "luau")
+    }
+
+    #[test]
+    fn test_emit_omits_build_only_compile_keys() {
+        let dir = env::temp_dir()
+            .join(format!("noctalia-manifest-keys-{}", process::id()));
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .entry(compiled_entry("widget", EntryKind::Widget, "-- compiled"));
+        emit(&plugin, &dir, "helper").expect("emit");
+        let text = fs::read_to_string(dir.join("plugin.toml")).expect("toml");
+        fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert!(!text.lines().any(is_build_only_key));
+        assert!(text.contains("entry = \"widget.luau\""));
+    }
 
     #[test]
     fn test_emit_writes_luau_source_instead_of_stub() {
