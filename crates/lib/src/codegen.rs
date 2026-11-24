@@ -1140,6 +1140,7 @@ mod tests {
                     entry: id,
                     state_key: "template.state",
                     kind: compiled_kind,
+                    strings: &["message"],
                 },
             )
             .expect("compile");

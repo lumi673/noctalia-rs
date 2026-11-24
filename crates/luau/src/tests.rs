@@ -852,3 +852,14 @@ end)
         "ok"
     );
 }
+
+#[test]
+fn launcher_rows_treat_an_empty_table_as_no_rows() {
+    let values = run(r#"
+function update()
+  launcher.setResults("none", {})
+end
+"#);
+    let results = find(&values, "launcher_results");
+    assert_eq!(results["rows"], json!([]));
+}

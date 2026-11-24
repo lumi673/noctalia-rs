@@ -239,6 +239,9 @@ pub struct Options<'a> {
     pub entry: &'a str,
     pub state_key: &'a str,
     pub kind: EntryKind,
+    /// Config keys declared as strings in the manifest. `config_str` on these
+    /// keys needs no runtime coercion.
+    pub strings: &'a [&'a str],
 }
 
 #[derive(Clone, Debug)]
@@ -257,7 +260,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let function = find_handler(&file, options.handler)?;
     let context = context_name(function)?;
 
-    let mut discovery = Emitter::new(context, None);
+    let mut discovery = Emitter::new(context, None, options.strings, &[]);
     discovery.constants(&file.items);
     discovery.block(&function.block)?;
     let events = discovery.finish().events;
@@ -283,7 +286,12 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let mut bodies: Vec<Slot> = Vec::new();
     let mut names = std::collections::BTreeMap::new();
     for label in &labels {
-        let mut emitter = Emitter::new(context, Some(label.clone()));
+        let mut emitter = Emitter::new(
+            context,
+            Some(label.clone()),
+            options.strings,
+            emit::payload_params(label),
+        );
         emitter.constants(&file.items);
         emitter.block(&function.block)?;
         let body = emitter.finish();
@@ -310,10 +318,15 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             .and_then(|name| bodies.iter().find(|slot| &slot.name == name))
     };
     let update = slot(&update_event).filter(|slot| !slot.body.is_empty);
+    let watch_label = if options.kind == EntryKind::Launcher {
+        "query"
+    } else {
+        update_event.as_str()
+    };
     let watch = options
         .kind
         .watches_state()
-        .then(|| slot(&update_event))
+        .then(|| slot(watch_label))
         .flatten()
         .filter(|slot| !slot.body.is_empty);
     let load_label =
@@ -322,7 +335,12 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         } else {
             update_event.as_str()
         };
-    let load = slot(load_label).filter(|slot| !slot.body.is_empty);
+    let load = options
+        .kind
+        .renders_on_load()
+        .then(|| slot(load_label))
+        .flatten()
+        .filter(|slot| !slot.body.is_empty);
 
     let uses_state =
         bodies.iter().any(|slot| slot.body.uses_state) || watch.is_some();
@@ -376,8 +394,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     if uses_bool_or {
         out.push_str(concat!(
             "local function bool_or(value, default)\n",
-            "  if value == nil then return default end\n",
-            "  return value\n",
+            "  if type(value) == \"boolean\" then return value end\n",
+            "  return default\n",
             "end\n",
         ));
     }
@@ -403,36 +421,51 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         if slot.body.is_empty {
             continue;
         }
-        let _ = writeln!(out, "local function {}(payload, source)", slot.name);
+        let _ = writeln!(
+            out,
+            "local function {}({})",
+            slot.name,
+            body_params(&slot.body)
+        );
         out.push_str(&slot.body.source);
         out.push_str("end\n\n");
     }
 
     if let Some(slot) = update {
-        let payload = wrapper_payload(&slot.body, "update", None, false);
-        let _ = writeln!(
-            out,
-            "function update() {}({payload}, \"update\") end",
-            slot.name
-        );
+        let args = call_args(&slot.body, &[], &[], Some("update"), None, false);
+        let _ = writeln!(out, "function update() {}({args}) end", slot.name);
     } else {
         out.push_str("function update() end\n");
     }
 
     if options.kind == EntryKind::Launcher
-        && let Some(slot) = slot("query").filter(|slot| !slot.body.is_empty)
+        && let Some(slot) = watch
     {
-        let payload =
-            wrapper_payload(&slot.body, "", Some("{ text = text }"), false);
-        let state_payload = wrapper_payload(&slot.body, "state", None, false);
+        let mapping = emit::payload_params("query");
+        let payload = call_args(
+            &slot.body,
+            mapping,
+            &["text"],
+            None,
+            Some("{ text = text }"),
+            false,
+        );
+        let state_payload = call_args(
+            &slot.body,
+            mapping,
+            &["last_query"],
+            Some("state"),
+            Some("{ text = last_query, source = \"state\" }"),
+            false,
+        );
         let _ = writeln!(
             out,
-            "local last_query = nil\nfunction onQuery(text) last_query = text; {}({payload}, \"\") end",
+            "local last_query = nil\nfunction onQuery(text) last_query = text; {}({payload}) end",
             slot.name
         );
         let _ = writeln!(
             out,
-            "noctalia.state.watch(STATE_KEY, function() if last_query then {}({state_payload}, \"state\") end end)",
+            "state.watch(STATE_KEY, function() if last_query then {}({state_payload}) end end)",
             slot.name
         );
     }
@@ -448,15 +481,22 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         };
         let dynamic =
             (!callback.payload.is_empty()).then_some(callback.payload);
-        let payload = wrapper_payload(
+        let mapping = emit::payload_params(callback.event);
+        let values = mapping
+            .iter()
+            .map(|(_, _, value)| *value)
+            .collect::<Vec<_>>();
+        let args = call_args(
             &slot.body,
-            "",
+            mapping,
+            &values,
+            None,
             dynamic,
             callback.payload.is_empty(),
         );
         let _ = writeln!(
             out,
-            "function {}({}) {}({payload}, \"\") end",
+            "function {}({}) {}({args}) end",
             callback.function, callback.params, slot.name
         );
     }
@@ -464,10 +504,10 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     if options.kind != EntryKind::Launcher
         && let Some(slot) = watch
     {
-        let payload = wrapper_payload(&slot.body, "state", None, false);
+        let args = call_args(&slot.body, &[], &[], Some("state"), None, false);
         let _ = writeln!(
             out,
-            "noctalia.state.watch(STATE_KEY, function() {}({payload}, \"state\") end)",
+            "state.watch(STATE_KEY, function() {}({args}) end)",
             slot.name
         );
     }
@@ -475,8 +515,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         out.push_str("panel.setWantsSecondTicks(true)\n");
     }
     if let Some(slot) = load {
-        let payload = wrapper_payload(&slot.body, "load", None, false);
-        let _ = writeln!(out, "{}({payload}, \"load\")", slot.name);
+        let args = call_args(&slot.body, &[], &[], Some("load"), None, false);
+        let _ = writeln!(out, "{}({args})", slot.name);
     }
 
     Ok(Compiled {
@@ -498,6 +538,40 @@ fn sanitize(value: &str) -> String {
         out.push_str("body");
     }
     out
+}
+
+fn body_params(body: &emit::Body) -> String {
+    let mut params = body.params.clone();
+    if body.uses_payload {
+        params.push("payload");
+    }
+    if body.uses_source {
+        params.push("source");
+    }
+    params.join(", ")
+}
+
+fn call_args(
+    body: &emit::Body,
+    mapping: &[emit::PayloadParam],
+    values: &[&str],
+    source: Option<&str>,
+    dynamic: Option<&str>,
+    empty: bool,
+) -> String {
+    let mut args = Vec::new();
+    for ((_, body_param, _), value) in mapping.iter().zip(values) {
+        if body.params.contains(body_param) {
+            args.push((*value).to_owned());
+        }
+    }
+    if body.uses_payload {
+        args.push(wrapper_payload(body, source.unwrap_or(""), dynamic, empty));
+    }
+    if body.uses_source {
+        args.push(source.map_or_else(|| "\"\"".to_owned(), quote));
+    }
+    args.join(", ")
 }
 
 fn wrapper_payload(

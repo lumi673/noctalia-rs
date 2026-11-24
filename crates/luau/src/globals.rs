@@ -224,6 +224,7 @@ fn host_converter<'a>(lua: &'a Lua, host: &'a Host) -> Convert<'a> {
 fn json_rows(value: JsonValue) -> Vec<JsonValue> {
     match value {
         JsonValue::Array(values) => values,
+        JsonValue::Object(values) if values.is_empty() => Vec::new(),
         JsonValue::Null => Vec::new(),
         other => vec![other],
     }

@@ -81,6 +81,29 @@ impl Ty {
     }
 }
 
+pub(crate) type PayloadParam = (&'static str, &'static str, &'static str);
+
+/// Payload keys that map directly to a callback parameter, so the generated
+/// body can take the argument instead of building and reading a payload table.
+pub(crate) fn payload_params(event: &str) -> &'static [PayloadParam] {
+    match event {
+        "activate" => &[("id", "arg_id", "id")],
+        "search" | "search_change" | "query" => &[("text", "arg_text", "text")],
+        "ipc" => &[
+            ("event", "arg_event", "event"),
+            ("payload", "arg_payload", "payload"),
+        ],
+        "scroll" => &[("axis", "arg_axis", "axis")],
+        "key" => &[("chord", "arg_chord", "chord")],
+        "open" => &[("context", "arg_context", "context")],
+        "audio_spectrum" => &[
+            ("values_csv", "arg_values_csv", "valuesCsv"),
+            ("state_csv", "arg_state_csv", "stateCsv"),
+        ],
+        _ => &[],
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Body {
     pub source: String,
@@ -93,6 +116,8 @@ pub(crate) struct Body {
     pub uses_unwrap: bool,
     pub uses_host_call: bool,
     pub uses_bool_or: bool,
+    pub uses_source: bool,
+    pub params: Vec<&'static str>,
     pub is_empty: bool,
 }
 
@@ -103,6 +128,9 @@ pub(crate) struct Emitter {
     scopes: Vec<HashMap<String, Ty>>,
     events: BTreeSet<String>,
     bound_event: Option<String>,
+    payload_params: &'static [PayloadParam],
+    params: Vec<&'static str>,
+    strings: Vec<String>,
     constants: HashMap<String, (String, Ty)>,
     uses_state: bool,
     uses_payload: bool,
@@ -112,12 +140,18 @@ pub(crate) struct Emitter {
     uses_unwrap: bool,
     uses_host_call: bool,
     uses_bool_or: bool,
+    uses_source: bool,
     emitted: bool,
     temp: usize,
 }
 
 impl Emitter {
-    pub(crate) fn new(ctx: &syn::Ident, bound_event: Option<String>) -> Self {
+    pub(crate) fn new(
+        ctx: &syn::Ident,
+        bound_event: Option<String>,
+        strings: &[&str],
+        payload_params: &'static [PayloadParam],
+    ) -> Self {
         Self {
             ctx: ctx.to_string(),
             out: String::new(),
@@ -125,6 +159,9 @@ impl Emitter {
             scopes: vec![HashMap::new()],
             events: BTreeSet::new(),
             bound_event,
+            payload_params,
+            params: Vec::new(),
+            strings: strings.iter().map(|key| (*key).to_owned()).collect(),
             constants: HashMap::new(),
             uses_state: false,
             uses_payload: false,
@@ -134,6 +171,7 @@ impl Emitter {
             uses_unwrap: false,
             uses_host_call: false,
             uses_bool_or: false,
+            uses_source: false,
             emitted: false,
             temp: 0,
         }
@@ -199,7 +237,7 @@ impl Emitter {
         let mut source = String::new();
         if self.uses_state {
             source.push_str(
-                "  local state = noctalia.state.get(STATE_KEY) or {}\n",
+                "  local plugin_state = state.get(STATE_KEY) or {}\n",
             );
         }
         if self.uses_entry {
@@ -217,6 +255,8 @@ impl Emitter {
             uses_unwrap: self.uses_unwrap,
             uses_host_call: self.uses_host_call,
             uses_bool_or: self.uses_bool_or,
+            uses_source: self.uses_source,
+            params: self.params.clone(),
             is_empty: !self.emitted,
         }
     }
@@ -245,6 +285,14 @@ impl Emitter {
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), Error> {
         match stmt {
             Stmt::Local(local) => self.local(local),
+            Stmt::Expr(expr, _) if diverges(expr) => {
+                self.line("do");
+                self.indent = self.indent.saturating_add(1);
+                self.expr_stmt(expr)?;
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok(())
+            }
             Stmt::Expr(expr, _) => self.expr_stmt(expr),
             other => Err(Error::at(
                 other.span(),
@@ -262,7 +310,7 @@ impl Emitter {
 
     fn tail_expr(&mut self, expr: &Expr) -> Result<(), Error> {
         match expr {
-            Expr::Call(call) if is_ok_call(call) => self.ok(&call.args),
+            Expr::Call(call) if is_ok_call(call) => self.ok_tail(&call.args),
             Expr::If(item) => self.if_stmt(item, true),
             Expr::Match(item) => self.match_stmt(item, true),
             Expr::Block(block) => self.block(&block.block),
@@ -343,7 +391,7 @@ impl Emitter {
 
     fn expr_stmt(&mut self, expr: &Expr) -> Result<(), Error> {
         match expr {
-            Expr::Call(call) if is_ok_call(call) => self.ok(&call.args),
+            Expr::Call(call) if is_ok_call(call) => self.ok_tail(&call.args),
             Expr::Call(call) if is_ops_push(call) => {
                 let value = call.args.first().ok_or_else(|| {
                     Error::at(call.span(), "push() needs a value")
@@ -355,7 +403,14 @@ impl Emitter {
             Expr::ForLoop(item) => self.for_stmt(item),
             Expr::Assign(item) => self.assign(&item.left, &item.right, "="),
             Expr::Return(item) => self.ret(item.expr.as_deref()),
-            Expr::Block(block) => self.block(&block.block),
+            Expr::Block(block) => {
+                self.line("do");
+                self.indent = self.indent.saturating_add(1);
+                self.block_inner(&block.block, false)?;
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok(())
+            }
             Expr::Struct(_) => self.op_expr(expr),
             Expr::Macro(mac) if macro_name(mac) == "vec" => {
                 for item in parse_vec(mac)? {
@@ -406,13 +461,30 @@ impl Emitter {
     }
 
     fn ok(&mut self, args: &Punctuated<Expr, Token![,]>) -> Result<(), Error> {
+        self.ok_impl(args, true)
+    }
+
+    fn ok_tail(
+        &mut self,
+        args: &Punctuated<Expr, Token![,]>,
+    ) -> Result<(), Error> {
+        self.ok_impl(args, false)
+    }
+
+    fn ok_impl(
+        &mut self,
+        args: &Punctuated<Expr, Token![,]>,
+        emit_return: bool,
+    ) -> Result<(), Error> {
         let value = args.first().ok_or_else(|| {
             Error::at(proc_macro2::Span::call_site(), "Ok() needs a value")
         })?;
         if let Expr::Call(call) = value
             && is_vec_new(call)
         {
-            self.line("return");
+            if emit_return {
+                self.line("return");
+            }
             return Ok(());
         }
         if let Expr::Macro(mac) = value
@@ -421,14 +493,18 @@ impl Emitter {
             for item in parse_vec(mac)? {
                 self.op_expr(&item)?;
             }
-            self.line("return");
+            if emit_return {
+                self.line("return");
+            }
             return Ok(());
         }
         if let Expr::Path(path) = value
             && let Some(segment) = path.path.get_ident()
             && self.lookup(&segment.to_string()) == Some(Ty::OPS)
         {
-            self.line("return");
+            if emit_return {
+                self.line("return");
+            }
             return Ok(());
         }
         Err(Error::at(
@@ -445,7 +521,7 @@ impl Emitter {
         {
             for (condition, block) in &chain {
                 if self.const_bool(condition) == Some(true) {
-                    return self.block_inner(block, tail);
+                    return self.inline_block(block, tail);
                 }
             }
             return self.emit_else(else_branch, tail);
@@ -460,12 +536,28 @@ impl Emitter {
     ) -> Result<(), Error> {
         match else_branch {
             None => Ok(()),
-            Some(Expr::Block(block)) => self.block_inner(&block.block, tail),
+            Some(Expr::Block(block)) => self.inline_block(&block.block, tail),
             Some(other) => Err(Error::at(
                 other.span(),
                 "only `else` and `else if` are supported",
             )),
         }
+    }
+
+    fn inline_block(
+        &mut self,
+        block: &syn::Block,
+        tail: bool,
+    ) -> Result<(), Error> {
+        if tail {
+            return self.block_inner(block, true);
+        }
+        self.line("do");
+        self.indent = self.indent.saturating_add(1);
+        self.block_inner(block, false)?;
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        Ok(())
     }
 
     fn write_if_chain(
@@ -596,11 +688,11 @@ impl Emitter {
                     Some(patterns)
                         if patterns.iter().any(|pattern| pattern == &bound) =>
                     {
-                        return self.arm_body(&arm.body, tail);
+                        return self.inline_arm(&arm.body, tail);
                     }
                     Some(_) => {}
                     None if matches!(arm.pat, Pat::Wild(_)) => {
-                        return self.arm_body(&arm.body, tail);
+                        return self.inline_arm(&arm.body, tail);
                     }
                     None => {}
                 }
@@ -647,6 +739,18 @@ impl Emitter {
         if opened {
             self.line("end");
         }
+        Ok(())
+    }
+
+    fn inline_arm(&mut self, body: &Expr, tail: bool) -> Result<(), Error> {
+        if tail {
+            return self.arm_body(body, true);
+        }
+        self.line("do");
+        self.indent = self.indent.saturating_add(1);
+        self.arm_body(body, false)?;
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
         Ok(())
     }
 
@@ -951,6 +1055,13 @@ impl Emitter {
             }
             "unwrap_or" => {
                 let (default, default_ty) = self.expr(arg(&args, 0, call)?)?;
+                if ty.base == Base::Bool || default_ty.base == Base::Bool {
+                    self.uses_bool_or = true;
+                    return Ok((
+                        format!("bool_or({receiver}, {default})"),
+                        Ty::BOOL,
+                    ));
+                }
                 Ok((
                     format!("({receiver} or {default})"),
                     Ty::new(wider(ty, default_ty).base),
@@ -1017,7 +1128,20 @@ impl Emitter {
         match method {
             "config_str" => {
                 let key = self.string_arg(args, 0, call)?;
-                Ok((format!("noctalia.getConfig({key})"), Ty::OPT_STR))
+                let raw = key.trim_matches('"');
+                if self.strings.iter().any(|item| item == raw) {
+                    return Ok((
+                        format!("noctalia.getConfig({key})"),
+                        Ty::OPT_STR,
+                    ));
+                }
+                Ok((
+                    self.coerced_string(
+                        format!("noctalia.getConfig({key})"),
+                        true,
+                    ),
+                    Ty::OPT_STR,
+                ))
             }
             "config_bool" => {
                 self.uses_bool_or = true;
@@ -1031,9 +1155,23 @@ impl Emitter {
                 ))
             }
             "payload_str" => {
-                self.uses_payload = true;
                 let key = self.string_arg(args, 0, call)?;
-                Ok((format!("payload[{key}]"), Ty::OPT_STR))
+                let raw = key.trim_matches('"');
+                if let Some((_, body_param, _)) = self
+                    .payload_params
+                    .iter()
+                    .find(|(payload_key, _, _)| *payload_key == raw)
+                {
+                    if !self.params.contains(body_param) {
+                        self.params.push(body_param);
+                    }
+                    return Ok(((*body_param).to_owned(), Ty::OPT_STR));
+                }
+                self.uses_payload = true;
+                Ok((
+                    self.coerced_string(format!("payload[{key}]"), false),
+                    Ty::OPT_STR,
+                ))
             }
             "payload_arg" => {
                 self.uses_payload = true;
@@ -1047,7 +1185,7 @@ impl Emitter {
                 self.uses_state = true;
                 let key = self.string_arg(args, 0, call)?;
                 let ty = turbofish_type(call.turbofish.as_ref());
-                Ok((format!("state[{key}]"), ty))
+                Ok((format!("plugin_state[{key}]"), ty))
             }
             "setting" | "setting_value" => {
                 let key = self.string_arg(args, 0, call)?;
@@ -1129,16 +1267,25 @@ impl Emitter {
             "global_state" => {
                 let key = self.string_arg(args, 0, call)?;
                 Ok((
-                    format!("noctalia.state.get({key})"),
+                    format!("state.get({key})"),
                     Ty::OPT_VALUE,
                 ))
             }
-            "render_source" => Ok(("source".to_owned(), Ty::STR)),
+            "render_source" => {
+                self.uses_source = true;
+                Ok(("source".to_owned(), Ty::STR))
+            }
             "is_load_event" => {
                 let text = match self.bound_event.as_deref() {
                     Some("load") => "true",
-                    Some(_) => "(source == \"load\")",
-                    None => "(event == \"load\" or source == \"load\")",
+                    Some(_) => {
+                        self.uses_source = true;
+                        "(source == \"load\")"
+                    }
+                    None => {
+                        self.uses_source = true;
+                        "(event == \"load\" or source == \"load\")"
+                    }
                 };
                 Ok((text.to_owned(), Ty::BOOL))
             }
@@ -1148,6 +1295,20 @@ impl Emitter {
                     "context method `{other}` is not supported by the Luau compiler"
                 ),
             )),
+        }
+    }
+
+    fn coerced_string(&mut self, value: String, allow_bool: bool) -> String {
+        let name = self.temp();
+        self.line(&format!("local {name} = {value}"));
+        if allow_bool {
+            format!(
+                "((type({name}) == \"string\" and {name}) or ((type({name}) == \"number\" or type({name}) == \"boolean\") and tostring({name})))"
+            )
+        } else {
+            format!(
+                "((type({name}) == \"string\" and {name}) or (type({name}) == \"number\" and tostring({name})))"
+            )
         }
     }
 
@@ -1286,7 +1447,7 @@ impl Emitter {
                 }
                 "state" => {
                     self.uses_state = true;
-                    Ok(("state".to_owned(), Ty::VALUE))
+                    Ok(("plugin_state".to_owned(), Ty::VALUE))
                 }
                 "data_dir" => Ok((
                     "(noctalia.pluginDataDir() or noctalia.pluginDir())"
@@ -1599,7 +1760,7 @@ impl Emitter {
             "StateSet" => {
                 let key = self.expr(field("key")?)?.0;
                 let value = self.expr(field("value")?)?.0;
-                self.line(&format!("noctalia.state.set({key}, {value})"));
+                self.line(&format!("state.set({key}, {value})"));
             }
             "TogglePanel" => {
                 let id = self.expr(field("id")?)?.0;
@@ -1698,13 +1859,13 @@ impl Emitter {
             "state" => {
                 let key = self.expr(arg(&args, 0, call)?)?.0;
                 let value = self.expr(arg(&args, 1, call)?)?.0;
-                self.line(&format!("noctalia.state.set({key}, {value})"));
+                self.line(&format!("state.set({key}, {value})"));
             }
             "state_watch" => {
                 let key = self.expr(arg(&args, 0, call)?)?.0;
                 let id = self.expr(arg(&args, 1, call)?)?.0;
                 self.line(&format!(
-                    "noctalia.state.watch({key}, {{ __host_callback = {id} }})"
+                    "state.watch({key}, {{ __host_callback = {id} }})"
                 ));
             }
             "set_interval" => {
@@ -1974,6 +2135,16 @@ fn strip_reference(expr: &Expr) -> &Expr {
 }
 
 type IfChain<'a> = (Vec<(&'a Expr, &'a syn::Block)>, Option<&'a Expr>);
+
+fn diverges(expr: &Expr) -> bool {
+    match expr {
+        Expr::Return(_) => true,
+        Expr::Call(call) => is_ok_call(call),
+        Expr::Paren(paren) => diverges(&paren.expr),
+        Expr::Group(group) => diverges(&group.expr),
+        _ => false,
+    }
+}
 
 fn if_chain(item: &syn::ExprIf) -> IfChain<'_> {
     let mut chain = Vec::new();

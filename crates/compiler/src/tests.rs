@@ -6,6 +6,7 @@ fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         entry: "widget",
         state_key: "hello.state",
         kind,
+        strings: &["message", "name"],
     }
 }
 
@@ -35,7 +36,7 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 
     assert!(compiled.source.contains("local function body_"));
     assert!(compiled.source.contains("function update() body_"));
-    assert!(compiled.source.contains(", \"update\") end"));
+    assert!(compiled.source.contains("function update() body_"));
     assert!(
         compiled.source.contains(
             "local message = (noctalia.getConfig(\"message\") or \"\")"
@@ -101,12 +102,12 @@ fn panel(ctx: &Context) -> Result<Vec<Op>> {
     assert!(
         compiled
             .source
-            .contains("local state = noctalia.state.get(STATE_KEY) or {}")
+            .contains("local plugin_state = state.get(STATE_KEY) or {}")
     );
     assert!(
         compiled
             .source
-            .contains("local label = (state[\"label\"] or \"\")")
+            .contains("local label = (plugin_state[\"label\"] or \"\")")
     );
     assert!(compiled.source.contains(
         "{ kind = \"column\", props = { id = \"root\", gap = 4 }, children = {"
@@ -320,7 +321,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "noctalia.compositor.name",
         "noctalia.pluginDir()",
         "noctalia.pluginDataDir()",
-        "noctalia.state.get(\"remote\")",
+        "state.get(\"remote\")",
         "noctalia.getSetting(\"shell.time_format\")",
         "noctalia.getSetting(\"shell.date_format\")",
         "os.clock()",
@@ -329,7 +330,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "payload[\"text\"]",
         "noctalia.notify(",
         "noctalia.notifyError(",
-        "noctalia.state.set(",
+        "state.set(",
         "noctalia.togglePanel(entry)",
         "noctalia.openSettings()",
         "barWidget.setColor(",
@@ -487,9 +488,9 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains(
-            "noctalia.state.set(\"example.state\", { retry = 5000 })"
-        )
+        compiled
+            .source
+            .contains("state.set(\"example.state\", { retry = 5000 })")
     );
     assert!(compiled.source.contains("noctalia.setUpdateInterval(5000)"));
 }
@@ -510,12 +511,36 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
-    assert!(compiled.source.contains("local PAYLOAD_EMPTY = {}"));
-    assert!(!compiled.source.contains("PAYLOAD_STATE"));
+    assert!(!compiled.source.contains("PAYLOAD_"));
     assert!(compiled.source.contains("function update() end"));
-    assert!(compiled.source.contains(
-        "function onActivate(id) body_activate({ id = id }, \"\") end"
-    ));
+    assert!(
+        compiled
+            .source
+            .contains("function onActivate(id) body_activate(id) end")
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local function body_activate(arg_id)")
+    );
+
+    let unmapped = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    match ctx.event.as_str() {
+        "activate" => {
+            let value = ctx.payload_arg(0).unwrap_or(0);
+            Ok(vec![Op::log(format!("{value}"))])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+"#;
+    let compiled =
+        compile(&source(unmapped), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("local PAYLOAD_UPDATE"));
+    assert!(compiled.source.contains("local PAYLOAD_LOAD"));
+    assert!(compiled.source.contains("body_activate(payload)"));
 
     let escaping = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
@@ -527,6 +552,51 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(!compiled.source.contains("PAYLOAD_UPDATE"));
     assert!(compiled.source.contains(
-        "function update() body_update({ source = \"update\" }, \"update\") end"
+        "function update() body_update({ source = \"update\" }) end"
     ));
+}
+
+#[test]
+fn unwraps_bools_without_replacing_false() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let on = ctx.state_value::<bool>("on").unwrap_or(true);
+    Ok(vec![Op::BarVisible { visible: on }])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled
+            .source
+            .contains("bool_or(plugin_state[\"on\"], true)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local function bool_or(value, default)")
+    );
+    assert!(!compiled.source.contains("(plugin_state[\"on\"] or true)"));
+}
+
+#[test]
+fn coerces_config_and_payload_strings_like_the_context() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("count").unwrap_or_default();
+    let text = ctx.payload_str("text").unwrap_or_default();
+    Ok(vec![Op::log(format!("{count}:{text}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(!compiled.source.contains("str_value"));
+    assert!(compiled.source.contains("noctalia.getConfig(\"count\")"));
+    assert!(compiled.source.contains("payload[\"text\"]"));
+    assert!(compiled.source.contains("local __t"));
+    assert!(compiled.source.contains("type("));
 }

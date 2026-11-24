@@ -32,6 +32,7 @@ fn compiled_source(entry: &str, handler: &str, kind: EntryKind) -> String {
             entry,
             state_key: "hello.state",
             kind,
+            strings: &["message"],
         },
     )
     .expect("compile")
@@ -219,5 +220,77 @@ fn callback_tables_match_the_bridge() {
         assert_eq!(left.function, right.function);
         assert_eq!(left.params, right.params);
         assert_eq!(left.payload, right.payload);
+    }
+}
+
+#[test]
+fn early_return_compiles_and_runs() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event != "update" {
+        return Ok(Vec::new());
+    }
+    Ok(vec![Op::log("tick".to_owned())])
+}
+"#;
+    let source = compiled_source("early_return", handler, EntryKind::Service);
+    let update = context("early_return", "update", json!({}), json!({}));
+    let expected = rust_ops(native_early(&update));
+    let actual = ops("early_return", &source, &update);
+    assert_eq!(actual, expected);
+}
+
+fn native_early(ctx: &Context) -> Vec<Op> {
+    if ctx.event != "update" {
+        Vec::new()
+    } else {
+        vec![Op::log("tick")]
+    }
+}
+
+#[test]
+fn launcher_with_a_payload_default_arm_starts() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    match ctx.event.as_str() {
+        "query" => {
+            let text = ctx.payload_str("text").unwrap_or_default();
+            Ok(vec![Op::LauncherResults { text, rows: vec![] }])
+        }
+        _ => {
+            let source = ctx.payload_str("source").unwrap_or_default();
+            Ok(vec![Op::log(source)])
+        }
+    }
+}
+"#;
+    let source =
+        compiled_source("launcher_payload", handler, EntryKind::Launcher);
+    assert!(!source.contains("body_update(nil, \"load\")"));
+    assert!(source.contains("body_query(last_query"));
+    let update = context(
+        "launcher_payload",
+        "update",
+        json!({ "source": "update" }),
+        json!({}),
+    );
+    let expected = rust_ops(native_launcher(&update));
+    let actual = ops("launcher_payload", &source, &update);
+    assert_eq!(actual, expected);
+}
+
+fn native_launcher(ctx: &Context) -> Vec<Op> {
+    match ctx.event.as_str() {
+        "query" => {
+            let text = ctx.payload_str("text").unwrap_or_default();
+            vec![Op::LauncherResults {
+                text,
+                rows: Vec::new(),
+            }]
+        }
+        _ => {
+            let source = ctx.payload_str("source").unwrap_or_default();
+            vec![Op::log(source)]
+        }
     }
 }

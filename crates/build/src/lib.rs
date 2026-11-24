@@ -36,6 +36,7 @@ struct CompileContext<'a> {
     source: &'a Path,
     out_dir: &'a Path,
     state_key: &'a str,
+    strings: &'a [&'a str],
     constants: &'a mut String,
 }
 
@@ -99,6 +100,8 @@ pub fn generate_to(manifest: &Path, out_dir: &Path) -> Result<(), BoxError> {
     write_settings(&mut generated.body, root, "plugin")
         .map_err(|error| format!("settings: {error}"))?;
     let state_key = state_key(root)?;
+    let string_keys = string_settings(root);
+    let strings = string_keys.iter().map(String::as_str).collect::<Vec<_>>();
     let mut constants = String::new();
     write_entries(
         &mut generated.body,
@@ -107,6 +110,7 @@ pub fn generate_to(manifest: &Path, out_dir: &Path) -> Result<(), BoxError> {
             source,
             out_dir,
             state_key: &state_key,
+            strings: &strings,
             constants: &mut constants,
         },
     )
@@ -757,6 +761,39 @@ fn compiler_kind(kind: &str) -> Result<compiler::EntryKind, BoxError> {
     })
 }
 
+fn string_settings(root: &toml::Table) -> Vec<String> {
+    let mut keys = Vec::new();
+    collect_string_settings(root.get("setting"), &mut keys);
+    for kind in ENTRY_KINDS {
+        let Some(entries) = root.get(*kind).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(table) = entry.as_table() {
+                collect_string_settings(table.get("setting"), &mut keys);
+            }
+        }
+    }
+    keys
+}
+
+fn collect_string_settings(value: Option<&Value>, keys: &mut Vec<String>) {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let Some(table) = item.as_table() else {
+            continue;
+        };
+        if table.get("type").and_then(Value::as_str) != Some("string") {
+            continue;
+        }
+        if let Some(key) = table.get("key").and_then(Value::as_str) {
+            keys.push(key.to_owned());
+        }
+    }
+}
+
 fn state_key(root: &toml::Table) -> Result<String, BoxError> {
     let id = text(root.get("id").ok_or("missing id")?, "id")?;
     let last = id.split('/').next_back().unwrap_or(id);
@@ -786,6 +823,7 @@ fn compile_entry(
             entry: id,
             state_key: context.state_key,
             kind: compiler_kind(kind)?,
+            strings: context.strings,
         },
     )
     .map_err(|error| error.render(&relative.to_string_lossy()))?;
