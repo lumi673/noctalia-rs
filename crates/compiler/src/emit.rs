@@ -87,6 +87,7 @@ pub(crate) struct Body {
     pub events: BTreeSet<String>,
     pub uses_state: bool,
     pub uses_entry: bool,
+    pub uses_payload: bool,
     pub uses_irem: bool,
     pub uses_unwrap: bool,
     pub uses_host_call: bool,
@@ -99,12 +100,15 @@ pub(crate) struct Emitter {
     indent: usize,
     scopes: Vec<HashMap<String, Ty>>,
     events: BTreeSet<String>,
+    constants: HashMap<String, (String, Ty)>,
     uses_state: bool,
+    uses_payload: bool,
     uses_entry: bool,
     uses_irem: bool,
     uses_unwrap: bool,
     uses_host_call: bool,
     uses_bool_or: bool,
+    temp: usize,
 }
 
 impl Emitter {
@@ -115,12 +119,46 @@ impl Emitter {
             indent: 1,
             scopes: vec![HashMap::new()],
             events: BTreeSet::new(),
+            constants: HashMap::new(),
             uses_state: false,
+            uses_payload: false,
             uses_entry: false,
             uses_irem: false,
             uses_unwrap: false,
             uses_host_call: false,
             uses_bool_or: false,
+            temp: 0,
+        }
+    }
+
+    pub(crate) fn constants(&mut self, items: &[syn::Item]) {
+        for item in items {
+            match item {
+                syn::Item::Const(item_const) => {
+                    let Expr::Lit(literal) = &*item_const.expr else {
+                        continue;
+                    };
+                    let value = match &literal.lit {
+                        Lit::Str(value) => (quote(&value.value()), Ty::STR),
+                        Lit::Int(value) => {
+                            (value.base10_digits().to_owned(), Ty::INT)
+                        }
+                        Lit::Bool(value) => (
+                            if value.value { "true" } else { "false" }
+                                .to_owned(),
+                            Ty::BOOL,
+                        ),
+                        _ => continue,
+                    };
+                    self.constants.insert(item_const.ident.to_string(), value);
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, items)) = &module.content {
+                        self.constants(items);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -165,6 +203,7 @@ impl Emitter {
             events: self.events,
             uses_state: self.uses_state,
             uses_entry: self.uses_entry,
+            uses_payload: self.uses_payload,
             uses_irem: self.uses_irem,
             uses_unwrap: self.uses_unwrap,
             uses_host_call: self.uses_host_call,
@@ -235,13 +274,16 @@ impl Emitter {
             Pat::Type(typed) => (&*typed.pat, Some(&*typed.ty)),
             other => (other, None),
         };
-        let Pat::Ident(pattern) = pattern else {
-            return Err(Error::at(
-                local.pat.span(),
-                "only plain `let` bindings are supported",
-            ));
+        let name = match pattern {
+            Pat::Ident(pattern) => pattern.ident.to_string(),
+            Pat::Wild(_) => "_".to_owned(),
+            _ => {
+                return Err(Error::at(
+                    local.pat.span(),
+                    "only plain `let` bindings are supported",
+                ));
+            }
         };
-        let name = pattern.ident.to_string();
         let Some(init) = &local.init else {
             let ty = hint.map_or(Ty::VALUE, type_hint);
             self.push(&name, ty);
@@ -610,6 +652,28 @@ impl Emitter {
                 self.op_expr(expr)?;
                 Ok((String::new(), Ty::VOID))
             }
+            Expr::If(item) => {
+                let name = self.temp();
+                self.line(&format!("local {name}"));
+                let (condition, _) = self.expr(&item.cond)?;
+                self.line(&format!("if {condition} then"));
+                self.indent = self.indent.saturating_add(1);
+                let (value, ty) = self.block_value(&item.then_branch)?;
+                self.line(&format!("{name} = {value}"));
+                self.indent = self.indent.saturating_sub(1);
+                if let Some((_, branch)) = &item.else_branch {
+                    self.line("else");
+                    self.indent = self.indent.saturating_add(1);
+                    let (value, _) = match &**branch {
+                        Expr::Block(block) => self.block_value(&block.block)?,
+                        other => self.expr(other)?,
+                    };
+                    self.line(&format!("{name} = {value}"));
+                    self.indent = self.indent.saturating_sub(1);
+                }
+                self.line("end");
+                Ok((name, ty))
+            }
             Expr::Tuple(tuple) if tuple.elems.is_empty() => {
                 Ok(("nil".to_owned(), Ty::VOID))
             }
@@ -617,6 +681,21 @@ impl Emitter {
                 other.span(),
                 "unsupported expression in a compilable handler",
             )),
+        }
+    }
+
+    fn temp(&mut self) -> String {
+        self.temp = self.temp.saturating_add(1);
+        format!("__t{}", self.temp)
+    }
+
+    fn block_value(
+        &mut self,
+        block: &syn::Block,
+    ) -> Result<(String, Ty), Error> {
+        match block.stmts.last() {
+            Some(Stmt::Expr(value, _)) => self.expr(value),
+            _ => Ok(("nil".to_owned(), Ty::VALUE)),
         }
     }
 
@@ -650,6 +729,9 @@ impl Emitter {
         if name == "true" || name == "false" {
             return Ok((name, Ty::BOOL));
         }
+        if name == "None" {
+            return Ok(("nil".to_owned(), Ty::VALUE));
+        }
         if name == self.ctx {
             return Err(Error::at(
                 expr.span(),
@@ -658,6 +740,9 @@ impl Emitter {
         }
         if let Some(ty) = self.lookup(&name) {
             return Ok((name, ty));
+        }
+        if let Some((value, ty)) = self.constants.get(&name) {
+            return Ok((value.clone(), *ty));
         }
         Err(Error::at(
             expr.span(),
@@ -828,10 +913,12 @@ impl Emitter {
                 ))
             }
             "payload_str" => {
+                self.uses_payload = true;
                 let key = self.string_arg(args, 0, call)?;
                 Ok((format!("payload[{key}]"), Ty::OPT_STR))
             }
             "payload_arg" => {
+                self.uses_payload = true;
                 let (index, _) = self.expr(arg(args, 0, call)?)?;
                 Ok((
                     format!("payload.args[({index}) + 1]"),
@@ -1067,7 +1154,10 @@ impl Emitter {
                     self.uses_entry = true;
                     Ok(("entry".to_owned(), Ty::STR))
                 }
-                "payload" => Ok(("payload".to_owned(), Ty::VALUE)),
+                "payload" => {
+                    self.uses_payload = true;
+                    Ok(("payload".to_owned(), Ty::VALUE))
+                }
                 "state" => {
                     self.uses_state = true;
                     Ok(("state".to_owned(), Ty::VALUE))
@@ -1170,24 +1260,16 @@ impl Emitter {
                             )
                         })?;
                         let (value, ty) = self.expr(expr)?;
-                        pieces.push(if ty.is_string() {
-                            value
-                        } else {
-                            format!("tostring({value})")
-                        });
+                        pieces.push(format_piece(value, ty));
                     } else if let Some((_, expr)) = parsed
                         .arguments
                         .iter()
                         .find(|(key, _)| key.as_deref() == Some(&placeholder))
                     {
                         let (value, ty) = self.expr(expr)?;
-                        pieces.push(if ty.is_string() {
-                            value
-                        } else {
-                            format!("tostring({value})")
-                        });
+                        pieces.push(format_piece(value, ty));
                     } else {
-                        self.lookup(&placeholder).ok_or_else(|| {
+                        let ty = self.lookup(&placeholder).ok_or_else(|| {
                             Error::at(
                                 mac.span(),
                                 format!(
@@ -1195,7 +1277,7 @@ impl Emitter {
                                 ),
                             )
                         })?;
-                        pieces.push(format!("tostring({placeholder})"));
+                        pieces.push(format_piece(placeholder, ty));
                     }
                 }
                 '}' => {
@@ -1320,6 +1402,23 @@ impl Emitter {
             }
             Expr::Paren(paren) => self.op_expr(&paren.expr),
             Expr::Group(group) => self.op_expr(&group.expr),
+            Expr::Path(path) => {
+                let name = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                if name == "OpenSettings" {
+                    self.line("noctalia.openSettings()");
+                    Ok(())
+                } else {
+                    Err(Error::at(
+                        expr.span(),
+                        format!("op `{name}` is not supported"),
+                    ))
+                }
+            }
             other => Err(Error::at(other.span(), "expected an Op constructor")),
         }
     }
@@ -1516,6 +1615,14 @@ fn compound_operator(operator: &BinOp) -> Option<&'static str> {
         BinOp::SubAssign(_) => Some("-="),
         BinOp::MulAssign(_) => Some("*="),
         _ => None,
+    }
+}
+
+fn format_piece(value: String, ty: Ty) -> String {
+    if ty.is_string() || ty.is_numeric() {
+        value
+    } else {
+        format!("tostring({value})")
     }
 }
 

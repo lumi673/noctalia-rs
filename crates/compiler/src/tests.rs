@@ -235,3 +235,261 @@ fn widget(_ctx: &Context) -> Result<Vec<Op>> {
     );
     assert!(compiled.source.contains(r#"noctalia.log("line\nbreak")"#));
 }
+
+#[test]
+fn compiles_the_whole_op_and_host_surface() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let flag = ctx.config_bool("flag", true);
+    let now = ctx.now_ms;
+    let entry = ctx.entry;
+    let count = ctx.state_value::<i64>("count").unwrap_or(0);
+    let name = ctx.state_value::<String>("name").unwrap_or("x");
+    let setting = ctx.setting("shell.font");
+    let color = ctx.color("primary");
+    let dark = ctx.dark_mode();
+    let vertical = ctx.bar_vertical();
+    let output = ctx.bar_output_name().unwrap_or_default();
+    let label = ctx.tr("greet.label", &[("name", name.as_str())]);
+    let clip = ctx.clipboard();
+    let stats = ctx.stats();
+    let media = ctx.media();
+    let calendar = ctx.calendar();
+    let night = ctx.nightlight();
+    let comp = ctx.compositor();
+    let bar = ctx.bar();
+    let dir = ctx.plugin_dir();
+    let data = ctx.plugin_data_dir().unwrap_or_default();
+    let status = ctx.global_state("remote");
+    let src = ctx.render_source();
+    let load = ctx.is_load_event();
+    let fmt = ctx.time_format().unwrap_or_default();
+    let date = ctx.date_format().unwrap_or_default();
+    let clock = ctx.os_clock();
+    let time = ctx.os_time();
+    let rnd = ctx.math_random();
+    let text = ctx.payload_str("text").unwrap_or_default();
+    let whole = ctx.payload;
+    let data_dir = ctx.data_dir;
+
+    ops.push(Op::Notify { title: label, body: text, options: None });
+    ops.push(Op::NotifyError { title: fmt, body: date, options: None });
+    ops.push(Op::StateSet { key: "k", value: json!({ "count": count }) });
+    ops.push(Op::TogglePanel { id: entry });
+    ops.push(Op::OpenSettings);
+    ops.push(Op::BarText { text: String::new() });
+    ops.push(Op::BarColor { role: "primary".to_owned() });
+    ops.push(Op::BarVisible { visible: flag });
+    ops.push(Op::BarTooltip { value: json!([1, 2, 3]) });
+    ops.push(Op::BarImage { path: dir, preserve: true, width: 26, height: 26 });
+    ops.push(Op::BarRender { tree: ui::row(json!({ "id": "r" }), vec![]) });
+    ops.push(Op::DesktopWidgetRender { tree: ui::scroll(json!({}), vec![ui::input(json!({})), ui::progress(json!({}))]) });
+    ops.push(Op::LayerShow { id: "layer".to_owned() });
+    ops.push(Op::LayerHide { id: "layer".to_owned() });
+    ops.push(Op::LayerRender { tree: ui::column(json!({}), vec![]) });
+    ops.push(Op::LayerConfigure { id: "layer".to_owned(), props: json!({ "a": true }) });
+    ops.push(Op::LauncherResults { text: output, rows: vec![json!({ "id": 1 })] });
+    ops.push(Op::RemoveFile { path: data });
+    ops.push(Op::HostCall { root: "noctalia".to_owned(), path: vec!["systemStats".to_owned()], args: vec![] });
+    ops.push(Op::log(format!("{} {} {} {} {} {} {} {}", now, dark, vertical, clock, time, rnd, load, src)));
+    ops.push(Op::state("k", json!({ "clip": clip, "stats": stats, "media": media, "calendar": calendar, "night": night, "comp": comp, "bar": bar, "status": status, "whole": whole, "data": data_dir, "setting": setting, "color": color })));
+    Ok(ops)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+
+    for needle in [
+        "bool_or(noctalia.getConfig(\"flag\"), true)",
+        "noctalia.nowMs()",
+        "local entry = ENTRY",
+        "state[\"count\"]",
+        "noctalia.getSetting(\"shell.font\")",
+        "noctalia.getColor(\"primary\")",
+        "noctalia.isDarkMode()",
+        "barWidget.isVertical()",
+        "barWidget.outputName()",
+        "noctalia.tr(\"greet.label\", { name = name })",
+        "noctalia.clipboardText()",
+        "noctalia.systemStats()",
+        "noctalia.mediaPlayer()",
+        "noctalia.calendarEvents()",
+        "noctalia.nightlight.state",
+        "noctalia.compositor.name",
+        "noctalia.pluginDir()",
+        "noctalia.pluginDataDir()",
+        "noctalia.state.get(\"remote\")",
+        "noctalia.getSetting(\"shell.time_format\")",
+        "noctalia.getSetting(\"shell.date_format\")",
+        "os.clock()",
+        "os.time()",
+        "math.random()",
+        "payload[\"text\"]",
+        "noctalia.notify(",
+        "noctalia.notifyError(",
+        "noctalia.state.set(",
+        "noctalia.togglePanel(entry)",
+        "noctalia.openSettings()",
+        "barWidget.setColor(",
+        "barWidget.setVisible(flag)",
+        "barWidget.setTooltip(",
+        "barWidget.setImage(",
+        "barWidget.render(",
+        "desktopWidget.render(",
+        "noctalia.layer.show(",
+        "noctalia.layer.hide(",
+        "layer.render(",
+        "noctalia.layer.configure(",
+        "launcher.setResults(",
+        "noctalia.removeFile(",
+        "host_call(\"noctalia\", { \"systemStats\" }, {})",
+    ] {
+        assert!(
+            compiled.source.contains(needle),
+            "missing {needle}\n{}",
+            compiled.source
+        );
+    }
+}
+
+#[test]
+fn compiles_ranges_remainders_and_unwrap() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let rows = ctx.payload_arg(0).unwrap();
+    let mut total = 0;
+    for index in 0..3 {
+        total += index % 2;
+    }
+    for index in 0..=3 {
+        total += rows.get(index).as_i64().unwrap_or(0);
+    }
+    let text = format!("{total:?}");
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("format spec is rejected");
+    assert!(error.message.contains("format specifiers"));
+
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let rows = ctx.payload_arg(0).unwrap();
+    let mut total = 0;
+    for index in 0..3 {
+        total += index % 2;
+    }
+    for index in 0..=3 {
+        total += rows.get(index).as_i64().unwrap_or(0);
+    }
+    Ok(vec![Op::log(format!("done {}", total))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("for index = 0, (3) - 1 do"));
+    assert!(compiled.source.contains("for index = 0, 3 do"));
+    assert!(compiled.source.contains("irem(index, 2)"));
+    assert!(compiled.source.contains("local function irem(a, b)"));
+    assert!(compiled.source.contains("unwrap(payload.args[(0) + 1])"));
+    assert!(compiled.source.contains("local function unwrap(value)"));
+}
+
+#[test]
+fn compiles_expressions_and_rejects_untranslatable_ones() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let trimmed = "  x  ".trim().to_uppercase();
+    let lowered = trimmed.to_lowercase();
+    let hit = lowered.contains("x");
+    let length = lowered.len();
+    let empty = lowered.is_empty();
+    let first = lowered.as_str();
+    let option = ctx.state_value::<String>("missing");
+    let present = option.is_some();
+    let absent = option.is_none();
+    let cloned = option.clone();
+    let cast = length as f64;
+    let chosen = if hit { "yes" } else { "no" };
+    Ok(vec![Op::log(format!("{} {} {} {} {} {} {} {}", first, present, absent, cloned.unwrap_or_default(), cast, empty, chosen, ctx.state_value::<String>("x").unwrap()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("string.trim(\"  x  \")"));
+    assert!(compiled.source.contains("string.upper("));
+    assert!(compiled.source.contains("string.lower("));
+    assert!(compiled.source.contains("string.find("));
+    assert!(compiled.source.contains("#lowered"));
+    assert!(compiled.source.contains("local __t1"));
+    assert!(compiled.source.contains("if hit then"));
+}
+
+#[test]
+fn rejects_constructs_outside_the_subset() {
+    for handler in [
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.fuzzy_score(\"a\", \"b\"); Ok(vec![]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { if let Some(x) = ctx.state_value::<String>(\"x\") { let _ = x; } Ok(vec![]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { match ctx.event.as_str() { other => { let _ = other; Ok(Vec::new()) } } }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { while ctx.now_ms > 0 { } Ok(vec![]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = std::process::id(); Ok(vec![]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.format_time(\"%H\"); Ok(vec![]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let x = ctx.command_exists(\"ls\"); Ok(vec![]) }",
+    ] {
+        assert!(
+            compile(&source(handler), &options("handler", EntryKind::Widget))
+                .is_err(),
+            "should reject: {handler}"
+        );
+    }
+}
+
+#[test]
+fn rejects_bad_signatures_and_duplicates() {
+    for handler in [
+        "fn handler() -> Result<Vec<Op>> { Ok(vec![]) }",
+        "fn handler(a: &Context, b: &Context) -> Result<Vec<Op>> { let _ = (a, b); Ok(vec![]) }",
+        "fn handler(ctx: &str) -> Result<Vec<Op>> { let _ = ctx; Ok(vec![]) }",
+    ] {
+        assert!(
+            compile(&source(handler), &options("handler", EntryKind::Widget))
+                .is_err(),
+            "should reject: {handler}"
+        );
+    }
+    let duplicate = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { Ok(vec![]) }\nmod inner { fn handler(_ctx: &Context) -> Result<Vec<Op>> { Ok(vec![]) } }";
+    let error =
+        compile(&source(duplicate), &options("handler", EntryKind::Widget))
+            .expect_err("duplicate");
+    assert!(error.message.contains("more than once"));
+}
+
+#[test]
+fn resolves_string_and_number_constants() {
+    let handler = r#"
+pub const STATE_KEY: &str = "example.state";
+const RETRY_MS: u64 = 5000;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let _ = ctx.now_ms;
+    Ok(vec![
+        Op::state(STATE_KEY, json!({ "retry": RETRY_MS })),
+        Op::set_interval(RETRY_MS),
+    ])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains(
+            "noctalia.state.set(\"example.state\", { retry = 5000 })"
+        )
+    );
+    assert!(compiled.source.contains("noctalia.setUpdateInterval(5000)"));
+}

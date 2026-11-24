@@ -258,6 +258,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let context = context_name(function)?;
 
     let mut emitter = Emitter::new(context);
+    emitter.constants(&file.items);
     emitter.block(&function.block)?;
     let body = emitter.finish();
 
@@ -317,14 +318,22 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     out.push_str(&body.source);
     out.push_str("end\n\n");
 
+    let callbacks_use_payload = body.uses_payload;
+    let update_payload = payload("update", callbacks_use_payload);
     let _ = writeln!(
         out,
-        "function update() body({}, {{ source = \"update\" }}, \"update\") end",
+        "function update() body({}, {update_payload}, \"update\") end",
         quote(options.kind.update_event())
     );
     if options.kind == EntryKind::Launcher {
-        out.push_str(
-            "local last_query = nil\nfunction onQuery(text) last_query = text; body(\"query\", { text = text }, \"\") end\n",
+        let query_payload = if callbacks_use_payload {
+            "{ text = text }"
+        } else {
+            "nil"
+        };
+        let _ = writeln!(
+            out,
+            "local last_query = nil\nfunction onQuery(text) last_query = text; body(\"query\", {query_payload}, \"\") end"
         );
     }
     for callback in CALLBACKS {
@@ -335,35 +344,37 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         if !body.events.iter().any(|event| event == callback.event) {
             continue;
         }
-        if callback.payload.is_empty() {
-            let _ = writeln!(
-                out,
-                "function {}({}) body({}, {{}}, \"\") end",
-                callback.function,
-                callback.params,
-                quote(callback.event)
-            );
+        let argument = if callbacks_use_payload && !callback.payload.is_empty()
+        {
+            callback.payload
         } else {
-            let _ = writeln!(
-                out,
-                "function {}({}) body({}, {}, \"\") end",
-                callback.function,
-                callback.params,
-                quote(callback.event),
-                callback.payload
-            );
-        }
+            "nil"
+        };
+        let _ = writeln!(
+            out,
+            "function {}({}) body({}, {argument}, \"\") end",
+            callback.function,
+            callback.params,
+            quote(callback.event)
+        );
     }
     out.push('\n');
 
     if options.kind == EntryKind::Launcher {
-        out.push_str(
-            "noctalia.state.watch(STATE_KEY, function() if last_query then body(\"query\", { text = last_query }, \"state\") end end)\n",
-        );
-    } else if options.kind.watches_state() {
+        let state_payload = if callbacks_use_payload {
+            "{ text = last_query }"
+        } else {
+            "nil"
+        };
         let _ = writeln!(
             out,
-            "noctalia.state.watch(STATE_KEY, function() body({}, {{ source = \"state\" }}, \"state\") end)",
+            "noctalia.state.watch(STATE_KEY, function() if last_query then body(\"query\", {state_payload}, \"state\") end end)"
+        );
+    } else if options.kind.watches_state() {
+        let state_payload = payload("state", callbacks_use_payload);
+        let _ = writeln!(
+            out,
+            "noctalia.state.watch(STATE_KEY, function() body({}, {state_payload}, \"state\") end)",
             quote(options.kind.update_event())
         );
     }
@@ -379,17 +390,23 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             | EntryKind::Layer => options.kind.update_event(),
             EntryKind::Launcher => options.kind.update_event(),
         };
-        let _ = writeln!(
-            out,
-            "body({}, {{ source = \"load\" }}, \"load\")",
-            quote(event)
-        );
+        let load_payload = payload("load", callbacks_use_payload);
+        let _ =
+            writeln!(out, "body({}, {load_payload}, \"load\")", quote(event));
     }
 
     Ok(Compiled {
         source: out,
         events: body.events.into_iter().collect(),
     })
+}
+
+fn payload(source: &str, used: bool) -> String {
+    if used {
+        format!("{{ source = {} }}", quote(source))
+    } else {
+        "nil".to_owned()
+    }
 }
 
 fn find_handler<'a>(
