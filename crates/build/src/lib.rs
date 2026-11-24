@@ -949,11 +949,12 @@ fn module_files(
         Some(name) => parent.join(name),
         None => parent.to_path_buf(),
     };
-    module_tree(&directory, module, is_root, &parsed.items, out)
+    module_tree(&directory, parent, module, is_root, &parsed.items, out)
 }
 
 fn module_tree(
     directory: &Path,
+    declaring: &Path,
     module: &str,
     is_root: bool,
     items: &[syn::Item],
@@ -970,7 +971,8 @@ fn module_tree(
             format!("{module}::{name}")
         };
         if let Some((_, inner)) = &item_mod.content {
-            module_tree(&directory.join(&name), &child, false, inner, out)?;
+            let nested = directory.join(&name);
+            module_tree(&nested, &nested, &child, false, inner, out)?;
             continue;
         }
         let attribute = item_mod.attrs.iter().find_map(|attr| {
@@ -989,7 +991,7 @@ fn module_tree(
             Some(path.value())
         });
         let candidate = match attribute {
-            Some(path) => directory.join(path),
+            Some(path) => declaring.join(path),
             None => {
                 let file = directory.join(format!("{name}.rs"));
                 let mod_file = directory.join(&name).join("mod.rs");
@@ -1896,6 +1898,36 @@ mod tests {
 
         assert!(!generated.contains(".with_luau("));
         assert!(warnings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn crate_modules_resolves_path_relative_to_the_declaring_file()
+    -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("noctalia-module-path-{nanos}"));
+        fs::create_dir_all(dir.join("src"))?;
+        fs::write(dir.join("src/main.rs"), "mod panel;\nfn main() {}\n")?;
+        fs::write(
+            dir.join("src/panel.rs"),
+            "#[path = \"panel_config.rs\"]\nmod panel_config;\n",
+        )?;
+        fs::write(
+            dir.join("src/panel_config.rs"),
+            "pub const GAP: u32 = 4;\n",
+        )?;
+
+        let modules = crate_modules(&dir)?;
+        fs::remove_dir_all(&dir)?;
+
+        assert!(modules.iter().any(|item| item.module == "panel"));
+        assert!(
+            modules
+                .iter()
+                .any(|item| item.module == "panel::panel_config"
+                    && item.file.ends_with("panel_config.rs"))
+        );
         Ok(())
     }
 
