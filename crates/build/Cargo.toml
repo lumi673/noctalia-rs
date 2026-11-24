@@ -8,7 +8,9 @@ description = "Build-time generator for noctalia plugins using noctalia.toml"
 
 
 [dependencies]
+noctalia-rs-compiler.workspace = true
 toml.workspace = true
 
 [lints.clippy]
 excessive_nesting = "allow"
+too_many_arguments = "allow"

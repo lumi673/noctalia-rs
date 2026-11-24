@@ -879,6 +879,9 @@ pub struct Entry {
     pub settings: Vec<Setting>,
     pub config: Option<Box<EntryConfig>>,
     pub handler: Handler,
+    /// Complete Luau script emitted instead of the bridge stub. Never
+    /// serialized into `plugin.toml`.
+    pub luau_source: Option<Text>,
 }
 
 impl Entry {
@@ -895,6 +898,7 @@ impl Entry {
             settings,
             config: None,
             handler,
+            luau_source: None,
         }
     }
 
@@ -911,7 +915,17 @@ impl Entry {
             settings,
             config: Some(Box::new(config)),
             handler,
+            luau_source: None,
         }
+    }
+
+    /// Emits `source` as this entry's Luau script instead of the stub that
+    /// forwards callbacks to the Rust helper.
+    #[inline]
+    #[must_use]
+    pub fn with_luau(mut self, source: impl Into<Text>) -> Self {
+        self.luau_source = Some(source.into());
+        self
     }
 }
 

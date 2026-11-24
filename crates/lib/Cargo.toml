@@ -19,6 +19,7 @@ serde_json.workspace      = true
 smallvec                  = "1.16"
 
 [dev-dependencies]
+noctalia-rs-compiler.workspace = true
 toml = "0.8.2"
 
 [lints]

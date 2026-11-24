@@ -380,6 +380,7 @@ name = "noctalia-rs"
 version = "0.2.1"
 dependencies = [
  "chrono",
+ "noctalia-rs-compiler",
  "noctalia-rs-macros",
  "notify",
  "serde",
@@ -392,6 +393,7 @@ dependencies = [
 name = "noctalia-rs-build"
 version = "0.2.1"
 dependencies = [
+ "noctalia-rs-compiler",
  "toml",
 ]
 

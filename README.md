@@ -108,6 +108,30 @@ fn main() -> ExitCode {
 }
 ```
 
+## Compiled Luau entries
+
+Add `luau` to an entry to compile its handler into a self-contained Luau script:
+
+```toml
+[[widget]]
+id = "widget"
+entry = "widget.luau"
+handler = "widget"
+luau = "src/main.rs"
+```
+
+The value is the Rust file holding the handler. The build translates the handler
+to Luau and embeds it, so the entry runs as a plain Luau script with no helper
+process and no spool IPC: raw Luau speed instead of the roughly 1.25 ms bridge
+round trip. The handler keeps the signature
+`fn handler(ctx: &Context) -> Result<Vec<Op>>`.
+
+The compiler covers the plugin API used by the template: events, config,
+payload, state, settings, `tr`, host reads, the common ops, and plain Rust
+control flow, arithmetic, and string work. Anything outside that subset fails
+the build with `file:line:column`. Omit `luau` and the entry keeps the generated
+stub that forwards every callback to the Rust helper.
+
 Build and install:
 
 ```sh

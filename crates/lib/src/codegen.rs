@@ -14,7 +14,6 @@ fn config(entry: &Entry) -> EntryConfig {
 }
 
 pub fn emit(plugin: &Plugin, dir: &Path, helper: &str) -> io::Result<()> {
-    fs::create_dir_all(dir.join("lib"))?;
     fs::create_dir_all(dir.join("translations"))?;
 
     fs::write(dir.join("plugin.toml"), manifest(plugin))?;
@@ -62,10 +61,17 @@ pub fn emit(plugin: &Plugin, dir: &Path, helper: &str) -> io::Result<()> {
         }
         fs::write(target, content)?;
     }
-    let bridge = SOURCE
-        .replace("{{HELPER}}", helper)
-        .replace("{{PREFIX}}", &plugin.state_key());
-    fs::write(dir.join("lib/bridge.luau"), bridge)?;
+    if plugin
+        .entries
+        .iter()
+        .any(|entry| entry.luau_source.is_none())
+    {
+        fs::create_dir_all(dir.join("lib"))?;
+        let bridge = SOURCE
+            .replace("{{HELPER}}", helper)
+            .replace("{{PREFIX}}", &plugin.state_key());
+        fs::write(dir.join("lib/bridge.luau"), bridge)?;
+    }
 
     for entry in &plugin.entries {
         let config = config(entry);
@@ -75,7 +81,11 @@ pub fn emit(plugin: &Plugin, dir: &Path, helper: &str) -> io::Result<()> {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(target, entry_script(entry, &plugin.settings, script))?;
+        let source = entry.luau_source.as_deref().map_or_else(
+            || entry_script(entry, &plugin.settings, script),
+            str::to_owned,
+        );
+        fs::write(target, source)?;
     }
 
     Ok(())
@@ -753,6 +763,8 @@ mod tests {
         Entry, EntryConfig, EntryKind, LauncherCategory, LayerConfig, Meta,
     };
     use crate::{Context, Op};
+    use noctalia_rs_compiler as compiler;
+    use noctalia_rs_compiler::EntryKind as CompilerKind;
     use std::env;
     use std::process;
 
@@ -1044,5 +1056,109 @@ mod tests {
         assert!(SOURCE.contains("noctalia.renameFile"));
         assert!(SOURCE.contains("shellQuote"));
         assert!(SOURCE.contains(" serve "));
+    }
+
+    fn compiled_entry(id: &str, kind: EntryKind, source: &str) -> Entry {
+        Entry::new((id.to_owned(), kind, Vec::new()), handler)
+            .with_luau(source.to_owned())
+    }
+
+    #[test]
+    fn test_emit_writes_luau_source_instead_of_stub() {
+        let dir =
+            env::temp_dir().join(format!("noctalia-luau-{}", process::id()));
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .widget("widget", (Vec::new(), handler))
+            .entry(compiled_entry("service", EntryKind::Service, "return nil"));
+
+        emit(&plugin, &dir, "helper").expect("emit");
+        let widget =
+            fs::read_to_string(dir.join("widget.luau")).expect("widget");
+        let service =
+            fs::read_to_string(dir.join("service.luau")).expect("service");
+        let bridged = dir.join("lib/bridge.luau").exists();
+        fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert!(widget.contains("require(\"./lib/bridge.luau\")"));
+        assert_eq!(service, "return nil");
+        assert!(bridged);
+    }
+
+    #[test]
+    fn test_emit_skips_bridge_for_compiled_plugins() {
+        let dir = env::temp_dir()
+            .join(format!("noctalia-luau-only-{}", process::id()));
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .entry(compiled_entry("widget", EntryKind::Widget, "-- compiled"));
+
+        emit(&plugin, &dir, "helper").expect("emit");
+        let widget =
+            fs::read_to_string(dir.join("widget.luau")).expect("widget");
+        let bridged = dir.join("lib/bridge.luau").exists();
+        let lib_dir = dir.join("lib").exists();
+        fs::remove_dir_all(&dir).expect("cleanup");
+        assert_eq!(widget, "-- compiled");
+        assert!(!bridged);
+        assert!(!lib_dir);
+    }
+
+    #[test]
+    fn test_template_emits_pure_luau_entries() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = fs::read_to_string(root.join("template/noctalia.toml"))
+            .expect("template manifest");
+        let manifest: toml::Value = toml::from_str(&text).expect("toml");
+        let source = fs::read_to_string(root.join("template/src/main.rs"))
+            .expect("template source");
+        let dir = env::temp_dir()
+            .join(format!("noctalia-template-{}", process::id()));
+
+        let mut plugin =
+            Plugin::new(Meta::new("iblameyou/template", "Template", "0.1.0"));
+        for (table, kind, compiled_kind) in [
+            ("service", EntryKind::Service, CompilerKind::Service),
+            ("widget", EntryKind::Widget, CompilerKind::Widget),
+        ] {
+            let row = manifest
+                .get(table)
+                .and_then(toml::Value::as_array)
+                .and_then(|rows| rows.first())
+                .expect("template entry");
+            let id = row.get("id").and_then(toml::Value::as_str).expect("id");
+            let handler_name = row
+                .get("handler")
+                .and_then(toml::Value::as_str)
+                .expect("handler");
+            let path =
+                row.get("luau").and_then(toml::Value::as_str).expect("luau");
+            assert!(root.join("template").join(path).is_file());
+
+            let compiled = compiler::compile(
+                &source,
+                &compiler::Options {
+                    handler: handler_name,
+                    entry: id,
+                    state_key: "template.state",
+                    kind: compiled_kind,
+                },
+            )
+            .expect("compile");
+            plugin = plugin.entry(compiled_entry(id, kind, &compiled.source));
+        }
+
+        emit(&plugin, &dir, "helper").expect("emit");
+        let widget =
+            fs::read_to_string(dir.join("widget.luau")).expect("widget");
+        let service =
+            fs::read_to_string(dir.join("service.luau")).expect("service");
+        let bridged = dir.join("lib/bridge.luau").exists();
+        fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert!(!bridged);
+        for (name, script) in [("widget", &widget), ("service", &service)] {
+            assert!(!script.contains("require"), "{name} requires a module");
+            assert!(!script.contains("bridge."), "{name} calls the bridge");
+            assert!(script.len() < 2048, "{name} is {} bytes", script.len());
+        }
     }
 }

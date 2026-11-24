@@ -4,8 +4,8 @@ use noctalia_rs::{Context, Op, Result};
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
+#[expect(clippy::unnecessary_wraps, reason = "handlers return Result")]
 fn service(ctx: &Context) -> Result<Vec<Op>> {
-    let _ = serde_json::from_str::<serde_json::Value>("null")?;
     if ctx.event == "init" || ctx.event == "update" {
         let message =
             ctx.config_str("message").unwrap_or_default().into_owned();
@@ -15,8 +15,8 @@ fn service(ctx: &Context) -> Result<Vec<Op>> {
     }
 }
 
+#[expect(clippy::unnecessary_wraps, reason = "handlers return Result")]
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
-    let _ = serde_json::from_str::<serde_json::Value>("null")?;
     if ctx.event == "render" || ctx.event == "click" {
         let message =
             ctx.config_str("message").unwrap_or_default().into_owned();

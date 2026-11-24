@@ -19,8 +19,10 @@ default = "Hello from Rust"
 id = "service"
 entry = "service.luau"
 handler = "service"
+luau = "src/main.rs"
 
 [[widget]]
 id = "widget"
 entry = "widget.luau"
 handler = "widget"
+luau = "src/main.rs"

@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use noctalia_rs_compiler as compiler;
 use toml::Value;
 
 type BoxError = Box<dyn Error>;
@@ -30,6 +31,14 @@ struct FileContext<'a> {
     out_dir: &'a Path,
     root: &'a toml::Table,
 }
+
+struct CompileContext<'a> {
+    source: &'a Path,
+    out_dir: &'a Path,
+    state_key: &'a str,
+    constants: &'a mut String,
+}
+
 fn identifier(value: &str) -> String {
     let mut out = String::new();
     for (index, item) in value.chars().enumerate() {
@@ -89,8 +98,20 @@ pub fn generate_to(manifest: &Path, out_dir: &Path) -> Result<(), BoxError> {
         .map_err(|error| format!("meta: {error}"))?;
     write_settings(&mut generated.body, root, "plugin")
         .map_err(|error| format!("settings: {error}"))?;
-    write_entries(&mut generated.body, root)
-        .map_err(|error| format!("entries: {error}"))?;
+    let state_key = state_key(root)?;
+    let mut constants = String::new();
+    write_entries(
+        &mut generated.body,
+        root,
+        &mut CompileContext {
+            source,
+            out_dir,
+            state_key: &state_key,
+            constants: &mut constants,
+        },
+    )
+    .map_err(|error| format!("entries: {error}"))?;
+    generated.prefix.push_str(&constants);
     {
         let mut context = FileContext {
             generated: &mut generated,
@@ -620,7 +641,11 @@ fn optional_number(item: &toml::Table, key: &str) -> Result<String, BoxError> {
     Ok(format!("Some({})", f64_literal(number(value, key)?)))
 }
 
-fn write_entries(out: &mut String, root: &toml::Table) -> Result<(), BoxError> {
+fn write_entries(
+    out: &mut String,
+    root: &toml::Table,
+    context: &mut CompileContext<'_>,
+) -> Result<(), BoxError> {
     for &kind in ENTRY_KINDS {
         let Some(value) = root.get(kind) else {
             continue;
@@ -628,7 +653,7 @@ fn write_entries(out: &mut String, root: &toml::Table) -> Result<(), BoxError> {
         for (index, item) in array(value, kind)?.iter().enumerate() {
             let label = format!("{kind}[{index}]");
             let row = table(item, &label)?;
-            let expression = entry_expression(row, kind, &label)?;
+            let expression = entry_expression(row, kind, &label, context)?;
             let _ = writeln!(out, "    plugin = plugin.entry({expression});");
         }
     }
@@ -639,6 +664,7 @@ fn entry_expression(
     row: &toml::Table,
     kind: &str,
     label: &str,
+    context: &mut CompileContext<'_>,
 ) -> Result<String, BoxError> {
     let id = text(row.get("id").ok_or("missing entry id")?, "id")?;
     let handler = row
@@ -646,6 +672,7 @@ fn entry_expression(
         .map(|value| text(value, "handler"))
         .transpose()?
         .unwrap_or("dispatch");
+    let handler_name = handler;
     let handler = identifier(handler);
     let script = row
         .get("entry")
@@ -705,10 +732,78 @@ fn entry_expression(
         .unwrap_or_default();
     let settings = format!("vec![{}]", settings.join(", "));
     let config = entry_config(row, script)?;
-    Ok(format!(
+    let mut expression = format!(
         "Entry::configured(({}.to_owned(), {entry_kind}, {settings}, {config}), {handler})",
         quote(id)
-    ))
+    );
+    if let Some(constant) =
+        compile_entry(row, id, script, kind, handler_name, context)?
+    {
+        let _ = write!(expression, ".with_luau({constant})");
+    }
+    Ok(expression)
+}
+
+fn compiler_kind(kind: &str) -> Result<compiler::EntryKind, BoxError> {
+    Ok(match kind {
+        "service" => compiler::EntryKind::Service,
+        "widget" => compiler::EntryKind::Widget,
+        "shortcut" => compiler::EntryKind::Shortcut,
+        "desktop_widget" => compiler::EntryKind::DesktopWidget,
+        "launcher_provider" => compiler::EntryKind::Launcher,
+        "panel" => compiler::EntryKind::Panel,
+        "layer" => compiler::EntryKind::Layer,
+        other => return Err(format!("unsupported entry kind {other}").into()),
+    })
+}
+
+fn state_key(root: &toml::Table) -> Result<String, BoxError> {
+    let id = text(root.get("id").ok_or("missing id")?, "id")?;
+    let last = id.split('/').next_back().unwrap_or(id);
+    Ok(format!("{last}.state"))
+}
+
+/// Compiles the handler in `luau` when the entry opts in, writing the script
+/// next to `generated.rs` and returning the constant that holds it.
+fn compile_entry(
+    row: &toml::Table,
+    id: &str,
+    script: Option<&str>,
+    kind: &str,
+    handler: &str,
+    context: &mut CompileContext<'_>,
+) -> Result<Option<String>, BoxError> {
+    let Some(value) = row.get("luau") else {
+        return Ok(None);
+    };
+    let relative = safe_relative_path(text(value, "luau")?, "luau")?;
+    let source = fs::read_to_string(context.source.join(&relative))
+        .map_err(|error| format!("read {}: {error}", relative.display()))?;
+    let compiled = compiler::compile(
+        &source,
+        &compiler::Options {
+            handler,
+            entry: id,
+            state_key: context.state_key,
+            kind: compiler_kind(kind)?,
+        },
+    )
+    .map_err(|error| error.render(&relative.to_string_lossy()))?;
+
+    let key = script.unwrap_or(id);
+    let name = format!("{key}.luau");
+    let target = context.out_dir.join("luau").join(&name);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(target, compiled.source)?;
+
+    let constant = format!("LUAU_{}", identifier(key).to_uppercase());
+    let _ = writeln!(
+        context.constants,
+        "pub const {constant}: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/luau/{name}\"));"
+    );
+    Ok(Some(constant))
 }
 
 fn numeric_or_text(
@@ -1188,6 +1283,81 @@ mod tests {
                 "{key} {path} was not rejected as relative"
             );
         }
+        Ok(())
+    }
+
+    const COMPILED_HANDLER: &str = "use noctalia_rs::{Context, Op, Result};\n\nfn handler(ctx: &Context) -> Result<Vec<Op>> {\n    if ctx.event == \"render\" {\n        Ok(vec![Op::BarText { text: \"hi\".to_owned() }])\n    } else {\n        Ok(Vec::new())\n    }\n}\n";
+
+    #[test]
+    fn generate_to_compiles_luau_entries() -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("noctalia-build-luau-{nanos}"));
+        fs::create_dir_all(dir.join("src"))?;
+        fs::write(
+            dir.join("noctalia.toml"),
+            "id = \"me/test\"\nname = \"Test\"\n\n[[widget]]\nid = \"widget\"\nentry = \"widget.luau\"\nhandler = \"handler\"\nluau = \"src/handler.rs\"\n",
+        )?;
+        fs::write(dir.join("src/handler.rs"), COMPILED_HANDLER)?;
+
+        generate_to(&dir.join("noctalia.toml"), &dir)?;
+        let generated = fs::read_to_string(dir.join("generated.rs"))?;
+        let script = fs::read_to_string(dir.join("luau/widget.luau"))?;
+        fs::remove_dir_all(&dir)?;
+
+        assert!(generated.contains(
+            "pub const LUAU_WIDGET: &str = include_str!(concat!(env!(\"OUT_DIR\"), \"/luau/widget.luau\"));"
+        ));
+        assert!(generated.contains(".with_luau(LUAU_WIDGET)"));
+        assert!(!generated.contains("src/handler.rs"));
+        assert!(script.contains("barWidget.setText"));
+        Ok(())
+    }
+
+    #[test]
+    fn generate_to_renders_luau_compile_errors() -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("noctalia-build-luau-error-{nanos}"));
+        fs::create_dir_all(dir.join("src"))?;
+        fs::write(
+            dir.join("noctalia.toml"),
+            "id = \"me/test\"\nname = \"Test\"\n\n[[widget]]\nid = \"widget\"\nhandler = \"handler\"\nluau = \"src/handler.rs\"\n",
+        )?;
+        fs::write(
+            dir.join("src/handler.rs"),
+            "use noctalia_rs::{Context, Op, Result};\n\nfn handler(ctx: &Context) -> Result<Vec<Op>> {\n    Ok(vec![Op::Nope])\n}\n",
+        )?;
+
+        let result = generate_to(&dir.join("noctalia.toml"), &dir);
+        fs::remove_dir_all(&dir)?;
+
+        let message = result.expect_err("compile error").to_string();
+        assert!(message.contains("src/handler.rs:4:"), "{message}");
+        assert!(message.contains("expected an Op constructor"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn generate_to_rejects_traversal_luau_paths() -> Result<(), BoxError> {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir = std::env::temp_dir()
+            .join(format!("noctalia-build-luau-path-{nanos}"));
+        fs::create_dir_all(&dir)?;
+        fs::write(
+            dir.join("noctalia.toml"),
+            "id = \"me/test\"\nname = \"Test\"\n\n[[widget]]\nid = \"widget\"\nhandler = \"handler\"\nluau = \"../escape.rs\"\n",
+        )?;
+
+        let result = generate_to(&dir.join("noctalia.toml"), &dir);
+        fs::remove_dir_all(&dir)?;
+
+        assert!(
+            result.err().is_some_and(|error| error
+                .to_string()
+                .contains("relative path")),
+            "luau path was not rejected"
+        );
         Ok(())
     }
 }
