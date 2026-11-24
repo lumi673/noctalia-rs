@@ -275,6 +275,7 @@ the bridge in `auto` mode; this scan only measures how many entries can skip it.
 | stage 1, whole-crate helpers | 14 / 1,067 | 1.31% |
 | stage 2, closures and statics | 30 / 1,067 | 2.81% |
 | stage 3, JSON and broader syntax | 77 / 1,067 | 7.22% |
+| stage 4, host callbacks and richer syntax | 185 / 1,067 | 17.34% |
 
 After stage 3: widget 44/319, shortcut 28/80, service 2/265, desktop widget
 1/36, launcher provider 2/64, panel 0/299, layer 0/4. The largest remaining
@@ -290,6 +291,39 @@ hand-written medians of 2.014 us, 17.007 us and 3.878 us. Median ratios were
 0.99x, 1.67x and 1.00x, so the small fixtures remain at parity within host
 noise and the UI tree keeps its advantage. `spool_dispatch` was 79 us in the
 median round.
+
+### Stage 4
+
+Stage 4 turns callback-id ops into named host callbacks. `Op::run`,
+`Op::run_stream`, `Op::http`, and `Op::state_watch` emit the marker table the
+bridge already uses, and the Luau runtime hands that name to the entry's
+`onHostCallback(payload)` global when no registered function matches the id.
+A compiled `host_callback` branch therefore runs with the same payload and
+emits the same ops as the Rust handler.
+
+After stage 4: widget 112/319, shortcut 41/80, panel 15/299, service 7/265,
+desktop widget 5/36, launcher provider 5/64, layer 0/4. The largest remaining
+blockers are unsupported methods (219), unresolved names (78), unresolved calls
+(63), unsupported expressions (52), host-start methods whose acceptance result
+is read (43), `vec!` of ops outside `Ok(...)` or a `let` (32), and tuple loop
+bindings over values (31). Each one fails the build with a position in strict
+mode.
+
+All 185 compiled scripts load in the Luau VM. A parse check over the whole set
+found eight shapes that emitted invalid Luau before this stage: an `else if`
+whose condition emits statements, an inlined helper body used as a statement, a
+table literal followed by an index or a method call, `drop(x)` in statement
+position, a unit closure passed to `get_or_init`, `vec!` elements that emit
+statements, a tuple pattern over a table literal, and a character class
+containing control characters.
+
+Two rounds of 300 samples measured compiled medians of 1.944 us and 1.924 us
+against hand-written medians of 1.923 us and 1.884 us for the bar, 11.075 us
+and 9.758 us against 16.602 us and 16.696 us for the UI panel, and 3.707 us and
+3.607 us against 3.657 us and 3.636 us for the event fixture. Ratios were
+0.99x, 1.50x and 0.99x, then 0.98x, 1.71x and 1.01x. Compiled source bytes are
+unchanged at 2,405, 2,938 and 3,174 for the three fixtures, so the generated
+code is byte-identical to stage 3 and the ratios move with host noise.
 
 ### Exact command
 

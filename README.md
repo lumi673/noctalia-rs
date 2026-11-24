@@ -171,11 +171,25 @@ common ops, and constants. Errors name the module when they sit in an inlined
 helper.
 
 JSON parsing and `serde_json::Value`, nested assignments, common iterators,
-string and numeric methods, blocks and loops are translated. Callback-id ops,
-arbitrary trait iterators, dynamic dispatch, and Rust constructs with no clear
-Luau equivalent fail the build with `file:line:column` instead of being
-approximated. The compiler currently covers 77 of 1,067 entries in the
-community corpus; see `BASELINE.md` for the per-stage adoption table.
+string and numeric methods, format specifiers, character-set trimming, string
+slices, blocks and loops are translated. Match guards read their pattern
+bindings, nested `or` patterns and constant patterns compare directly, and a
+crate function passed as a callback value, such as `map(lua_text)`, is inlined
+at the call.
+
+Host callbacks use stable names. `Op::run`, `Op::run_stream`, `Op::http`, and
+`Op::state_watch` emit `{ __host_callback = "name" }`, and the runtime delivers
+that name to the entry's `onHostCallback(payload)` global, so a compiled
+`host_callback` branch sees the same payload the Rust handler does.
+`ctx.run_async_start`, `ctx.run_stream_start`, and `ctx.http_start` compile when
+their acceptance result is dropped, because compiled Luau starts the call
+without blocking.
+
+Arbitrary trait iterators, dynamic dispatch, trait methods without a Luau
+equivalent, and ops that need a response path fail the build with
+`file:line:column` instead of being approximated. The compiler currently covers
+185 of 1,067 entries in the community corpus; see `BASELINE.md` for the
+per-stage adoption table.
 
 
 Build and install:
