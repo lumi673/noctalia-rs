@@ -7,6 +7,9 @@ const VERSION = 1
 const METHOD = 1
 const MARKER = '<!-- performance-report -->'
 const FAIL_MARGIN = 0.1
+// Identical code swings by a couple of microseconds on the smallest workloads,
+// so a difference below this never fails the gate on its own.
+const MIN_MARGIN_MS = 0.002
 const NAME = /^[a-z0-9][a-z0-9/_-]*$/u
 const SHA = /^[0-9a-f]{40}$/u
 
@@ -136,6 +139,7 @@ function percent(value) {
 
 function milliseconds(value) {
   if (value === null || value === undefined) return 'n/a'
+  if (value < 1) return `${(value * 1000).toFixed(1)} µs`
   if (value < 10) return `${value.toFixed(2)} ms`
   if (value < 100) return `${value.toFixed(1)} ms`
   return `${Math.round(value).toLocaleString('en-US')} ms`
@@ -152,7 +156,8 @@ function regression(label, after, reference) {
   const margin = Math.max(
     bound * FAIL_MARGIN,
     bound - reference.best,
-    ownBound - after.best
+    ownBound - after.best,
+    MIN_MARGIN_MS
   )
   if (after.best > bound + margin)
     return {
@@ -318,7 +323,7 @@ ${table.join('\n')}
 
 ${ceilingLine}
 
-All workloads run three times on a release build in the same CI session, and the best round is used. The reference is a ceiling commit re-measured in this session when one exists, otherwise main from this session. A workload fails when its median, p95, or p99 is more than 10% slower than the reference worst round, or by more than either side's spread between rounds, whichever is larger. It warns at half that margin. It also fails when its median is more than 10% over budget while the reference is within budget. Budgets can only be tightened. Benchmarks use generated fixtures and never read a Noctalia config.`
+All workloads run three times on a release build in the same CI session, and the best round is used. The reference is a ceiling commit re-measured in this session when one exists, otherwise main from this session. A workload fails when its median, p95, or p99 is more than 10% slower than the reference worst round, or by more than either side's spread between rounds, whichever is larger, with a floor of 2 µs. It warns at half that margin. It also fails when its median is more than 10% over budget while the reference is within budget. Budgets can only be tightened. Benchmarks use generated fixtures and never read a Noctalia config.`
 }
 
 function parseArgs(argv) {

@@ -46,6 +46,12 @@ jobs:
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       RUN_KIND: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
+      # Every commit here builds the same dependencies and each benchmark run
+      # compiles a fixture, so one compiler cache serves the whole job.
+      RUSTC_WRAPPER: sccache
+      CC: sccache cc
+      CXX: sccache c++
+      SCCACHE_CACHE_SIZE: 3G
     steps:
       # pull_request checks out the merge commit, so base-only changes are
       # included in the PR measurement.
@@ -54,6 +60,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
 
       # Ceilings live on their own branch so a PR cannot move them.
       - name: Plan variants
@@ -88,14 +98,16 @@ jobs:
           set -euo pipefail
           head="$(git rev-parse HEAD)"
           for run in 1 2 3; do
-            cargo run --release -p noctalia-bench -- \
-              --samples 60 --warmup 6 --build-samples 2 --build-warmup 1 \
-              --report "performance/raw/$head-$run.json"
+            NOCTALIA_BENCH_FIXTURE_TARGET="$RUNNER_TEMP/fixture-$head" \
+              cargo run --release -p noctalia-bench -- \
+                --samples 60 --warmup 6 --build-samples 2 --build-warmup 1 \
+                --report "performance/raw/$head-$run.json"
             while read -r sha dir; do
               [ -n "$sha" ] || continue
               (
                 cd "$dir"
                 CARGO_TARGET_DIR="$RUNNER_TEMP/target-$sha" \
+                  NOCTALIA_BENCH_FIXTURE_TARGET="$RUNNER_TEMP/fixture-$sha" \
                   cargo run --release -p noctalia-bench -- \
                     --samples 60 --warmup 6 --build-samples 2 --build-warmup 1 \
                     --report "$GITHUB_WORKSPACE/performance/raw/$sha-$run.json"
@@ -107,6 +119,13 @@ jobs:
             cp "performance/$head.json" performance/pr.json
             cp "performance/$BASE_SHA.json" performance/base.json
           fi
+
+      - name: Compiler cache stats
+        if: always()
+        run: |
+          sccache --show-stats || true
+          df -h "$RUNNER_TEMP" || true
+          du -shc "$RUNNER_TEMP"/target-* "$RUNNER_TEMP"/fixture-* 2>/dev/null | sort -h | tail -n 6 || true
 
       - uses: actions/upload-artifact@v6
         with:

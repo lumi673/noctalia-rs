@@ -80,6 +80,51 @@ test('a slowdown beyond the reference spread fails at the median, p95, and p99',
   assert.match(body, /p99 2/)
 })
 
+test('a few microseconds of swing on a sub-millisecond workload passes', () => {
+  // Values from the run that failed PR #16: identical medians, a p95 that
+  // swung by 37% between two commits measured minutes apart.
+  const base = artifact([
+    metric('bridge_snapshot_reads', {
+      medianMs: 0.0033,
+      worstMedianMs: 0.0034,
+      p95Ms: 0.0039,
+      worstP95Ms: 0.0045,
+      p99Ms: 0.0055,
+      worstP99Ms: 0.0134,
+    }),
+  ])
+  const head = artifact([
+    metric('bridge_snapshot_reads', {
+      medianMs: 0.0033,
+      worstMedianMs: 0.0033,
+      p95Ms: 0.0054,
+      worstP95Ms: 0.0061,
+      p99Ms: 0.0092,
+      worstP99Ms: 0.0355,
+    }),
+  ])
+  const compared = perf.compare({ meta: meta(), floor: perf.emptyFloor(), head, base })
+  assert.equal(compared.failed, false)
+  assert.equal(compared.rows[0].status, 'ok')
+  const body = perf.markdown(compared)
+  assert.match(body, /5\.4 µs/)
+  assert.match(body, /with a floor of 2 µs/)
+
+  const worse = artifact([
+    metric('bridge_snapshot_reads', {
+      medianMs: 0.0033,
+      worstMedianMs: 0.0033,
+      p95Ms: 0.0075,
+      worstP95Ms: 0.0076,
+      p99Ms: 0.0092,
+      worstP99Ms: 0.0093,
+    }),
+  ])
+  const regressed = perf.compare({ meta: meta(), floor: perf.emptyFloor(), head: worse, base })
+  assert.equal(regressed.failed, true)
+  assert.equal(regressed.rows[0].status, 'fail')
+})
+
 test('a recorded workload missing from the PR fails', () => {
   const floor = {
     version: 1,

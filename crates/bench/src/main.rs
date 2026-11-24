@@ -771,7 +771,10 @@ impl Fixture {
             "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\nfn main() {}\n",
         )?;
 
-        let target_dir = root.join("target");
+        // An environment variable rather than a flag: CI points every commit at
+        // its own directory, and commits older than this option still run.
+        let target_dir = env::var_os("NOCTALIA_BENCH_FIXTURE_TARGET")
+            .map_or_else(|| root.join("target"), PathBuf::from);
         Ok(Self {
             manifest: root.join("noctalia.toml"),
             out_dir,
@@ -910,6 +913,10 @@ fn usage() -> String {
         "  --helper PATH      use an existing release helper binary"
     );
     let _ = writeln!(text, "  --report PATH      write a JSON report");
+    let _ = writeln!(
+        text,
+        "  NOCTALIA_BENCH_FIXTURE_TARGET=DIR\n                     reuse the fixture build directory between runs"
+    );
     text
 }
 
