@@ -91,7 +91,7 @@ pub fn wrapper(fixture: &Value, body: &str) -> Result<String> {
     ))
 }
 
-fn canonical(ops: &[Op]) -> Result<String> {
+pub(crate) fn canonical(ops: &[Op]) -> Result<String> {
     let value = serde_json::to_value(ops)?;
     Ok(canonical_value(&value))
 }

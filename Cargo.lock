@@ -361,6 +361,7 @@ dependencies = [
  "chrono",
  "noctalia-rs",
  "noctalia-rs-build",
+ "noctalia-rs-compiler",
  "noctalia-rs-luau",
  "serde",
  "serde_json",
