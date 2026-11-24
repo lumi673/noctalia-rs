@@ -253,10 +253,23 @@ impl Run<'_> {
         // second one returns only the ops of the event being compared.
         noctalia_rs_luau::dispatch(&ctx, &sources)?;
         let ops = noctalia_rs_luau::dispatch(&ctx, &sources)?;
-        Ok(ops
-            .into_iter()
-            .filter(|op| !matches!(op, Op::HostCall { .. }))
-            .collect())
+        Ok(filter_ops(ops))
+    }
+
+    /// The first dispatch: startup render plus the measured event. The VM
+    /// cache is keyed by entry name, so use a fresh name to guarantee the
+    /// script's load render is replayed.
+    fn first_ops(&self, side: Side) -> Result<Vec<Op>> {
+        let entry = format!(
+            "{}::validate-{}",
+            self.fixture.plan.entry(side),
+            self.event
+        );
+        let sources = [(entry.as_str(), self.fixture.source(side))];
+        let ctx = self.context(side);
+        Ok(filter_ops(noctalia_rs_luau::dispatch_entry(
+            &ctx, &sources, &entry,
+        )?))
     }
 }
 
@@ -265,15 +278,6 @@ pub struct GeneratedSource {
     pub workload: &'static str,
     pub compiled_bytes: usize,
     pub handwritten_bytes: usize,
-}
-
-impl GeneratedSource {
-    pub fn ratio(&self) -> f64 {
-        if self.handwritten_bytes == 0 {
-            return 0.0;
-        }
-        self.compiled_bytes as f64 / self.handwritten_bytes as f64
-    }
 }
 
 pub struct Generated {
@@ -395,6 +399,7 @@ fn compile_fixture(plan: &Plan, handler: &str) -> Result<String> {
             entry: plan.workload,
             state_key: plan.state_key,
             kind: plan.kind,
+            strings: &["message", "prefix", "name"],
         },
     )
     .map_err(|error| format!("{}: {error}", plan.workload))?;
@@ -414,23 +419,67 @@ fn validate(fixture: &Fixture, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn filter_ops(ops: Vec<Op>) -> Vec<Op> {
+    ops.into_iter()
+        .filter(|op| !matches!(op, Op::HostCall { .. }))
+        .collect()
+}
+
 fn validate_event(fixture: &Fixture, event: &str, dir: &Path) -> Result<()> {
     let run = Run {
         fixture,
         event,
         dir,
     };
-    let native = (fixture.native)(&context(
+    let compiled = canonical(&run.first_ops(Side::Compiled)?)?;
+    let handwritten = canonical(&run.first_ops(Side::Handwritten)?)?;
+    if compiled != handwritten {
+        return Err(format!(
+            "{} {event}: compiled startup differs from hand-written startup\n\
+             compiled: {compiled}\nhand-written: {handwritten}",
+            fixture.workload(),
+        )
+        .into());
+    }
+
+    let mut native = Vec::new();
+    if fixture.plan.kind.renders_on_load() {
+        let load_event = match fixture.plan.kind {
+            EntryKind::Service | EntryKind::Shortcut => "load",
+            _ => fixture.plan.kind.update_event(),
+        };
+        let load = context(
+            (fixture.workload(), load_event),
+            dir,
+            json!({ "source": "load" }),
+        );
+        native.extend((fixture.native)(&load)?);
+    }
+    native.extend((fixture.native)(&context(
         (fixture.workload(), event),
         dir,
         fixture.payload.clone(),
-    ))?;
+    ))?);
     let expected = canonical(&native)?;
+    if compiled != expected {
+        return Err(format!(
+            "{} {event}: Luau startup and event ops differ from the native handler\n\
+             compiled: {compiled}\nnative: {expected}",
+            fixture.workload(),
+        )
+        .into());
+    }
+
+    let expected = canonical(&(fixture.native)(&context(
+        (fixture.workload(), event),
+        dir,
+        fixture.payload.clone(),
+    ))?)?;
     for side in [Side::Compiled, Side::Handwritten] {
         let actual = canonical(&run.ops(side)?)?;
         if actual != expected {
             return Err(format!(
-                "{} {event}: {} Luau output differs from the native handler\n\
+                "{} {event}: {} event output differs from the native handler\n\
                  {}: {actual}\nnative: {expected}",
                 fixture.workload(),
                 side.name(),

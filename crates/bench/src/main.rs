@@ -997,7 +997,11 @@ fn print_report(report: &Report) {
         "speedup",
         "target"
     );
-    for pair in &report.pairs {
+    for pair in report
+        .pairs
+        .iter()
+        .filter(|pair| !pair.workload.starts_with("generated_"))
+    {
         println!(
             "{:<20} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>9.2} {:>7}",
             pair.workload,
@@ -1017,22 +1021,51 @@ fn print_report(report: &Report) {
             "Generated Luau: compiled from the Rust handler vs hand-written"
         );
         println!(
-            "{:<24} {:>14} {:>17} {:>7}",
-            "workload", "compiled_bytes", "handwritten_bytes", "ratio"
+            "{:<24} {:>10} {:>10} {:>10} {:>10} {:>9} {:>14} {:>17}",
+            "workload",
+            "compiled",
+            "compiled95",
+            "hand",
+            "hand95",
+            "speedup",
+            "compiled_bytes",
+            "handwritten_bytes"
         );
         for item in &report.generated {
+            let (compiled, compiled95, hand, hand95, speedup) =
+                generated_times(&report.pairs, item.workload);
             println!(
-                "{:<24} {:>14} {:>17} {:>6.2}x",
+                "{:<24} {:>10.3} {:>10.3} {:>10.3} {:>10.3} {:>8.2}x {:>14} {:>17}",
                 item.workload,
+                compiled,
+                compiled95,
+                hand,
+                hand95,
+                speedup,
                 item.compiled_bytes,
-                item.handwritten_bytes,
-                item.ratio()
+                item.handwritten_bytes
             );
         }
         println!(
-            "generated_* pairs above pair compiled Luau (left) with hand-written Luau (right), so their speedup is hand-written median / compiled median. Target: compiled Luau >= hand-written Luau (parity). Both sides pay the same ~2 us dispatch floor, so the 3x target applies to spool_dispatch, not to this comparison."
+            "compiled/hand are medians in microseconds; speedup = hand / compiled. Target: compiled Luau >= hand-written Luau (parity). Both sides pay the same ~2 us dispatch floor, so the 3x target applies to spool_dispatch, not to this comparison."
         );
     }
+}
+
+fn generated_times(
+    pairs: &[Pair],
+    workload: &str,
+) -> (f64, f64, f64, f64, f64) {
+    let Some(pair) = pairs.iter().find(|pair| pair.workload == workload) else {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    };
+    (
+        pair.rust.median_us,
+        pair.rust.p95_us,
+        pair.luau.median_us,
+        pair.luau.p95_us,
+        pair.speedup_median,
+    )
 }
 
 fn target(pair: &Pair) -> &'static str {
