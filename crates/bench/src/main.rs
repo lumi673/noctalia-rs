@@ -793,14 +793,13 @@ fn bridge_event_source() -> String {
         .replace("{{HELPER}}", "bench-helper")
         .replace("{{PREFIX}}", "bench");
     format!(
-        "local payload_bytes = 0\n\
-         noctalia.mkdirAll = function() return true end\n\
+        "noctalia.mkdirAll = function() return true end\n\
          noctalia.runStream = function(_, on_line)\n\
          on_line('{{\"control\":\"ready\",\"boot\":\"bench\",\"spool\":\"/bench/spool\"}}')\n\
          return true\n\
          end\n\
          noctalia.writeFile = function(_, contents)\n\
-         payload_bytes = #contents\n\
+         assert(#contents > 0, \"empty bridge request\")\n\
          return true\n\
          end\n\
          noctalia.renameFile = function() return true end\n\

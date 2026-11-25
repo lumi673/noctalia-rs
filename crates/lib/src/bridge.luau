@@ -231,6 +231,13 @@ local function sameValue(left, right)
   return true
 end
 
+local function mergeHost(fixed, live)
+  local host = {}
+  for key, value in pairs(fixed) do host[key] = value end
+  for key, value in pairs(live) do host[key] = value end
+  return host
+end
+
 local function resolve(root, path)
   local value = ROOTS[root]
   if not value then
@@ -332,19 +339,24 @@ local function writeRequest(request)
   sequence += 1
   local target = REQUEST_DIR .. "/" .. string.format("%012d", sequence) .. ".json"
   local host, fixed = snapshot()
-  M.host = {}
-  for key, value in pairs(fixed) do M.host[key] = value end
-  for key, value in pairs(host) do M.host[key] = value end
+  M.host = mergeHost(fixed, host)
   request.host = host
-  if not fixed_sent or not sameValue(fixed, fixed_host) then
-    fixed_host = fixed
-    fixed_sent = true
+  local sends_fixed = not fixed_sent or not sameValue(fixed, fixed_host)
+  if sends_fixed then
     request.host_fixed = fixed
   end
   -- Written in place. The helper wakes on the create and retries a truncated
   -- payload, so the round trip overlaps the write instead of waiting for a
   -- rename to publish the file.
   local ok, err = noctalia.writeFile(target, noctalia.json.encode(encodeBytes(request)))
+  if sends_fixed then
+    -- A write that failed never reached the helper, so the fixed part has to
+    -- travel again even though it was built once.
+    fixed_sent = ok == true
+    if fixed_sent then
+      fixed_host = fixed
+    end
+  end
   if not ok then
     noctalia.removeFile(target)
     noctalia.log("noctalia bridge: spool write failed: " .. tostring(err))
@@ -438,7 +450,8 @@ function M.setup(entry, configKeys)
     M.config[key] = noctalia.getConfig(key)
   end
   M.state = noctalia.state.get(STATE_KEY) or {}
-  M.host = snapshot()
+  local host, fixed = snapshot()
+  M.host = mergeHost(fixed, host)
   startStream()
 end
 

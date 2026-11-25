@@ -341,9 +341,9 @@ fn wait_for_work(watched: Option<&(Receiver<()>, notify::RecommendedWatcher)>) {
 ///
 /// Reading the spool emits access events and deleting a handled request emits
 /// a removal. Waking for those costs a full wakeup cycle per request and never
-/// finds work, so only created or modified request names wake the loop. Events
-/// without a path still wake it: that is the rescan notify emits when it lost
-/// events.
+/// finds work, so only a request name that was created, modified, or reported
+/// as `Any` wakes the loop. Events without a path still wake it: that is the
+/// rescan notify emits when it lost events.
 fn wakes_serve(event: &notify::Event) -> bool {
     if event.paths.is_empty() {
         return true;
