@@ -32,14 +32,14 @@ a plugin computes.
 
 ```toml
 [dependencies]
-noctalia-rs = "0.2"
+noctalia-rs = "0.3"
 serde_json = "1.0"
 
 [build-dependencies]
-noctalia-rs-build = "0.2"
+noctalia-rs-build = "0.3"
 ```
 
-For Rust handlers, the dependency, `build.rs`, and `noctalia.toml` shown below are enough. Entries with a hand-written `.luau` script and no `handler` also need `noctalia-rs-luau = "0.2"` in `[dependencies]`.
+For Rust handlers, the dependency, `build.rs`, and `noctalia.toml` shown below are enough. Entries with a hand-written `.luau` script and no `handler` also need `noctalia-rs-luau = "0.3"` in `[dependencies]`.
 Package names and Rust library names now match. Plugin code imports `noctalia_rs::`, and `build.rs` calls `noctalia_rs_build::generate()`.
 
 Add `build.rs`:
