@@ -96,6 +96,7 @@ impl<'a> Emitter<'a> {
             uses_source: false,
             emitted: false,
             temp: 0,
+            kw_names: HashMap::new(),
             native_mode,
             known_native,
             native_found: BTreeMap::new(),
@@ -210,6 +211,38 @@ impl<'a> Emitter<'a> {
             .rev()
             .find_map(|scope| scope.get(name).copied())
     }
+    pub(super) fn bind_name(&mut self, name: &str) -> String {
+        if !is_luau_keyword(name) {
+            return name.to_owned();
+        }
+        if let Some(existing) = self.kw_names.get(name) {
+            return existing.clone();
+        }
+        let mut candidate = format!("__kw_{name}");
+        let mut suffix = 1;
+        while self
+            .scopes
+            .iter()
+            .any(|scope| scope.contains_key(&candidate))
+            || self.kw_names.values().any(|value| value == &candidate)
+        {
+            candidate = format!("__kw_{name}_{suffix}");
+            suffix += 1;
+        }
+        self.kw_names.insert(name.to_owned(), candidate.clone());
+        candidate
+    }
+
+    pub(super) fn local_name(&self, name: &str) -> String {
+        if is_luau_keyword(name) {
+            self.kw_names
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| format!("__kw_{name}"))
+        } else {
+            name.to_owned()
+        }
+    }
 
     pub(super) fn temp(&mut self) -> String {
         self.temp = self.temp.saturating_add(1);
@@ -323,6 +356,7 @@ pub(crate) struct Emitter<'a> {
     uses_source: bool,
     emitted: bool,
     temp: usize,
+    kw_names: HashMap<String, String>,
     native_mode: NativeMode,
     known_native: &'a BTreeMap<String, NativeFn>,
     native_found: BTreeMap<String, NativeFn>,

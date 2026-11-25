@@ -22,13 +22,37 @@ impl<'a> Emitter<'a> {
         match expr {
             Expr::Lit(lit) => self.literal(lit),
             Expr::Path(path) => self.path(expr, path),
+            Expr::Let(item) => {
+                let condition = self.let_condition(item)?;
+                Ok((condition, Ty::BOOL))
+            }
             Expr::Paren(paren) => self.expr(&paren.expr),
             Expr::Group(group) => self.expr(&group.expr),
             Expr::Reference(reference) => self.expr(&reference.expr),
             Expr::Unary(unary) => self.unary(unary),
             Expr::Binary(binary) => self.binary(binary),
+            Expr::MethodCall(call)
+                if call.method == "collect"
+                    && call.turbofish.as_ref().is_some_and(|generic| {
+                        generic.args.iter().any(|argument| {
+                            matches!(
+                                argument,
+                                syn::GenericArgument::Type(Type::Path(path))
+                                    if path.path.segments.last().is_some_and(
+                                        |segment| segment.ident == "String"
+                                    )
+                            )
+                        })
+                    }) =>
+            {
+                let (text, _) = self.expr(&call.receiver)?;
+                Ok((format!("table.concat({text})"), Ty::STR))
+            }
             Expr::MethodCall(call) => self.method(call),
-            Expr::Call(call) => self.call(call),
+            Expr::Call(call) => match self.std_call(call)? {
+                Some(value) => Ok(value),
+                None => self.call(call),
+            },
             Expr::Field(field) => self.field(expr, field),
             Expr::Macro(mac) => self.macro_expr(mac),
             Expr::Index(index) => self.index(index),
@@ -244,6 +268,98 @@ impl<'a> Emitter<'a> {
             _ => Ok(("nil".to_owned(), Ty::VALUE)),
         }
     }
+    fn std_call(&mut self, call: &ExprCall) -> Result<OptionalValue, Error> {
+        let Some(name) = path_last_name(&call.func) else {
+            return Ok(None);
+        };
+        let args = call.args.iter().collect::<Vec<_>>();
+        if matches!(
+            name.as_str(),
+            "Box::new"
+                | "Arc::new"
+                | "std::sync::Arc::new"
+                | "Arc::clone"
+                | "ByteBuf::new"
+                | "std::str::from_utf8"
+                | "std::str::from_utf8_lossy"
+        ) && args.len() == 1
+        {
+            return Ok(Some((self.expr(arg(&args, 0, call)?)?.0, Ty::VALUE)));
+        }
+        if name == "std::time::SystemTime::now" && args.is_empty() {
+            return Ok(Some(("noctalia.nowMs()".to_owned(), Ty::INT)));
+        }
+        if name == "PathBuf::new" && args.is_empty() {
+            return Ok(Some(("\"\"".to_owned(), Ty::STR)));
+        }
+        if name == "ByteBuf::new" && args.is_empty() {
+            return Ok(Some(("\"\"".to_owned(), Ty::STR)));
+        }
+        if name == "OpenOptions::new" && args.is_empty() {
+            return Ok(Some(("{}".to_owned(), Ty::VALUE)));
+        }
+        let last = name.rsplit("::").next().unwrap_or(&name);
+        let ui_import = name == "callback"
+            || name == "call"
+            || name == "node"
+            || name.contains("::ui::");
+        if ui_import && matches!(last, "callback" | "call") && args.len() == 1 {
+            let value = self.expr(arg(&args, 0, call)?)?.0;
+            let marker = if last == "call" {
+                "__call"
+            } else {
+                "__host_callback"
+            };
+            return Ok(Some((format!("{{ {marker} = {value} }}"), Ty::VALUE)));
+        }
+        if ui_import && last == "node" && !args.is_empty() {
+            let kind = self.expr(arg(&args, 0, call)?)?.0;
+            let props = match args.get(1) {
+                Some(props) => self.expr(props)?.0,
+                None => "{}".to_owned(),
+            };
+            let children = match args.get(2) {
+                Some(children) => {
+                    let children = strip_reference(children);
+                    if matches!(children, Expr::Call(call) if is_vec_new(call))
+                        || matches!(children, Expr::Macro(mac) if macro_name(mac) == "vec"
+                            && parse_vec(mac).is_ok_and(|items| items.is_empty()))
+                    {
+                        "{}".to_owned()
+                    } else {
+                        self.expr(children)?.0
+                    }
+                }
+                None => "{}".to_owned(),
+            };
+            return Ok(Some((
+                format!(
+                    "{{ kind = {kind}, props = {props}, children = {children} }}"
+                ),
+                Ty::NODE,
+            )));
+        }
+        let numeric = ["f64", "f32", "i64", "u64", "usize", "i32", "u32"];
+        if (name.ends_with("::max") || name.ends_with("::min"))
+            && numeric
+                .iter()
+                .any(|kind| name.starts_with(&format!("{kind}::")))
+            && args.len() == 2
+        {
+            let left = self.expr(arg(&args, 0, call)?)?.0;
+            let right = self.expr(arg(&args, 1, call)?)?.0;
+            let function = if name.ends_with("::max") {
+                "max"
+            } else {
+                "min"
+            };
+            return Ok(Some((
+                format!("math.{function}({left}, {right})"),
+                Ty::VALUE,
+            )));
+        }
+        Ok(None)
+    }
 
     fn block_value(
         &mut self,
@@ -271,6 +387,12 @@ impl<'a> Emitter<'a> {
             )),
             Lit::Char(value) => {
                 Ok((quote(&value.value().to_string()), Ty::STR))
+            }
+            Lit::Byte(value) => {
+                Ok((quote(&(value.value() as char).to_string()), Ty::STR))
+            }
+            Lit::ByteStr(value) => {
+                Ok((quote(&String::from_utf8_lossy(&value.value())), Ty::STR))
             }
             other => Err(Error::at(other.span(), "unsupported literal")),
         }
@@ -343,6 +465,16 @@ impl<'a> Emitter<'a> {
                 "(function(__value) return __value end)".to_owned(),
                 Ty::VALUE,
             ));
+        }
+        if let Some(segments) = path_segments(&path.path)
+            && segments.iter().any(|name| name == "Ordering")
+            && let Some(last) = segments.last()
+            && matches!(
+                last.as_str(),
+                "Relaxed" | "Acquire" | "Release" | "AcqRel" | "SeqCst"
+            )
+        {
+            return Ok((quote(last), Ty::STR));
         }
         if let Some(segments) = path_segments(&path.path)
             && segments.iter().any(|name| name == "Value")
@@ -431,6 +563,56 @@ impl<'a> Emitter<'a> {
                     Ty::VALUE,
                 ));
             }
+            if last == "is_null" {
+                return Ok((
+                    "(function(__value) return __value == nil end)".to_owned(),
+                    Ty::BOOL,
+                ));
+            }
+            if matches!(
+                last,
+                "as_str"
+                    | "as_bool"
+                    | "as_f64"
+                    | "as_i64"
+                    | "as_u64"
+                    | "as_array"
+                    | "as_object"
+            ) && segments
+                .iter()
+                .any(|name| matches!(name.as_str(), "Value" | "String" | "str"))
+            {
+                return Ok((
+                    "(function(__value) return __value end)".to_owned(),
+                    Ty::VALUE,
+                ));
+            }
+            let math_call = match last {
+                "floor" => Some("math.floor"),
+                "ceil" => Some("math.ceil"),
+                "round" => Some("math.floor(__value + 0.5)"),
+                "abs" => Some("math.abs"),
+                _ => None,
+            };
+            if let Some(function) = math_call
+                && segments.len() > 1
+                && segments.iter().any(|name| {
+                    matches!(
+                        name.as_str(),
+                        "f64" | "f32" | "i64" | "u64" | "usize" | "i32"
+                    )
+                })
+            {
+                let body = if function.contains("__value") {
+                    function.to_owned()
+                } else {
+                    format!("{function}(__value)")
+                };
+                return Ok((
+                    format!("(function(__value) return {body} end)"),
+                    Ty::VALUE,
+                ));
+            }
             if matches!(last, "new" | "default")
                 && segments.len() > 1
                 && container_default(&segments[segments.len() - 2]).is_some()
@@ -500,7 +682,7 @@ impl<'a> Emitter<'a> {
             ));
         }
         if let Some(ty) = self.lookup(&name) {
-            return Ok((name, ty));
+            return Ok((self.local_name(&name), ty));
         }
         if let Some((value, ty)) = self.constant(&name) {
             return Ok((value, ty));
@@ -509,6 +691,11 @@ impl<'a> Emitter<'a> {
             && let Some((text, ty)) = constant(value)
         {
             return Ok((text, ty));
+        }
+        if let Some(value) = self.program.imported_constant(&self.module, &name)
+        {
+            let value = value.clone();
+            return Ok((self.static_value(&value)?, Ty::VALUE));
         }
         Err(Error::at(
             expr.span(),
@@ -763,20 +950,8 @@ impl<'a> Emitter<'a> {
             match input {
                 syn::Pat::Ident(pattern) => {
                     let name = pattern.ident.to_string();
-                    if is_luau_keyword(&name) {
-                        self.local_statics.pop();
-                        self.scopes.pop();
-                        self.out = saved_out;
-                        self.indent = saved_indent;
-                        self.tail_target = saved_target;
-                        self.deferred = saved_deferred;
-                        return Err(Error::at(
-                            pattern.span(),
-                            format!("identifier `{name}` is a Luau keyword"),
-                        ));
-                    }
                     self.push(&name, Ty::VALUE);
-                    params.push(name);
+                    params.push(self.bind_name(&name));
                 }
                 syn::Pat::Wild(_) => params.push("_".to_owned()),
                 other => {
@@ -844,13 +1019,8 @@ impl<'a> Emitter<'a> {
         match pattern {
             Pat::Ident(pattern) => {
                 let name = pattern.ident.to_string();
-                if is_luau_keyword(&name) {
-                    return Err(Error::at(
-                        pattern.span(),
-                        format!("identifier `{name}` is a Luau keyword"),
-                    ));
-                }
-                self.line(&format!("local {name} = {value}"));
+                let lua = self.bind_name(&name);
+                self.line(&format!("local {lua} = {value}"));
                 self.push(&name, Ty::VALUE);
                 Ok(())
             }
@@ -911,7 +1081,27 @@ impl<'a> Emitter<'a> {
                         self.stmt(stmt)?;
                     }
                     match last {
-                        Stmt::Expr(expr, _) => self.value_or_statement(expr),
+                        Stmt::Expr(expr, _) => {
+                            if self.in_statement
+                                && let Expr::Call(call) = expr
+                                && let Some(helper) = self.helper(call)
+                                && matches!(
+                                    return_kind(&helper.function)?,
+                                    Returns::Value(_)
+                                )
+                            {
+                                let bindings = self.bindings(&helper, call)?;
+                                self.inline_resolved(
+                                    helper,
+                                    Inline::Statement,
+                                    call.span(),
+                                    bindings,
+                                )?;
+                                Ok((String::new(), Ty::VOID))
+                            } else {
+                                self.value_or_statement(expr)
+                            }
+                        }
                         _ => Ok(("nil".to_owned(), Ty::VALUE)),
                     }
                 }

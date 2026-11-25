@@ -223,6 +223,17 @@ impl Program {
                 module: resolved.module.clone(),
                 function: resolved.function,
             }),
+            [first, rest @ ..]
+                if rest.iter().all(|resolved| {
+                    resolved.module == first.module
+                        && std::ptr::eq(resolved.function, first.function)
+                }) =>
+            {
+                Some(Resolved {
+                    module: first.module.clone(),
+                    function: first.function,
+                })
+            }
             _ => None,
         }
     }

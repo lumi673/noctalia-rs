@@ -79,7 +79,7 @@ impl<'a> Emitter<'a> {
                     {
                         self.expr(expr)?
                     } else if let Some(ty) = self.lookup(&placeholder) {
-                        (placeholder.clone(), ty)
+                        (self.local_name(&placeholder), ty)
                     } else if let Some((text, ty)) = self.constant(&placeholder)
                     {
                         (text, ty)
@@ -136,8 +136,24 @@ impl<'a> Emitter<'a> {
         let parsed: MatchesArgs = syn::parse2(mac.mac.tokens.clone())?;
         self.record_pattern_events(&parsed.expr, &parsed.pat);
         let (expr, _) = self.expr(&parsed.expr)?;
-        let condition = self.pattern_condition(&expr, &parsed.pat)?;
-        Ok((format!("({condition})"), Ty::BOOL))
+        let Some(guard) = parsed.guard else {
+            let condition = self.pattern_condition(&expr, &parsed.pat)?;
+            return Ok((format!("({condition})"), Ty::BOOL));
+        };
+        let value = self.temp();
+        self.line(&format!("local {value} = {expr}"));
+        let (condition, bindings) =
+            self.pattern_match(&value, &parsed.pat, None)?;
+        self.scopes.push(HashMap::new());
+        for (name, text) in bindings {
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {text}"));
+            self.push(&name, Ty::VALUE);
+        }
+        let guard_result = self.expr(&guard);
+        self.scopes.pop();
+        let (guard_text, _) = guard_result?;
+        Ok((format!("({condition} and {guard_text})"), Ty::BOOL))
     }
 
     fn pattern_condition(
@@ -257,6 +273,9 @@ impl<'a> Emitter<'a> {
                     )),
                 }
             }
+            Pat::Struct(_) | Pat::Range(_) => self
+                .pattern_match(value, pattern, None)
+                .map(|(text, _)| text),
             _ => Err(Error::at(
                 pattern.span(),
                 "matches! pattern is not supported by the Luau compiler",
@@ -415,6 +434,7 @@ pub(super) fn parse_vec(mac: &ExprMacro) -> Result<Vec<Expr>, Error> {
 pub(crate) struct MatchesArgs {
     pub(crate) expr: Expr,
     pub(crate) pat: Pat,
+    pub(crate) guard: Option<Expr>,
 }
 
 impl Parse for MatchesArgs {
@@ -422,7 +442,13 @@ impl Parse for MatchesArgs {
         let expr: Expr = input.parse()?;
         let _: Token![,] = input.parse()?;
         let pat: Pat = Pat::parse_multi(input)?;
-        Ok(Self { expr, pat })
+        let guard = if input.peek(Token![if]) {
+            let _: Token![if] = input.parse()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        Ok(Self { expr, pat, guard })
     }
 }
 

@@ -363,3 +363,23 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(generated.contains(finite), "{generated}");
     assert!(generated.contains("~= nil then"), "{generated}");
 }
+
+#[test]
+fn compiles_matches_with_a_guard() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = Some(3);
+    let matched = matches!(value, Some(number) if number > 1);
+    Ok(vec![Op::log(format!("{matched}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains(" and "), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("local number"),
+        "{}",
+        compiled.source
+    );
+}
