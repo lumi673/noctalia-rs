@@ -15,7 +15,7 @@ a plugin computes.
 ## Features
 
 - `noctalia.toml` as the source of truth for metadata, settings, and entries
-- Compiled Luau entries by default, with bridge fallback in `auto` mode
+- Compiled Luau entries by default, with per-function native calls for arbitrary Rust and bridge fallback in `auto` mode
 - Version taken from `Cargo.toml` through `CARGO_PKG_VERSION`
 - No Nix requirement; Nix packaging stays optional
 - All Noctalia setting types and entry kinds
@@ -117,12 +117,13 @@ fn main() -> ExitCode {
 compile = "auto"
 ```
 
-`auto` compiles each handler it finds and emits a pure-Luau script on success.
-A handler the compiler cannot translate keeps the bridge stub, and the build
-prints one `cargo:warning` with the entry id and `file:line:column: reason`.
-`strict` fails the build on the first failure and emits no bridge. It also
-rejects entries without a handler. `off` skips the compiler and bridges every
-entry.
+`auto` compiles each handler it finds, splits the functions it cannot translate
+into native calls, and bridges only the entries it cannot split. The build
+prints one `cargo:warning` per function that crossed the boundary and one per
+entry that kept the bridge stub, each with the entry id and the reason.
+`strict` fails the build on the first function it cannot translate and emits no
+bridge, so it measures pure-Luau coverage. It also rejects entries without a
+handler. `off` skips the compiler and bridges every entry.
 
 The handler signature is `fn handler(ctx: &Context) -> Result<Vec<Op>>`. The
 build walks the module tree from `src/main.rs` or `src/lib.rs`, follows `mod`
@@ -186,10 +187,123 @@ their acceptance result is dropped, because compiled Luau starts the call
 without blocking.
 
 Arbitrary trait iterators, dynamic dispatch, trait methods without a Luau
-equivalent, and ops that need a response path fail the build with
-`file:line:column` instead of being approximated. The compiler currently covers
-197 of 1,067 entries in the community corpus; see `BASELINE.md` for the
-per-stage adoption table.
+equivalent, and ops that need a response path are never approximated. In
+`auto` they move the whole function to the plugin binary and the rest of the
+handler still compiles; in `strict` they fail the build with
+`file:line:column`. `BASELINE.md` has the per-stage adoption table for the
+community corpus.
+
+## Native functions
+
+A handler compiles in one of three tiers:
+
+- **Fully compiled**: every function reached from the handler translates to
+  Luau. The script needs no helper and runs at hand-written Luau speed.
+- **Hybrid**: the functions the compiler cannot translate keep running in the
+  plugin binary, and the rest of the handler still compiles to Luau. Each
+  uncached native call costs one round trip to the helper that is already
+  running, then the handler continues in Luau.
+- **Bridged**: the entry cannot be split, so the whole handler runs in the
+  helper through `bridge.luau` as before. This happens when the handler body
+  itself contains a construct with no faithful translation, or when a module
+  initializer needs native code.
+
+The split point is always a whole function, never inside one. A helper that
+calls a native function still compiles: the call becomes a call to the stub.
+Recursion between native functions is fine, because the helper runs real Rust.
+The build prints one line per function that crossed the boundary, for example:
+
+```
+entry widget: native `git::fetch_prs` (cache 0 ms): call to `reqwest::blocking::get` is not supported by the Luau compiler
+```
+
+### Attributes
+
+```rust
+use noctalia_rs::{Context, Op, Result, native, luau};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Row {
+    title: String,
+}
+
+/// Always runs in the plugin binary, even if the compiler could translate it.
+#[native]
+fn parse_rows(document: String) -> Result<Vec<Row>> {
+    Ok(serde_json::from_str::<Vec<Row>>(&document)?)
+}
+
+/// Same, with a 30 second cache shared by the whole helper process.
+#[native(cache_ms = 30_000)]
+fn fetch_prs(limit: usize) -> Result<Vec<Row>> {
+    let url = format!("https://api.github.com/repos/lumi673/noctalia-rs/pulls?per_page={limit}");
+    let rows = reqwest::blocking::get(url)?.json::<Vec<Row>>()?;
+    Ok(rows)
+}
+
+/// Requires Luau: the build fails with `file:line:column` instead of splitting.
+#[luau]
+fn label(count: usize) -> String {
+    format!("{count} pull requests")
+}
+
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let document = ctx.config_str("document").unwrap_or_default().into_owned();
+    let rows = parse_rows(document)?;
+    let titles = rows.iter().map(|row| row.title.clone()).collect::<Vec<_>>();
+    Ok(vec![Op::BarText { text: label(titles.len()) }])
+}
+```
+
+`#[native]` and `#[luau]` are inert attribute macros: `rustc` expands them to
+the unchanged function, and the build script reads them from the source text.
+`#[native]` and `#[native(cache_ms = ...)]` skip the translation attempt
+entirely. `#[luau]` turns a would-be split into a build error, even in `auto`.
+
+### Signature requirement
+
+The arguments and the result cross as JSON. A native function must:
+
+- take plain identifier parameters with owned types (`String`, `usize`,
+  `Vec<Row>`, `serde_json::Value`). References, `self`, generics and
+  `impl Trait` are rejected with `file:line:column`,
+- implement `serde::de::DeserializeOwned` for every parameter type,
+- return `T: serde::Serialize`, or `Result<T, E>` where `T: Serialize` and
+  `E: std::fmt::Display`.
+
+The build cannot prove the serde bounds, so it writes the dispatch table to
+`$OUT_DIR/native.rs` and `rustc` reports the missing trait on the exact
+parameter or return type.
+
+### Calling semantics
+
+Compiled Luau has no blocking. A hybrid handler runs inside a coroutine: when a
+native stub is called, the handler yields, the runtime writes the request to
+the helper's spool, and the host returns to its event loop. The helper answers
+on the existing stdout stream and the coroutine resumes where it stopped.
+
+- Ops emitted before the call apply immediately. Ops emitted after it apply
+  when the result arrives.
+- `?` on a native `Result` propagates the helper error as a Luau error, the
+  same way `Err(...)` does in compiled Luau.
+- One event per entry is handled at a time. If another event arrives while a
+  coroutine is parked, it is queued and drained in arrival order.
+- A native call inside a closure or callback cannot cross the boundary,
+  because there is no coroutine to park. Move it into the handler body or a
+  helper function, or mark that helper `#[native]` so the whole function runs
+  in the helper.
+
+### Caching
+
+`#[native]` always calls the helper. `#[native(cache_ms = 30_000)]` caches the
+result for the key `(function name, encoded arguments)` for 30 seconds. The
+compiled script keeps a bounded in-memory cache (128 entries, oldest first) and
+the helper keeps the same bound as a backstop shared by every Luau session. A
+cached call performs no round trip at all.
+
+A native function argument that contains a large table is part of the cache
+key, so change the arguments only when the result should change.
 
 
 Build and install:
