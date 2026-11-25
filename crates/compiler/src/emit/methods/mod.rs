@@ -177,8 +177,34 @@ impl<'a> Emitter<'a> {
             "lock" | "read" | "write" => {
                 return Ok(Some((receiver.to_owned(), Ty::result(ty.base))));
             }
-            "map_err" if ty.result => {
+            "map_err" => {
                 return Ok(Some((receiver.to_owned(), ty)));
+            }
+            "get_or_init" | "get_or_try_init"
+                if is_identifier(receiver)
+                    || (receiver.starts_with(|c: char| {
+                        c.is_ascii_alphabetic() || c == '_'
+                    }) && (receiver.ends_with(']')
+                        || receiver.contains('.'))) =>
+            {
+                let closure = arg(args, 0, call)?;
+                self.line(&format!("if {receiver} == nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, value_ty) = self.invoke_arg(closure, &[])?;
+                if text.is_empty() || value_ty.base == Base::Void {
+                    self.line(&format!("{receiver} = true"));
+                } else {
+                    self.line(&format!("{receiver} = {text}"));
+                }
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((
+                    receiver.to_owned(),
+                    Ty {
+                        result: false,
+                        ..value_ty
+                    },
+                )));
             }
             "unwrap_or_else" if ty.result => {
                 let closure = arg(args, 0, call)?;
@@ -349,13 +375,40 @@ impl<'a> Emitter<'a> {
         call: &ExprMethodCall,
     ) -> Result<OptionalValue, Error> {
         let method = call.method.to_string();
-        if !matches!(
-            method.as_str(),
-            "any" | "all" | "sum" | "count" | "for_each" | "find" | "position"
-        ) {
+        if method != "nth"
+            && !matches!(
+                method.as_str(),
+                "any"
+                    | "all"
+                    | "sum"
+                    | "count"
+                    | "for_each"
+                    | "find"
+                    | "position"
+            )
+        {
             return Ok(None);
         }
         let args = call.args.iter().collect::<Vec<_>>();
+        if method == "nth" {
+            let wanted = self.expr(arg(&args, 0, call)?)?.0;
+            let result = self.temp();
+            let seen = self.temp();
+            self.line(&format!("local {result}"));
+            self.line(&format!("local {seen} = 0"));
+            let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                emitter.line(&format!("{seen} = {seen} + 1"));
+                emitter.line(&format!("if {seen} == ({wanted}) then"));
+                emitter.indent = emitter.indent.saturating_add(1);
+                emitter.line(&format!("{result} = {value}"));
+                emitter.line("break");
+                emitter.indent = emitter.indent.saturating_sub(1);
+                emitter.line("end");
+                Ok(())
+            };
+            self.emit_iter(&call.receiver, &body)?;
+            return Ok(Some((result, Ty::OPT_VALUE)));
+        }
         let Some(closure) = args.first().copied() else {
             if method == "count" {
                 let (receiver, _) = self.expr(&call.receiver)?;
@@ -366,20 +419,6 @@ impl<'a> Emitter<'a> {
         if matches!(method.as_str(), "find" | "position")
             && matches!(closure, Expr::Closure(_))
         {
-            if method == "position" && is_iterator_adaptor(&call.receiver) {
-                return Err(Error::at(
-                    call.method.span(),
-                    "position after an iterator adaptor is not supported by the Luau compiler",
-                ));
-            }
-            if has_flatten_adaptor(&call.receiver) {
-                return Err(Error::at(
-                    call.method.span(),
-                    format!(
-                        "{method} after `flatten` is not supported by the Luau compiler"
-                    ),
-                ));
-            }
             let result = self.temp();
             self.line(&format!("local {result}"));
             let index = (method == "position").then(|| {
@@ -387,6 +426,7 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("local {index} = 0"));
                 index
             });
+            let nested = has_flatten_adaptor(&call.receiver);
             let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
                 if let Some(index) = &index {
                     emitter.line(&format!("{index} = {index} + 1"));
@@ -395,7 +435,12 @@ impl<'a> Emitter<'a> {
                     closure,
                     std::slice::from_ref(&value.to_owned()),
                 )?;
-                emitter.line(&format!("if {text} then"));
+                let condition = if nested {
+                    format!("{result} == nil and ({text})")
+                } else {
+                    text.clone()
+                };
+                emitter.line(&format!("if {condition} then"));
                 emitter.indent = emitter.indent.saturating_add(1);
                 let found = index.as_deref().unwrap_or(value);
                 emitter.line(&format!("{result} = {found}"));
@@ -549,6 +594,25 @@ impl<'a> Emitter<'a> {
                     };
                     return self.emit_iter(&call.receiver, &inner);
                 }
+                "splitn" | "match_indices" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let (text, ty) = self.expr(&call.receiver)?;
+                    let (list, _) = self
+                        .string_method(
+                            call,
+                            &call.method.to_string(),
+                            &args,
+                            &text,
+                            ty,
+                        )?
+                        .ok_or_else(|| {
+                            Error::at(
+                                call.method.span(),
+                                "iterator method is not supported",
+                            )
+                        })?;
+                    return self.emit_table(&list, false, false, body);
+                }
                 "split" => {
                     let args = call.args.iter().collect::<Vec<_>>();
                     let (text, _) = self.expr(&call.receiver)?;
@@ -564,6 +628,13 @@ impl<'a> Emitter<'a> {
                     let (text, _) = self.expr(&call.receiver)?;
                     let words = self.whitespace_split(&text);
                     return self.emit_table(&words, false, false, body);
+                }
+                "char_indices" => {
+                    let (text, _) = self.expr(&call.receiver)?;
+                    let pairs = format!(
+                        "(function() local __out = {{}}; for __offset, __code in utf8.codes({text}) do __out[#__out + 1] = {{ __offset - 1, utf8.char(__code) }} end; __out.__next = 1; return __out end)()"
+                    );
+                    return self.emit_table(&pairs, false, false, body);
                 }
                 "chars" | "bytes" => {
                     let (text, _) = self.expr(&call.receiver)?;
@@ -627,6 +698,109 @@ impl<'a> Emitter<'a> {
                     };
                     return self.emit_iter(&call.receiver, &inner);
                 }
+                "rev" => {
+                    let (source, _) = self.expr(&call.receiver)?;
+                    let table = self.temp();
+                    let index = self.temp();
+                    self.line(&format!("local {table} = {source}"));
+                    self.line(&format!("for {index} = #{table}, 1, -1 do"));
+                    self.indent = self.indent.saturating_add(1);
+                    let result = body(self, &format!("{table}[{index}]"));
+                    self.indent = self.indent.saturating_sub(1);
+                    self.line("end");
+                    return result;
+                }
+                "enumerate" => {
+                    let index = self.temp();
+                    self.line(&format!("local {index} = 0"));
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        emitter.line(&format!("{index} = {index} + 1"));
+                        body(emitter, &format!("{{ {index}, {value} }}"))
+                    };
+                    return self.emit_iter(&call.receiver, &inner);
+                }
+                "zip" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let (other, _) = self.expr(arg(&args, 0, call)?)?;
+                    let other_table = self.temp();
+                    let index = self.temp();
+                    self.line(&format!("local {other_table} = {other}"));
+                    self.line(&format!("local {index} = 0"));
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        emitter.line(&format!("{index} = {index} + 1"));
+                        body(
+                            emitter,
+                            &format!("{{ {value}, {other_table}[{index}] }}"),
+                        )
+                    };
+                    return self.emit_iter(&call.receiver, &inner);
+                }
+                "take_while" | "skip_while" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let closure = arg(&args, 0, call)?;
+                    let active = self.temp();
+                    self.line(&format!("local {active} = true"));
+                    let taking = call.method == "take_while";
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        emitter.line(&format!("if {active} then"));
+                        emitter.indent = emitter.indent.saturating_add(1);
+                        let (condition, _) = emitter.invoke_arg(
+                            closure,
+                            std::slice::from_ref(&value.to_owned()),
+                        )?;
+                        if taking {
+                            emitter.line(&format!(
+                                "if not ({condition}) then {active} = false end"
+                            ));
+                            emitter.line(&format!("if {active} then"));
+                            emitter.indent = emitter.indent.saturating_add(1);
+                            body(emitter, value)?;
+                            emitter.indent = emitter.indent.saturating_sub(1);
+                            emitter.line("end");
+                        } else {
+                            emitter.line(&format!(
+                                "if {condition} then {active} = false end"
+                            ));
+                            emitter.line(&format!("if not {active} then"));
+                            emitter.indent = emitter.indent.saturating_add(1);
+                            body(emitter, value)?;
+                            emitter.indent = emitter.indent.saturating_sub(1);
+                            emitter.line("end");
+                        }
+                        emitter.indent = emitter.indent.saturating_sub(1);
+                        emitter.line("end");
+                        Ok(())
+                    };
+                    return self.emit_iter(&call.receiver, &inner);
+                }
+                "flat_map" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let closure = arg(&args, 0, call)?;
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        let (text, _) = emitter.invoke_arg(
+                            closure,
+                            std::slice::from_ref(&value.to_owned()),
+                        )?;
+                        if text.is_empty() {
+                            return Ok(());
+                        }
+                        emitter.emit_table(
+                            &format!("({text})"),
+                            false,
+                            false,
+                            body,
+                        )
+                    };
+                    return self.emit_iter(&call.receiver, &inner);
+                }
                 "flatten" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     if ty.optional {
@@ -637,7 +811,7 @@ impl<'a> Emitter<'a> {
                             body,
                         );
                     }
-                    if ty.base == Base::List {
+                    if matches!(ty.base, Base::List | Base::Value | Base::Ops) {
                         let inner =
                             |emitter: &mut Self,
                              value: &str|
@@ -656,6 +830,10 @@ impl<'a> Emitter<'a> {
                 }
                 _ => {}
             },
+            Expr::Range(range) => {
+                let list = self.range_list(range)?;
+                return self.emit_table(&list, false, false, body);
+            }
             other => {
                 let (source, _) = self.expr(other)?;
                 return self.emit_table(&source, false, false, body);
@@ -874,6 +1052,11 @@ impl<'a> Emitter<'a> {
         let args = call.args.iter().collect::<Vec<_>>();
         if let Some(value) = self.entry_method(call, &method, &args)? {
             return Ok(value);
+        }
+        if method == "contains"
+            && let Expr::Range(range) = strip_reference(&call.receiver)
+        {
+            return self.range_contains(call, &args, range);
         }
         if self.is_ctx_expr(&call.receiver) {
             return self.context_method(call, &method, &args);
@@ -1766,29 +1949,14 @@ fn guard_target(expr: &Expr) -> &Expr {
     guard_target(&call.receiver)
 }
 
-fn is_iterator_adaptor(expr: &Expr) -> bool {
-    let Expr::MethodCall(call) = strip_reference(expr) else {
-        return false;
-    };
-    matches!(
-        call.method.to_string().as_str(),
-        "map"
-            | "filter"
-            | "filter_map"
-            | "take"
-            | "skip"
-            | "flatten"
-            | "rsplit"
-    )
-}
-
 /// `flatten` opens an inner loop, so a `break` in the callback would only
 /// leave that inner loop.
 fn has_flatten_adaptor(expr: &Expr) -> bool {
     let Expr::MethodCall(call) = strip_reference(expr) else {
         return false;
     };
-    call.method == "flatten" || has_flatten_adaptor(&call.receiver)
+    matches!(call.method.to_string().as_str(), "flatten" | "flat_map")
+        || has_flatten_adaptor(&call.receiver)
 }
 
 /// Every character an or-pattern of literals matches.

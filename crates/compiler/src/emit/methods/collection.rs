@@ -1,6 +1,57 @@
 use super::*;
 
 impl<'a> Emitter<'a> {
+    pub(super) fn range_contains(
+        &mut self,
+        call: &ExprMethodCall,
+        args: &[&Expr],
+        range: &syn::ExprRange,
+    ) -> Result<(String, Ty), Error> {
+        let value = self.expr(arg(args, 0, call)?)?.0;
+        let start = match &range.start {
+            Some(expr) => self.expr(expr)?.0,
+            None => "(-math.huge)".to_owned(),
+        };
+        let end = match &range.end {
+            Some(expr) => self.expr(expr)?.0,
+            None => "math.huge".to_owned(),
+        };
+        let upper = match range.limits {
+            syn::RangeLimits::HalfOpen(_) => "<",
+            syn::RangeLimits::Closed(_) => {
+                return Err(Error::at(
+                    call.method.span(),
+                    "inclusive ranges are not supported by the Luau compiler",
+                ));
+            }
+        };
+        Ok((
+            format!(
+                "(function() local __v = {value}; return (__v >= ({start}) and __v {upper} ({end})) end)()"
+            ),
+            Ty::BOOL,
+        ))
+    }
+    pub(super) fn range_list(
+        &mut self,
+        range: &syn::ExprRange,
+    ) -> Result<String, Error> {
+        let start = match &range.start {
+            Some(expr) => self.expr(expr)?.0,
+            None => "1".to_owned(),
+        };
+        let end = match &range.end {
+            Some(expr) => self.expr(expr)?.0,
+            None => "0".to_owned(),
+        };
+        let stop = match range.limits {
+            syn::RangeLimits::HalfOpen(_) => format!("(({end}) - 1)"),
+            syn::RangeLimits::Closed(_) => format!("({end})"),
+        };
+        Ok(format!(
+            "(function() local __out = {{}}; for __i = ({start}), {stop} do __out[#__out + 1] = __i end; return __out end)()"
+        ))
+    }
     pub(super) fn collection_method(
         &mut self,
         call: &ExprMethodCall,
@@ -25,6 +76,18 @@ impl<'a> Emitter<'a> {
             | "as_bytes" | "into_bytes" | "copied" | "peekable"
             | "iter_mut" => Ok((receiver.to_owned(), ty)),
             "first" => Ok((format!("({receiver}[1])"), Ty::OPT_VALUE)),
+            "nth"
+                if matches!(ty.base, Base::List | Base::Ops | Base::Value) =>
+            {
+                let index = self.expr(arg(args, 0, call)?)?.0;
+                Ok((format!("({receiver}[({index}) + 1])"), Ty::OPT_VALUE))
+            }
+            "last" => Ok((
+                format!(
+                    "(function() local __v = {receiver}; if type(__v) == \"string\" then return string.byte(__v, #__v) end; return __v[#__v] end)()"
+                ),
+                Ty::OPT_VALUE,
+            )),
             "pop" => Ok((format!("table.remove({receiver})"), Ty::OPT_VALUE)),
             "push_back" => {
                 let item = arg(args, 0, call)?;
@@ -39,12 +102,6 @@ impl<'a> Emitter<'a> {
                 Ok((format!("table.insert({receiver}, {text})"), Ty::VOID))
             }
             "flatten" if ty.optional || ty.base == Base::List => {
-                if ty.optional && ty.base != Base::List {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "flatten() needs an optional list or a list of lists",
-                    ));
-                }
                 if ty.optional {
                     Ok((format!("({receiver} or {{}})"), Ty::LIST))
                 } else {
@@ -95,7 +152,9 @@ impl<'a> Emitter<'a> {
                     Expr::Closure(closure) => closure.inputs.len(),
                     _ => 1,
                 };
-                if ty.base == Base::Table {
+                if ty.base == Base::Table
+                    || (ty.base == Base::Value && arity == 2)
+                {
                     if arity != 2 {
                         return Err(Error::at(
                             call.method.span(),
@@ -115,7 +174,10 @@ impl<'a> Emitter<'a> {
                     ));
                     self.indent = self.indent.saturating_sub(1);
                     self.line("end");
-                } else if ty.base == Base::List {
+                } else if matches!(
+                    ty.base,
+                    Base::List | Base::Ops | Base::Value
+                ) {
                     if arity != 1 {
                         return Err(Error::at(
                             call.method.span(),
@@ -142,12 +204,97 @@ impl<'a> Emitter<'a> {
                 }
                 Ok((String::new(), Ty::VOID))
             }
-            "sort_by" | "sort_unstable_by" | "sort_by_key" => Err(Error::at(
-                call.method.span(),
-                format!(
-                    "`{method}` needs a Rust comparator and is not supported by the Luau compiler"
-                ),
-            )),
+            "sort"
+                if matches!(ty.base, Base::List | Base::Ops | Base::Value)
+                    && args.is_empty() =>
+            {
+                self.line(&format!("table.sort({receiver})"));
+                Ok((String::new(), Ty::VOID))
+            }
+            "sort_by" | "sort_unstable_by"
+                if matches!(ty.base, Base::List | Base::Ops | Base::Value) =>
+            {
+                let closure = arg(args, 0, call)?;
+                let left = self.temp();
+                let right = self.temp();
+                self.line(&format!(
+                    "table.sort({receiver}, function({left}, {right})"
+                ));
+                self.indent = self.indent.saturating_add(1);
+                let (order, _) =
+                    self.invoke_arg(closure, &[left.clone(), right.clone()])?;
+                self.line(&format!(
+                    "if ({order}) == \"Less\" then return true end"
+                ));
+                self.line("return false");
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end)");
+                Ok((String::new(), Ty::VOID))
+            }
+            "sort_by_key" | "sort_unstable_by_key"
+                if matches!(ty.base, Base::List | Base::Ops | Base::Value) =>
+            {
+                let closure = arg(args, 0, call)?;
+                let left = self.temp();
+                let right = self.temp();
+                let left_key = self.temp();
+                let right_key = self.temp();
+                self.line(&format!("local {left_key}, {right_key}"));
+                self.line(&format!(
+                    "table.sort({receiver}, function({left}, {right})"
+                ));
+                self.indent = self.indent.saturating_add(1);
+                self.line("do");
+                self.indent = self.indent.saturating_add(1);
+                let (text, _) =
+                    self.invoke_arg(closure, std::slice::from_ref(&left))?;
+                self.line(&format!("{left_key} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                self.line("do");
+                self.indent = self.indent.saturating_add(1);
+                let (text, _) =
+                    self.invoke_arg(closure, std::slice::from_ref(&right))?;
+                self.line(&format!("{right_key} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                self.line(&format!("return ({left_key}) < ({right_key})"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end)");
+                Ok((String::new(), Ty::VOID))
+            }
+            "then" if matches!(args.first(), Some(Expr::Closure(_))) => {
+                let closure = arg(args, 0, call)?;
+                let flag = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {flag} = {receiver}"));
+                self.line(&format!("local {result}"));
+                self.line(&format!("if {flag} then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, value_ty) = self.invoke_arg(closure, &[])?;
+                self.line(&format!("{result} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok((result, Ty::opt(value_ty.base)))
+            }
+            "then_with" => {
+                let closure = arg(args, 0, call)?;
+                let order = self.temp();
+                self.line(&format!("local {order} = {receiver}"));
+                self.line(&format!("if {order} == \"Equal\" then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, _) = self.invoke_arg(closure, &[])?;
+                self.line(&format!("{order} = {text}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                Ok((order, Ty::VALUE))
+            }
+            "reverse" if ty.base == Base::Value => {
+                let order = self.temp();
+                let mapping = "(function(__o) if __o == \"Less\" then return \"Greater\" elseif __o == \"Greater\" then return \"Less\" end return __o end)";
+                self.line(&format!("local {order} = {mapping}({receiver})"));
+                Ok((order, Ty::VALUE))
+            }
             "then_some" => {
                 let value = self.expr(arg(args, 0, call)?)?.0;
                 let stored = self.temp();
@@ -357,7 +504,20 @@ impl<'a> Emitter<'a> {
                 Ok((format!("unwrap({receiver})"), Ty::new(ty.base)))
             }
             "unwrap_or" => {
-                let (default, default_ty) = self.expr(arg(args, 0, call)?)?;
+                let fallback = arg(args, 0, call)?;
+                let (default, default_ty) =
+                    match path_last_name(fallback).as_deref() {
+                        Some(name) if name.ends_with("Ordering::Equal") => {
+                            ("\"Equal\"".to_owned(), Ty::VALUE)
+                        }
+                        Some(name) if name.ends_with("Ordering::Less") => {
+                            ("\"Less\"".to_owned(), Ty::VALUE)
+                        }
+                        Some(name) if name.ends_with("Ordering::Greater") => {
+                            ("\"Greater\"".to_owned(), Ty::VALUE)
+                        }
+                        _ => self.expr(fallback)?,
+                    };
                 if !ty.result
                     && (ty.base == Base::Bool || default_ty.base == Base::Bool)
                 {

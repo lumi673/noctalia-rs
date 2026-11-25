@@ -1037,10 +1037,14 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(text)])
 }
 "#;
-    let error =
+    let compiled =
         compile(&source(indices), &options("handler", EntryKind::Service))
-            .expect_err("bails");
-    assert!(error.message.contains("char_indices"), "{}", error.message);
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("utf8.codes(text)"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]
@@ -1151,15 +1155,11 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 
 #[test]
 fn bails_on_comparators_and_type_erased_maps() {
-    for handler in [
-        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let mut values = vec![2, 1]; values.sort_by(|a, b| a.cmp(b)); Ok(vec![]) }",
-        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let cell = once_cell(); cell.get_or_init(|| 1); Ok(vec![]) }",
-    ] {
-        let error =
-            compile(&source(handler), &options("handler", EntryKind::Service))
-                .expect_err("bail");
-        assert!(error.line > 0 && error.column > 0, "{error:?}");
-    }
+    let handler = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let cell = once_cell(); cell.get_or_init(|| 1); Ok(vec![]) }";
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bail");
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
 }
 
 #[test]
@@ -1222,11 +1222,14 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(format!("{found}"))])
 }
 "#;
-    let error =
+    let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect_err("bail");
-    assert!(error.message.contains("flatten"), "{}", error.message);
-    assert!(error.line > 0 && error.column > 0, "{error:?}");
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("__t1 == nil and"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]
@@ -1539,4 +1542,213 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(source.contains("__keys.__next = 1"), "{source}");
     assert!(source.contains("for __key in pairs(map) do"), "{source}");
     assert!(source.contains("local key = __t"), "{source}");
+}
+
+#[test]
+fn lowers_numeric_edge_methods() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let n: i64 = 7;
+    let clamped = n.saturating_sub(9);
+    let wrapped = n.wrapping_add(2);
+    let divided = n.div_ceil(3);
+    let power = 2.0_f64.powi(3);
+    let decimal = 100.0_f64.log10();
+    let signed = (-1.0_f64).is_sign_positive();
+    Ok(vec![Op::log(format!("{} {} {} {} {} {}", clamped, wrapped, divided, power, decimal, signed))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let emitted = &compiled.source;
+    assert!(
+        emitted.contains("math.clamp((math.floor(n) - math.floor(9))"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("(math.floor(n) + math.floor(2))"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("function() local __a, __b = math.floor(n)"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("math.pow(2.0, 3)"), "{emitted}");
+    assert!(emitted.contains("math.log(100.0, 10)"), "{emitted}");
+    assert!(emitted.contains("(1 / __v) > 0"), "{emitted}");
+}
+
+#[test]
+fn lowers_remaining_string_methods() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.config_str("message").unwrap_or_default();
+    let pieces = text.splitn(2, ',').collect::<Vec<_>>();
+    let replaced = text.replacen("a", "b", 1);
+    let divided = text.rsplit_once('/');
+    let terminated = text.split_terminator(',');
+    let same = text.eq_ignore_ascii_case("ABC");
+    let indexed = text.char_indices().collect::<Vec<_>>();
+    let matches = text.match_indices("a").collect::<Vec<_>>();
+    let mut owned = text.clone();
+    owned.truncate(2);
+    let _ = (divided, terminated, matches);
+    Ok(vec![Op::log(format!("{} {} {} {} {}", pieces.len(), replaced, same, indexed.len(), owned))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let emitted = &compiled.source;
+    assert!(
+        emitted.contains("string.find(__s, __sep, __start, true)"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("table.concat(__out)"), "{emitted}");
+    assert!(
+        emitted.contains("if not __last then return nil end"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("__parts[#__parts] == \"\""), "{emitted}");
+    assert!(emitted.contains("string.lower("), "{emitted}");
+    assert!(emitted.contains("utf8.codes("), "{emitted}");
+    assert!(emitted.contains("string.sub(owned, 1"), "{emitted}");
+}
+
+#[test]
+fn lowers_sort_and_iterator_adaptors() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut names = vec!["b".to_owned(), "a".to_owned()];
+    names.sort();
+    names.sort_by(|left, right| left.cmp(right));
+    let mut numbers = vec![1, 2, 3];
+    numbers.retain(|number| *number > 1);
+    let pairs = numbers.iter().enumerate().collect::<Vec<_>>();
+    let backwards = numbers.iter().rev().collect::<Vec<_>>();
+    let taken = numbers.iter().take_while(|number| **number < 3).collect::<Vec<_>>();
+    let zipped = numbers.iter().zip(names.iter()).collect::<Vec<_>>();
+    let found = names.iter().find(|name| name.as_str() == "a");
+    let _ = (pairs, backwards, taken, zipped, found);
+    Ok(Vec::new())
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let emitted = &compiled.source;
+    assert!(emitted.contains("table.sort(names)"), "{emitted}");
+    assert!(
+        emitted.contains("== \"Less\" then return true"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("table.remove(numbers"), "{emitted}");
+    assert!(emitted.contains(", 1, -1 do"), "{emitted}");
+    assert!(emitted.contains("__t6 = __t6 + 1"), "{emitted}");
+    assert!(emitted.contains("then __t14 = false end"), "{emitted}");
+    assert!(emitted.contains("__t20] }"), "{emitted}");
+}
+
+#[test]
+fn lowers_cells_ranges_and_bool_then() {
+    let handler = r#"
+static CELL: OnceLock<i64> = OnceLock::new();
+fn cell() -> i64 {
+    let slot = &CELL;
+    *slot.get_or_init(|| 3)
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.config_str("count").unwrap_or_default().parse::<f64>().unwrap_or(0.0);
+    let inside = (0.0..300.0).contains(&value);
+    let kept = (!String::new().is_empty()).then(|| 1);
+    let nth = (0..4).map(|index| index + 1).nth(2);
+    Ok(vec![Op::log(format!("{} {} {} {}", cell(), inside, kept.unwrap_or(0), nth.unwrap_or(0)))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let emitted = &compiled.source;
+    assert!(emitted.contains("if slot == nil then"), "{emitted}");
+    assert!(
+        emitted.contains("__v >= (0.0) and __v < (300.0)"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("if __t6 then"), "{emitted}");
+    assert!(emitted.contains("for __i = (0), ((4) - 1) do"), "{emitted}");
+}
+
+#[test]
+fn rejects_inclusive_range_contains() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = 2;
+    if (0..=3).contains(&value) {
+        return Ok(vec![Op::log("yes")]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("inclusive range is rejected");
+    let rendered = error.render("main.rs");
+    assert!(
+        rendered.contains("inclusive ranges are not supported"),
+        "{rendered}"
+    );
+    assert!(error.line > 0 && error.column > 0, "{rendered}");
+}
+
+#[test]
+fn lowers_remaining_numeric_string_and_iterator_branches() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let a: i64 = 3;
+    let product = a.saturating_mul(4);
+    let underflow = a.wrapping_sub(9);
+    let order = a.cmp(&4);
+    let left = 1.0_f64;
+    let right = 2.0_f64;
+    let partial = left.partial_cmp(&right);
+    let total = left.total_cmp(&right);
+    let text = ctx.config_str("message").unwrap_or_default();
+    let repeated = text.repeat(2);
+    let utf8 = "é".len_utf8();
+    let cascade = "a".cmp("b").then_with(|| "x".cmp("y")).reverse();
+    let flat = vec![vec![1, 2], vec![3]].into_iter().flat_map(|items| items).collect::<Vec<_>>();
+    let mut words = vec!["aaa".to_owned(), "b".to_owned()];
+    words.sort_by_key(|word| word.len());
+    let _ = (partial, total, utf8, cascade, flat);
+    Ok(vec![Op::log(format!("{} {} {} {} {}", product, underflow, order, repeated, words.len()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let emitted = &compiled.source;
+    assert!(
+        emitted.contains("math.clamp((math.floor(a) * math.floor(4))"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("(math.floor(a) - math.floor(9))"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("return nil end; if __a < __b"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("if (1 / __a) < (1 / __b) then"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("string.rep("), "{emitted}");
+    assert!(emitted.contains("utf8.codes(\"é\")"), "{emitted}");
+    assert!(
+        emitted.contains("== \"Less\" then return \"Greater\""),
+        "{emitted}"
+    );
+    assert!(emitted.contains("table.sort(words, function"), "{emitted}");
 }

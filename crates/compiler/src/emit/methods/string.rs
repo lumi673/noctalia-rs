@@ -74,7 +74,7 @@ impl<'a> Emitter<'a> {
                 }
                 Ok((Self::reverse_split(receiver, &separator), Ty::LIST))
             }
-            "match_indices" if ty.base == Base::Str => {
+            "match_indices" if ty.is_string() || ty.base == Base::Value => {
                 let needle = self.expr(arg(args, 0, call)?)?.0;
                 Ok((
                     format!(
@@ -126,7 +126,7 @@ impl<'a> Emitter<'a> {
                 format!("(string.find({receiver}, \"^%s+$\") ~= nil)"),
                 Ty::BOOL,
             )),
-            "is_char_boundary" | "char_indices" => Err(Error::at(
+            "is_char_boundary" => Err(Error::at(
                 call.method.span(),
                 format!(
                     "`{method}` has no Luau equivalent and is not supported by the Luau compiler"
@@ -221,6 +221,115 @@ impl<'a> Emitter<'a> {
                     Ty::BOOL,
                 ))
             }
+            "split_terminator" => {
+                let separator = self.expr(arg(args, 0, call)?)?.0;
+                if !ty.is_string() && ty.base != Base::Value {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "split_terminator() needs a string receiver",
+                    ));
+                }
+                Ok((
+                    format!(
+                        "(function() local __parts = string.split({receiver}, {separator}); if #__parts > 0 and __parts[#__parts] == \"\" then table.remove(__parts) end; __parts.__next = 1; return __parts end)()"
+                    ),
+                    Ty::LIST,
+                ))
+            }
+            "rsplit_once" => {
+                let separator = self.expr(arg(args, 0, call)?)?.0;
+                if !ty.is_string() && ty.base != Base::Value {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "rsplit_once() needs a string receiver",
+                    ));
+                }
+                Ok((
+                    format!(
+                        "(function() local __s, __sep = {receiver}, {separator}; local __at = string.find(__s, __sep, 1, true); local __last; while __at do __last = __at; __at = string.find(__s, __sep, __at + 1, true) end; if not __last then return nil end; return {{ string.sub(__s, 1, __last - 1), string.sub(__s, __last + #__sep) }} end)()"
+                    ),
+                    Ty::opt(Base::List),
+                ))
+            }
+            "replacen" => {
+                let from = self.expr(arg(args, 0, call)?)?.0;
+                let to = self.expr(arg(args, 1, call)?)?.0;
+                let count = self.expr(arg(args, 2, call)?)?.0;
+                if !ty.is_string() && ty.base != Base::Value {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "replacen() needs a string receiver",
+                    ));
+                }
+                Ok((
+                    format!(
+                        "(function() local __text, __from, __to, __limit = {receiver}, {from}, {to}, {count}; if __from == \"\" or __limit <= 0 then return __text end; local __out, __start, __done = {{}}, 1, 0; while __done < __limit do local __at = string.find(__text, __from, __start, true); if not __at then break end; __out[#__out + 1] = string.sub(__text, __start, __at - 1); __out[#__out + 1] = __to; __start = __at + #__from; __done = __done + 1 end; __out[#__out + 1] = string.sub(__text, __start); return table.concat(__out) end)()"
+                    ),
+                    Ty::STR,
+                ))
+            }
+            "eq_ignore_ascii_case" => {
+                let other = self.expr(arg(args, 0, call)?)?.0;
+                Ok((
+                    format!(
+                        "(string.lower({receiver}) == string.lower({other}))"
+                    ),
+                    Ty::BOOL,
+                ))
+            }
+            "truncate" if ty.is_string() && !ty.optional => {
+                let length = self.expr(arg(args, 0, call)?)?.0;
+                self.line(&format!(
+                    "{receiver} = string.sub({receiver}, 1, math.max(0, math.floor({length})))"
+                ));
+                Ok((String::new(), Ty::VOID))
+            }
+            "char_indices" if ty.is_string() || ty.base == Base::Value => Ok((
+                format!(
+                    "(function() local __out = {{}}; for __offset, __code in utf8.codes({receiver}) do __out[#__out + 1] = {{ __offset - 1, utf8.char(__code) }} end; __out.__next = 1; return __out end)()"
+                ),
+                Ty::LIST,
+            )),
+            "cmp"
+                if !matches!(
+                    ty.base,
+                    Base::Ops | Base::Void | Base::Context
+                ) =>
+            {
+                let other = self.expr(arg(args, 0, call)?)?.0;
+                Ok((
+                    format!(
+                        "(function() local __a, __b = {receiver}, {other}; if __a < __b then return \"Less\" end; if __a > __b then return \"Greater\" end; return \"Equal\" end)()"
+                    ),
+                    Ty::VALUE,
+                ))
+            }
+            "splitn" => {
+                let separator = self.expr(arg(args, 0, call)?)?.0;
+                let limit = self.expr(arg(args, 1, call)?)?.0;
+                if !ty.is_string() && ty.base != Base::Value {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "splitn() needs a string receiver",
+                    ));
+                }
+                Ok((
+                    format!(
+                        "(function() local __s, __sep, __n = {receiver}, {separator}, math.max(0, math.floor({limit})); local __out = {{}}; if __n == 0 then return __out end; local __start = 1; while __n > 1 do local __at = string.find(__s, __sep, __start, true); if not __at then break end; __out[#__out + 1] = string.sub(__s, __start, __at - 1); __start = __at + #__sep; __n = __n - 1 end; __out[#__out + 1] = string.sub(__s, __start); __out.__next = 1; return __out end)()"
+                    ),
+                    Ty::LIST,
+                ))
+            }
+            "repeat" if ty.is_string() || ty.base == Base::Value => {
+                let count = self.expr(arg(args, 0, call)?)?.0;
+                Ok((format!("string.rep({receiver}, {count})"), Ty::STR))
+            }
+            "len_utf8" if ty.is_string() || ty.base == Base::Value => Ok((
+                format!(
+                    "(function() for __offset in utf8.codes({receiver}) do if __offset > 1 then return __offset - 1 end end; return #{receiver} end)()"
+                ),
+                Ty::INT,
+            )),
             _ => return Ok(None),
         };
         Ok(Some(value?))
