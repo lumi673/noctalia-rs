@@ -799,6 +799,11 @@ fn write_native(
         "    ) -> Result<Value, String> {\n",
         "        match name {\n",
     ));
+    let needs_pathbuf = natives.values().any(|item| {
+        item.params
+            .iter()
+            .any(|param| param.owned.as_deref() == Some("PathBuf"))
+    });
     for item in natives.values() {
         let mut rust_path = String::from("crate::");
         if item.module != "main" {
@@ -810,13 +815,26 @@ fn write_native(
             rust_path.push_str("::");
         }
         rust_path.push_str(&item.function);
-        let args = item.params.join(", ");
+        let mut args = Vec::new();
+        for param in &item.params {
+            let name = &param.name;
+            args.push(if param.slice {
+                format!("&{name}[..]")
+            } else if param.borrow {
+                format!("&{name}")
+            } else {
+                name.clone()
+            });
+        }
+        let args = args.join(", ");
         let _ = writeln!(out, "            {} => {{", quote(&item.name));
         for param in &item.params {
+            let name = &param.name;
+            let declared = param.owned.as_deref().unwrap_or("_");
             let _ = writeln!(
                 out,
-                "                let {param}: _ = argument(&args, {})?;",
-                quote(param)
+                "                let {name}: {declared} = argument(&args, {})?;",
+                quote(name)
             );
         }
         if item.result {
@@ -833,6 +851,14 @@ fn write_native(
             let _ = writeln!(out, "                value({rust_path}({args}))");
         }
         let _ = writeln!(out, "            }}");
+    }
+    if needs_pathbuf {
+        // Insert the import after the existing `use serde_json::Value;` line.
+        out = out.replacen(
+            "    use serde_json::Value;\n",
+            "    use serde_json::Value;\n    use std::path::PathBuf;\n",
+            1,
+        );
     }
     out.push_str(concat!(
         "            _ => Err(format!(\"unknown native function `{name}`\")),\n",

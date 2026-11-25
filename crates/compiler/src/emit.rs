@@ -11,8 +11,8 @@ use syn::{
 
 use crate::program::{Program, typed_args};
 use crate::{
-    Error, NativeFn, NativeMode, is_context, is_identifier, is_luau_keyword,
-    quote, sanitize,
+    Error, NativeFn, NativeMode, NativeParam, is_context, is_identifier,
+    is_luau_keyword, quote, sanitize,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6922,11 +6922,12 @@ pub(crate) fn native_local(name: &str) -> String {
 pub(crate) fn stub_source(item: &NativeFn) -> String {
     let mut declared = Vec::new();
     let mut fields = Vec::new();
-    for (index, name) in item.params.iter().enumerate() {
+    for (index, param) in item.params.iter().enumerate() {
+        let name = &param.name;
         let local = if is_luau_keyword(name) {
             format!("{name}_{}", index + 1)
         } else {
-            (*name).clone()
+            name.clone()
         };
         declared.push(local.clone());
         let key = if is_identifier(name) && !is_luau_keyword(name) {
@@ -7122,7 +7123,7 @@ fn native_reason(error: &Error) -> String {
 }
 
 /// Checks the JSON-crossable signature a native function needs.
-fn native_signature(function: &ItemFn) -> Result<Vec<String>, Error> {
+fn native_signature(function: &ItemFn) -> Result<Vec<NativeParam>, Error> {
     let name = function.sig.ident.to_string();
     if !function.sig.generics.params.is_empty() {
         return Err(Error::at(
@@ -7158,33 +7159,15 @@ fn native_signature(function: &ItemFn) -> Result<Vec<String>, Error> {
                 ),
             ));
         }
-        match ty {
-            Type::Reference(_) => {
-                return Err(Error::at(
-                    ty.span(),
-                    format!(
-                        "native function `{name}` parameters cannot be references; take owned values"
-                    ),
-                ));
-            }
-            Type::ImplTrait(_) => {
-                return Err(Error::at(
-                    ty.span(),
-                    format!(
-                        "native function `{name}` parameters cannot be `impl Trait`; name the type"
-                    ),
-                ));
-            }
-            _ => {}
-        }
-        params.push(pattern.ident.to_string());
+        let param = native_param(pattern.ident.to_string(), ty, &name)?;
+        params.push(param);
     }
     if let syn::ReturnType::Type(_, ty) = &function.sig.output {
-        if matches!(&**ty, Type::Reference(_) | Type::ImplTrait(_)) {
+        if matches!(&**ty, Type::ImplTrait(_)) {
             return Err(Error::at(
                 ty.span(),
                 format!(
-                    "native function `{name}` must return an owned value or `Result<T, E>`"
+                    "native function `{name}` must return a concrete value or `Result<T, E>`"
                 ),
             ));
         }
@@ -7198,6 +7181,68 @@ fn native_signature(function: &ItemFn) -> Result<Vec<String>, Error> {
         }
     }
     Ok(params)
+}
+
+/// Maps one declared parameter to the local the dispatch needs.
+fn native_param(
+    name: String,
+    ty: &Type,
+    function: &str,
+) -> Result<NativeParam, Error> {
+    let mut param = NativeParam {
+        name,
+        owned: None,
+        borrow: false,
+        slice: false,
+    };
+    let Type::Reference(reference) = ty else {
+        if matches!(ty, Type::ImplTrait(_)) {
+            return Err(Error::at(
+                ty.span(),
+                format!(
+                    "native function `{function}` parameters cannot be `impl Trait`; name the type"
+                ),
+            ));
+        }
+        return Ok(param);
+    };
+    if reference.mutability.is_some() {
+        return Err(Error::at(
+            ty.span(),
+            format!(
+                "native function `{function}` cannot take `&mut` parameters; changes would be lost"
+            ),
+        ));
+    }
+    if matches!(&*reference.elem, Type::Reference(_)) {
+        return Err(Error::at(
+            ty.span(),
+            format!(
+                "native function `{function}` cannot take nested references"
+            ),
+        ));
+    }
+    param.borrow = true;
+    let owned = match &*reference.elem {
+        Type::Slice(_) => {
+            param.slice = true;
+            Some("Vec<_>".to_owned())
+        }
+        inner => match type_text(inner).as_str() {
+            "str" | "String" => Some("String".to_owned()),
+            "Path" | "PathBuf" => Some("PathBuf".to_owned()),
+            "Vec" => {
+                param.slice = true;
+                Some("Vec<_>".to_owned())
+            }
+            _ => None,
+        },
+    };
+    param.owned = owned;
+    if param.slice {
+        param.borrow = false;
+    }
+    Ok(param)
 }
 
 #[derive(Default)]

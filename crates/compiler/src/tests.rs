@@ -4379,7 +4379,7 @@ fn auto_mode_splits_at_the_function_boundary() {
     assert_eq!(compiled.native.len(), 1, "{:?}", compiled.native);
     let native = &compiled.native[0];
     assert_eq!(native.name, "main::load_rows");
-    assert_eq!(native.params, Vec::<String>::new());
+    assert!(native.params.is_empty());
     assert!(native.reason.contains("std::fs"), "{}", native.reason);
     assert!(
         compiled.source.contains(
@@ -4468,7 +4468,14 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 
     assert_eq!(compiled.native.len(), 1);
     assert_eq!(compiled.native[0].cache_ms, 30_000);
-    assert_eq!(compiled.native[0].params, vec!["value".to_owned()]);
+    assert_eq!(
+        compiled.native[0]
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["value"]
+    );
     assert!(
         compiled.source.contains("{ value = value }, 30000"),
         "{}",
@@ -4507,25 +4514,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn native_signatures_reject_references_and_self() {
-    let reference = r#"
-fn load_rows(path: &str) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path)?;
-    Ok(vec![text])
-}
-
-fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let rows = load_rows("/tmp/rows")?;
-    Ok(vec![Op::log(rows.join(","))])
-}
-"#;
-    let error = compile(
-        &source(reference),
-        &native_options("handler", EntryKind::Widget),
-    )
-    .expect_err("references cannot cross the boundary");
-    assert!(error.message.contains("cannot be references"), "{error}");
-
+fn native_methods_with_self_are_rejected() {
     let receiver = r#"
 struct Store {
     value: i64,
@@ -4615,4 +4604,79 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "{}",
         compiled.source
     );
+}
+
+#[test]
+fn native_reference_parameters_receive_owned_values() {
+    let handler = r#"
+fn parse(path: &str, items: &[String]) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(vec![format!("{text}{}", items.len())])
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = parse("/tmp/x", &["a".to_owned()])?;
+    Ok(vec![Op::log(rows.join(","))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    let params = &compiled.native[0].params;
+    assert_eq!(params.len(), 2);
+    assert_eq!(params[0].name, "path");
+    assert_eq!(params[0].owned.as_deref(), Some("String"));
+    assert!(params[0].borrow);
+    assert_eq!(params[1].name, "items");
+    assert_eq!(params[1].owned.as_deref(), Some("Vec<_>"));
+    assert!(params[1].slice);
+    assert!(!params[1].borrow);
+}
+
+#[test]
+fn native_mutable_and_nested_reference_parameters_are_rejected() {
+    let mutable = r#"
+fn parse(path: &mut String) -> Result<Vec<String>> {
+    path.push('x');
+    let text = std::fs::read_to_string(path)?;
+    Ok(vec![text])
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = parse(&mut "a".to_owned())?;
+    Ok(vec![Op::log(rows.join(","))])
+}
+"#;
+    let error = compile(
+        &source(mutable),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect_err("mutable references lose writes");
+    assert!(error.message.contains("&mut"), "{error}");
+}
+
+#[test]
+fn native_reference_returns_are_serialized() {
+    let handler = r#"
+fn label() -> Result<&'static str> {
+    let text = std::fs::read_to_string("/tmp/x")?;
+    let _ = text;
+    Ok("ready")
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = label()?;
+    Ok(vec![Op::log(text.to_owned())])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("reference returns serialize");
+    assert_eq!(compiled.native.len(), 1);
+    assert!(compiled.native[0].result);
 }

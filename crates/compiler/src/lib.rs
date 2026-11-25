@@ -276,6 +276,20 @@ pub enum NativeMode {
     Deny,
 }
 
+/// One argument of a native function.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeParam {
+    /// Parameter name in the Rust signature.
+    pub name: String,
+    /// Owned type for the local that receives the deserialized value, when the
+    /// declared parameter is a reference that needs one (`&str` -> `String`).
+    pub owned: Option<String>,
+    /// Pass `&local`.
+    pub borrow: bool,
+    /// Pass `&local[..]`.
+    pub slice: bool,
+}
+
 /// One function that runs in the helper process instead of in Luau.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeFn {
@@ -285,8 +299,8 @@ pub struct NativeFn {
     pub module: String,
     /// Function identifier.
     pub function: String,
-    /// Parameter names, in declaration order.
-    pub params: Vec<String>,
+    /// Parameters, in declaration order.
+    pub params: Vec<NativeParam>,
     /// Implementing type for an inherent method.
     pub class: Option<String>,
     /// Whether the declared return type is `Result<...>`.
