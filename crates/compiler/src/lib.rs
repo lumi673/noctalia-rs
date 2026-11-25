@@ -289,6 +289,8 @@ pub struct NativeFn {
     pub params: Vec<String>,
     /// Implementing type for an inherent method.
     pub class: Option<String>,
+    /// Whether the declared return type is `Result<...>`.
+    pub result: bool,
     /// In-helper cache lifetime in milliseconds, `0` for no cache.
     pub cache_ms: u64,
     /// Why the function crossed the boundary.

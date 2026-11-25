@@ -4315,6 +4315,45 @@ fn native_options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
     }
 }
 
+#[test]
+fn native_result_flag_tracks_the_declared_return_type() {
+    let handler = r#"
+#[native]
+fn load_rows() -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+#[native]
+fn now() -> i64 {
+    1
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = load_rows()?;
+    let time = now();
+    Ok(vec![Op::log(rows.join(",")), Op::log(format!("{time}"))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    let load = compiled
+        .native
+        .iter()
+        .find(|item| item.function == "load_rows")
+        .expect("Result native");
+    let now = compiled
+        .native
+        .iter()
+        .find(|item| item.function == "now")
+        .expect("plain native");
+    assert!(load.result, "{load:?}");
+    assert!(!now.result, "{now:?}");
+}
+
 const NATIVE_HELPER: &str = r#"
 use noctalia_rs::{Context, Op, Result};
 

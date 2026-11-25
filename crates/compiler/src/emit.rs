@@ -732,6 +732,10 @@ impl<'a> Emitter<'a> {
             module: helper.module.clone(),
             function: helper.function.sig.ident.to_string(),
             class: helper.class.clone(),
+            result: matches!(
+                &helper.function.sig.output,
+                syn::ReturnType::Type(_, ty) if is_result(ty)
+            ),
             params,
             cache_ms,
             reason: reason.to_owned(),
