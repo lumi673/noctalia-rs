@@ -950,6 +950,11 @@ impl<'a> Emitter<'a> {
             Pat::Type(typed) => (&*typed.pat, Some(&*typed.ty)),
             other => (other, None),
         };
+        if let (Pat::Wild(_), Some(init)) = (pattern, &local.init)
+            && self.is_ctx_expr(&init.expr)
+        {
+            return Ok(());
+        }
         if let Some(init) = &local.init
             && let Some((_, diverge)) = &init.diverge
         {
@@ -2082,11 +2087,51 @@ impl<'a> Emitter<'a> {
             self.line("end");
             return Ok(());
         }
-        if bindings.len() > 1 && ty.base == Base::Value {
-            return Err(Error::at(
-                item.pat.span(),
-                "tuple loop bindings need a list of tuples",
+        if bindings.len() > 1 && ty.base == Base::Value && !enumerate {
+            if bindings.len() != 2 {
+                return Err(Error::at(
+                    item.pat.span(),
+                    "tuple loop bindings over a JSON object need two names",
+                ));
+            }
+            self.line(&format!(
+                "if type({source}) == \"table\" and type({source}[1]) == \"table\" then"
             ));
+            self.indent = self.indent.saturating_add(1);
+            let index = self.temp();
+            self.line(&format!("local {index} = {source}.__next or 1"));
+            self.line(&format!("for {index} = {index}, #{source} do"));
+            self.indent = self.indent.saturating_add(1);
+            for (position, name) in bindings.iter().enumerate() {
+                let Some(name) = name else { continue };
+                self.push(name, Ty::VALUE);
+                self.line(&format!(
+                    "local {name} = {source}[{index}][{}]",
+                    position + 1
+                ));
+            }
+            self.line(&format!(
+                "if {source}.__next ~= nil then {source}.__next = {index} + 1 end"
+            ));
+            self.statement_block(&item.body)?;
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            self.indent = self.indent.saturating_sub(1);
+            self.line("else");
+            self.indent = self.indent.saturating_add(1);
+            let first = bindings[0].clone().unwrap_or_else(|| "_".to_owned());
+            let second = bindings[1].clone().unwrap_or_else(|| "_".to_owned());
+            for name in bindings.iter().flatten() {
+                self.push(name, Ty::VALUE);
+            }
+            self.line(&format!("for {first}, {second} in pairs({source}) do"));
+            self.indent = self.indent.saturating_add(1);
+            self.statement_block(&item.body)?;
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            return Ok(());
         }
         let index = self.temp();
         self.line(&format!("local {index} = {source}.__next or 1"));
@@ -3181,8 +3226,8 @@ impl<'a> Emitter<'a> {
             return Ok(None);
         };
         if matches!(method.as_str(), "find" | "position")
-                && matches!(closure, Expr::Closure(_))
-            {
+            && matches!(closure, Expr::Closure(_))
+        {
             if method == "position" && is_iterator_adaptor(&call.receiver) {
                 return Err(Error::at(
                     call.method.span(),
@@ -3200,8 +3245,10 @@ impl<'a> Emitter<'a> {
                 if let Some(index) = &index {
                     emitter.line(&format!("{index} = {index} + 1"));
                 }
-                let (text, _) = emitter
-                    .invoke_arg(closure, std::slice::from_ref(&value.to_owned()))?;
+                let (text, _) = emitter.invoke_arg(
+                    closure,
+                    std::slice::from_ref(&value.to_owned()),
+                )?;
                 emitter.line(&format!("if {text} then"));
                 emitter.indent = emitter.indent.saturating_add(1);
                 let found = index.as_deref().unwrap_or(value);
@@ -3212,7 +3259,11 @@ impl<'a> Emitter<'a> {
                 Ok(())
             };
             self.emit_iter(&call.receiver, &body)?;
-            let ty = if index.is_some() { Ty::OPT_INT } else { Ty::OPT_VALUE };
+            let ty = if index.is_some() {
+                Ty::OPT_INT
+            } else {
+                Ty::OPT_VALUE
+            };
             return Ok(Some((result, ty)));
         }
         if matches!(method.as_str(), "find" | "position") {
@@ -3400,7 +3451,9 @@ impl<'a> Emitter<'a> {
                     let (count, _) = self.expr(arg(&args, 0, call)?)?;
                     let remaining = self.temp();
                     self.line(&format!("local {remaining} = {count}"));
-                    let inner = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
                         emitter.line(&format!("if {remaining} > 0 then"));
                         emitter.indent = emitter.indent.saturating_add(1);
                         emitter.line(&format!("{remaining} = {remaining} - 1"));
@@ -3419,7 +3472,9 @@ impl<'a> Emitter<'a> {
                     let (count, _) = self.expr(arg(&args, 0, call)?)?;
                     let left = self.temp();
                     self.line(&format!("local {left} = {count}"));
-                    let inner = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
                         emitter.line(&format!("if {left} <= 0 then break end"));
                         emitter.line(&format!("{left} = {left} - 1"));
                         body(emitter, value)
@@ -3437,9 +3492,12 @@ impl<'a> Emitter<'a> {
                         );
                     }
                     if ty.base == Base::List {
-                        let inner = |emitter: &mut Self, value: &str| -> Result<(), Error> {
-                            emitter.emit_table(value, false, false, body)
-                        };
+                        let inner =
+                            |emitter: &mut Self,
+                             value: &str|
+                             -> Result<(), Error> {
+                                emitter.emit_table(value, false, false, body)
+                            };
                         return self.emit_iter(&call.receiver, &inner);
                     }
                 }
@@ -3504,11 +3562,11 @@ impl<'a> Emitter<'a> {
         )
     }
 
-fn reverse_split(text: &str, separator: &str) -> String {
-    format!(
-        "(function() local __parts = string.split({text}, {separator}); local __out = {{}}; for __i = #__parts, 1, -1 do __out[#__out + 1] = __parts[__i] end; __out.__next = 1; return __out end)()"
-    )
-}
+    fn reverse_split(text: &str, separator: &str) -> String {
+        format!(
+            "(function() local __parts = string.split({text}, {separator}); local __out = {{}}; for __i = #__parts, 1, -1 do __out[#__out + 1] = __parts[__i] end; __out.__next = 1; return __out end)()"
+        )
+    }
 
     fn split_lines(&self, text: &str) -> String {
         format!(
@@ -3669,7 +3727,9 @@ fn reverse_split(text: &str, separator: &str) -> String {
                 let other = self.expr(arg(&args, 0, call)?)?.0;
                 Ok((format!("math.floor({receiver} / {other})"), Ty::INT))
             }
-            "sin" | "cos" => Ok((format!("math.{method}({receiver})"), Ty::FLOAT)),
+            "sin" | "cos" => {
+                Ok((format!("math.{method}({receiver})"), Ty::FLOAT))
+            }
             "is_infinite" => Ok((
                 format!(
                     "({receiver} == math.huge or {receiver} == -math.huge)"
@@ -3800,10 +3860,8 @@ fn reverse_split(text: &str, separator: &str) -> String {
                         "for {key}, {value} in pairs({receiver}) do"
                     ));
                     self.indent = self.indent.saturating_add(1);
-                    let (text, _) = self.invoke_arg(
-                        closure,
-                        &[key.clone(), value.clone()],
-                    )?;
+                    let (text, _) = self
+                        .invoke_arg(closure, &[key.clone(), value.clone()])?;
                     self.line(&format!(
                         "if not ({text}) then {receiver}[{key}] = nil end"
                     ));
@@ -3817,9 +3875,7 @@ fn reverse_split(text: &str, separator: &str) -> String {
                         ));
                     }
                     let index = self.temp();
-                    self.line(&format!(
-                        "for {index} = #{receiver}, 1, -1 do"
-                    ));
+                    self.line(&format!("for {index} = #{receiver}, 1, -1 do"));
                     self.indent = self.indent.saturating_add(1);
                     let item = self.temp();
                     self.line(&format!("local {item} = {receiver}[{index}]"));
@@ -3838,12 +3894,12 @@ fn reverse_split(text: &str, separator: &str) -> String {
                 }
                 Ok((String::new(), Ty::VOID))
             }
-            "sort_by" | "sort_unstable_by" | "sort_by_key" => {
-                Err(Error::at(
-                    call.method.span(),
-                    format!("`{method}` needs a Rust comparator and is not supported by the Luau compiler"),
-                ))
-            }
+            "sort_by" | "sort_unstable_by" | "sort_by_key" => Err(Error::at(
+                call.method.span(),
+                format!(
+                    "`{method}` needs a Rust comparator and is not supported by the Luau compiler"
+                ),
+            )),
             "entry" => Err(Error::at(
                 call.method.span(),
                 "HashMap entry API is not supported by the Luau compiler",
@@ -4459,7 +4515,7 @@ fn reverse_split(text: &str, separator: &str) -> String {
                 Ty::OPT_STR,
             )),
             "tr" => {
-                let key = self.string_arg(args, 0, call)?;
+                let key = self.expr(arg(args, 0, call)?)?.0;
                 let params = arg(args, 1, call)?;
                 let params = strip_reference(params);
                 let table = self.tr_params(params)?;
@@ -4604,7 +4660,7 @@ fn reverse_split(text: &str, separator: &str) -> String {
                 Ok((format!("math.random({min}, {max})"), Ty::FLOAT))
             }
             "trp" => {
-                let key = self.string_arg(args, 0, call)?;
+                let key = self.expr(arg(args, 0, call)?)?.0;
                 let count = self.expr(arg(args, 1, call)?)?.0;
                 let params = arg(args, 2, call)?;
                 let table = self.tr_params(strip_reference(params))?;
@@ -5417,6 +5473,40 @@ fn reverse_split(text: &str, separator: &str) -> String {
         self.expr(expr)
     }
 
+    fn bind_closure_pattern(
+        &mut self,
+        pattern: &Pat,
+        value: &str,
+    ) -> Result<(), Error> {
+        match pattern {
+            Pat::Ident(pattern) => {
+                let name = pattern.ident.to_string();
+                self.line(&format!("local {name} = {value}"));
+                self.push(&name, Ty::VALUE);
+                Ok(())
+            }
+            Pat::Wild(_) => Ok(()),
+            Pat::Reference(reference) => {
+                self.bind_closure_pattern(&reference.pat, value)
+            }
+            Pat::Paren(paren) => self.bind_closure_pattern(&paren.pat, value),
+            Pat::Type(typed) => self.bind_closure_pattern(&typed.pat, value),
+            Pat::Tuple(tuple) => {
+                for (index, element) in tuple.elems.iter().enumerate() {
+                    self.bind_closure_pattern(
+                        element,
+                        &format!("{value}[{}]", index + 1),
+                    )?;
+                }
+                Ok(())
+            }
+            other => Err(Error::at(
+                other.span(),
+                "closure parameters must be plain identifiers or tuples",
+            )),
+        }
+    }
+
     fn closure_value(
         &mut self,
         closure: &syn::ExprClosure,
@@ -5439,21 +5529,10 @@ fn reverse_split(text: &str, separator: &str) -> String {
                 Pat::Type(typed) => &*typed.pat,
                 other => other,
             };
-            match input {
-                syn::Pat::Ident(pattern) => {
-                    let name = pattern.ident.to_string();
-                    self.line(&format!("local {name} = {value}"));
-                    self.push(&name, Ty::VALUE);
-                }
-                syn::Pat::Wild(_) => {}
-                other => {
-                    self.local_statics.pop();
-                    self.scopes.pop();
-                    return Err(Error::at(
-                        other.span(),
-                        "closure parameters must be plain identifiers",
-                    ));
-                }
+            if let Err(error) = self.bind_closure_pattern(input, value) {
+                self.local_statics.pop();
+                self.scopes.pop();
+                return Err(error);
             }
         }
         let result = match &*closure.body {
@@ -7165,7 +7244,13 @@ fn is_iterator_adaptor(expr: &Expr) -> bool {
     };
     matches!(
         call.method.to_string().as_str(),
-        "map" | "filter" | "filter_map" | "take" | "skip" | "flatten" | "rsplit"
+        "map"
+            | "filter"
+            | "filter_map"
+            | "take"
+            | "skip"
+            | "flatten"
+            | "rsplit"
     )
 }
 

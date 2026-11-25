@@ -3939,8 +3939,16 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(compiled.source.contains("break"), "{}", compiled.source);
-    assert!(compiled.source.contains("string.split"), "{}", compiled.source);
-    assert!(compiled.source.contains("table.insert"), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("string.split"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("table.insert"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]
@@ -3969,7 +3977,11 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(compiled.source.contains("math.sin"), "{}", compiled.source);
     assert!(compiled.source.contains("math.cos"), "{}", compiled.source);
-    assert!(compiled.source.contains("table.remove"), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("table.remove"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]
@@ -3986,7 +3998,11 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
-    assert!(compiled.source.contains("string.find"), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("string.find"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]
@@ -4000,4 +4016,36 @@ fn bails_on_comparators_and_type_erased_maps() {
                 .expect_err("bail");
         assert!(error.line > 0 && error.column > 0, "{error:?}");
     }
+}
+
+#[test]
+fn compiles_tuple_loops_closure_patterns_and_dynamic_translation_keys() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let _ = ctx;
+    let rows = ctx.state.get("rows").unwrap_or(&serde_json::Value::Null);
+    let mut total = 0;
+    for (key, value) in rows {
+        total += value.as_i64().unwrap_or(0);
+    }
+    let pairs = [("a", 1), ("b", 2)];
+    let found = pairs.iter().find(|(key, _)| *key == "a").is_some();
+    let label = ctx.tr(ctx.config_str("message").unwrap_or_default(), &[]);
+    Ok(vec![Op::log(format!("{total} {found} {label}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("type(") && compiled.source.contains("pairs("),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("noctalia.tr("),
+        "{}",
+        compiled.source
+    );
+    assert!(compiled.source.contains("[1]"), "{}", compiled.source);
 }
