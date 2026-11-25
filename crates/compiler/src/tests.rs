@@ -4049,3 +4049,85 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     );
     assert!(compiled.source.contains("[1]"), "{}", compiled.source);
 }
+
+#[test]
+fn compiles_finite_json_numbers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let number = serde_json::Number::from_f64(1.5)
+        .map_or(serde_json::Value::Null, serde_json::Value::Number);
+    Ok(vec![Op::log(format!("{number}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    let finite = "(function() local __value = 1.5; if __value == __value and __value ~= math.huge and __value ~= -math.huge then return __value end end)()";
+    assert!(generated.contains(finite), "{generated}");
+    assert!(generated.contains("~= nil then"), "{generated}");
+}
+
+#[test]
+fn compiles_transparent_tuple_structs() {
+    let handler = r#"
+struct Score(pub i64);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let score = Score(3);
+    let value = score.0;
+    Ok(vec![Op::log(format!("{value}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("local score = 3"), "{generated}");
+    assert!(generated.contains("local value = score"), "{generated}");
+    assert!(!generated.contains("score[1]"), "{generated}");
+}
+
+#[test]
+fn compiles_empty_vector_constructors() {
+    let handler = r#"
+use std::collections::VecDeque;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let list = Vec::<i64>::new();
+    let queue = VecDeque::<i64>::new();
+    Ok(vec![Op::log(format!("{}{}", list.len(), queue.len()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("local list = {}"), "{generated}");
+    assert!(generated.contains("local queue = {}"), "{generated}");
+}
+
+#[test]
+fn bails_on_array_initializers_and_comparators_with_positions() {
+    for (handler, name) in [
+        (
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let values = std::array::from_fn(|_| 1); Ok(vec![]) }",
+            "from_fn",
+        ),
+        (
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let mut values = vec![2, 1]; values.sort_by(|a, b| a.cmp(b)); Ok(vec![]) }",
+            "sort_by",
+        ),
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("bail");
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+        assert!(
+            error.render("main.rs").starts_with(&format!(
+                "main.rs:{}:{}:",
+                error.line, error.column
+            )),
+            "{error:?}"
+        );
+        assert!(error.message.contains(name), "{}", error.message);
+    }
+}
