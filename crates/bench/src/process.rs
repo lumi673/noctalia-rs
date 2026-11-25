@@ -99,9 +99,10 @@ impl Spool {
             "state": {},
             "host": crate::sample_host(),
         });
-        let temporary = self.spool_dir.join(format!("{name}.tmp"));
-        fs::write(&temporary, serde_json::to_string(&request)?)?;
-        fs::rename(&temporary, self.spool_dir.join(&name))?;
+        fs::write(
+            self.spool_dir.join(&name),
+            serde_json::to_string(&request)?,
+        )?;
 
         let start = Instant::now();
         wait_line(&self.lines, |value| {

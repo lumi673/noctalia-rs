@@ -315,17 +315,15 @@ end
 
 local function writeRequest(request)
   sequence += 1
-  local name = string.format("%012d", sequence)
-  local temporary = REQUEST_DIR .. "/" .. name .. ".pending"
-  local target = REQUEST_DIR .. "/" .. name .. ".json"
+  local target = REQUEST_DIR .. "/" .. string.format("%012d", sequence) .. ".json"
   M.host = snapshot()
   request.host = M.host
-  local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(encodeBytes(request)))
-  if ok then
-    ok, err = noctalia.renameFile(temporary, target)
-  end
+  -- Written in place. The helper wakes on the create and retries a truncated
+  -- payload, so the round trip overlaps the write instead of waiting for a
+  -- rename to publish the file.
+  local ok, err = noctalia.writeFile(target, noctalia.json.encode(encodeBytes(request)))
   if not ok then
-    noctalia.removeFile(temporary)
+    noctalia.removeFile(target)
     noctalia.log("noctalia bridge: spool write failed: " .. tostring(err))
   end
 end

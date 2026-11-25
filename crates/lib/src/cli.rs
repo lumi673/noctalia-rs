@@ -24,6 +24,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const IDLE_WAIT: Duration = Duration::from_secs(1);
 
 const NATIVE_CACHE_LIMIT: usize = 128;
+// A request is written in place, so a read can catch a partial payload. A
+// truncated JSON document is retried a few times before it is reported.
+const REQUEST_READ_ATTEMPTS: u32 = 20;
+const REQUEST_READ_WAIT: Duration = Duration::from_micros(100);
 #[derive(Debug, Deserialize)]
 struct Request {
     boot: String,
@@ -112,8 +116,7 @@ impl<W: Write> Serve<'_, W> {
     }
 
     fn process_request(&mut self, path: &Path) -> Result<Processed> {
-        let text = fs::read_to_string(path)?;
-        let request: Request = serde_json::from_str(&text)?;
+        let request = read_request(path)?;
         if request.boot != self.boot {
             return Err(format!(
                 "stale boot {} (expected {})",
@@ -297,19 +300,29 @@ fn wait_for_work(watched: Option<&(Receiver<()>, notify::RecommendedWatcher)>) {
     }
 }
 
+/// Wakes the serve loop only for work it can read.
+///
+/// Reading the spool emits access events, deleting a handled request emits a
+/// removal, and a two-step write emits a create for its temporary name. Waking
+/// for those costs a full wakeup cycle per event and never finds a request, so
+/// only created or modified request names wake the loop. Events without a path
+/// still wake it: that is the rescan notify emits when it lost events.
+fn wakes_serve(event: &notify::Event) -> bool {
+    if event.paths.is_empty() {
+        return true;
+    }
+    let request =
+        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+    request && event.paths.iter().any(|path| is_request_name(path))
+}
+
 fn watch_spool(
     spool_dir: &Path,
 ) -> Option<(Receiver<()>, notify::RecommendedWatcher)> {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(
         move |event: notify::Result<notify::Event>| {
-            // Reading the spool directory emits access events. Ignore those
-            // so the helper does not wake itself up; everything else wakes it,
-            // including the rescan notify emits when it loses events.
-            let relevant = matches!(
-                event,
-                Ok(change) if !matches!(change.kind, EventKind::Access(_))
-            );
+            let relevant = event.is_ok_and(|change| wakes_serve(&change));
             if relevant {
                 let _ = sender.send(());
             }
@@ -429,11 +442,28 @@ fn request_files(spool_dir: &Path) -> Result<BTreeSet<PathBuf>> {
 }
 
 fn is_request(path: &Path) -> bool {
-    let json = path
-        .extension()
+    is_request_name(path) && path.is_file()
+}
+
+fn is_request_name(path: &Path) -> bool {
+    path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
-    json && path.is_file()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
+fn read_request(path: &Path) -> Result<Request> {
+    let mut attempt = 0;
+    loop {
+        let text = fs::read_to_string(path)?;
+        match serde_json::from_str(&text) {
+            Ok(request) => return Ok(request),
+            Err(error) if error.is_eof() && attempt < REQUEST_READ_ATTEMPTS => {
+                attempt = attempt.saturating_add(1);
+                thread::sleep(REQUEST_READ_WAIT);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 fn request_name(path: &Path) -> String {
@@ -486,6 +516,62 @@ mod tests {
     use std::result::Result as StdResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use notify::event::{
+        AccessKind, CreateKind, ModifyKind, RemoveKind, RenameMode,
+    };
+
+    fn event(kind: EventKind, paths: &[&str]) -> notify::Event {
+        let mut event = notify::Event::new(kind);
+        for path in paths {
+            event = event.add_path(PathBuf::from(path));
+        }
+        event
+    }
+
+    #[test]
+    fn test_wakes_serve_only_for_new_request_files() {
+        let create = EventKind::Create(CreateKind::File);
+        let modify = EventKind::Modify(ModifyKind::Name(RenameMode::To));
+        let remove = EventKind::Remove(RemoveKind::File);
+        let access = EventKind::Access(AccessKind::Read);
+
+        assert!(wakes_serve(&event(create, &["/spool/000000000001.json"])));
+        assert!(wakes_serve(&event(modify, &["/spool/000000000001.json"])));
+        assert!(!wakes_serve(&event(remove, &["/spool/000000000001.json"])));
+        assert!(!wakes_serve(&event(access, &["/spool/000000000001.json"])));
+        assert!(!wakes_serve(&event(
+            create,
+            &["/spool/000000000001.pending"]
+        )));
+        assert!(!wakes_serve(&event(modify, &["/spool"])));
+        assert!(wakes_serve(&event(EventKind::Other, &[])));
+    }
+
+    #[test]
+    fn test_read_request_waits_for_an_in_place_write() {
+        let spool = TestSpool::new("read-partial");
+        let path = spool.spool.join("000000000001.json");
+        let text = request("boot-1", "render").to_string();
+        let split = text.len().div_euclid(2);
+        fs::write(&path, &text[..split]).expect("partial write");
+        let writer = path.clone();
+        let tail = text[split..].to_owned();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(writer)
+                .expect("open request");
+            file.write_all(tail.as_bytes()).expect("finish request");
+        });
+
+        let read = read_request(&path).expect("retried request");
+        handle.join().expect("writer");
+        spool.cleanup();
+
+        assert_eq!(read.boot, "boot-1");
+        assert_eq!(read.event, "render");
+    }
     fn plugin() -> Plugin {
         fn handler(ctx: &Context) -> crate::Result<Vec<Op>> {
             let _ = serde_json::to_value(&ctx.entry)?;
