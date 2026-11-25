@@ -1,0 +1,535 @@
+use super::*;
+
+impl<'a> Emitter<'a> {
+    pub(super) fn record_pattern_events(&mut self, expr: &Expr, pattern: &Pat) {
+        match pattern {
+            Pat::Lit(literal) => {
+                self.record_event(expr, &Expr::Lit(literal.clone()), false)
+            }
+            Pat::Or(or) => {
+                for case in &or.cases {
+                    self.record_pattern_events(expr, case);
+                }
+            }
+            Pat::Paren(paren) => self.record_pattern_events(expr, &paren.pat),
+            _ => {}
+        }
+    }
+
+    pub(super) fn record_event(
+        &mut self,
+        event: &Expr,
+        literal: &Expr,
+        negated: bool,
+    ) {
+        if !self.is_event_expr(event) {
+            return;
+        }
+        if let Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) = literal
+        {
+            if negated {
+                self.negative_events.insert(value.value());
+            } else {
+                self.events.insert(value.value());
+            }
+        }
+    }
+
+    pub(super) fn is_ctx_expr(&self, expr: &Expr) -> bool {
+        let Expr::Path(path) = expr else {
+            return false;
+        };
+        path.path.get_ident().is_some_and(|ident| {
+            let name = ident.to_string();
+            name == self.ctx || self.lookup(&name) == Some(Ty::CONTEXT)
+        })
+    }
+
+    pub(super) fn is_event_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Field(field) => {
+                self.is_ctx_expr(&field.base)
+                    && matches!(&field.member, Member::Named(name) if name == "event")
+            }
+            Expr::MethodCall(call) => {
+                self.is_event_expr(&call.receiver) && call.method == "as_str"
+            }
+            Expr::Paren(paren) => self.is_event_expr(&paren.expr),
+            Expr::Group(group) => self.is_event_expr(&group.expr),
+            _ => false,
+        }
+    }
+
+    pub(super) fn op_expr(&mut self, expr: &Expr) -> Result<(), Error> {
+        self.emitted = true;
+        match expr {
+            Expr::Struct(item) => {
+                let segments = item
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                if segments.len() < 2
+                    || segments.get(segments.len().saturating_sub(2))
+                        != Some(&"Op".to_owned())
+                {
+                    return Err(Error::at(
+                        item.span(),
+                        "expected an Op constructor",
+                    ));
+                }
+                let name = segments.last().cloned().unwrap_or_default();
+                self.op_struct(&name, item)
+            }
+            Expr::Call(call) => {
+                let name = path_last_name(&call.func).ok_or_else(|| {
+                    Error::at(call.span(), "unsupported op expression")
+                })?;
+                let variant =
+                    name.rsplit("::").next().unwrap_or(&name).to_owned();
+                if op_constructor(&name).is_some() {
+                    return self.op_call(call, &variant);
+                }
+                if let Some(message) = unsupported_op(&name) {
+                    return Err(Error::at(call.span(), message));
+                }
+                Err(Error::at(call.span(), "expected an Op constructor"))
+            }
+            Expr::Paren(paren) => self.op_expr(&paren.expr),
+            Expr::Group(group) => self.op_expr(&group.expr),
+            Expr::Path(path) => {
+                let segments = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect::<Vec<_>>();
+                let name = if segments.len() >= 2
+                    && segments.get(segments.len().saturating_sub(2))
+                        == Some(&"Op".to_owned())
+                {
+                    segments.last().cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                if name == "OpenSettings" {
+                    self.line("noctalia.openSettings()");
+                    Ok(())
+                } else {
+                    Err(Error::at(
+                        expr.span(),
+                        format!("op `{name}` is not supported"),
+                    ))
+                }
+            }
+            other => Err(Error::at(other.span(), "expected an Op constructor")),
+        }
+    }
+
+    fn op_struct(
+        &mut self,
+        name: &str,
+        item: &syn::ExprStruct,
+    ) -> Result<(), Error> {
+        let mut fields = HashMap::new();
+        for field in &item.fields {
+            let Member::Named(member) = &field.member else {
+                return Err(Error::at(
+                    field.member.span(),
+                    "unsupported op field",
+                ));
+            };
+            fields.insert(member.to_string(), &field.expr);
+        }
+        let field = |name: &str| -> Result<&Expr, Error> {
+            fields.get(name).copied().ok_or_else(|| {
+                Error::at(
+                    item.span(),
+                    format!("op `{name}` is missing its `{name}` field"),
+                )
+            })
+        };
+        match name {
+            "Log" => {
+                let message = self.expr(field("message")?)?.0;
+                self.line(&format!("noctalia.log({message})"));
+            }
+            "Notify" | "NotifyError" => {
+                let title = self.expr(field("title")?)?.0;
+                let body = self.expr(field("body")?)?.0;
+                let options = match fields.get("options") {
+                    Some(expr) => self.expr(expr)?.0,
+                    None => "nil".to_owned(),
+                };
+                let function = if name == "Notify" {
+                    "noctalia.notify"
+                } else {
+                    "noctalia.notifyError"
+                };
+                self.line(&format!("{function}({title}, {body}, {options})"));
+            }
+            "SetInterval" => {
+                let ms = self.expr(field("ms")?)?.0;
+                self.line(&format!("noctalia.setUpdateInterval({ms})"));
+            }
+            "StateSet" => {
+                let key = self.expr(field("key")?)?.0;
+                let value = self.expr(field("value")?)?.0;
+                self.line(&format!("state.set({key}, {value})"));
+            }
+            "TogglePanel" => {
+                let id = self.expr(field("id")?)?.0;
+                self.line(&format!("noctalia.togglePanel({id})"));
+            }
+            "OpenSettings" => self.line("noctalia.openSettings()"),
+            "BarText" => {
+                let text = self.expr(field("text")?)?.0;
+                self.line(&format!("barWidget.setText({text})"));
+            }
+            "BarColor" => {
+                let role = self.expr(field("role")?)?.0;
+                self.line(&format!("barWidget.setColor({role})"));
+            }
+            "BarVisible" => {
+                let visible = self.expr(field("visible")?)?.0;
+                self.line(&format!("barWidget.setVisible({visible})"));
+            }
+            "BarTooltip" => {
+                let value = self.expr(field("value")?)?.0;
+                self.line(&format!("barWidget.setTooltip({value})"));
+            }
+            "BarImage" => {
+                let path = self.expr(field("path")?)?.0;
+                let preserve = self.expr(field("preserve")?)?.0;
+                let width = self.expr(field("width")?)?.0;
+                let height = self.expr(field("height")?)?.0;
+                self.line(&format!(
+                    "barWidget.setImage({path}, {preserve}, {width}, {height})"
+                ));
+            }
+            "BarRender" => {
+                let tree = self.expr(field("tree")?)?.0;
+                self.line(&format!("barWidget.render({tree})"));
+            }
+            "PanelRender" => {
+                let tree = self.expr(field("tree")?)?.0;
+                self.line(&format!("panel.render({tree})"));
+            }
+            "DesktopWidgetRender" => {
+                let tree = self.expr(field("tree")?)?.0;
+                self.line(&format!("desktopWidget.render({tree})"));
+            }
+            "LayerShow" => {
+                let id = self.expr(field("id")?)?.0;
+                self.line(&format!("noctalia.layer.show({id})"));
+            }
+            "LayerHide" => {
+                let id = self.expr(field("id")?)?.0;
+                self.line(&format!("noctalia.layer.hide({id})"));
+            }
+            "LayerRender" => {
+                let tree = self.expr(field("tree")?)?.0;
+                self.line(&format!("layer.render({tree})"));
+            }
+            "LayerConfigure" => {
+                let id = self.expr(field("id")?)?.0;
+                let props = self.expr(field("props")?)?.0;
+                self.line(&format!("noctalia.layer.configure({id}, {props})"));
+            }
+            "LauncherResults" => {
+                let text = self.expr(field("text")?)?.0;
+                let rows = self.expr(field("rows")?)?.0;
+                self.line(&format!("launcher.setResults({text}, {rows})"));
+            }
+            "RemoveFile" => {
+                let path = self.expr(field("path")?)?.0;
+                self.line(&format!("noctalia.removeFile({path})"));
+            }
+            "HostCall" => {
+                self.uses_host_call = true;
+                let root = self.expr(field("root")?)?.0;
+                let path = self.expr(field("path")?)?.0;
+                let args = self.expr(field("args")?)?.0;
+                self.line(&format!("host_call({root}, {path}, {args})"));
+            }
+            other => {
+                return Err(Error::at(
+                    item.span(),
+                    format!(
+                        "op `{other}` is not supported by the Luau compiler"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The host-callback marker for a callback-id argument, or `None` when the
+    /// argument is `None`. Compiled Luau names its callbacks, so the runtime
+    /// hands the payload back to the entry's `onHostCallback`.
+    pub(super) fn callback_marker(
+        &mut self,
+        args: &[&Expr],
+        index: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(argument) = args.get(index) else {
+            return Ok(None);
+        };
+        let argument = strip_reference(argument);
+        if let Expr::Path(path) = argument
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "None")
+        {
+            return Ok(None);
+        }
+        let inner = match argument {
+            Expr::Call(inner)
+                if path_last_name(&inner.func).as_deref() == Some("Some") =>
+            {
+                arg(&inner.args.iter().collect::<Vec<_>>(), 0, inner)?
+            }
+            other => other,
+        };
+        let (text, _) = self.expr(inner)?;
+        Ok(Some(format!("{{ __host_callback = {text} }}")))
+    }
+
+    /// The value inside a `Some(...)` argument, or `nil` for `None`.
+    pub(super) fn option_value(
+        &mut self,
+        argument: &Expr,
+    ) -> Result<String, Error> {
+        let argument = strip_reference(argument);
+        if let Expr::Path(path) = argument
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "None")
+        {
+            return Ok("nil".to_owned());
+        }
+        let inner = match argument {
+            Expr::Call(inner)
+                if path_last_name(&inner.func).as_deref() == Some("Some") =>
+            {
+                arg(&inner.args.iter().collect::<Vec<_>>(), 0, inner)?
+            }
+            other => other,
+        };
+        Ok(self.expr(inner)?.0)
+    }
+
+    pub(super) fn op_call(
+        &mut self,
+        call: &ExprCall,
+        name: &str,
+    ) -> Result<(), Error> {
+        let args = call.args.iter().collect::<Vec<_>>();
+        match name {
+            "log" | "log_static" => {
+                let message = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!("noctalia.log({message})"));
+            }
+            "state" => {
+                let key = self.expr(arg(&args, 0, call)?)?.0;
+                let value = self.expr(arg(&args, 1, call)?)?.0;
+                self.line(&format!("state.set({key}, {value})"));
+            }
+            "state_watch" => {
+                let key = self.expr(arg(&args, 0, call)?)?.0;
+                let id = self.expr(arg(&args, 1, call)?)?.0;
+                self.line(&format!(
+                    "state.watch({key}, {{ __host_callback = {id} }})"
+                ));
+            }
+            "run" => {
+                let command = self.expr(arg(&args, 0, call)?)?.0;
+                let callback = self.callback_marker(&args, 1)?;
+                let line = match callback {
+                    Some(marker) => {
+                        format!("noctalia.runAsync({command}, {marker})")
+                    }
+                    None => format!("noctalia.runAsync({command})"),
+                };
+                self.line(&line);
+            }
+            "run_with_timeout" => {
+                let command = self.expr(arg(&args, 0, call)?)?.0;
+                let callback = self
+                    .callback_marker(&args, 1)?
+                    .unwrap_or_else(|| "nil".to_owned());
+                let timeout = match args.get(2) {
+                    Some(timeout) => self.expr(strip_reference(timeout))?.0,
+                    None => "nil".to_owned(),
+                };
+                self.line(&format!(
+                    "noctalia.runAsync({command}, {callback}, {timeout})"
+                ));
+            }
+            "run_stream" => {
+                let command = self.expr(arg(&args, 0, call)?)?.0;
+                let callback =
+                    self.callback_marker(&args, 1)?.ok_or_else(|| {
+                        Error::at(
+                            call.span(),
+                            "op `run_stream` needs a callback id",
+                        )
+                    })?;
+                self.line(&format!(
+                    "noctalia.runStream({command}, {callback})"
+                ));
+            }
+            "http" => {
+                let request = self.expr(arg(&args, 0, call)?)?.0;
+                let callback = self.callback_marker(&args, 1)?;
+                let line = match callback {
+                    Some(marker) => {
+                        format!("noctalia.http({request}, {marker})")
+                    }
+                    None => format!("noctalia.http({request})"),
+                };
+                self.line(&line);
+            }
+            "set_interval" => {
+                let ms = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!("noctalia.setUpdateInterval({ms})"));
+            }
+            "host_call" => {
+                self.uses_host_call = true;
+                let root = self.expr(arg(&args, 0, call)?)?.0;
+                let path = self.expr(arg(&args, 1, call)?)?.0;
+                let value = self.expr(arg(&args, 2, call)?)?.0;
+                self.line(&format!("host_call({root}, {path}, {value})"));
+            }
+            "notify" | "notify_with_options" => {
+                let title = self.expr(arg(&args, 0, call)?)?.0;
+                let body = self.expr(arg(&args, 1, call)?)?.0;
+                let options = if name == "notify_with_options" {
+                    self.expr(arg(&args, 2, call)?)?.0
+                } else {
+                    "nil".to_owned()
+                };
+                self.line(&format!(
+                    "noctalia.notify({title}, {body}, {options})"
+                ));
+            }
+            "notify_error" | "notify_error_with_options" => {
+                let title = self.expr(arg(&args, 0, call)?)?.0;
+                let body = self.expr(arg(&args, 1, call)?)?.0;
+                let options = if name == "notify_error_with_options" {
+                    self.expr(arg(&args, 2, call)?)?.0
+                } else {
+                    "nil".to_owned()
+                };
+                self.line(&format!(
+                    "noctalia.notifyError({title}, {body}, {options})"
+                ));
+            }
+            "copy" => {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!("noctalia.copyToClipboard({text})"));
+            }
+            "copy_with_mime" => {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                let mime = self.expr(arg(&args, 1, call)?)?.0;
+                self.line(&format!("noctalia.copyToClipboard({text}, {mime})"));
+            }
+            "open_path" => {
+                let path = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!("noctalia.openPath({path})"));
+            }
+            other => {
+                return Err(Error::at(
+                    call.span(),
+                    format!("op constructor `{other}` is not supported"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn qualified_variant<'a>(
+    name: &'a str,
+    root: &str,
+) -> Option<&'a str> {
+    let mut parts = name.rsplit("::");
+    let variant = parts.next()?;
+    (parts.next()? == root).then_some(variant)
+}
+
+pub(super) fn unsupported_op(name: &str) -> Option<String> {
+    let variant = qualified_variant(name, "Op")?;
+    let message = match variant {
+        "http_bytes" => {
+            "op `http_bytes` sends a raw byte body, which compiled Luau cannot build"
+        }
+        "query" => {
+            "op `query` needs a response path, which compiled Luau cannot allocate"
+        }
+        _ => return None,
+    };
+    Some(message.to_owned())
+}
+
+pub(super) fn op_constructor(name: &str) -> Option<String> {
+    let variant = qualified_variant(name, "Op")?;
+    let supported = [
+        "log",
+        "log_static",
+        "state",
+        "state_watch",
+        "set_interval",
+        "host_call",
+        "notify",
+        "notify_with_options",
+        "notify_error",
+        "notify_error_with_options",
+        "copy",
+        "copy_with_mime",
+        "open_path",
+        "run",
+        "run_with_timeout",
+        "run_stream",
+        "http",
+    ];
+    supported.contains(&variant).then(|| variant.to_owned())
+}
+
+pub(super) fn is_ops_push(emitter: &Emitter<'_>, call: &ExprCall) -> bool {
+    let Expr::MethodCall(method) = &*call.func else {
+        return false;
+    };
+    if method.method != "push" || call.args.len() != 1 {
+        return false;
+    }
+    call.args.first().is_some_and(is_op_expr)
+        && path_ident(&method.receiver)
+            .and_then(|name| emitter.lookup(&name))
+            .is_some_and(|ty| ty.base == Base::Ops)
+}
+
+pub(super) fn is_op_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Struct(item) => {
+            let segments = item.path.segments.iter().collect::<Vec<_>>();
+            segments.len() >= 2
+                && segments
+                    .get(segments.len().saturating_sub(2))
+                    .is_some_and(|segment| segment.ident == "Op")
+        }
+        Expr::Call(call) => path_last_name(&call.func)
+            .is_some_and(|name| op_constructor(&name).is_some()),
+        Expr::Path(path) => path_last_name(&Expr::Path(path.clone()))
+            .is_some_and(|name| name == "Op::OpenSettings"),
+        _ => false,
+    }
+}
