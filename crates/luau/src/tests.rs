@@ -608,6 +608,77 @@ fn embedded_bridge_source_parses() {
         .expect("bridge.luau must parse");
 }
 
+const BRIDGE_STUBS: &str = r#"
+noctalia.mkdirAll = function() return true end
+noctalia.runStream = function(_, on_line)
+  on_line('{"control":"ready","boot":"test","spool":"/spool"}')
+  return true
+end
+noctalia.writeFile = function(_, contents)
+  noctalia.log(contents)
+  return true
+end
+noctalia.renameFile = function() return true end
+"#;
+
+fn bridge_requests(events: &[&str]) -> Vec<Value> {
+    let bridge = noctalia_rs::bridge::SOURCE
+        .replace("{{HELPER}}", "helper")
+        .replace("{{PREFIX}}", "prefix");
+    let calls = events
+        .iter()
+        .map(|event| format!("  bridge.call(\"{event}\", {{}})\n"))
+        .collect::<String>();
+    let source = format!(
+        "{BRIDGE_STUBS}\nlocal bridge = (function()\n{bridge}\nend)()\n\
+         bridge.setup(\"service\", {{\"name\"}})\n\
+         function update()\n{calls}end\n"
+    );
+    let ctx = context(Fixture {
+        event: "update",
+        payload: json!({}),
+        config: json!({ "name": "bench" }),
+        state: json!({}),
+        host: json!({
+            "now_ms": 1_700_000_000_i64,
+            "setting": { "shell.time_format": "time" },
+            "colors": { "primary": "#fff" },
+        }),
+    });
+    let ops = dispatch(&ctx, &[("entry", source.as_str())]).expect("dispatch");
+    let values = ops
+        .iter()
+        .map(|op| serde_json::to_value(op).expect("serialize op"))
+        .collect::<Vec<_>>();
+    values
+        .iter()
+        .filter(|value| value.get("op").and_then(Value::as_str) == Some("log"))
+        .filter_map(|value| value.get("message").and_then(Value::as_str))
+        .filter_map(|message| serde_json::from_str(message).ok())
+        .collect()
+}
+
+#[test]
+fn bridged_requests_resend_the_fixed_host_only_when_it_changes() {
+    let requests = bridge_requests(&["render", "render"]);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+
+    let first = &requests[0];
+    let second = &requests[1];
+    assert_eq!(first["event"], json!("render"));
+    assert_eq!(
+        first["host_fixed"]["setting"]["shell.time_format"],
+        json!("time")
+    );
+    assert_eq!(first["host_fixed"]["colors"]["primary"], json!("#fff"));
+    assert_eq!(first["host"]["now_ms"], json!(1_700_000_000_i64));
+
+    assert_eq!(second["event"], json!("render"));
+    assert!(second.get("host_fixed").is_none(), "{second}");
+    assert_eq!(second["host"]["now_ms"], json!(1_700_000_000_i64));
+    assert!(second["host"].get("setting").is_none());
+}
+
 const OFFICIAL_CALLBACKS: &str =
     include_str!("../../lib/tests/fixtures/callbacks.txt");
 
