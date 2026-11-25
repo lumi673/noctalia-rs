@@ -5110,11 +5110,11 @@ impl<'a> Emitter<'a> {
                 _ => {}
             }
             if args.len() == 1
-                && path_last_name(&call.func).is_some_and(|name| {
-                    self.program.is_newtype(&self.module, &name)
-                })
+                && let Some(name) = path_last_name(&call.func)
+                && self.program.is_newtype(&self.module, &name)
             {
                 let value = self.expr(arg(&args, 0, call)?)?.0;
+                self.pending_class = Some(name.to_owned());
                 return Ok((value, Ty::VALUE));
             }
             let identity = name.ends_with("::try_from")
