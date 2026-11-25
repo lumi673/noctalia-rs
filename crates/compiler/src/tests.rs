@@ -4350,9 +4350,7 @@ fn auto_mode_splits_at_the_function_boundary() {
         compiled.source
     );
     assert!(
-        compiled
-            .source
-            .contains("local function body_render("),
+        compiled.source.contains("local function body_render("),
         "{}",
         compiled.source
     );
@@ -4419,20 +4417,31 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(text)])
 }
 "#;
-    let compiled = compile(
-        &source(&handler.replace(
-            "fn digest(",
-            "#[native(cache_ms = 30_000)]\nfn digest(",
-        )),
-        &native_options("handler", EntryKind::Widget),
-    )
-    .expect("compiles");
+    let compiled =
+        compile(
+            &source(&handler.replace(
+                "fn digest(",
+                "#[native(cache_ms = 30_000)]\nfn digest(",
+            )),
+            &native_options("handler", EntryKind::Widget),
+        )
+        .expect("compiles");
 
     assert_eq!(compiled.native.len(), 1);
     assert_eq!(compiled.native[0].cache_ms, 30_000);
     assert_eq!(compiled.native[0].params, vec!["value".to_owned()]);
-    assert!(compiled.source.contains("{ value = value }, 30000"), "{}", compiled.source);
-    assert!(compiled.source.contains("local function __native_fn_main__digest(value)"), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("{ value = value }, 30000"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local function __native_fn_main__digest(value)"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]
@@ -4559,7 +4568,10 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     .expect("compiles");
     assert_eq!(compiled.native.len(), 1);
     assert_eq!(
-        compiled.source.matches("local function __native_fn_main__load__rows").count(),
+        compiled
+            .source
+            .matches("local function __native_fn_main__load__rows")
+            .count(),
         1,
         "{}",
         compiled.source

@@ -34,6 +34,7 @@ fn compiled_source(entry: &str, handler: &str, kind: EntryKind) -> String {
             strings: &["message"],
             module: "main",
             modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
         },
     )
     .expect("compile")
@@ -338,6 +339,7 @@ pub fn handle(ctx: &Context) -> Result<Vec<Op>> {
             strings: &["message"],
             module: "main",
             modules: &modules,
+            native: noctalia_rs_compiler::NativeMode::Deny,
         },
     )
     .expect("compile")

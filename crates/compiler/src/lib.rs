@@ -584,7 +584,9 @@ fn compile_once(
     let mut natives = known.clone();
     for slot in &bodies {
         for item in &slot.body.native {
-            natives.entry(item.name.clone()).or_insert_with(|| item.clone());
+            natives
+                .entry(item.name.clone())
+                .or_insert_with(|| item.clone());
         }
     }
     if !natives.is_empty() {
@@ -624,7 +626,11 @@ fn compile_once(
             false,
             &update_event,
         );
-        let _ = writeln!(out, "function update() {} end", invoke(&slot.body, &slot.name, &args));
+        let _ = writeln!(
+            out,
+            "function update() {} end",
+            invoke(&slot.body, &slot.name, &args)
+        );
     } else {
         out.push_str("function update() end\n");
     }
