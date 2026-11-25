@@ -25,10 +25,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const IDLE_WAIT: Duration = Duration::from_secs(1);
 
 const NATIVE_CACHE_LIMIT: usize = 128;
-// A request is written in place, so a read can catch a partial payload. A
-// truncated document is retried with yields, which resolves in microseconds
-// because the write finishes in microseconds.
-const REQUEST_READ_ATTEMPTS: u32 = 2000;
+// A request is written in place, so a read can catch a partial payload.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(2);
 #[derive(Debug, Deserialize)]
 struct Request {
     boot: String,
@@ -310,11 +308,11 @@ fn wait_for_work(watched: Option<&(Receiver<()>, notify::RecommendedWatcher)>) {
 
 /// Wakes the serve loop only for work it can read.
 ///
-/// Reading the spool emits access events, deleting a handled request emits a
-/// removal, and a two-step write emits a create for its temporary name. Waking
-/// for those costs a full wakeup cycle per event and never finds a request, so
-/// only created or modified request names wake the loop. Events without a path
-/// still wake it: that is the rescan notify emits when it lost events.
+/// Reading the spool emits access events and deleting a handled request emits
+/// a removal. Waking for those costs a full wakeup cycle per request and never
+/// finds work, so only created or modified request names wake the loop. Events
+/// without a path still wake it: that is the rescan notify emits when it lost
+/// events.
 fn wakes_serve(event: &notify::Event) -> bool {
     if event.paths.is_empty() {
         return true;
@@ -464,8 +462,8 @@ fn is_request_name(path: &Path) -> bool {
 ///
 /// The bridge sends the per-event values in `host` and the fixed values
 /// (settings, colors, paths) in `host_fixed` only when they changed, so the
-/// cached fixed part is merged under the live one. A request that still sends
-/// one complete `host` covers the cache and wins the merge.
+/// cached fixed part is merged under the live one. A request that sends one
+/// complete `host` overrides every cached key.
 fn request_host(fixed: &Value, live: Value) -> Value {
     let Some(mut host) = fixed.as_object().cloned() else {
         return live;
@@ -480,14 +478,21 @@ fn request_host(fixed: &Value, live: Value) -> Value {
     Value::Object(host)
 }
 
+/// Reads a request, retrying a truncated payload.
+///
+/// The bridge writes a request in place, so a wake can land while the write is
+/// still running. The write finishes in microseconds, which a yield covers, so
+/// only a document that stays truncated is reported.
 fn read_request(path: &Path) -> Result<Request> {
-    let mut attempt = 0;
+    let deadline = Instant::now().checked_add(REQUEST_READ_TIMEOUT);
     loop {
         let text = fs::read_to_string(path)?;
         match serde_json::from_str(&text) {
             Ok(request) => return Ok(request),
-            Err(error) if error.is_eof() && attempt < REQUEST_READ_ATTEMPTS => {
-                attempt = attempt.saturating_add(1);
+            Err(error)
+                if error.is_eof()
+                    && deadline.is_some_and(|end| Instant::now() < end) =>
+            {
                 thread::yield_now();
             }
             Err(error) => return Err(error.into()),
@@ -601,6 +606,7 @@ mod tests {
         assert_eq!(read.boot, "boot-1");
         assert_eq!(read.event, "render");
     }
+
     fn plugin() -> Plugin {
         fn handler(ctx: &Context) -> crate::Result<Vec<Op>> {
             let _ = serde_json::to_value(&ctx.entry)?;
