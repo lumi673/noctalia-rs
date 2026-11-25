@@ -41,6 +41,8 @@ struct Request {
     #[serde(default)]
     cache_ms: Option<u64>,
     #[serde(default)]
+    context: Value,
+    #[serde(default)]
     payload: Value,
     #[serde(default)]
     config: Value,
@@ -149,7 +151,8 @@ impl<W: Write> Serve<'_, W> {
 
     fn process_native(&mut self, request: Request, path: &Path) -> Result<()> {
         let id = request.id.clone().unwrap_or_else(|| request_name(path));
-        let Some(name) = request.name else {
+        let context = self.native_context(&request);
+        let Some(name) = request.name.clone() else {
             return self.emit_native_error(&id, "missing native function name");
         };
         if name.is_empty() {
@@ -157,7 +160,15 @@ impl<W: Write> Serve<'_, W> {
         }
         let args = request.args;
         let cache_ms = request.cache_ms.unwrap_or(0);
-        let key = native_key(&name, &args);
+        let key = if context.is_some() {
+            format!(
+                "{}\0{}",
+                native_key(&name, &args),
+                canonical_json(&request.context)
+            )
+        } else {
+            native_key(&name, &args)
+        };
         let cached = if cache_ms > 0 {
             self.cached_native(&key, cache_ms)
         } else {
@@ -165,7 +176,7 @@ impl<W: Write> Serve<'_, W> {
         };
         let result = match cached {
             Some(value) => Ok(value),
-            None => self.plugin.native(&name, args),
+            None => self.plugin.native(&name, args, context.as_ref()),
         };
         let value = match result {
             Ok(value) => value,
@@ -175,6 +186,30 @@ impl<W: Write> Serve<'_, W> {
             self.remember_native(&key, value.clone());
         }
         self.emit_native_value(&id, &value)
+    }
+
+    /// Rebuilds the invocation context a `&Context` native parameter sees.
+    fn native_context(&self, request: &Request) -> Option<Context> {
+        if !request.context.is_object() {
+            return None;
+        }
+        let field = |key: &str| {
+            request.context.get(key).cloned().unwrap_or(Value::Null)
+        };
+        Some(Context::new(
+            Parts {
+                entry: request.entry.clone(),
+                event: field("event")
+                    .as_str()
+                    .map_or_else(String::new, str::to_owned),
+                payload: field("payload"),
+                config: field("config"),
+                state: field("state"),
+                host: field("host"),
+                data_dir: self.data_dir.to_path_buf(),
+            },
+            self.translations.clone(),
+        ))
     }
 
     fn cached_native(&self, key: &str, cache_ms: u64) -> Option<Value> {
@@ -822,7 +857,11 @@ mod tests {
     fn test_serve_caches_native_results_without_done() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         #[expect(clippy::unnecessary_wraps)]
-        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
+        fn dispatch(
+            _name: &str,
+            _args: Value,
+            _context: Option<&crate::Context>,
+        ) -> StdResult<Value, String> {
             CALLS.fetch_add(1, Ordering::Relaxed);
             Ok(json!({ "rows": 1 }))
         }
@@ -891,7 +930,11 @@ mod tests {
     fn test_serve_caches_canonical_args() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
         #[expect(clippy::unnecessary_wraps)]
-        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
+        fn dispatch(
+            _name: &str,
+            _args: Value,
+            _context: Option<&crate::Context>,
+        ) -> StdResult<Value, String> {
             CALLS.fetch_add(1, Ordering::Relaxed);
             Ok(json!({ "ok": true }))
         }
@@ -945,7 +988,11 @@ mod tests {
 
     #[test]
     fn test_serve_reports_native_dispatch_error_as_result() {
-        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
+        fn dispatch(
+            _name: &str,
+            _args: Value,
+            _context: Option<&crate::Context>,
+        ) -> StdResult<Value, String> {
             Err("native exploded".to_owned())
         }
 
@@ -1055,7 +1102,11 @@ mod tests {
     #[test]
     fn test_serve_keeps_stale_boot_handling_for_native_requests() {
         #[expect(clippy::unnecessary_wraps)]
-        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
+        fn dispatch(
+            _name: &str,
+            _args: Value,
+            _context: Option<&crate::Context>,
+        ) -> StdResult<Value, String> {
             Ok(json!({ "rows": 1 }))
         }
 
@@ -1117,5 +1168,77 @@ mod tests {
         assert!(server.native_cache.contains_key("name-1"));
         assert!(server.native_cache.contains_key("latest"));
         assert_eq!(server.native_cache_order.len(), NATIVE_CACHE_LIMIT);
+    }
+
+    #[test]
+    fn test_serve_rebuilds_the_native_context() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn dispatch(
+            _name: &str,
+            _args: Value,
+            context: Option<&crate::Context>,
+        ) -> StdResult<Value, String> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            let handler = context.ok_or("missing context")?;
+            Ok(json!({
+                "event": handler.event,
+                "payload": handler.payload,
+                "config": handler.config,
+                "state": handler.state,
+                "now_ms": handler.now_ms,
+                "data_dir": handler.data_dir.to_string_lossy(),
+            }))
+        }
+
+        CALLS.store(0, Ordering::Relaxed);
+        let spool = TestSpool::new("serve-native-context");
+        let mut first = native_request(
+            "boot-native-context",
+            "describe",
+            1000,
+            "first",
+            json!({ "value": 1 }),
+        );
+        first["context"] = json!({
+            "event": "click",
+            "payload": { "id": "a" },
+            "config": { "message": "hi" },
+            "state": { "count": 2 },
+            "host": { "now_ms": 1_700_000_000 },
+        });
+        let mut second = first.clone();
+        second["id"] = json!("second");
+        // Same arguments, different event: the context is part of the cache key.
+        second["context"]["event"] = json!("render");
+        spool.write("000000000001.json", &first);
+        spool.write("000000000002.json", &second);
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .with_native(dispatch);
+
+        let writer = Capture {
+            plugin: &plugin,
+            data: &spool.data,
+            spool: &spool.spool,
+            boot: "boot-native-context",
+            stale: BTreeSet::new(),
+            stop_after: 3,
+        }
+        .run();
+        let lines = writer.lines();
+        spool.cleanup();
+
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+        let results: Vec<Value> = lines
+            .iter()
+            .filter(|line| line.contains("native_result"))
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect();
+        assert_eq!(results.len(), 2, "{lines:?}");
+        assert_eq!(results[0]["value"]["event"], "click");
+        assert_eq!(results[0]["value"]["payload"]["id"], "a");
+        assert_eq!(results[0]["value"]["config"]["message"], "hi");
+        assert_eq!(results[0]["value"]["state"]["count"], 2);
+        assert_eq!(results[0]["value"]["now_ms"], 1_700_000_000_i64);
+        assert_eq!(results[1]["value"]["event"], "render");
     }
 }

@@ -67,6 +67,7 @@ struct CompileContext<'a> {
     mode: CompileMode,
     state_key: &'a str,
     strings: &'a [&'a str],
+    settings: &'a [&'a str],
     constants: &'a mut String,
     warnings: &'a mut Vec<String>,
     natives: &'a mut std::collections::BTreeMap<String, compiler::NativeFn>,
@@ -150,6 +151,8 @@ fn generate_with(
     let state_key = state_key(root)?;
     let string_keys = string_settings(root);
     let strings = string_keys.iter().map(String::as_str).collect::<Vec<_>>();
+    let setting_keys = setting_keys(root);
+    let settings = setting_keys.iter().map(String::as_str).collect::<Vec<_>>();
     let mut constants = String::new();
     let mut natives = std::collections::BTreeMap::new();
     write_entries(
@@ -161,6 +164,7 @@ fn generate_with(
             mode,
             state_key: &state_key,
             strings: &strings,
+            settings: &settings,
             constants: &mut constants,
             warnings: &mut warnings,
             natives: &mut natives,
@@ -189,9 +193,9 @@ fn generate_with(
         write_files(&mut context).map_err(|error| format!("files: {error}"))?;
     }
     let plugin = if natives.is_empty() {
-        "    plugin\n}}\n"
+        "    plugin\n}\n"
     } else {
-        "    plugin.with_native(__noctalia_native::dispatch)\n}}\n"
+        "    plugin.with_native(__noctalia_native::dispatch)\n}\n"
     };
     let _ = write!(generated.body, "{plugin}");
     let defaults = default_entry_scripts(root)?;
@@ -796,7 +800,9 @@ fn write_native(
         "    pub(crate) fn dispatch(\n",
         "        name: &str,\n",
         "        args: Value,\n",
+        "        context: Option<&noctalia_rs::Context>,\n",
         "    ) -> Result<Value, String> {\n",
+        "        let _ = context;\n",
         "        match name {\n",
     ));
     let needs_pathbuf = natives.values().any(|item| {
@@ -816,7 +822,13 @@ fn write_native(
         }
         rust_path.push_str(&item.function);
         let mut args = Vec::new();
+        let mut needs_context = false;
         for param in &item.params {
+            if param.kind == compiler::NativeParamKind::Context {
+                needs_context = true;
+                args.push("__context".to_owned());
+                continue;
+            }
             let name = &param.name;
             args.push(if param.slice {
                 format!("&{name}[..]")
@@ -828,7 +840,17 @@ fn write_native(
         }
         let args = args.join(", ");
         let _ = writeln!(out, "            {} => {{", quote(&item.name));
+        if needs_context {
+            let _ = writeln!(
+                out,
+                "                let __context = context.ok_or(\"native function `{}` needs the handler context\")?;",
+                item.name
+            );
+        }
         for param in &item.params {
+            if param.kind == compiler::NativeParamKind::Context {
+                continue;
+            }
             let name = &param.name;
             let declared = param.owned.as_deref().unwrap_or("_");
             let _ = writeln!(
@@ -965,6 +987,37 @@ fn compiler_kind(kind: &str) -> Result<compiler::EntryKind, BoxError> {
         "layer" => compiler::EntryKind::Layer,
         other => return Err(format!("unsupported entry kind {other}").into()),
     })
+}
+
+/// Every declared setting key, in manifest order.
+fn setting_keys(root: &toml::Table) -> Vec<String> {
+    let mut keys = Vec::new();
+    collect_setting_keys(root.get("setting"), &mut keys);
+    for kind in ENTRY_KINDS {
+        let Some(entries) = root.get(*kind).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(table) = entry.as_table() {
+                collect_setting_keys(table.get("setting"), &mut keys);
+            }
+        }
+    }
+    keys
+}
+
+fn collect_setting_keys(value: Option<&Value>, keys: &mut Vec<String>) {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let Some(table) = item.as_table() else {
+            continue;
+        };
+        if let Some(key) = table.get("key").and_then(Value::as_str) {
+            keys.push(key.to_owned());
+        }
+    }
 }
 
 fn string_settings(root: &toml::Table) -> Vec<String> {
@@ -1362,6 +1415,7 @@ fn compile_entry(
             state_key: context.state_key,
             kind: compiler_kind(kind)?,
             strings: context.strings,
+            settings: context.settings,
             module: &site.module,
             modules: &owned,
             native: match context.mode {
@@ -2190,6 +2244,20 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 
     const LUAU_NATIVE_SOURCE: &str = "use noctalia_rs::{Context, Op, Result};\n\n#[luau]\nfn fetch_prs() -> Result<Vec<String>> {\n    let text = std::fs::read_to_string(\"/tmp/x\")?;\n    Ok(vec![text])\n}\n\nfn handler(_ctx: &Context) -> Result<Vec<Op>> {\n    let rows = fetch_prs()?;\n    Ok(vec![Op::log(rows.join(\",\"))])\n}\n";
 
+    const NATIVE_CONTEXT_MANIFEST: &str = "id = \"me/test\"\nname = \"Test\"\n\n[[setting]]\nkey = \"message\"\ntype = \"string\"\nlabel_key = \"settings.message.label\"\ndefault = \"hi\"\n\n[[widget]]\nid = \"widget\"\nentry = \"widget.luau\"\nhandler = \"handler\"\n";
+
+    const NATIVE_CONTEXT_SOURCE: &str = r#"use noctalia_rs::{Context, Op, Result};
+
+fn describe(ctx: &Context) -> Result<String> {
+    let text = std::fs::read_to_string("/tmp/x")?;
+    Ok(format!("{}:{text}", ctx.event))
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(describe(ctx)?)])
+}
+"#;
+
     const PLAIN_NATIVE_SOURCE: &str = r#"use noctalia_rs::{Context, Op, Result};
 
 #[native]
@@ -2292,7 +2360,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         assert!(!native_exists);
         assert!(!generated.contains("native.rs"), "{generated}");
         assert!(!generated.contains(".with_native("), "{generated}");
-        assert!(generated.contains("    plugin\n}}\n"), "{generated}");
+        assert!(generated.contains("    plugin\n}\n"), "{generated}");
         Ok(())
     }
 
@@ -2309,6 +2377,37 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 
         assert!(native.contains("value(crate::now())"), "{native}");
         assert!(!native.contains("match crate::now("), "{native}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn generate_with_native_context_builds_the_snapshot() -> Result<(), BoxError>
+    {
+        let (manifest, dir) = compile_fixture(
+            "native-context",
+            NATIVE_CONTEXT_MANIFEST,
+            NATIVE_CONTEXT_SOURCE,
+        )?;
+        let warnings = generate_with(&manifest, &dir, None)?;
+        let native = fs::read_to_string(dir.join("native.rs"))?;
+        let script = fs::read_to_string(dir.join("luau/widget.luau"))?;
+        fs::remove_dir_all(&dir)?;
+
+        assert!(
+            native.contains("context: Option<&noctalia_rs::Context>,"),
+            "{native}"
+        );
+        assert!(
+            native.contains("let __context = context.ok_or("),
+            "{native}"
+        );
+        assert!(native.contains("crate::describe(__context)"), "{native}");
+        assert!(script.contains("CONFIG_KEYS = { \"message\" }"), "{script}");
+        assert!(
+            script.contains("__native.call(\"main::describe\", {}, 0, true)"),
+            "{script}"
+        );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         Ok(())
     }

@@ -44,6 +44,7 @@ fn compile_kind(entry: &str, kind: EntryKind, handler: &str) -> String {
             state_key: "native.state",
             kind,
             strings: &[],
+            settings: &[],
             module: "main",
             modules: &[],
             native: NativeMode::Allow,
@@ -329,5 +330,59 @@ fn one_event_while_parked_is_queued_and_drained_in_order() {
         bar_text(&click).as_deref(),
         Some("click|click"),
         "{click:?}"
+    );
+}
+
+const CONTEXT_CALL: &str = r#"
+fn describe(ctx: &Context) -> Result<String> {
+    let text = std::fs::read_to_string("/tmp/rows")?;
+    Ok(format!("{}:{text}", ctx.event))
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::BarText { text: describe(ctx)? }])
+}
+"#;
+
+#[test]
+fn a_native_function_that_takes_the_context_resumes() {
+    let source = compile("context", CONTEXT_CALL);
+    assert!(
+        source.contains("__native.call(\"main::describe\", {}, 0, true)"),
+        "{source}"
+    );
+    assert!(
+        source.contains("local function snapshot(descriptor)"),
+        "{source}"
+    );
+
+    let parked = dispatch("context", &source, "render", json!({}));
+    let stream = stream_id(&parked);
+    let ready = dispatch(
+        "context",
+        &source,
+        "host_callback",
+        line(
+            &stream,
+            json!({ "control": "ready", "boot": "b1", "spool": "/tmp/x" }),
+        ),
+    );
+    // The request write goes through the host, which the test does not provide,
+    // but building the context snapshot must not raise.
+    assert!(bar_text(&ready).is_none(), "{ready:?}");
+
+    let resumed = dispatch(
+        "context",
+        &source,
+        "host_callback",
+        line(
+            &stream,
+            json!({ "control": "native_result", "id": "1", "value": "render:rows", "error": null }),
+        ),
+    );
+    assert_eq!(
+        bar_text(&resumed).as_deref(),
+        Some("render:rows"),
+        "{resumed:?}"
     );
 }

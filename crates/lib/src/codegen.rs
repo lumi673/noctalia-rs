@@ -1161,6 +1161,7 @@ mod tests {
                     state_key: "template.state",
                     kind: compiled_kind,
                     strings: &["message"],
+                    settings: &["message"],
                     native: compiler::NativeMode::Deny,
                     module: "main",
                     modules: &[],

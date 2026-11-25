@@ -11,8 +11,8 @@ use syn::{
 
 use crate::program::{Program, typed_args};
 use crate::{
-    Error, NativeFn, NativeMode, NativeParam, is_context, is_identifier,
-    is_luau_keyword, quote, sanitize,
+    Error, NativeFn, NativeMode, NativeParam, NativeParamKind, is_context,
+    is_identifier, is_luau_keyword, quote, sanitize,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +155,7 @@ pub(crate) struct Body {
     pub params: Vec<&'static str>,
     pub is_empty: bool,
     pub uses_native: bool,
+    pub uses_native_context: bool,
     pub native: Vec<NativeFn>,
     pub statics: Vec<(String, String)>,
 }
@@ -223,6 +224,7 @@ pub(crate) struct Emitter<'a> {
     known_native: &'a BTreeMap<String, NativeFn>,
     native_found: BTreeMap<String, NativeFn>,
     uses_native: bool,
+    uses_native_context: bool,
     deferred: usize,
 }
 
@@ -286,6 +288,7 @@ impl<'a> Emitter<'a> {
             known_native,
             native_found: BTreeMap::new(),
             uses_native: false,
+            uses_native_context: false,
             deferred: 0,
         }
     }
@@ -771,16 +774,19 @@ impl<'a> Emitter<'a> {
         }
         let mut values = Vec::new();
         for binding in bindings {
-            let Binding::Local { text, .. } = binding else {
-                return Err(Error::at(
-                    span,
-                    format!(
-                        "native function `{}` cannot take the context or an ops vector",
-                        item.name
-                    ),
-                ));
-            };
-            values.push(text.clone());
+            match binding {
+                Binding::Context(_) => self.uses_native_context = true,
+                Binding::Local { text, .. } => values.push(text.clone()),
+                Binding::Ops(_) => {
+                    return Err(Error::at(
+                        span,
+                        format!(
+                            "native function `{}` cannot take a `Vec<Op>` parameter",
+                            item.name
+                        ),
+                    ));
+                }
+            }
         }
         let call =
             format!("{}({})", native_local(&item.name), values.join(", "));
@@ -999,6 +1005,7 @@ impl<'a> Emitter<'a> {
                 .collect(),
             is_empty: !self.emitted,
             uses_native: self.uses_native,
+            uses_native_context: self.uses_native_context,
             native: self.native_found.into_values().collect(),
             statics: self
                 .statics
@@ -6922,16 +6929,23 @@ pub(crate) fn native_local(name: &str) -> String {
 pub(crate) fn stub_source(item: &NativeFn) -> String {
     let mut declared = Vec::new();
     let mut fields = Vec::new();
-    for (index, param) in item.params.iter().enumerate() {
+    let mut index = 0usize;
+    let mut needs_context = false;
+    for param in &item.params {
+        if param.kind == NativeParamKind::Context {
+            needs_context = true;
+            continue;
+        }
+        index = index.saturating_add(1);
         let name = &param.name;
         let local = if is_luau_keyword(name) {
-            format!("{name}_{}", index + 1)
+            format!("{name}_{index}")
         } else {
             name.clone()
         };
         declared.push(local.clone());
         let key = if is_identifier(name) && !is_luau_keyword(name) {
-            (*name).clone()
+            name.clone()
         } else {
             format!("[{}]", quote(name))
         };
@@ -6945,7 +6959,7 @@ pub(crate) fn stub_source(item: &NativeFn) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
-        "local function {}({})\n  return __native.call({}, {args}, {})\nend\n\n",
+        "local function {}({})\n  return __native.call({}, {args}, {}, {needs_context})\nend\n\n",
         native_local(&item.name),
         declared.join(", "),
         quote(&item.name),
@@ -6954,127 +6968,260 @@ pub(crate) fn stub_source(item: &NativeFn) -> String {
     out
 }
 
-/// The Luau side of the native boundary: request writing, caching, and the
-/// coroutine that parks while the helper computes.
-pub(crate) fn native_runtime(entry: &str) -> String {
+/// The Luau side of the native boundary: request writing, caching, the
+/// invocation context, and the coroutine that parks while the helper computes.
+pub(crate) fn native_runtime(
+    entry: &str,
+    state_key: &str,
+    settings: &[&str],
+) -> String {
+    // Kept in step with `crates/lib/src/bridge.luau`: a native function that
+    // takes `&Context` must see the same host snapshot the bridge sends.
+    const SETTING_PATHS: &[&str] = &[
+        "shell.time_format",
+        "shell.date_format",
+        "shell.offline_mode",
+        "shell.lang",
+        "shell.language",
+        "shell.corner_radius_scale",
+        "shell.show_close_buttons",
+        "general.language",
+        "bar",
+        "bar.order",
+        "widget",
+        "desktop_widgets",
+        "desktop_widgets.widget",
+        "theme.source",
+        "theme.pure_black_dark",
+        "theme.wallpaper_scheme",
+        "system.monitor.network_poll_seconds",
+    ];
+    const COLOR_ROLES: &[&str] = &[
+        "primary",
+        "on_primary",
+        "primary_container",
+        "on_primary_container",
+        "secondary",
+        "on_secondary",
+        "secondary_container",
+        "on_secondary_container",
+        "tertiary",
+        "on_tertiary",
+        "tertiary_container",
+        "on_tertiary_container",
+        "error",
+        "on_error",
+        "error_container",
+        "on_error_container",
+        "surface",
+        "on_surface",
+        "on_surface_variant",
+        "surface_container_low",
+        "surface_container",
+        "surface_container_high",
+        "surface_container_highest",
+        "outline_variant",
+        "shadow",
+        "scrim",
+        "hover",
+        "on_hover",
+        "surface_variant",
+        "outline",
+    ];
     let mut out = String::new();
-    let _ = writeln!(out, "local __native = (function()");
-    out.push_str(&NATIVE_RUNTIME_BODY.replace("__ENTRY__", &quote(entry)));
-    out.push_str("end)()\n\n");
+    out.push_str("local __native = (function()\n");
+    let _ = writeln!(out, "  local ENTRY = {}", quote(entry));
+    let _ = writeln!(out, "  local STATE_KEY = {}", quote(state_key));
+    out.push_str(
+        r#"  local BIN = noctalia.pluginDir() .. "/{{HELPER}}"
+  local DATA_DIR = noctalia.pluginDataDir() or noctalia.pluginDir()
+  local RUNTIME_ID = (tostring({}):gsub("[^%w_%-]", "_"))
+  local SPOOL_DIR = DATA_DIR .. "/.noctalia-rs/native/" .. ENTRY:gsub("[^%w_]", "_") .. "-" .. RUNTIME_ID
+  local CACHE_LIMIT = 128
+"#,
+    );
+    let _ = writeln!(out, "  local CONFIG_KEYS = {}", lua_list(settings));
+    let _ =
+        writeln!(out, "  local SETTING_PATHS = {}", lua_list(SETTING_PATHS));
+    let _ = writeln!(out, "  local COLOR_ROLES = {}", lua_list(COLOR_ROLES));
+    out.push_str(
+        r#"  local M = {}
+  local queue, active, current = {}, nil, nil
+  local pending, boot, request_dir, sequence = {}, nil, nil, 0
+  local cache, order = {}, {}
+
+  local function shellQuote(value)
+    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+  end
+
+  local function write(request)
+    sequence += 1
+    local name = string.format("%012d", sequence)
+    local temporary = request_dir .. "/" .. name .. ".pending"
+    local target = request_dir .. "/" .. name .. ".json"
+    request.boot = boot
+    request.entry = ENTRY
+    local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(request))
+    if ok then ok, err = noctalia.renameFile(temporary, target) end
+    if not ok then
+      noctalia.removeFile(temporary)
+      noctalia.log("noctalia native: spool write failed: " .. tostring(err))
+    end
+  end
+
+  function M.send(request)
+    if boot then write(request) else pending[#pending + 1] = request end
+  end
+
+  local function remember(key, value)
+    if cache[key] == nil then order[#order + 1] = key end
+    cache[key] = { at = noctalia.nowMs(), value = value }
+    while #order > CACHE_LIMIT do
+      cache[table.remove(order, 1)] = nil
+    end
+  end
+
+  local function resolve(root, path)
+    local value = root
+    for part in string.gmatch(path, "[^.]+") do
+      if type(value) ~= "table" then return nil end
+      value = value[part]
+    end
+    return value
+  end
+
+  local function invoke(root, path, ...)
+    local value = resolve(root, path)
+    if type(value) ~= "function" then return nil end
+    local ok, result = pcall(value, ...)
+    if ok then return result end
+    return nil
+  end
+
+  local function snapshot(descriptor)
+    if descriptor == nil then return nil end
+    local host = {
+      now_ms = invoke(noctalia, "nowMs") or 0,
+      dark = invoke(noctalia, "isDarkMode"),
+      outputs = invoke(noctalia, "outputs"),
+      focused_output_name = invoke(noctalia, "focusedOutputName"),
+      pluginDir = invoke(noctalia, "pluginDir"),
+      pluginDataDir = invoke(noctalia, "pluginDataDir"),
+      clipboard = invoke(noctalia, "clipboardText"),
+      calendar = invoke(noctalia, "calendarEvents"),
+      media = invoke(noctalia, "mediaPlayer"),
+      stats = invoke(noctalia, "systemStats"),
+      nightlight = invoke(noctalia, "nightlight.state"),
+      compositor = { name = invoke(noctalia, "compositor.name") },
+      setting = {},
+      bar = { vertical = invoke(barWidget, "isVertical"), output_name = invoke(barWidget, "outputName") },
+      colors = {},
+    }
+    for _, path in ipairs(SETTING_PATHS) do host.setting[path] = invoke(noctalia, "getSetting", path) end
+    for _, role in ipairs(COLOR_ROLES) do host.colors[role] = invoke(noctalia, "getColor", role) end
+    local config = {}
+    for _, key in ipairs(CONFIG_KEYS) do config[key] = noctalia.getConfig(key) end
+    return {
+      entry = ENTRY,
+      event = descriptor.event,
+      payload = descriptor.payload or {},
+      config = config,
+      state = noctalia.state.get(STATE_KEY) or {},
+      host = host,
+    }
+  end
+
+  function M.call(name, args, cache_ms, needs_context)
+    local context = nil
+    if needs_context then context = snapshot(current) end
+    local encoded = nil
+    if cache_ms and cache_ms > 0 then
+      encoded = name .. string.char(0) .. noctalia.json.encode(args)
+      if context ~= nil then
+        encoded = encoded .. string.char(0) .. noctalia.json.encode(context)
+      end
+      local hit = cache[encoded]
+      if hit and noctalia.nowMs() - hit.at < cache_ms then return hit.value end
+    end
+    local value, failure = coroutine.yield({
+      kind = "native",
+      name = name,
+      args = args,
+      cache_ms = cache_ms or 0,
+      context = context,
+    })
+    if failure ~= nil then error(tostring(failure), 0) end
+    if encoded ~= nil then remember(encoded, value) end
+    return value
+  end
+
+  local function park(co, request)
+    active = { co = co, request = request, context = current }
+    M.send(request)
+  end
+
+  function M.pump()
+    while active == nil and #queue > 0 do
+      local job = table.remove(queue, 1)
+      current = job.context
+      local co = coroutine.create(job.fn)
+      local ok, yielded = coroutine.resume(co, table.unpack(job.args))
+      if not ok then error(yielded, 0) end
+      if type(yielded) == "table" and yielded.kind == "native" then park(co, yielded) end
+    end
+  end
+
+  function M.run(fn, context, ...)
+    queue[#queue + 1] = { fn = fn, context = context, args = { ... } }
+    M.pump()
+  end
+
+  local function on_line(line)
+    if type(line) ~= "table" then return end
+    if line.control == "ready" then
+      boot = line.boot
+      request_dir = line.spool
+      local queued = pending
+      pending = {}
+      for _, request in ipairs(queued) do write(request) end
+      if active ~= nil and active.request ~= nil then write(active.request) end
+      return
+    end
+    if line.control ~= "native_result" or active == nil then return end
+    local co = active.co
+    current = active.context
+    active = nil
+    local ok, yielded = coroutine.resume(co, line.value, line.error)
+    if not ok then error(yielded, 0) end
+    if type(yielded) == "table" and yielded.kind == "native" then
+      park(co, yielded)
+      return
+    end
+    M.pump()
+  end
+
+  function M.setup()
+    if noctalia.mkdirAll then noctalia.mkdirAll(SPOOL_DIR) end
+    local command = shellQuote(BIN) .. " serve " .. shellQuote(DATA_DIR) .. " " .. shellQuote(SPOOL_DIR)
+    local loop = "while kill -0 \"$PPID\" 2>/dev/null; do " .. command .. "; sleep 0.2; done"
+    if not noctalia.runStream(loop, on_line) then
+      noctalia.log("noctalia native: could not start the persistent helper")
+    end
+  end
+
+  M.setup()
+  return M
+end)()
+
+"#,
+    );
     out
 }
 
-const NATIVE_RUNTIME_BODY: &str = concat!(
-    "  local ENTRY = __ENTRY__\n",
-    "  local BIN = noctalia.pluginDir() .. \"/{{HELPER}}\"\n",
-    "  local DATA_DIR = noctalia.pluginDataDir() or noctalia.pluginDir()\n",
-    "  local RUNTIME_ID = (tostring({}):gsub(\"[^%w_%-]\", \"_\"))\n",
-    "  local SPOOL_DIR = DATA_DIR .. \"/.noctalia-rs/native/\" .. ENTRY:gsub(\"[^%w_]\", \"_\") .. \"-\" .. RUNTIME_ID\n",
-    "  local CACHE_LIMIT = 128\n",
-    "  local M = {}\n",
-    "  local queue, active = {}, nil\n",
-    "  local pending, boot, request_dir, sequence = {}, nil, nil, 0\n",
-    "  local cache, order = {}, {}\n",
-    "\n",
-    "  local function shellQuote(value)\n",
-    "    return \"'\" .. tostring(value):gsub(\"'\", \"'\\\\''\") .. \"'\"\n",
-    "  end\n",
-    "\n",
-    "  local function write(request)\n",
-    "    sequence += 1\n",
-    "    local name = string.format(\"%012d\", sequence)\n",
-    "    local temporary = request_dir .. \"/\" .. name .. \".pending\"\n",
-    "    local target = request_dir .. \"/\" .. name .. \".json\"\n",
-    "    request.boot = boot\n",
-    "    request.entry = ENTRY\n",
-    "    local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(request))\n",
-    "    if ok then ok, err = noctalia.renameFile(temporary, target) end\n",
-    "    if not ok then\n",
-    "      noctalia.removeFile(temporary)\n",
-    "      noctalia.log(\"noctalia native: spool write failed: \" .. tostring(err))\n",
-    "    end\n",
-    "  end\n",
-    "\n",
-    "  function M.send(request)\n",
-    "    if boot then write(request) else pending[#pending + 1] = request end\n",
-    "  end\n",
-    "\n",
-    "  local function remember(key, value)\n",
-    "    if cache[key] == nil then order[#order + 1] = key end\n",
-    "    cache[key] = { at = noctalia.nowMs(), value = value }\n",
-    "    while #order > CACHE_LIMIT do\n",
-    "      cache[table.remove(order, 1)] = nil\n",
-    "    end\n",
-    "  end\n",
-    "\n",
-    "  function M.call(name, args, cache_ms)\n",
-    "    local key = name .. string.char(0) .. noctalia.json.encode(args)\n",
-    "    if cache_ms and cache_ms > 0 then\n",
-    "      local hit = cache[key]\n",
-    "      if hit and noctalia.nowMs() - hit.at < cache_ms then return hit.value end\n",
-    "    end\n",
-    "    local value, failure = coroutine.yield({ __native = name, args = args })\n",
-    "    if failure ~= nil then error(tostring(failure), 0) end\n",
-    "    if cache_ms and cache_ms > 0 then remember(key, value) end\n",
-    "    return value\n",
-    "  end\n",
-    "\n",
-    "  local function park(co, yielded)\n",
-    "    local request = { kind = \"native\", name = yielded.__native, args = yielded.args or {}, cache_ms = yielded.cache_ms or 0 }\n",
-    "    active = { co = co, request = request }\n",
-    "    M.send(request)\n",
-    "  end\n",
-    "\n",
-    "  function M.pump()\n",
-    "    while active == nil and #queue > 0 do\n",
-    "      local job = table.remove(queue, 1)\n",
-    "      local co = coroutine.create(job.fn)\n",
-    "      local ok, yielded = coroutine.resume(co, table.unpack(job.args))\n",
-    "      if not ok then error(yielded, 0) end\n",
-    "      if type(yielded) == \"table\" and yielded.__native ~= nil then park(co, yielded) end\n",
-    "    end\n",
-    "  end\n",
-    "\n",
-    "  function M.run(fn, ...)\n",
-    "    queue[#queue + 1] = { fn = fn, args = { ... } }\n",
-    "    M.pump()\n",
-    "  end\n",
-    "\n",
-    "  local function on_line(line)\n",
-    "    if type(line) ~= \"table\" then return end\n",
-    "    if line.control == \"ready\" then\n",
-    "      boot = line.boot\n",
-    "      request_dir = line.spool\n",
-    "      local queued = pending\n",
-    "      pending = {}\n",
-    "      for _, request in ipairs(queued) do write(request) end\n",
-    "      if active ~= nil and active.request ~= nil then write(active.request) end\n",
-    "      return\n",
-    "    end\n",
-    "    if line.control ~= \"native_result\" or active == nil then return end\n",
-    "    local co = active.co\n",
-    "    active = nil\n",
-    "    local ok, yielded = coroutine.resume(co, line.value, line.error)\n",
-    "    if not ok then error(yielded, 0) end\n",
-    "    if type(yielded) == \"table\" and yielded.__native ~= nil then\n",
-    "      park(co, yielded)\n",
-    "      return\n",
-    "    end\n",
-    "    M.pump()\n",
-    "  end\n",
-    "\n",
-    "  function M.setup()\n",
-    "    if noctalia.mkdirAll then noctalia.mkdirAll(SPOOL_DIR) end\n",
-    "    local command = shellQuote(BIN) .. \" serve \" .. shellQuote(DATA_DIR) .. \" \" .. shellQuote(SPOOL_DIR)\n",
-    "    local loop = \"while kill -0 \\\"$PPID\\\" 2>/dev/null; do \" .. command .. \"; sleep 0.2; done\"\n",
-    "    if not noctalia.runStream(loop, on_line) then\n",
-    "      noctalia.log(\"noctalia native: could not start the persistent helper\")\n",
-    "    end\n",
-    "  end\n",
-    "\n",
-    "  M.setup()\n",
-    "  return M\n",
-);
+fn lua_list(values: &[&str]) -> String {
+    let items = values.iter().map(|value| quote(value)).collect::<Vec<_>>();
+    format!("{{ {} }}", items.join(", "))
+}
 
 /// Parses `#[native]` and `#[native(cache_ms = 30_000)]`.
 fn forced_native(function: &ItemFn) -> Result<Option<u64>, Error> {
@@ -7191,10 +7338,15 @@ fn native_param(
 ) -> Result<NativeParam, Error> {
     let mut param = NativeParam {
         name,
+        kind: NativeParamKind::Value,
         owned: None,
         borrow: false,
         slice: false,
     };
+    if is_context(ty) {
+        param.kind = NativeParamKind::Context;
+        return Ok(param);
+    }
     let Type::Reference(reference) = ty else {
         if matches!(ty, Type::ImplTrait(_)) {
             return Err(Error::at(

@@ -7,6 +7,7 @@ fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         state_key: "hello.state",
         kind,
         strings: &["message", "name"],
+        settings: &["message", "name"],
         module: "main",
         modules: &[],
         native: NativeMode::Deny,
@@ -780,6 +781,7 @@ fn module_options<'a>(
         state_key: "hello.state",
         kind,
         strings: &["message", "name"],
+        settings: &["message", "name"],
         module: "main",
         modules,
         native: NativeMode::Deny,
@@ -4309,6 +4311,7 @@ fn native_options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         state_key: "hello.state",
         kind,
         strings: &["message", "name"],
+        settings: &["message", "name"],
         module: "main",
         modules: &[],
         native: NativeMode::Allow,
@@ -4383,7 +4386,7 @@ fn auto_mode_splits_at_the_function_boundary() {
     assert!(native.reason.contains("std::fs"), "{}", native.reason);
     assert!(
         compiled.source.contains(
-            "local function __native_fn_main__load__rows()\n  return __native.call(\"main::load_rows\", {}, 0)\nend"
+            "local function __native_fn_main__load__rows()\n  return __native.call(\"main::load_rows\", {}, 0, false)\nend"
         ),
         "{}",
         compiled.source
@@ -4679,4 +4682,65 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     .expect("reference returns serialize");
     assert_eq!(compiled.native.len(), 1);
     assert!(compiled.native[0].result);
+}
+
+#[test]
+fn native_functions_can_take_the_handler_context() {
+    let handler = r#"
+fn describe(ctx: &Context) -> Result<String> {
+    let text = std::fs::read_to_string("/tmp/x")?;
+    Ok(format!("{}:{}", ctx.event, text))
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let line = describe(ctx)?;
+    Ok(vec![Op::log(line)])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    let native = &compiled.native[0];
+    assert_eq!(native.params.len(), 1);
+    assert_eq!(
+        native.params[0].kind,
+        crate::NativeParamKind::Context,
+        "{native:?}"
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local function __native_fn_main__describe()\n  return __native.call(\"main::describe\", {}, 0, true)\nend"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains(
+            "__native.run(body_events, { event = \"click\", payload = { axis = axis, steps = steps, starts_gesture = startsGesture } }"
+        ) || compiled.source.contains("__native.run(body_render, { event = \"render\""),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local function snapshot(descriptor)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("CONFIG_KEYS = { \"message\", \"name\" }"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("STATE_KEY = \"hello.state\""),
+        "{}",
+        compiled.source
+    );
 }

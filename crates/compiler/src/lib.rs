@@ -254,6 +254,9 @@ pub struct Options<'a> {
     /// Config keys declared as strings in the manifest. `config_str` on these
     /// keys needs no runtime coercion.
     pub strings: &'a [&'a str],
+    /// Every config key declared in the manifest. A native function that takes
+    /// `&Context` sees the same config map the bridge sends.
+    pub settings: &'a [&'a str],
     /// Module path of `source`, such as `main` or `widget`.
     ///
     /// An empty `modules` list keeps the single-file behavior: helpers defined
@@ -276,11 +279,22 @@ pub enum NativeMode {
     Deny,
 }
 
+/// How a native function receives one parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeParamKind {
+    /// Deserialized from the request arguments.
+    Value,
+    /// The handler context, rebuilt in the helper from the request.
+    Context,
+}
+
 /// One argument of a native function.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeParam {
     /// Parameter name in the Rust signature.
     pub name: String,
+    /// Whether the parameter travels as JSON or as the handler context.
+    pub kind: NativeParamKind,
     /// Owned type for the local that receives the deserialized value, when the
     /// declared parameter is a reference that needs one (`&str` -> `String`).
     pub owned: Option<String>,
@@ -606,7 +620,11 @@ fn compile_once(
         }
     }
     if !natives.is_empty() {
-        out.push_str(&emit::native_runtime(options.entry));
+        out.push_str(&emit::native_runtime(
+            options.entry,
+            options.state_key,
+            options.settings,
+        ));
         for item in natives.values() {
             out.push_str(&emit::stub_source(item));
         }
@@ -645,7 +663,12 @@ fn compile_once(
         let _ = writeln!(
             out,
             "function update() {} end",
-            invoke(&slot.body, &slot.name, &args)
+            invoke(
+                &slot.body,
+                &slot.name,
+                &args,
+                Some(descriptor(&update_event, Some("update"), None, false))
+            )
         );
     } else {
         out.push_str("function update() end\n");
@@ -665,7 +688,12 @@ fn compile_once(
         let _ = writeln!(
             out,
             "function onHostCallback(payload) {} end",
-            invoke(&slot.body, &slot.name, &args)
+            invoke(
+                &slot.body,
+                &slot.name,
+                &args,
+                Some(descriptor("host_callback", None, Some("payload"), false))
+            )
         );
     }
 
@@ -694,12 +722,27 @@ fn compile_once(
         let _ = writeln!(
             out,
             "local last_query = nil\nfunction onQuery(text) last_query = text; {} end",
-            invoke(&slot.body, &slot.name, &payload)
+            invoke(
+                &slot.body,
+                &slot.name,
+                &payload,
+                Some(descriptor("query", None, Some("{ text = text }"), false))
+            )
         );
         let _ = writeln!(
             out,
             "state.watch(STATE_KEY, function() if last_query then {} end end)",
-            invoke(&slot.body, &slot.name, &state_payload)
+            invoke(
+                &slot.body,
+                &slot.name,
+                &state_payload,
+                Some(descriptor(
+                    "query",
+                    Some("state"),
+                    Some("{ text = last_query, source = \"state\" }"),
+                    false
+                ))
+            )
         );
     }
     for callback in CALLBACKS {
@@ -734,7 +777,17 @@ fn compile_once(
             "function {}({}) {} end",
             callback.function,
             callback.params,
-            invoke(&slot.body, &slot.name, &args)
+            invoke(
+                &slot.body,
+                &slot.name,
+                &args,
+                Some(descriptor(
+                    callback.event,
+                    None,
+                    dynamic,
+                    callback.payload.is_empty()
+                ))
+            )
         );
     }
     out.push('\n');
@@ -753,7 +806,12 @@ fn compile_once(
         let _ = writeln!(
             out,
             "state.watch(STATE_KEY, function() {} end)",
-            invoke(&slot.body, &slot.name, &args)
+            invoke(
+                &slot.body,
+                &slot.name,
+                &args,
+                Some(descriptor(&update_event, Some("state"), None, false))
+            )
         );
     }
     if options.kind == EntryKind::Panel {
@@ -769,7 +827,16 @@ fn compile_once(
             false,
             load_label,
         );
-        let _ = writeln!(out, "{}", invoke(&slot.body, &slot.name, &args));
+        let _ = writeln!(
+            out,
+            "{}",
+            invoke(
+                &slot.body,
+                &slot.name,
+                &args,
+                Some(descriptor(load_label, Some("load"), None, false))
+            )
+        );
     }
 
     Ok((
@@ -784,15 +851,41 @@ fn compile_once(
 
 /// Calls a body directly, or through the native coroutine driver when the body
 /// reaches a native function.
-fn invoke(body: &emit::Body, name: &str, args: &str) -> String {
+fn invoke(
+    body: &emit::Body,
+    name: &str,
+    args: &str,
+    descriptor: Option<String>,
+) -> String {
     if !body.uses_native {
         return format!("{name}({args})");
     }
+    let descriptor = match (body.uses_native_context, descriptor) {
+        (true, Some(descriptor)) => descriptor,
+        _ => "nil".to_owned(),
+    };
     if args.is_empty() {
-        format!("__native.run({name})")
+        format!("__native.run({name}, {descriptor})")
     } else {
-        format!("__native.run({name}, {args})")
+        format!("__native.run({name}, {descriptor}, {args})")
     }
+}
+
+/// The event and payload a native `&Context` parameter must see.
+fn descriptor(
+    event: &str,
+    source: Option<&str>,
+    dynamic: Option<&str>,
+    empty: bool,
+) -> String {
+    let payload = if let Some(table) = dynamic {
+        table.to_owned()
+    } else if empty {
+        "{}".to_owned()
+    } else {
+        format!("{{ source = {} }}", quote(source.unwrap_or("")))
+    };
+    format!("{{ event = {}, payload = {payload} }}", quote(event))
 }
 
 pub(crate) fn sanitize(value: &str) -> String {
