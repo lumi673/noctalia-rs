@@ -335,6 +335,16 @@ fn run() -> Result<()> {
         },
     )?);
 
+    let event_source = bridge_event_source();
+    let event_sources = [("entry", event_source.as_str())];
+    let event_dir = scratch.path().join("bridge-event");
+    results.push(measure(options.phase("bridge_event", false), || {
+        let ctx = event_context(&event_dir);
+        let ops = noctalia_rs_luau::dispatch(&ctx, &event_sources)?;
+        std::hint::black_box(ops);
+        Ok(())
+    })?);
+
     let sample = sample_value();
     let encoded = serde_json::to_string(&sample)?;
     results.push(measure(options.phase("json_encode_rust", false), || {
@@ -678,6 +688,124 @@ fn sample_host() -> Value {
         "setting": { "shell.font": "sans" },
         "stats": { "cpu": 12 }
     })
+}
+
+// Mirrors the setting paths and color roles `bridge.luau` reads, so the host
+// snapshot a bridged event ships has the shape it has in production.
+const BRIDGE_SETTINGS: [&str; 17] = [
+    "shell.time_format",
+    "shell.date_format",
+    "shell.offline_mode",
+    "shell.lang",
+    "shell.language",
+    "shell.corner_radius_scale",
+    "shell.show_close_buttons",
+    "general.language",
+    "bar",
+    "bar.order",
+    "widget",
+    "desktop_widgets",
+    "desktop_widgets.widget",
+    "theme.source",
+    "theme.pure_black_dark",
+    "theme.wallpaper_scheme",
+    "system.monitor.network_poll_seconds",
+];
+
+const BRIDGE_COLORS: [&str; 30] = [
+    "primary",
+    "on_primary",
+    "primary_container",
+    "on_primary_container",
+    "secondary",
+    "on_secondary",
+    "secondary_container",
+    "on_secondary_container",
+    "tertiary",
+    "on_tertiary",
+    "tertiary_container",
+    "on_tertiary_container",
+    "error",
+    "on_error",
+    "error_container",
+    "on_error_container",
+    "surface",
+    "on_surface",
+    "on_surface_variant",
+    "surface_container_low",
+    "surface_container",
+    "surface_container_high",
+    "surface_container_highest",
+    "outline_variant",
+    "shadow",
+    "scrim",
+    "hover",
+    "on_hover",
+    "surface_variant",
+    "outline",
+];
+
+fn event_host() -> Value {
+    let setting = BRIDGE_SETTINGS
+        .iter()
+        .map(|path| ((*path).to_owned(), json!("value")))
+        .collect::<serde_json::Map<String, Value>>();
+    let colors = BRIDGE_COLORS
+        .iter()
+        .map(|role| ((*role).to_owned(), json!("#aabbcc")))
+        .collect::<serde_json::Map<String, Value>>();
+    json!({
+        "now_ms": 1700000000_i64,
+        "dark": true,
+        "outputs": [{ "name": "DP-1", "width": 1920, "height": 1080 }],
+        "focused_output_name": "DP-1",
+        "clipboard": "clip",
+        "media": { "title": "Song", "artist": "Artist", "status": "playing" },
+        "stats": { "cpu": 12 },
+        "nightlight": Value::Null,
+        "calendar": Value::Null,
+        "compositor": { "name": "niri" },
+        "setting": setting,
+        "bar": { "vertical": false, "output_name": "DP-1" },
+        "colors": colors,
+    })
+}
+
+fn event_context(data_dir: &Path) -> Context {
+    Context::new(
+        noctalia_rs::Parts {
+            entry: "entry".to_owned(),
+            event: "update".to_owned(),
+            payload: payload("{}"),
+            config: sample_config(),
+            state: sample_state(),
+            host: event_host(),
+            data_dir: data_dir.to_path_buf(),
+        },
+        json!({ "greet": { "label": "Hello {name}" } }),
+    )
+}
+
+fn bridge_event_source() -> String {
+    let bridge = noctalia_rs::bridge::SOURCE
+        .replace("{{HELPER}}", "bench-helper")
+        .replace("{{PREFIX}}", "bench");
+    format!(
+        "local written = 0\n\
+         noctalia.mkdirAll = function() return true end\n\
+         noctalia.runStream = function(_, on_line)\n\
+         on_line('{{\"control\":\"ready\",\"boot\":\"bench\",\"spool\":\"/bench/spool\"}}')\n\
+         return true\n\
+         end\n\
+         noctalia.writeFile = function(_, contents)\n\
+         written = #contents\n\
+         return true\n\
+         end\n\
+         noctalia.renameFile = function() return true end\n\
+         local bridge = (function()\n{bridge}\nend)()\n\
+         bridge.setup(\"service\", {{\"name\"}})\n\
+         function update()\n  bridge.call(\"update\", {{}})\nend\n"
+    )
 }
 
 fn sample_value() -> Value {
