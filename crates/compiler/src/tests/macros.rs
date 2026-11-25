@@ -363,3 +363,22 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(generated.contains(finite), "{generated}");
     assert!(generated.contains("~= nil then"), "{generated}");
 }
+
+#[test]
+fn compiles_matches_with_a_guard() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.setting("flag");
+    let flag = matches!(value, Some(Value::String(text)) if text == "true");
+    let plain = matches!(value, Some(Value::Bool(true)));
+    Ok(vec![Op::log(format!("{}{}", flag, plain))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("(function()"), "{generated}");
+    assert!(generated.contains("text == \"true\""), "{generated}");
+    assert!(generated.contains("local __t"), "{generated}");
+}

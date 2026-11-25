@@ -17,6 +17,61 @@ impl<'a> Emitter<'a> {
         self.invoke_arg(expr, &[])
     }
 
+    /// `Type::default` used as a callback value, such as
+    /// `get_or_insert_with(WidgetState::default)`.
+    fn default_reference(
+        &mut self,
+        expr: &Expr,
+        values: &[String],
+    ) -> Result<OptionalValue, Error> {
+        if !values.is_empty() {
+            return Ok(None);
+        }
+        let Expr::Path(path) = strip_reference(expr) else {
+            return Ok(None);
+        };
+        let Some(segments) = path_segments(&path.path) else {
+            return Ok(None);
+        };
+        if segments.len() < 2
+            || segments.last().is_none_or(|name| name != "default")
+        {
+            return Ok(None);
+        }
+        let class = segments[segments.len() - 2].clone();
+        if let Some((module, function)) =
+            self.program.resolve_method(&self.module, &class, "default")
+        {
+            let function = function.clone();
+            let helper = Helper {
+                module,
+                name: format!("{class}::default"),
+                function,
+                class: Some(class.clone()),
+            };
+            let returns = return_kind(&helper.function)?;
+            let check = self.check_inline(
+                &helper,
+                Inline::Value,
+                returns,
+                &expr.span(),
+            )?;
+            let (text, _) = self.inline(
+                &helper,
+                Vec::new(),
+                Inline::Value,
+                returns,
+                check,
+            )?;
+            return Ok(Some((text, Ty::VALUE)));
+        }
+        let ty: Type = syn::parse_str(&class).map_err(|error| {
+            Error::at(expr.span(), format!("invalid default type: {error}"))
+        })?;
+        let text = default_value(self, &ty, expr.span())?;
+        Ok(Some((text, type_hint(&ty))))
+    }
+
     /// Inlines a crate function used as a callback value, such as
     /// `map(lua_text)` or `unwrap_or_else(default_snapshot)`.
     pub(super) fn function_reference(
@@ -24,6 +79,9 @@ impl<'a> Emitter<'a> {
         expr: &Expr,
         values: &[String],
     ) -> Result<OptionalValue, Error> {
+        if let Some(value) = self.default_reference(expr, values)? {
+            return Ok(Some(value));
+        }
         let Expr::Path(path) = strip_reference(expr) else {
             return Ok(None);
         };
@@ -214,6 +272,34 @@ impl<'a> Emitter<'a> {
             if name == "serde_json::to_string" {
                 let text = self.expr(arg(&args, 0, call)?)?.0;
                 return Ok((format!("json.encode({text})"), Ty::STR));
+            }
+            if matches!(name.rsplit("::").next(), Some("from_iter"))
+                && args.len() == 1
+            {
+                let list = arg(&args, 0, call)?;
+                let Expr::Array(items) = strip_reference(list) else {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                };
+                if items
+                    .elems
+                    .iter()
+                    .any(|item| !matches!(item, Expr::Tuple(tuple) if tuple.elems.len() == 2))
+                {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                }
+                let list = self.expr(list)?.0;
+                return Ok((
+                    format!(
+                        "(function() local __map = {{}} for _, __pair in ipairs({list}) do __map[__pair[1]] = __pair[2] end return __map end)()"
+                    ),
+                    Ty::TABLE,
+                ));
             }
             if name.ends_with("::from_str_radix") {
                 let text = self.expr(arg(&args, 0, call)?)?.0;

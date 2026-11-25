@@ -552,3 +552,155 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let source = compiled_source("chained", handler, EntryKind::Widget);
     luau_parses(&source).unwrap_or_else(|error| panic!("{error}\n{source}"));
 }
+
+#[test]
+fn json_value_breadth_matches_the_native_handler() {
+    let handler = r#"
+use serde_json::Map;
+
+fn describe(value: Value) -> String {
+    let kind = if value.is_null() {
+        "null"
+    } else if value.is_string() {
+        "string"
+    } else if value.is_number() {
+        "number"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_array() {
+        "array"
+    } else {
+        "other"
+    };
+    format!("{kind}:{}", value.to_string())
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let mut props = Map::new();
+    props.insert("text".to_owned(), json!("hi"));
+    props.insert("count".to_owned(), json!(2));
+    props.insert("flag".to_owned(), json!(true));
+    if !props.contains_key("color") {
+        props.insert("color".to_owned(), json!("red"));
+    }
+    let mut object = Value::Object(props);
+    object["extra"] = json!([1, 2]);
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let count = object["count"].as_i64().unwrap_or_default();
+    let ratio = object["count"].as_f64().unwrap_or(0.5);
+    let missing = object.get("missing");
+    let absent = missing.is_none() && json!(null).is_null();
+    let flag = object["flag"].as_bool().unwrap_or(false);
+    let array = object["extra"].as_array().map(|items| items.len()).unwrap_or(0);
+    let object_keys = object.as_object().map(|map| map.len()).unwrap_or(0);
+    let decoded = serde_json::from_str::<Value>(&object.to_string()).unwrap_or(Value::Null);
+    let round = decoded["extra"].as_array().map(|items| items.len()).unwrap_or(0);
+    let mut store = Map::new();
+    store.entry("hits".to_owned()).or_insert(json!(0));
+    store.entry("hits".to_owned()).or_insert(json!(9));
+    let hits = store.get("hits").and_then(Value::as_i64).unwrap_or_default();
+    let mut cloned = store.clone();
+    cloned.insert("extra".to_owned(), json!("kept"));
+    let original = store.len();
+    let mut taken = Some(json!(4));
+    let removed = taken.take().unwrap_or(Value::Null);
+    let removed_number = removed.as_u64().unwrap_or_default();
+    ops.push(Op::log(format!(
+        "{text}|{count}|{ratio}|{absent}|{flag}|{array}|{object_keys}|{round}|{hits}|{original}|{removed_number}"
+    )));
+    ops.push(Op::log(describe(json!(null))));
+    ops.push(Op::log(describe(json!("s"))));
+    ops.push(Op::log(describe(json!(7))));
+    ops.push(Op::log(describe(json!([1]))));
+    ops.push(Op::log(describe(json!({ "a": 1 }))));
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("json_breadth", handler, EntryKind::Service);
+    let state = json!({});
+    let ctx = context("json_breadth", "load", json!({}), state);
+    assert_eq!(
+        ops("json_breadth", &source, &ctx),
+        rust_ops(native_json(&ctx))
+    );
+}
+
+fn native_json(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    fn describe(value: Value) -> String {
+        let kind = if value.is_null() {
+            "null"
+        } else if value.is_string() {
+            "string"
+        } else if value.is_number() {
+            "number"
+        } else if value.is_boolean() {
+            "boolean"
+        } else if value.is_array() {
+            "array"
+        } else {
+            "other"
+        };
+        format!("{kind}:{value}")
+    }
+
+    let mut ops = Vec::new();
+    let mut props = Map::new();
+    props.insert("text".to_owned(), json!("hi"));
+    props.insert("count".to_owned(), json!(2));
+    props.insert("flag".to_owned(), json!(true));
+    if !props.contains_key("color") {
+        props.insert("color".to_owned(), json!("red"));
+    }
+    let mut object = Value::Object(props);
+    object["extra"] = json!([1, 2]);
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let count = object["count"].as_i64().unwrap_or_default();
+    let ratio = object["count"].as_f64().unwrap_or(0.5);
+    let missing = object.get("missing");
+    let absent = missing.is_none() && json!(null).is_null();
+    let flag = object["flag"].as_bool().unwrap_or(false);
+    let array = object["extra"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let object_keys = object.as_object().map(|map| map.len()).unwrap_or(0);
+    let decoded = serde_json::from_str::<Value>(&object.to_string())
+        .unwrap_or(Value::Null);
+    let round = decoded["extra"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let mut store = Map::new();
+    store.entry("hits".to_owned()).or_insert(json!(0));
+    store.entry("hits".to_owned()).or_insert(json!(9));
+    let hits = store
+        .get("hits")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let mut cloned = store.clone();
+    cloned.insert("extra".to_owned(), json!("kept"));
+    let original = store.len();
+    let mut taken = Some(json!(4));
+    let removed = taken.take().unwrap_or(Value::Null);
+    let removed_number = removed.as_u64().unwrap_or_default();
+    ops.push(Op::log(format!(
+        "{text}|{count}|{ratio}|{absent}|{flag}|{array}|{object_keys}|{round}|{hits}|{original}|{removed_number}"
+    )));
+    ops.push(Op::log(describe(json!(null))));
+    ops.push(Op::log(describe(json!("s"))));
+    ops.push(Op::log(describe(json!(7))));
+    ops.push(Op::log(describe(json!([1]))));
+    ops.push(Op::log(describe(json!({ "a": 1 }))));
+    ops
+}

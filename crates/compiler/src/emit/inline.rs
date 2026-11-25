@@ -201,6 +201,15 @@ impl<'a> Emitter<'a> {
             ));
         }
         let (text, value) = self.expr(argument)?;
+        let declared = type_hint(ty);
+        let value = if declared.base == Base::Value {
+            Ty {
+                optional: declared.optional,
+                ..Ty::VALUE
+            }
+        } else {
+            value
+        };
         let kind = static_kind(ty);
         if kind != StaticKind::Value
             && let Expr::Path(path) = strip_reference(argument)

@@ -241,8 +241,9 @@ impl<'a> Emitter<'a> {
         let (condition, bindings) =
             self.pattern_match(&value, pattern, error.as_deref())?;
         for (name, text) in bindings {
+            let binding = self.binding_ty(pattern, &name, ty);
             self.line(&format!("local {name} = {text}"));
-            self.push(&name, Ty::VALUE);
+            self.push(&name, binding);
         }
         self.line(&format!("if not ({condition}) then"));
         self.indent = self.indent.saturating_add(1);
@@ -516,8 +517,9 @@ impl<'a> Emitter<'a> {
         let (condition, bindings) =
             self.pattern_match(&value, &item.pat, error.as_deref())?;
         for (name, text) in bindings {
+            let binding = self.binding_ty(&item.pat, &name, ty);
             self.line(&format!("local {name} = {text}"));
-            self.push(&name, Ty::VALUE);
+            self.push(&name, binding);
         }
         Ok(condition)
     }
@@ -713,8 +715,9 @@ impl<'a> Emitter<'a> {
             self.indent = self.indent.saturating_add(1);
             self.scopes.push(HashMap::new());
             for (name, text) in bindings {
+                let binding = self.binding_ty(pattern, &name, scrutinee_ty);
                 self.line(&format!("local {name} = {text}"));
-                self.push(&name, Ty::VALUE);
+                self.push(&name, binding);
             }
             if let Some(guard) = guard {
                 let (text, _) = self.expr(guard)?;
@@ -748,7 +751,7 @@ impl<'a> Emitter<'a> {
         Ok(name)
     }
 
-    fn pattern_match(
+    pub(super) fn pattern_match(
         &self,
         value: &str,
         pattern: &Pat,
@@ -926,6 +929,77 @@ impl<'a> Emitter<'a> {
                 pattern.span(),
                 "match pattern is not supported by the Luau compiler",
             )),
+        }
+    }
+
+    /// The static type a pattern binds, so `Value::String(text)` reads as a
+    /// string and `Some(items)` keeps the scrutee's array shape.
+    pub(super) fn binding_ty(
+        &self,
+        pattern: &Pat,
+        name: &str,
+        outer: Ty,
+    ) -> Ty {
+        match pattern {
+            Pat::Ident(item) => {
+                if item.ident == name {
+                    Ty {
+                        optional: false,
+                        result: false,
+                        ..outer
+                    }
+                } else {
+                    Ty::VALUE
+                }
+            }
+            Pat::Or(or) => or
+                .cases
+                .iter()
+                .map(|case| self.binding_ty(case, name, outer))
+                .find(|ty| *ty != Ty::VALUE)
+                .unwrap_or(Ty::VALUE),
+            Pat::Paren(paren) => self.binding_ty(&paren.pat, name, outer),
+            Pat::Reference(reference) => {
+                self.binding_ty(&reference.pat, name, outer)
+            }
+            Pat::TupleStruct(item) => {
+                let kind = item
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                let inner = match kind.as_str() {
+                    "Some" | "Ok" | "Err" => outer,
+                    "String" => Ty::STR,
+                    "Bool" => Ty::BOOL,
+                    "Number" => Ty::FLOAT,
+                    "Object" => Ty::TABLE,
+                    "Array" => Ty::LIST,
+                    _ => Ty::VALUE,
+                };
+                item.elems
+                    .iter()
+                    .map(|element| self.binding_ty(element, name, inner))
+                    .find(|ty| *ty != Ty::VALUE)
+                    .unwrap_or(Ty::VALUE)
+            }
+            Pat::Tuple(tuple) => tuple
+                .elems
+                .iter()
+                .enumerate()
+                .map(|(index, element)| {
+                    let inner = Ty {
+                        optional: false,
+                        result: false,
+                        ..outer
+                    };
+                    let _ = index;
+                    self.binding_ty(element, name, inner)
+                })
+                .find(|ty| *ty != Ty::VALUE)
+                .unwrap_or(Ty::VALUE),
+            _ => Ty::VALUE,
         }
     }
 
@@ -1292,7 +1366,7 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn assign_target(
+    pub(super) fn assign_target(
         &mut self,
         expr: &Expr,
         is_local: &mut bool,

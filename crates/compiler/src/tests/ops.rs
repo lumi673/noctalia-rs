@@ -26,8 +26,10 @@ fn update(ctx: &Context) -> Result<Vec<Op>> {
     assert!(
         compiled
             .source
-            .contains("local value = (row[\"value\"] or 0)")
+            .contains("type(row[\"value\"]) == \"number\"")
     );
+    assert!(compiled.source.contains("row[\"value\"] % 1 == 0"));
+    assert!(compiled.source.contains(" or 0)"));
     assert!(compiled.source.contains("total += value"));
     assert!(compiled.source.contains("barWidget.setText(status)"));
 }

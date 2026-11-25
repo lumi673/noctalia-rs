@@ -135,133 +135,39 @@ impl<'a> Emitter<'a> {
     ) -> Result<(String, Ty), Error> {
         let parsed: MatchesArgs = syn::parse2(mac.mac.tokens.clone())?;
         self.record_pattern_events(&parsed.expr, &parsed.pat);
-        let (expr, _) = self.expr(&parsed.expr)?;
-        let condition = self.pattern_condition(&expr, &parsed.pat)?;
-        Ok((format!("({condition})"), Ty::BOOL))
-    }
-
-    fn pattern_condition(
-        &self,
-        value: &str,
-        pattern: &Pat,
-    ) -> Result<String, Error> {
-        match pattern {
-            Pat::Wild(_) => Ok("true".to_owned()),
-            Pat::Lit(lit) => {
-                let literal = Expr::Lit(lit.clone());
-                let (text, _) = constant(&literal).ok_or_else(|| {
-                    Error::at(lit.span(), "unsupported matches! literal")
-                })?;
-                Ok(format!("({value} == {text})"))
-            }
-            Pat::Or(or) => {
-                let mut parts = Vec::new();
-                for case in &or.cases {
-                    parts.push(self.pattern_condition(value, case)?);
-                }
-                Ok(format!("({})", parts.join(" or ")))
-            }
-            Pat::Paren(paren) => self.pattern_condition(value, &paren.pat),
-            Pat::Ident(pattern) => {
-                let name = pattern.ident.to_string();
-                match name.as_str() {
-                    "None" | "Null" => Ok(format!("({value} == nil)")),
-                    "Some" => Ok(format!("({value} ~= nil)")),
-                    _ => match self.pattern_constant(&name) {
-                        Some((text, _)) => Ok(format!("({value} == {text})")),
-                        None => Ok("true".to_owned()),
-                    },
-                }
-            }
-            Pat::Path(path) => {
-                let name = path
-                    .path
-                    .segments
-                    .last()
-                    .map(|segment| segment.ident.to_string())
-                    .unwrap_or_default();
-                match name.as_str() {
-                    "None" | "Null" => Ok(format!("({value} == nil)")),
-                    "Some" => Ok(format!("({value} ~= nil)")),
-                    _ => {
-                        let segments = path
-                            .path
-                            .segments
-                            .iter()
-                            .map(|segment| segment.ident.to_string())
-                            .collect::<Vec<_>>();
-                        if let Some(variant) =
-                            self.program.enum_variant(&self.module, &segments)
-                        {
-                            return Ok(format!(
-                                "({value} == {})",
-                                quote(&variant)
-                            ));
-                        }
-                        Err(Error::at(
-                            path.span(),
-                            format!(
-                                "matches! pattern `{name}` is not supported by the Luau compiler"
-                            ),
-                        ))
-                    }
-                }
-            }
-            Pat::TupleStruct(item) => {
-                let name = item
-                    .path
-                    .segments
-                    .last()
-                    .map(|segment| segment.ident.to_string())
-                    .unwrap_or_default();
-                match name.as_str() {
-                    "Some" => {
-                        let mut conditions = vec![format!("({value} ~= nil)")];
-                        let mut bindings = Vec::new();
-                        for inner in &item.elems {
-                            self.nested_pattern(
-                                value,
-                                inner,
-                                &mut conditions,
-                                &mut bindings,
-                            )?;
-                        }
-                        Ok(format!("({})", conditions.join(" and ")))
-                    }
-                    "Null" => Ok(format!("({value} == nil)")),
-                    "Bool" | "String" | "Number" | "Object" | "Array" => {
-                        let lua_type = match name.as_str() {
-                            "Bool" => "boolean",
-                            "String" => "string",
-                            "Number" => "number",
-                            _ => "table",
-                        };
-                        let mut conditions =
-                            vec![format!("(type({value}) == \"{lua_type}\")")];
-                        let mut bindings = Vec::new();
-                        for inner in &item.elems {
-                            self.nested_pattern(
-                                value,
-                                inner,
-                                &mut conditions,
-                                &mut bindings,
-                            )?;
-                        }
-                        Ok(format!("({})", conditions.join(" and ")))
-                    }
-                    _ => Err(Error::at(
-                        item.span(),
-                        format!(
-                            "matches! pattern `{name}` is not supported by the Luau compiler"
-                        ),
-                    )),
-                }
-            }
-            _ => Err(Error::at(
-                pattern.span(),
-                "matches! pattern is not supported by the Luau compiler",
-            )),
+        let (expr, ty) = self.expr(&parsed.expr)?;
+        let Some(guard) = parsed.guard else {
+            let (condition, _) =
+                self.pattern_match(&expr, &parsed.pat, None)?;
+            return Ok((format!("({condition})"), Ty::BOOL));
+        };
+        let value = self.temp();
+        let result = self.temp();
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        self.indent = 0;
+        self.line(&format!("local {value} = {expr}"));
+        self.line(&format!("local {result} = false"));
+        let (condition, bindings) =
+            self.pattern_match(&value, &parsed.pat, None)?;
+        self.line(&format!("if {condition} then"));
+        self.indent = self.indent.saturating_add(1);
+        self.scopes.push(HashMap::new());
+        for (name, text) in bindings {
+            let binding = self.binding_ty(&parsed.pat, &name, ty);
+            self.line(&format!("local {name} = {text}"));
+            self.push(&name, binding);
         }
+        let guard = self.expr(&guard);
+        self.scopes.pop();
+        let (guard, _) = guard?;
+        self.line(&format!("{result} = ({guard})"));
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        self.line(&format!("return {result}"));
+        let body = std::mem::replace(&mut self.out, saved_out);
+        self.indent = saved_indent;
+        Ok((format!("(function()\n{body}end)()"), Ty::BOOL))
     }
 
     fn json_node(&mut self, node: &JsonNode) -> Result<(String, Ty), Error> {
@@ -415,6 +321,7 @@ pub(super) fn parse_vec(mac: &ExprMacro) -> Result<Vec<Expr>, Error> {
 pub(crate) struct MatchesArgs {
     pub(crate) expr: Expr,
     pub(crate) pat: Pat,
+    pub(crate) guard: Option<Expr>,
 }
 
 impl Parse for MatchesArgs {
@@ -422,7 +329,13 @@ impl Parse for MatchesArgs {
         let expr: Expr = input.parse()?;
         let _: Token![,] = input.parse()?;
         let pat: Pat = Pat::parse_multi(input)?;
-        Ok(Self { expr, pat })
+        let guard = if input.peek(Token![if]) {
+            let _: Token![if] = input.parse()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        Ok(Self { expr, pat, guard })
     }
 }
 

@@ -1272,3 +1272,120 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(generated.contains("local list = {}"), "{generated}");
     assert!(generated.contains("local queue = {}"), "{generated}");
 }
+
+#[test]
+fn emits_typed_json_accessors() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.setting("payload");
+    let text = value.as_str();
+    let count = value.as_i64();
+    let ratio = value.as_f64();
+    let flag = value.as_bool();
+    let items = value.as_array();
+    let object = value.as_object();
+    let number = value.as_number();
+    let integer = value.is_i64() || value.is_u64();
+    let kind = value.is_null() || value.is_object() || value.is_array();
+    let _ = (text, count, ratio, flag, items, object, number);
+    Ok(vec![Op::log(format!("{}|{}", integer, kind))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(
+        generated.contains("type(value) == \"string\" and value or nil"),
+        "{generated}"
+    );
+    assert!(generated.contains("value % 1 == 0"), "{generated}");
+    assert!(
+        generated.contains("value >= -9223372036854775808")
+            && generated.contains("value <= 9223372036854775807"),
+        "{generated}"
+    );
+    assert!(
+        generated.contains("type(value) == \"boolean\""),
+        "{generated}"
+    );
+    assert!(generated.contains("is_array(value)"), "{generated}");
+    assert!(generated.contains("not is_array(value)"), "{generated}");
+}
+
+#[test]
+fn emits_map_lookup_mutation_and_clone() {
+    let handler = r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    map.insert("a".to_owned(), json!(1));
+    let known = map.contains_key("a");
+    let hit = map.get("a");
+    let mut slot = map.get_mut("a");
+    let taken = slot.take();
+    let keys = map.keys();
+    let size = map.len();
+    let mut copy = map.clone();
+    copy.insert("b".to_owned(), json!(2));
+    let counts = Map::from_iter([("x", json!(1)), ("y", json!(2))]);
+    let _ = (known, hit, taken, keys, counts);
+    Ok(vec![Op::log(format!("{}|{}", size, map.len()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("(map[\"a\"] ~= nil)"), "{generated}");
+    assert!(
+        generated.contains("local function count_keys(value)"),
+        "{generated}"
+    );
+    assert!(generated.contains("deep_clone(map)"), "{generated}");
+    assert!(generated.contains("for _, __pair in ipairs"), "{generated}");
+}
+
+#[test]
+fn emits_entry_insert_and_take() {
+    let handler = r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    let hit = map.entry("hits".to_owned()).or_insert(json!(0));
+    let made = map.entry("made".to_owned()).or_insert_with(|| json!({ "a": 1 }));
+    map.entry("mod".to_owned()).and_modify(|value| json!(value)).or_insert(json!(3));
+    let mut pending = Some(json!(4));
+    let taken = pending.take();
+    let _ = (hit, made, taken);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("local __t1 = map"), "{generated}");
+    assert!(generated.contains("if __t3 == nil then"), "{generated}");
+    assert!(generated.contains("__t1[__t2] = __t3"), "{generated}");
+    assert!(generated.contains("pending = nil"), "{generated}");
+    assert!(generated.contains("if __t9 ~= nil then"), "{generated}");
+}
+
+#[test]
+fn rejects_entry_default_without_a_value_type() {
+    let handler = r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    let hit = map.entry("hits".to_owned()).or_default();
+    let _ = hit;
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("or_default"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0);
+}

@@ -1,4 +1,20 @@
+//! Method-call lowering, split by receiver class.
+//!
+//! `mod.rs` classifies a call and holds the dispatch shared by every class:
+//! context methods, statics, crate methods, `Option`/`Result` combinators,
+//! iterators and the `entry` chain. `value.rs` covers the `serde_json` value
+//! model, `string.rs` string methods, `number.rs` numeric methods,
+//! `collection.rs` `Vec`/`HashMap` and `Option`/`Result` values, and `fs.rs`
+//! and `path.rs` are the `std::fs` and `std::path` receivers.
+
 use super::*;
+
+mod collection;
+mod fs;
+mod number;
+mod path;
+mod string;
+mod value;
 
 impl<'a> Emitter<'a> {
     fn static_receiver(
@@ -771,6 +787,77 @@ impl<'a> Emitter<'a> {
         result
     }
 
+    /// `map.entry(key).or_insert(value)` reads and writes the slot under one
+    /// evaluation of the map and the key.
+    fn entry_method(
+        &mut self,
+        call: &ExprMethodCall,
+        method: &str,
+        args: &[&Expr],
+    ) -> Result<OptionalValue, Error> {
+        if !matches!(method, "or_insert" | "or_insert_with" | "or_default") {
+            return Ok(None);
+        }
+        let mut modify = None;
+        let mut node = strip_reference(&call.receiver);
+        if let Expr::MethodCall(inner) = node
+            && inner.method == "and_modify"
+        {
+            let inner_args = inner.args.iter().collect::<Vec<_>>();
+            modify = Some(arg(&inner_args, 0, inner)?);
+            node = strip_reference(&inner.receiver);
+        }
+        let Expr::MethodCall(entry) = node else {
+            return Ok(None);
+        };
+        if entry.method != "entry" {
+            return Ok(None);
+        }
+        let entry_args = entry.args.iter().collect::<Vec<_>>();
+        let key = arg(&entry_args, 0, entry)?;
+        let (receiver, _) = self.expr(&entry.receiver)?;
+        let (key, _) = self.expr(key)?;
+        let map = self.temp();
+        let slot = self.temp();
+        self.line(&format!("local {map} = {receiver}"));
+        self.line(&format!("local {slot} = {key}"));
+        let value = self.temp();
+        self.line(&format!("local {value} = {map}[{slot}]"));
+        if let Some(modify) = modify {
+            self.line(&format!("if {value} ~= nil then"));
+            self.indent = self.indent.saturating_add(1);
+            let (text, _) =
+                self.invoke_arg(modify, std::slice::from_ref(&value))?;
+            self.line(&format!("{value} = {text}"));
+            self.line(&format!("{map}[{slot}] = {value}"));
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+        }
+        let (default, ty) = match method {
+            "or_insert" => self.expr(arg(args, 0, call)?)?,
+            "or_insert_with" => self.invoke_arg(arg(args, 0, call)?, &[])?,
+            _ => {
+                return Err(Error::at(
+                    call.method.span(),
+                    "entry().or_default() needs the default of the map value, which the Luau model cannot derive; insert the default explicitly",
+                ));
+            }
+        };
+        self.line(&format!("if {value} == nil then"));
+        self.indent = self.indent.saturating_add(1);
+        self.line(&format!("{value} = {default}"));
+        self.line(&format!("{map}[{slot}] = {value}"));
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        Ok(Some((
+            value,
+            Ty {
+                optional: false,
+                ..ty
+            },
+        )))
+    }
+
     pub(super) fn method(
         &mut self,
         call: &ExprMethodCall,
@@ -785,6 +872,9 @@ impl<'a> Emitter<'a> {
         }
         let method = call.method.to_string();
         let args = call.args.iter().collect::<Vec<_>>();
+        if let Some(value) = self.entry_method(call, &method, &args)? {
+            return Ok(value);
+        }
         if self.is_ctx_expr(&call.receiver) {
             return self.context_method(call, &method, &args);
         }
@@ -815,713 +905,40 @@ impl<'a> Emitter<'a> {
         {
             return Ok(value);
         }
-        match method.as_str() {
-            "to_string" if ty.base == Base::Value => {
-                Ok((format!("json.encode({receiver})"), Ty::STR))
-            }
-            "to_string" => Ok((format!("tostring({receiver})"), Ty::STR)),
-            "into_owned" | "to_owned" | "clone" | "as_ref" | "as_deref"
-            | "cloned" | "into_inner" | "into" | "as_mut" | "as_slice"
-            | "as_bytes" | "into_bytes" | "copied" | "peekable"
-            | "iter_mut" => Ok((receiver, ty)),
-            "first" => Ok((format!("({receiver}[1])"), Ty::OPT_VALUE)),
-            "as_object_mut" => Ok((
-                format!(
-                    "(type({receiver}) == \"table\" and {receiver} or nil)"
-                ),
-                Ty::OPT_VALUE,
-            )),
-            "push_str" => {
-                let value = self.expr(arg(&args, 0, call)?)?.0;
-                self.line(&format!("{receiver} = {receiver} .. ({value})"));
-                Ok((String::new(), Ty::VOID))
-            }
-            "pop" => Ok((format!("table.remove({receiver})"), Ty::OPT_VALUE)),
-            "push_back" => {
-                let value = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((format!("table.insert({receiver}, {value})"), Ty::VOID))
-            }
-            "find" if !matches!(args.first(), Some(Expr::Closure(_))) => {
-                let needle = self.expr(arg(&args, 0, call)?)?.0;
-                if ty.base != Base::Str {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "find() needs a string receiver",
-                    ));
-                }
-                Ok((
-                    format!(
-                        "(function() local __at = string.find({receiver}, {needle}, 1, true); if __at then return __at - 1 end end)()"
-                    ),
-                    Ty::OPT_INT,
-                ))
-            }
-            "is_nan" => Ok((format!("({receiver} ~= {receiver})"), Ty::BOOL)),
-            "div_euclid" => {
-                let other = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((format!("math.floor({receiver} / {other})"), Ty::INT))
-            }
-            "sin" | "cos" => {
-                Ok((format!("math.{method}({receiver})"), Ty::FLOAT))
-            }
-            "is_infinite" => Ok((
-                format!(
-                    "({receiver} == math.huge or {receiver} == -math.huge)"
-                ),
-                Ty::BOOL,
-            )),
-            "is_ascii_hexdigit" if ty.base == Base::Int => Ok((
-                format!(
-                    "(function() local __byte = {receiver}; return (__byte >= 48 and __byte <= 57) or (__byte >= 65 and __byte <= 70) or (__byte >= 97 and __byte <= 102) end)()"
-                ),
-                Ty::BOOL,
-            )),
-            "is_ascii_hexdigit" => Ok((
-                format!("(string.find({receiver}, \"^[0-9A-Fa-f]$\") ~= nil)"),
-                Ty::BOOL,
-            )),
-            "rfind" => {
-                let needle = self.expr(arg(&args, 0, call)?)?.0;
-                if ty.base != Base::Str {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "rfind() needs a string receiver",
-                    ));
-                }
-                Ok((
-                    format!(
-                        "(function() local __s = {receiver}; local __i = string.find(__s, {needle}, 1, true); local __last; while __i do __last = __i - 1; __i = string.find(__s, {needle}, __i + 1, true) end; return __last end)()"
-                    ),
-                    Ty::OPT_INT,
-                ))
-            }
-            "split_once" => {
-                let separator = self.expr(arg(&args, 0, call)?)?.0;
-                if ty.base != Base::Str {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "split_once() needs a string receiver",
-                    ));
-                }
-                Ok((
-                    format!(
-                        "(function() local __s = {receiver}; local __at = string.find(__s, {separator}, 1, true); if not __at then return nil end; return {{ string.sub(__s, 1, __at - 1), string.sub(__s, __at + #{separator}) }} end)()"
-                    ),
-                    Ty::opt(Base::List),
-                ))
-            }
-            "rsplit" => {
-                let separator = self.expr(arg(&args, 0, call)?)?.0;
-                if ty.base != Base::Str {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "rsplit() needs a string receiver",
-                    ));
-                }
-                Ok((Self::reverse_split(&receiver, &separator), Ty::LIST))
-            }
-            "flatten" if ty.optional || ty.base == Base::List => {
-                if ty.optional && ty.base != Base::List {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "flatten() needs an optional list or a list of lists",
-                    ));
-                }
-                if ty.optional {
-                    Ok((format!("({receiver} or {{}})"), Ty::LIST))
-                } else {
-                    Ok((
-                        format!(
-                            "(function() local __out = {{}}; local __lists = {receiver}; for __i = 1, #__lists do local __inner = __lists[__i]; if type(__inner) == \"table\" then for __j = 1, #__inner do __out[#__out + 1] = __inner[__j] end end end; __out.__next = 1; return __out end)()"
-                        ),
-                        Ty::LIST,
-                    ))
-                }
-            }
-            "skip" if ty.base == Base::List && !ty.optional => {
-                let count = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((
-                    format!(
-                        "(function() local __out = {{}}; local __n = math.max(0, {count}); for __i = __n + 1, #{receiver} do __out[#__out + 1] = {receiver}[__i] end; __out.__next = 1; return __out end)()"
-                    ),
-                    Ty::LIST,
-                ))
-            }
-            "take" if ty.base == Base::List && !ty.optional => {
-                let count = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((
-                    format!(
-                        "(function() local __out = {{}}; local __n = math.min(math.max(0, {count}), #{receiver}); for __i = 1, __n do __out[#__out + 1] = {receiver}[__i] end; __out.__next = 1; return __out end)()"
-                    ),
-                    Ty::LIST,
-                ))
-            }
-            "extend_from_slice" => {
-                let (value, _) = self.expr(arg(&args, 0, call)?)?;
-                let item = self.temp();
-                self.line(&format!(
-                    "for _, {item} in ipairs({value}) do table.insert({receiver}, {item}) end"
-                ));
-                Ok((String::new(), Ty::VOID))
-            }
-            "trunc" => Ok((
-                format!(
-                    "(({receiver} >= 0) and math.floor({receiver}) or math.ceil({receiver}))"
-                ),
-                Ty::FLOAT,
-            )),
-            "truncate" if ty.base == Base::List && !ty.optional => {
-                let length = self.expr(arg(&args, 0, call)?)?.0;
-                self.line(&format!(
-                    "for __i = #{receiver}, ({length}) + 1, -1 do table.remove({receiver}, __i) end"
-                ));
-                Ok((String::new(), Ty::VOID))
-            }
-            "match_indices" if ty.base == Base::Str => {
-                let needle = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((
-                    format!(
-                        "(function() local __s, __needle = {receiver}, {needle}; local __out = {{}}; local __at = string.find(__s, __needle, 1, true); while __at do __out[#__out + 1] = {{ __at - 1, string.sub(__s, __at, __at + #__needle - 1) }}; __at = string.find(__s, __needle, __at + 1, true) end; return __out end)()"
-                    ),
-                    Ty::LIST,
-                ))
-            }
-            "retain" => {
-                let closure = arg(&args, 0, call)?;
-                let arity = match closure {
-                    Expr::Closure(closure) => closure.inputs.len(),
-                    _ => 1,
-                };
-                if ty.base == Base::Table {
-                    if arity != 2 {
-                        return Err(Error::at(
-                            call.method.span(),
-                            "retain() on a map needs a closure with key and value",
-                        ));
-                    }
-                    let key = self.temp();
-                    let value = self.temp();
-                    self.line(&format!(
-                        "for {key}, {value} in pairs({receiver}) do"
-                    ));
-                    self.indent = self.indent.saturating_add(1);
-                    let (text, _) = self
-                        .invoke_arg(closure, &[key.clone(), value.clone()])?;
-                    self.line(&format!(
-                        "if not ({text}) then {receiver}[{key}] = nil end"
-                    ));
-                    self.indent = self.indent.saturating_sub(1);
-                    self.line("end");
-                } else if ty.base == Base::List {
-                    if arity != 1 {
-                        return Err(Error::at(
-                            call.method.span(),
-                            "retain() on a list needs a closure with one argument",
-                        ));
-                    }
-                    let index = self.temp();
-                    self.line(&format!("for {index} = #{receiver}, 1, -1 do"));
-                    self.indent = self.indent.saturating_add(1);
-                    let item = self.temp();
-                    self.line(&format!("local {item} = {receiver}[{index}]"));
-                    let (text, _) =
-                        self.invoke_arg(closure, std::slice::from_ref(&item))?;
-                    self.line(&format!(
-                        "if not ({text}) then table.remove({receiver}, {index}) end"
-                    ));
-                    self.indent = self.indent.saturating_sub(1);
-                    self.line("end");
-                } else {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "retain() needs a list or map receiver",
-                    ));
-                }
-                Ok((String::new(), Ty::VOID))
-            }
-            "sort_by" | "sort_unstable_by" | "sort_by_key" => Err(Error::at(
-                call.method.span(),
-                format!(
-                    "`{method}` needs a Rust comparator and is not supported by the Luau compiler"
-                ),
-            )),
-            "entry" => Err(Error::at(
-                call.method.span(),
-                "HashMap entry API is not supported by the Luau compiler",
-            )),
-            "round" => Ok((format!("math.round({receiver})"), Ty::FLOAT)),
-            "then_some" => {
-                let value = self.expr(arg(&args, 0, call)?)?.0;
-                let stored = self.temp();
-                self.line(&format!("local {stored} = {value}"));
-                Ok((
-                    format!(
-                        "(function() if {receiver} then return {stored} end end)()"
-                    ),
-                    Ty::OPT_VALUE,
-                ))
-            }
-            "is_none_or" => {
-                let closure = arg(&args, 0, call)?;
-                let value = self.temp();
-                let result = self.temp();
-                self.line(&format!("local {value} = {receiver}"));
-                self.line(&format!("local {result} = true"));
-                self.line(&format!("if {value} ~= nil then"));
-                self.indent = self.indent.saturating_add(1);
-                let (text, _) =
-                    self.invoke_arg(closure, std::slice::from_ref(&value))?;
-                self.line(&format!("{result} = {text}"));
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-                Ok((result, Ty::BOOL))
-            }
-            "or" if ty.optional => {
-                let other = self.expr(arg(&args, 0, call)?)?.0;
-                let value = self.temp();
-                self.line(&format!("local {value} = {receiver}"));
-                Ok((
-                    format!(
-                        "(function() if {value} ~= nil then return {value} end return {other} end)()"
-                    ),
-                    ty,
-                ))
-            }
-            "trim_start" => Ok((
-                format!("string.gsub({receiver}, \"^%s+\", \"\")"),
-                Ty::STR,
-            )),
-            "trim_end" => Ok((
-                format!("string.gsub({receiver}, \"%s+$\", \"\")"),
-                Ty::STR,
-            )),
-            "strip_suffix" => {
-                let suffix = self.expr(arg(&args, 0, call)?)?.0;
-                let value = self.temp();
-                self.line(&format!("local {value} = {receiver}"));
-                Ok((
-                    format!(
-                        "(string.sub({value}, -#{suffix}) == {suffix} and string.sub({value}, 1, #{value} - #{suffix}) or nil)"
-                    ),
-                    Ty::OPT_STR,
-                ))
-            }
-            "is_ascii_uppercase" => Ok((
-                format!("(string.find({receiver}, \"^%u+$\") ~= nil)"),
-                Ty::BOOL,
-            )),
-            "is_ascii_lowercase" => Ok((
-                format!("(string.find({receiver}, \"^%l+$\") ~= nil)"),
-                Ty::BOOL,
-            )),
-            "is_ascii_alphabetic" => Ok((
-                format!("(string.find({receiver}, \"^%a+$\") ~= nil)"),
-                Ty::BOOL,
-            )),
-            "is_ascii_alphanumeric" => Ok((
-                format!("(string.find({receiver}, \"^%w+$\") ~= nil)"),
-                Ty::BOOL,
-            )),
-            "is_ascii_digit" => Ok((
-                format!("(string.find({receiver}, \"^%d+$\") ~= nil)"),
-                Ty::BOOL,
-            )),
-            "is_ascii_whitespace" | "is_whitespace" => Ok((
-                format!("(string.find({receiver}, \"^%s+$\") ~= nil)"),
-                Ty::BOOL,
-            )),
-            "is_char_boundary" | "char_indices" => Err(Error::at(
-                call.method.span(),
-                format!(
-                    "`{method}` has no Luau equivalent and is not supported by the Luau compiler"
-                ),
-            )),
-            "to_string_lossy" | "display" => Ok((receiver, Ty::STR)),
-            "as_str" => Ok((receiver, Ty::OPT_STR)),
-            "as_i64" | "as_u64" => Ok((receiver, Ty::OPT_INT)),
-            "as_f64" => Ok((receiver, Ty::OPT_FLOAT)),
-            "as_bool" => Ok((receiver, Ty::OPT_BOOL)),
-            "as_array" => Ok((receiver, Ty::OPT_LIST)),
-            "is_some" => Ok((format!("({receiver} ~= nil)"), Ty::BOOL)),
-            "is_none" => Ok((format!("({receiver} == nil)"), Ty::BOOL)),
-            "is_ok" => Ok((format!("({receiver} ~= nil)"), Ty::BOOL)),
-            "is_err" => Ok((format!("({receiver} == nil)"), Ty::BOOL)),
-            "is_null" => Ok((format!("({receiver} == nil)"), Ty::BOOL)),
-            "is_finite" => Ok((
-                format!(
-                    "({receiver} == {receiver} and {receiver} ~= math.huge and {receiver} ~= -math.huge)"
-                ),
-                Ty::BOOL,
-            )),
-            "floor" | "ceil" | "abs" | "sqrt" => {
-                Ok((format!("math.{method}({receiver})"), Ty::FLOAT))
-            }
-            "fract" => Ok((
-                format!("({receiver} - math.floor({receiver}))"),
-                Ty::FLOAT,
-            )),
-            "clamp" => {
-                let min = self.expr(arg(&args, 0, call)?)?.0;
-                let max = self.expr(arg(&args, 1, call)?)?.0;
-                Ok((format!("math.clamp({receiver}, {min}, {max})"), Ty::FLOAT))
-            }
-            "max" | "min" => {
-                let other = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((format!("math.{method}({receiver}, {other})"), Ty::FLOAT))
-            }
-            "rem_euclid" => {
-                let other = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((
-                    format!("(({receiver} % {other}) + {other}) % {other}"),
-                    Ty::FLOAT,
-                ))
-            }
-            "join" if args.len() == 1 => {
-                let part = self.expr(arg(&args, 0, call)?)?.0;
-                if ty.base == Base::List {
-                    return Ok((
-                        format!("table.concat({receiver}, {part})"),
-                        Ty::STR,
-                    ));
-                }
-                if ty.base != Base::Str {
-                    self.uses_join = true;
-                    return Ok((format!("join({receiver}, {part})"), Ty::STR));
-                }
-                let base = self.temp();
-                self.line(&format!("local {base} = {receiver}"));
-                Ok((
-                    format!(
-                        "({base} .. ((string.sub({base}, -1) == \"/\") and \"\" or \"/\") .. {part})"
-                    ),
-                    Ty::STR,
-                ))
-            }
-            "strip_prefix" => {
-                let prefix = self.expr(arg(&args, 0, call)?)?.0;
-                let value = self.temp();
-                self.line(&format!("local {value} = {receiver}"));
-                Ok((
-                    format!(
-                        "(string.sub({value}, 1, #{prefix}) == {prefix} and string.sub({value}, #{prefix} + 1) or nil)"
-                    ),
-                    Ty::OPT_STR,
-                ))
-            }
-            "trim_matches" | "trim_start_matches" | "trim_end_matches" => {
-                let argument = arg(&args, 0, call)?;
-                let pattern = self.char_class(argument, call)?;
-                let leading = quote(&format!("^{pattern}+"));
-                let trailing = quote(&format!("{pattern}+$"));
-                let trimmed =
-                    format!("string.gsub({receiver}, {leading}, \"\")");
-                if method == "trim_start_matches" {
-                    return Ok((trimmed, Ty::STR));
-                }
-                let base = if method == "trim_end_matches" {
-                    receiver.clone()
-                } else {
-                    trimmed
-                };
-                Ok((format!("string.gsub({base}, {trailing}, \"\")"), Ty::STR))
-            }
-            "to_ascii_uppercase" => {
-                Ok((format!("string.upper({receiver})"), Ty::STR))
-            }
-            "to_ascii_lowercase" => {
-                Ok((format!("string.lower({receiver})"), Ty::STR))
-            }
-            "starts_with" => {
-                let prefix = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((
-                    format!(
-                        "(string.sub({receiver}, 1, #{prefix}) == {prefix})"
-                    ),
-                    Ty::BOOL,
-                ))
-            }
-            "ends_with" => {
-                let suffix = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((
-                    format!("(string.sub({receiver}, -#{suffix}) == {suffix})"),
-                    Ty::BOOL,
-                ))
-            }
-            "as_object" => Ok((
-                format!(
-                    "(type({receiver}) == \"table\" and {receiver} or nil)"
-                ),
-                Ty::OPT_VALUE,
-            )),
-            "replace" => {
-                let from = self.expr(arg(&args, 0, call)?)?.0;
-                let to = self.expr(arg(&args, 1, call)?)?.0;
-                self.uses_replace = true;
-                Ok((format!("replace_all({receiver}, {from}, {to})"), Ty::STR))
-            }
-            "duration_since" | "as_millis" => Ok((receiver, Ty::INT)),
-            "as_secs" => {
-                Ok((format!("math.floor({receiver} / 1000)"), Ty::INT))
-            }
-            "as_nanos" => Ok((format!("({receiver} * 1000000)"), Ty::INT)),
-            "iter" | "into_iter" | "values" => Ok((receiver, ty)),
-            "split" => {
-                let delimiter = self.expr(arg(&args, 0, call)?)?.0;
-                Ok((
-                    format!(
-                        "(function() local __parts = string.split({receiver}, {delimiter}); __parts.__next = 1; return __parts end)()"
-                    ),
-                    Ty::LIST,
-                ))
-            }
-            "split_whitespace" => {
-                Ok((self.whitespace_split(&receiver), Ty::LIST))
-            }
-            "next" => {
-                let value = self.temp();
-                self.line(&format!(
-                    "local {value} = {receiver}[{receiver}.__next]"
-                ));
-                self.line(&format!(
-                    "if {value} ~= nil then {receiver}.__next = {receiver}.__next + 1 end"
-                ));
-                Ok((value, Ty::opt(ty.base)))
-            }
-            "as_os_str" | "to_str" | "to_vec" => Ok((receiver, Ty::VALUE)),
-            "bytes" | "chars" => {
-                Ok((format!("string.split({receiver}, \"\")"), Ty::LIST))
-            }
-            "lines" => Ok((self.split_lines(&receiver), Ty::LIST)),
-            "clear" => {
-                self.line(&format!("table.clear({receiver})"));
-                Ok((String::new(), Ty::VOID))
-            }
-            "insert" if args.len() == 1 => {
-                let value = self.expr(arg(&args, 0, call)?)?.0;
-                self.line(&format!("{receiver}[{value}] = true"));
-                Ok((String::new(), Ty::VOID))
-            }
-            "insert" if args.len() == 2 => {
-                let key = self.expr(arg(&args, 0, call)?)?.0;
-                let value = self.expr(arg(&args, 1, call)?)?.0;
-                if ty.base != Base::Table
-                    && key.chars().all(|character| character.is_ascii_digit())
-                {
-                    self.line(&format!(
-                        "table.insert({receiver}, ({key}) + 1, {value})"
-                    ));
-                } else {
-                    self.line(&format!("{receiver}[{key}] = {value}"));
-                }
-                Ok((String::new(), Ty::VOID))
-            }
-            "remove" if args.len() == 1 => {
-                let (key, key_ty) = self.expr(arg(&args, 0, call)?)?;
-                let removed = self.temp();
-                if ty.base == Base::Table {
-                    self.line(&format!("local {removed} = {receiver}[{key}]"));
-                    self.line(&format!("{receiver}[{key}] = nil"));
-                    return Ok((removed, Ty::OPT_VALUE));
-                }
-                if ty.base == Base::List && key_ty.base == Base::Int {
-                    self.line(&format!(
-                        "local {removed} = table.remove({receiver}, ({key}) + 1)"
-                    ));
-                    return Ok((removed, Ty::VALUE));
-                }
-                if key_ty.base != Base::Int {
-                    self.line(&format!("local {removed} = {receiver}[{key}]"));
-                    self.line(&format!("{receiver}[{key}] = nil"));
-                    return Ok((removed, Ty::OPT_VALUE));
-                }
-                Err(Error::at(
-                    call.method.span(),
-                    "remove() needs a list with an integer index or a map with the key",
-                ))
-            }
-            "is_object" | "is_array" => {
-                Ok((format!("(type({receiver}) == \"table\")"), Ty::BOOL))
-            }
-            "is_string" => {
-                Ok((format!("(type({receiver}) == \"string\")"), Ty::BOOL))
-            }
-            "is_number" => {
-                Ok((format!("(type({receiver}) == \"number\")"), Ty::BOOL))
-            }
-            "is_boolean" => {
-                Ok((format!("(type({receiver}) == \"boolean\")"), Ty::BOOL))
-            }
-            "expect" => {
-                let (message, _) = self.expr(arg(&args, 0, call)?)?;
-                let value = self.temp();
-                if ty.result {
-                    let error = self.temp();
-                    self.line(&format!("local {value}, {error} = {receiver}"));
-                    self.line(&format!(
-                        "if {error} ~= nil then error(tostring({message})) end"
-                    ));
-                } else {
-                    self.line(&format!("local {value} = {receiver}"));
-                    self.line(&format!(
-                        "if {value} == nil then error(tostring({message})) end"
-                    ));
-                }
-                Ok((value, Ty::new(ty.base)))
-            }
-            "parse" => {
-                let ty = turbofish_type(call.turbofish.as_ref());
-                Ok((receiver, ty))
-            }
-            "ok" if ty.result => {
-                let value = self.temp();
-                let error = self.temp();
-                self.line(&format!("local {value}, {error} = {receiver}"));
-                Ok((value, Ty::opt(ty.base)))
-            }
-            "ok" => Ok((
-                receiver,
-                Ty {
-                    optional: true,
-                    ..ty
-                },
-            )),
-            "get_or_insert" | "get_or_insert_with" => {
-                let value = arg(&args, 0, call)?;
-                let (text, value_ty) = if method == "get_or_insert" {
-                    self.expr(value)?
-                } else {
-                    self.invoke_arg(value, &[])?
-                };
-                self.line(&format!("if {receiver} == nil then"));
-                self.indent = self.indent.saturating_add(1);
-                if text.is_empty() || value_ty.base == Base::Void {
-                    self.line(&format!("{receiver} = true"));
-                } else {
-                    self.line(&format!("{receiver} = {text}"));
-                }
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-                Ok((receiver, value_ty))
-            }
-            "unwrap" if ty.result => {
-                let value = self.temp();
-                let error = self.temp();
-                self.line(&format!("local {value}, {error} = {receiver}"));
-                self.line(&format!(
-                    "if {error} ~= nil then error(tostring({error})) end"
-                ));
-                Ok((value, Ty::new(ty.base)))
-            }
-            "unwrap" => {
-                self.uses_unwrap = true;
-                Ok((format!("unwrap({receiver})"), Ty::new(ty.base)))
-            }
-            "unwrap_or" => {
-                let (default, default_ty) = self.expr(arg(&args, 0, call)?)?;
-                if !ty.result
-                    && (ty.base == Base::Bool || default_ty.base == Base::Bool)
-                {
-                    self.uses_bool_or = true;
-                    return Ok((
-                        format!("bool_or({receiver}, {default})"),
-                        Ty::BOOL,
-                    ));
-                }
-                if ty.result {
-                    let value = self.temp();
-                    let error = self.temp();
-                    let result = self.temp();
-                    self.line(&format!("local {value}, {error} = {receiver}"));
-                    self.line(&format!("local {result} = {value}"));
-                    self.line(&format!(
-                        "if {error} ~= nil then {result} = {default} end"
-                    ));
-                    return Ok((result, Ty::new(wider(ty, default_ty).base)));
-                }
-                Ok((
-                    format!("({receiver} or {default})"),
-                    Ty::new(wider(ty, default_ty).base),
-                ))
-            }
-            "unwrap_or_default" => {
-                let default = if ty.base == Base::Value {
-                    "nil".to_owned()
-                } else {
-                    ty.default_literal().ok_or_else(|| {
-                        Error::at(
-                            call.span(),
-                            "this type has no default in a compilable handler",
-                        )
-                    })?.to_owned()
-                };
-                if ty.result {
-                    let value = self.temp();
-                    let error = self.temp();
-                    let result = self.temp();
-                    self.line(&format!("local {value}, {error} = {receiver}"));
-                    self.line(&format!("local {result} = {value}"));
-                    self.line(&format!(
-                        "if {error} ~= nil then {result} = {default} end"
-                    ));
-                    return Ok((result, Ty::new(ty.base)));
-                }
-                Ok((format!("({receiver} or {default})"), Ty::new(ty.base)))
-            }
-            "len" => Ok((format!("#{receiver}"), Ty::INT)),
-            "is_empty" => Ok((format!("(#{receiver} == 0)"), Ty::BOOL)),
-            "get" => {
-                let (key, key_ty) = self.expr(arg(&args, 0, call)?)?;
-                if ty.base != Base::Table && key_ty.base == Base::Int {
-                    Ok((format!("{receiver}[({key}) + 1]"), Ty::OPT_VALUE))
-                } else {
-                    Ok((format!("{receiver}[{key}]"), Ty::OPT_VALUE))
-                }
-            }
-            "trim" => Ok((format!("string.trim({receiver})"), Ty::STR)),
-            "to_lowercase" => {
-                Ok((format!("string.lower({receiver})"), Ty::STR))
-            }
-            "to_uppercase" => {
-                Ok((format!("string.upper({receiver})"), Ty::STR))
-            }
-            "contains" => {
-                let (needle, _) = self.expr(arg(&args, 0, call)?)?;
-                Ok((
-                    format!(
-                        "(string.find({receiver}, {needle}, 1, true) ~= nil)"
-                    ),
-                    Ty::BOOL,
-                ))
-            }
-            "push" if ty.base == Base::Ops => {
-                let value = arg(&args, 0, call)?;
-                if is_op_expr(value) {
-                    self.op_expr(value)?;
-                } else {
-                    let (text, _) = self.expr(value)?;
-                    self.line(&format!("table.insert({receiver}, {text})"));
-                }
-                Ok((String::new(), Ty::VOID))
-            }
-            "extend" => {
-                let (value, _) = self.expr(arg(&args, 0, call)?)?;
-                let item = self.temp();
-                self.line(&format!(
-                    "for _, {item} in ipairs({value}) do {receiver}[#({receiver}) + 1] = {item} end"
-                ));
-                Ok((String::new(), Ty::VOID))
-            }
-            "push" => {
-                let (value, _) = self.expr(arg(&args, 0, call)?)?;
-                Ok((format!("table.insert({receiver}, {value})"), Ty::VOID))
-            }
-            _ => Err(Error::at(
-                call.method.span(),
-                format!(
-                    "method `{method}` is not supported by the Luau compiler"
-                ),
-            )),
+        if let Some((text, ty)) =
+            self.value_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
         }
+        if let Some((text, ty)) =
+            self.number_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
+        }
+        if let Some((text, ty)) =
+            self.string_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
+        }
+        if let Some((text, ty)) =
+            self.collection_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
+        }
+        if let Some((text, ty)) =
+            self.fs_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
+        }
+        if let Some((text, ty)) =
+            self.path_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
+        }
+        Err(Error::at(
+            call.method.span(),
+            format!("method `{method}` is not supported by the Luau compiler"),
+        ))
     }
 
     fn context_method(
@@ -2226,6 +1643,90 @@ fn host_path(path: &str) -> Result<&'static str, Error> {
         }
     };
     Ok(value)
+}
+
+/// `i64` bounds as Luau literals. `u64::MAX` rounds to 2^64, which keeps the
+/// comparison below exact because no integer above `i64::MAX` is representable
+/// as a Luau integer anyway.
+pub(super) const I64_RANGE: (&str, &str) =
+    ("-9223372036854775808", "9223372036854775807");
+pub(super) const U64_RANGE: (&str, &str) = ("0", "18446744073709551615");
+pub(super) const I128_RANGE: (&str, &str) =
+    ("-1.7014118346046923e38", "1.7014118346046923e38");
+
+/// `Value::as_str` and friends only answer for the matching JSON type. A
+/// receiver already known to hold that type needs no check.
+fn string_check(receiver: &str, ty: Ty) -> String {
+    if ty.base == Base::Str {
+        receiver.to_owned()
+    } else {
+        format!("(type({receiver}) == \"string\" and {receiver} or nil)")
+    }
+}
+
+fn boolean_check(receiver: &str, ty: Ty) -> String {
+    if ty.base == Base::Bool {
+        receiver.to_owned()
+    } else {
+        format!("(type({receiver}) == \"boolean\" and {receiver} or nil)")
+    }
+}
+
+fn number_check(receiver: &str, ty: Ty) -> String {
+    if ty.is_numeric() {
+        receiver.to_owned()
+    } else {
+        format!("(type({receiver}) == \"number\" and {receiver} or nil)")
+    }
+}
+
+/// `serde_json` stores integers and floats apart, and Luau keeps the same
+/// distinction in its integer subtype. A value that is integral and inside the
+/// bounds is an integer whatever its storage.
+fn integer_test(receiver: &str, ty: Ty, range: (&str, &str)) -> String {
+    let (low, high) = range;
+    if ty.base == Base::Int {
+        return "(true)".to_owned();
+    }
+    format!(
+        "(type({receiver}) == \"number\" and {receiver} % 1 == 0 and {receiver} >= {low} and {receiver} <= {high})"
+    )
+}
+
+fn integer_check(receiver: &str, ty: Ty, range: (&str, &str)) -> String {
+    if ty.base == Base::Int {
+        return receiver.to_owned();
+    }
+    format!(
+        "({} and {receiver} or nil)",
+        integer_test(receiver, ty, range)
+    )
+}
+
+/// The assignable expression behind lock and deref wrappers, so `take()` can
+/// clear the storage the receiver reads from.
+fn guard_target(expr: &Expr) -> &Expr {
+    let expr = strip_reference(expr);
+    let Expr::MethodCall(call) = expr else {
+        return expr;
+    };
+    if !matches!(
+        call.method.to_string().as_str(),
+        "lock"
+            | "read"
+            | "write"
+            | "borrow"
+            | "borrow_mut"
+            | "deref"
+            | "as_mut"
+            | "as_ref"
+            | "unwrap"
+            | "expect"
+            | "unwrap_or_else"
+    ) {
+        return expr;
+    }
+    guard_target(&call.receiver)
 }
 
 fn is_iterator_adaptor(expr: &Expr) -> bool {
