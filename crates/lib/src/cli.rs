@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use notify::event::EventKind;
 use notify::{RecursiveMode, Watcher};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::Result;
 use crate::context::{Context, Parts};
@@ -25,9 +26,9 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 
 const NATIVE_CACHE_LIMIT: usize = 128;
 // A request is written in place, so a read can catch a partial payload. A
-// truncated JSON document is retried a few times before it is reported.
-const REQUEST_READ_ATTEMPTS: u32 = 20;
-const REQUEST_READ_WAIT: Duration = Duration::from_micros(100);
+// truncated document is retried with yields, which resolves in microseconds
+// because the write finishes in microseconds.
+const REQUEST_READ_ATTEMPTS: u32 = 2000;
 #[derive(Debug, Deserialize)]
 struct Request {
     boot: String,
@@ -54,6 +55,8 @@ struct Request {
     state: Value,
     #[serde(default)]
     host: Value,
+    #[serde(default)]
+    host_fixed: Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +73,7 @@ struct Serve<'a, W: Write> {
     stale: BTreeSet<PathBuf>,
     native_cache: BTreeMap<String, (Instant, Value)>,
     native_cache_order: VecDeque<String>,
+    host_fixed: Value,
     translations: &'a Value,
     out: &'a mut W,
 }
@@ -116,7 +120,7 @@ impl<W: Write> Serve<'_, W> {
     }
 
     fn process_request(&mut self, path: &Path) -> Result<Processed> {
-        let request = read_request(path)?;
+        let mut request = read_request(path)?;
         if request.boot != self.boot {
             return Err(format!(
                 "stale boot {} (expected {})",
@@ -129,13 +133,17 @@ impl<W: Write> Serve<'_, W> {
             return Ok(Processed::Native);
         }
 
+        if request.host_fixed.is_object() {
+            self.host_fixed = mem::take(&mut request.host_fixed);
+        }
+        let host = request_host(&self.host_fixed, request.host);
         let parts = Parts {
             entry: request.entry,
             event: request.event,
             payload: request.payload,
             config: request.config,
             state: request.state,
-            host: request.host,
+            host,
             data_dir: self.data_dir.to_path_buf(),
         };
         let mut context = Context::new(parts, self.translations.clone());
@@ -407,6 +415,7 @@ fn serve(plugin: &Plugin, data_dir: &Path, spool_dir: &Path) -> Result<()> {
         stale,
         native_cache: BTreeMap::new(),
         native_cache_order: VecDeque::new(),
+        host_fixed: Value::Object(Map::new()),
         translations: &translations,
         out: &mut out,
     };
@@ -451,6 +460,26 @@ fn is_request_name(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
+/// Builds the host snapshot a request carries.
+///
+/// The bridge sends the per-event values in `host` and the fixed values
+/// (settings, colors, paths) in `host_fixed` only when they changed, so the
+/// cached fixed part is merged under the live one. A request that still sends
+/// one complete `host` covers the cache and wins the merge.
+fn request_host(fixed: &Value, live: Value) -> Value {
+    let Some(mut host) = fixed.as_object().cloned() else {
+        return live;
+    };
+    if let Some(values) = live.as_object() {
+        host.extend(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    Value::Object(host)
+}
+
 fn read_request(path: &Path) -> Result<Request> {
     let mut attempt = 0;
     loop {
@@ -459,7 +488,7 @@ fn read_request(path: &Path) -> Result<Request> {
             Ok(request) => return Ok(request),
             Err(error) if error.is_eof() && attempt < REQUEST_READ_ATTEMPTS => {
                 attempt = attempt.saturating_add(1);
-                thread::sleep(REQUEST_READ_WAIT);
+                thread::yield_now();
             }
             Err(error) => return Err(error.into()),
         }
@@ -726,6 +755,7 @@ mod tests {
             stale: config.stale,
             native_cache: BTreeMap::new(),
             native_cache_order: VecDeque::new(),
+            host_fixed: Value::Object(Map::new()),
             translations: &Value::Null,
             out: writer,
         };
@@ -828,6 +858,70 @@ mod tests {
         assert!(ops.get(2).is_some_and(|line| line.contains("third")));
 
         spool.cleanup();
+    }
+
+    #[test]
+    fn test_serve_merges_the_fixed_host_snapshot() {
+        #[expect(clippy::unnecessary_wraps, reason = "handlers return Result")]
+        fn handler(ctx: &Context) -> crate::Result<Vec<Op>> {
+            let value =
+                |path: &str| ctx.host(path).cloned().unwrap_or(Value::Null);
+            Ok(vec![Op::log(format!(
+                "{}|{}|{}",
+                ctx.setting("shell.font")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+                value("colors.primary").as_str().unwrap_or(""),
+                value("now_ms").as_i64().unwrap_or_default()
+            ))])
+        }
+
+        let spool = TestSpool::new("serve-host-fixed");
+        let boot = "boot-host";
+        spool.write(
+            "000000000001.json",
+            &json!({
+                "boot": boot,
+                "entry": "service",
+                "event": "render",
+                "host": { "now_ms": 1 },
+                "host_fixed": {
+                    "setting": { "shell.font": "sans" },
+                    "colors": { "primary": "#fff" },
+                },
+            }),
+        );
+        spool.write(
+            "000000000002.json",
+            &json!({
+                "boot": boot,
+                "entry": "service",
+                "event": "render",
+                "host": { "now_ms": 2, "clipboard": "clip" },
+            }),
+        );
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .service("service", handler);
+
+        let writer = Capture {
+            plugin: &plugin,
+            data: &spool.data,
+            spool: &spool.spool,
+            boot,
+            stale: BTreeSet::new(),
+            stop_after: 4,
+        }
+        .run();
+        let lines = writer.lines();
+        spool.cleanup();
+
+        let logs: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("\"log\""))
+            .collect();
+        assert_eq!(logs.len(), 2, "{lines:?}");
+        assert!(logs[0].contains("sans|#fff|1"), "{}", logs[0]);
+        assert!(logs[1].contains("sans|#fff|2"), "{}", logs[1]);
     }
 
     #[test]
@@ -1250,6 +1344,7 @@ mod tests {
             stale: BTreeSet::new(),
             native_cache: BTreeMap::new(),
             native_cache_order: VecDeque::new(),
+            host_fixed: Value::Object(Map::new()),
             translations: &translations,
             out: &mut out,
         };

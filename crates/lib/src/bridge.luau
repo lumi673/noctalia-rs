@@ -84,6 +84,8 @@ end
 M.last_query = nil
 
 local boot = nil
+local fixed_host = nil
+local fixed_sent = false
 local sequence = 0
 local pending = {}
 local stream_started = false
@@ -187,18 +189,9 @@ local function invoke(root, path, ...)
   return nil
 end
 local function snapshot()
-  local host = {
-    now_ms = invoke(noctalia, "nowMs") or 0,
-    dark = invoke(noctalia, "isDarkMode"),
-    outputs = invoke(noctalia, "outputs"),
-    focused_output_name = invoke(noctalia, "focusedOutputName"),
+  local fixed = {
     pluginDir = invoke(noctalia, "pluginDir"),
     pluginDataDir = invoke(noctalia, "pluginDataDir"),
-    clipboard = invoke(noctalia, "clipboardText"),
-    calendar = invoke(noctalia, "calendarEvents"),
-    media = invoke(noctalia, "mediaPlayer"),
-    stats = invoke(noctalia, "systemStats"),
-    nightlight = invoke(noctalia, "nightlight.state"),
     compositor = { name = invoke(noctalia, "compositor.name") },
     setting = {},
     bar = {
@@ -208,12 +201,34 @@ local function snapshot()
     colors = {},
   }
   for _, path in ipairs(SETTING_PATHS) do
-    host.setting[path] = invoke(noctalia, "getSetting", path)
+    fixed.setting[path] = invoke(noctalia, "getSetting", path)
   end
   for _, role in ipairs(COLOR_ROLES) do
-    host.colors[role] = invoke(noctalia, "getColor", role)
+    fixed.colors[role] = invoke(noctalia, "getColor", role)
   end
-  return host
+  return {
+    now_ms = invoke(noctalia, "nowMs") or 0,
+    dark = invoke(noctalia, "isDarkMode"),
+    outputs = invoke(noctalia, "outputs"),
+    focused_output_name = invoke(noctalia, "focusedOutputName"),
+    clipboard = invoke(noctalia, "clipboardText"),
+    calendar = invoke(noctalia, "calendarEvents"),
+    media = invoke(noctalia, "mediaPlayer"),
+    stats = invoke(noctalia, "systemStats"),
+    nightlight = invoke(noctalia, "nightlight.state"),
+  }, fixed
+end
+
+local function sameValue(left, right)
+  if left == right then return true end
+  if type(left) ~= "table" or type(right) ~= "table" then return false end
+  for key, value in pairs(left) do
+    if not sameValue(value, right[key]) then return false end
+  end
+  for key in pairs(right) do
+    if left[key] == nil then return false end
+  end
+  return true
 end
 
 local function resolve(root, path)
@@ -316,8 +331,14 @@ end
 local function writeRequest(request)
   sequence += 1
   local target = REQUEST_DIR .. "/" .. string.format("%012d", sequence) .. ".json"
-  M.host = snapshot()
-  request.host = M.host
+  local host, fixed = snapshot()
+  M.host = host
+  request.host = host
+  if not fixed_sent or not sameValue(fixed, fixed_host) then
+    fixed_host = fixed
+    fixed_sent = true
+    request.host_fixed = fixed
+  end
   -- Written in place. The helper wakes on the create and retries a truncated
   -- payload, so the round trip overlaps the write instead of waiting for a
   -- rename to publish the file.
@@ -346,6 +367,8 @@ local function onLine(line)
     return
   end
   if message.control == "ready" then
+    -- A fresh helper has no cached fixed snapshot.
+    fixed_sent = false
     boot = message.boot
     REQUEST_DIR = message.spool or SPOOL_DIR
     flushPending()
