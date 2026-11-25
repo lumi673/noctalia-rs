@@ -105,20 +105,29 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("if {condition} then"));
                 self.indent = self.indent.saturating_add(1);
                 let (value, ty) = self.block_value(&item.then_branch)?;
-                self.line(&format!("{name} = {value}"));
+                let mut result = ty;
+                if !value.is_empty() && ty.base != Base::Void {
+                    self.line(&format!("{name} = {value}"));
+                } else {
+                    result = Ty::VALUE;
+                }
                 self.indent = self.indent.saturating_sub(1);
                 if let Some((_, branch)) = &item.else_branch {
                     self.line("else");
                     self.indent = self.indent.saturating_add(1);
-                    let (value, _) = match &**branch {
+                    let (value, ty) = match &**branch {
                         Expr::Block(block) => self.block_value(&block.block)?,
                         other => self.expr(other)?,
                     };
-                    self.line(&format!("{name} = {value}"));
+                    if !value.is_empty() && ty.base != Base::Void {
+                        self.line(&format!("{name} = {value}"));
+                    } else {
+                        result = Ty::VALUE;
+                    }
                     self.indent = self.indent.saturating_sub(1);
                 }
                 self.line("end");
-                Ok((name, ty))
+                Ok((name, result))
             }
             Expr::Array(array) => {
                 let mut values = Vec::new();

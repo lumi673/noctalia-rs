@@ -203,7 +203,13 @@ impl<'a> Emitter<'a> {
             self.push(&name, type_hint(hint));
             return Ok(());
         }
-        let (text, mut ty) = self.expr(&init.expr)?;
+        let saved_value = self.value_needed;
+        if !matches!(pattern, Pat::Wild(_)) {
+            self.value_needed = true;
+        }
+        let result = self.expr(&init.expr);
+        self.value_needed = saved_value;
+        let (text, mut ty) = result?;
         if ty.result
             && let Some(hint) = hint
         {
@@ -335,9 +341,12 @@ impl<'a> Emitter<'a> {
             Expr::Tuple(tuple) if tuple.elems.is_empty() => Ok(()),
             _ => {
                 let saved_statement = self.in_statement;
+                let saved_value = self.value_needed;
                 self.in_statement = true;
+                self.value_needed = false;
                 let result = self.expr(expr);
                 self.in_statement = saved_statement;
+                self.value_needed = saved_value;
                 let (text, ty) = result?;
                 if ty.base == Base::Void {
                     if !text.is_empty() {

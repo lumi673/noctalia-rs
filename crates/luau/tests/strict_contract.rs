@@ -467,6 +467,70 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     }
 }
 
+const CROSS_ACCEPT: &str = r#"
+fn subscribe(ctx: &Context, ops: &mut Vec<Op>) {
+    let streaming = ctx.run_stream_start(json!(["tail", "-f"]), "lines");
+    if !streaming {
+        ops.push(Op::log("failed"));
+    }
+}
+
+fn load(ctx: &Context, ops: &mut Vec<Op>) {
+    subscribe(ctx, ops);
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let mut ops = Vec::new();
+        let flag: Option<u8> = None;
+        flag.unwrap_or_else(|| {
+            load(ctx, &mut ops);
+            1
+        });
+        ops.push(Op::log("subscribed"));
+        return Ok(ops);
+    }
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(Vec::new())
+}
+"#;
+
+const CROSS_OPS_IF: &str = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let vertical = ctx.bar_vertical();
+        let mut ops = vec![if vertical {
+            Op::BarRender { tree: ui::column(json!({}), Vec::new()) }
+        } else {
+            Op::BarRender { tree: ui::row(json!({}), Vec::new()) }
+        }];
+        ops.push(Op::BarTooltip { value: json!("tip") });
+        return Ok(ops);
+    }
+    Ok(Vec::new())
+}
+"#;
+
+#[test]
+fn strict_and_auto_agree_on_an_inlined_acceptance_value() {
+    let auto = compile_mode(CROSS_ACCEPT, false);
+    let strict = compile_mode(CROSS_ACCEPT, true);
+    let auto_ops = normalized(&render_ops(&auto, false));
+    let strict_ops = normalized(&render_ops(&strict, true));
+    assert_eq!(strict_ops, auto_ops);
+}
+
+#[test]
+fn strict_and_auto_agree_on_a_vec_of_ops_from_an_if() {
+    let auto = compile_mode(CROSS_OPS_IF, false);
+    let strict = compile_mode(CROSS_OPS_IF, true);
+    let auto_ops = normalized(&render_ops(&auto, false));
+    let strict_ops = normalized(&render_ops(&strict, true));
+    assert_eq!(strict_ops, auto_ops);
+}
+
 fn render_ops(source: &str, strict: bool) -> Vec<Value> {
     let ctx = context("render", json!({}));
     let ops = if strict {

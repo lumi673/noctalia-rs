@@ -102,6 +102,7 @@ impl<'a> Emitter<'a> {
                 }
                 Err(Error::at(call.span(), "expected an Op constructor"))
             }
+            Expr::If(item) => self.op_if(item),
             Expr::Paren(paren) => self.op_expr(&paren.expr),
             Expr::Group(group) => self.op_expr(&group.expr),
             Expr::Path(path) => {
@@ -131,6 +132,30 @@ impl<'a> Emitter<'a> {
             }
             other => Err(Error::at(other.span(), "expected an Op constructor")),
         }
+    }
+
+    /// Emits an `if` whose branches build ops, such as an op chosen per value.
+    fn op_if(&mut self, item: &syn::ExprIf) -> Result<(), Error> {
+        let condition = match *item.cond.clone() {
+            Expr::Let(condition) => self.let_condition(&condition)?,
+            other => self.expr(&other)?.0,
+        };
+        self.line(&format!("if {condition} then"));
+        self.indent = self.indent.saturating_add(1);
+        self.statement_block(&item.then_branch)?;
+        self.indent = self.indent.saturating_sub(1);
+        if let Some((_, branch)) = &item.else_branch {
+            self.line("else");
+            self.indent = self.indent.saturating_add(1);
+            match &**branch {
+                Expr::Block(block) => self.statement_block(&block.block)?,
+                Expr::If(inner) => self.op_if(inner)?,
+                other => self.op_expr(other)?,
+            }
+            self.indent = self.indent.saturating_sub(1);
+        }
+        self.line("end");
+        Ok(())
     }
 
     fn op_struct(
@@ -697,8 +722,21 @@ pub(super) fn is_op_expr(expr: &Expr) -> bool {
             .is_some_and(|name| op_constructor(&name).is_some()),
         Expr::Path(path) => path_last_name(&Expr::Path(path.clone()))
             .is_some_and(|name| name == "Op::OpenSettings"),
+        Expr::If(item) => {
+            block_tail_is_op(&item.then_branch)
+                || item.else_branch.as_ref().is_some_and(|(_, branch)| {
+                    match &**branch {
+                        Expr::Block(block) => block_tail_is_op(&block.block),
+                        other => is_op_expr(other),
+                    }
+                })
+        }
         _ => false,
     }
+}
+
+fn block_tail_is_op(block: &syn::Block) -> bool {
+    matches!(block.stmts.last(), Some(Stmt::Expr(expr, _)) if is_op_expr(expr))
 }
 
 /// Whether `expr` is a `ui::<variant>(...)` call.

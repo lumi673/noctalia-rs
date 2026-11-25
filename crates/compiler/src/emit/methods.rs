@@ -1915,6 +1915,9 @@ impl<'a> Emitter<'a> {
                 } else {
                     format!("{head}({request}, {callback})")
                 };
+                if self.value_needed {
+                    return Ok((line, Ty::BOOL));
+                }
                 self.line(&line);
                 Ok((String::new(), Ty::VOID))
             }
