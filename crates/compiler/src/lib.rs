@@ -1,6 +1,7 @@
 mod emit;
 mod error;
 mod program;
+pub mod strict;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,6 +10,7 @@ use syn::spanned::Spanned;
 use syn::{FnArg, Pat, Type};
 
 pub use error::Error;
+pub use strict::StrictOptions;
 
 use emit::Emitter;
 use program::Program;
@@ -268,6 +270,10 @@ pub struct Options<'a> {
     /// Whether a function the compiler cannot translate may cross into the
     /// helper process as a native call. `strict` denies it.
     pub native: NativeMode,
+    /// Strict-mode data from the build. `Some` selects strict emission:
+    /// no bridge, no helper, direct member calls, and the synthesized
+    /// context tables. `None` keeps auto and off output unchanged.
+    pub strict: Option<StrictOptions<'a>>,
 }
 
 /// Whether functions may cross into the helper process.
@@ -398,12 +404,17 @@ fn compile_once(
         &module,
         options.native,
         known,
+        options.strict,
+        true,
+        true,
     );
     discovery.constants();
     discovery.block(&function.block)?;
     let discovery_body = discovery.finish();
     let events = discovery_body.events.clone();
     let negatives = discovery_body.negative_events.clone();
+    let has_action = discovery_body.events.contains("action");
+    let has_host_callback = discovery_body.events.contains("host_callback");
     let positive = events.difference(&negatives).cloned().collect::<Vec<_>>();
 
     let update_event = options.kind.update_event().to_owned();
@@ -436,6 +447,9 @@ fn compile_once(
             &module,
             options.native,
             known,
+            options.strict,
+            has_action,
+            has_host_callback,
         );
         emitter.constants();
         emitter.block(&function.block)?;
@@ -624,6 +638,20 @@ fn compile_once(
             "end\n",
         ));
     }
+    if let Some(strict) = &options.strict {
+        let uses_config = bodies.iter().any(|slot| slot.body.uses_config_table);
+        let uses_translations =
+            bodies.iter().any(|slot| slot.body.uses_translations_table);
+        if uses_config {
+            out.push_str(strict.config);
+        }
+        if uses_translations {
+            out.push_str(strict.translations);
+        }
+        if (uses_config || uses_translations) && !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
     let mut natives = known.clone();
     for slot in &bodies {
         for item in &slot.body.native {
@@ -689,25 +717,59 @@ fn compile_once(
 
     if let Some(slot) = slot("host_callback").filter(|slot| !slot.body.is_empty)
     {
-        let args = call_args(
-            &slot.body,
-            &[],
-            &[],
-            None,
-            Some("payload"),
-            false,
-            "host_callback",
-        );
-        let _ = writeln!(
-            out,
-            "function onHostCallback(payload) {} end",
-            invoke(
+        if options.strict.is_some() {
+            let payload = "{ id = id, args = { ... } }";
+            let args = call_args(
                 &slot.body,
-                &slot.name,
-                &args,
-                Some(descriptor("host_callback", None, Some("payload"), false))
-            )
-        );
+                &[],
+                &[],
+                None,
+                Some(payload),
+                false,
+                "host_callback",
+            );
+            let _ = writeln!(
+                out,
+                "function {}(id, ...) {} end",
+                strict::CALLBACK_DISPATCH,
+                invoke(
+                    &slot.body,
+                    &slot.name,
+                    &args,
+                    Some(descriptor(
+                        "host_callback",
+                        None,
+                        Some(payload),
+                        false
+                    ))
+                )
+            );
+        } else {
+            let args = call_args(
+                &slot.body,
+                &[],
+                &[],
+                None,
+                Some("payload"),
+                false,
+                "host_callback",
+            );
+            let _ = writeln!(
+                out,
+                "function onHostCallback(payload) {} end",
+                invoke(
+                    &slot.body,
+                    &slot.name,
+                    &args,
+                    Some(descriptor(
+                        "host_callback",
+                        None,
+                        Some("payload"),
+                        false
+                    ))
+                )
+            );
+        }
     }
 
     if options.kind == EntryKind::Launcher
@@ -802,6 +864,85 @@ fn compile_once(
                 ))
             )
         );
+    }
+    if options.strict.is_some() {
+        let actions = bodies
+            .iter()
+            .flat_map(|slot| slot.body.actions.iter().cloned())
+            .collect::<std::collections::BTreeSet<String>>();
+        let dynamic_action =
+            bodies.iter().any(|slot| slot.body.uses_action_dispatch);
+        let notify_actions = bodies
+            .iter()
+            .flat_map(|slot| slot.body.notify_actions.iter().cloned())
+            .collect::<std::collections::BTreeSet<String>>();
+        if !(actions.is_empty() && notify_actions.is_empty() && !dynamic_action)
+        {
+            let Some(action) =
+                slot("action").filter(|slot| !slot.body.is_empty)
+            else {
+                return Err(Error::plain(
+                    "strict emit needs an action branch for ui::call",
+                ));
+            };
+            for name in &actions {
+                let payload =
+                    format!("{{ name = {}, args = {{ ... }} }}", quote(name));
+                let args = call_args(
+                    &action.body,
+                    &[],
+                    &[],
+                    None,
+                    Some(&payload),
+                    false,
+                    "action",
+                );
+                let _ = writeln!(
+                    out,
+                    "function {}(...) {} end",
+                    strict::action_global(name),
+                    invoke(&action.body, &action.name, &args, None)
+                );
+            }
+            if dynamic_action {
+                let payload = "{ name = name, args = { ... } }";
+                let args = call_args(
+                    &action.body,
+                    &[],
+                    &[],
+                    None,
+                    Some(payload),
+                    false,
+                    "action",
+                );
+                let _ = writeln!(
+                    out,
+                    "function {}(name, ...) {} end",
+                    strict::ACTION_DISPATCH,
+                    invoke(&action.body, &action.name, &args, None)
+                );
+            }
+            for name in &notify_actions {
+                let payload = format!(
+                    "{{ name = {}, args = {{ id, context }} }}",
+                    quote(name)
+                );
+                let args = call_args(
+                    &action.body,
+                    &[],
+                    &[],
+                    None,
+                    Some(&payload),
+                    false,
+                    "action",
+                );
+                let _ = writeln!(
+                    out,
+                    "function {name}(id, context) {} end",
+                    invoke(&action.body, &action.name, &args, None)
+                );
+            }
+        }
     }
     out.push('\n');
     if options.kind != EntryKind::Launcher

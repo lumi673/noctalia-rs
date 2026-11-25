@@ -824,6 +824,7 @@ impl<'a> Emitter<'a> {
             | "cloned" | "into_inner" | "into" | "as_mut" | "as_slice"
             | "as_bytes" | "into_bytes" | "copied" | "peekable"
             | "iter_mut" => Ok((receiver, ty)),
+            "into_vec" if self.strict() => Ok((receiver, ty)),
             "first" => Ok((format!("({receiver}[1])"), Ty::OPT_VALUE)),
             "as_object_mut" => Ok((
                 format!(
@@ -1604,8 +1605,25 @@ impl<'a> Emitter<'a> {
                 Ok((format!("noctalia.getColor({role})"), Ty::OPT_VALUE))
             }
             "host" => {
+                if self.strict() {
+                    let argument = arg(args, 0, call)?;
+                    let Some(path) = literal_string(argument) else {
+                        return Err(Error::at(
+                            argument.span(),
+                            "strict host resolution needs a literal path",
+                        ));
+                    };
+                    return Ok((
+                        host_path(&path)?.to_owned(),
+                        Ty::OPT_VALUE,
+                    ));
+                }
                 let path = self.string_arg(args, 0, call)?;
                 Ok((host_path(&unquote(&path))?.to_owned(), Ty::OPT_VALUE))
+            }
+            "translations" if self.strict() => {
+                self.uses_translations_table = true;
+                Ok(("TRANSLATIONS".to_owned(), Ty::VALUE))
             }
             "clipboard" => Ok((
                 "noctalia.clipboardText()".to_owned(),
@@ -1814,6 +1832,14 @@ impl<'a> Emitter<'a> {
                     Ty::STR,
                 ))
             }
+            "query_value" | "query_bool"
+                if self.strict() =>
+            {
+                self.strict_query(method, args, call)
+            }
+            "query_pair" | "query_response" if self.strict() => {
+                self.strict_query(method, args, call)
+            }
             "query_value" | "query_bool" => {
                 let root = self.string_arg(args, 0, call)?;
                 let path = self.expr(arg(args, 1, call)?)?.0;
@@ -1836,6 +1862,33 @@ impl<'a> Emitter<'a> {
             "file_info" => {
                 let path = self.path_arg(args, 0, call)?;
                 Ok((format!("noctalia.fileInfo({path})"), Ty::VALUE))
+            }
+            "run_async_start" | "run_stream_start" | "http_start"
+                if self.strict() =>
+            {
+                let (request, _) = self.expr(arg(args, 0, call)?)?;
+                let callback = arg(args, 1, call)?;
+                let callback =
+                    self.strict_callback(callback, callback.span())?;
+                let head = match method {
+                    "run_async_start" => "noctalia.runAsync",
+                    "run_stream_start" => "noctalia.runStream",
+                    _ => "noctalia.http",
+                };
+                let line = if method == "run_async_start" {
+                    let timeout = match args.get(2) {
+                        Some(timeout) => self.option_value(timeout)?,
+                        None => "nil".to_owned(),
+                    };
+                    format!("{head}({request}, {callback}, {timeout})")
+                } else {
+                    format!("{head}({request}, {callback})")
+                };
+                if self.in_statement {
+                    self.line(&line);
+                    return Ok((String::new(), Ty::VOID));
+                }
+                Ok((line, Ty::BOOL))
             }
             "run_async_start" | "run_stream_start" | "http_start" => {
                 if !self.in_statement {
@@ -1867,12 +1920,113 @@ impl<'a> Emitter<'a> {
                 self.line(&line);
                 Ok((String::new(), Ty::VOID))
             }
+            "write_file_result" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                let contents = self.expr(arg(args, 1, call)?)?.0;
+                Ok((
+                    format!("noctalia.writeFile({path}, {contents})"),
+                    Ty::VOID,
+                ))
+            }
+            "rename_file_result" if self.strict() => {
+                let from = self.path_arg(args, 0, call)?;
+                let to = self.path_arg(args, 1, call)?;
+                Ok((
+                    format!("noctalia.renameFile({from}, {to})"),
+                    Ty::VOID,
+                ))
+            }
+            "copy_bytes" if self.strict() => {
+                let bytes = self.expr(arg(args, 0, call)?)?.0;
+                let mime = self.expr(arg(args, 1, call)?)?.0;
+                Ok((
+                    format!("noctalia.copyToClipboard({bytes}, {mime})"),
+                    Ty::BOOL,
+                ))
+            }
+            "write_file_bytes" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                let bytes = self.expr(arg(args, 1, call)?)?.0;
+                Ok((
+                    format!("noctalia.writeFile({path}, {bytes})"),
+                    Ty::VOID,
+                ))
+            }
+            "read_file_bytes" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                Ok((
+                    format!("noctalia.readFile({path})"),
+                    Ty::result(Base::Str),
+                ))
+            }
+            "read_file_bytes_result" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                Ok((format!("(noctalia.readFile({path}))"), Ty::VALUE))
+            }
+            "payload_bytes" if self.strict() => {
+                self.uses_payload = true;
+                let key = self.string_arg(args, 0, call)?;
+                Ok((format!("payload[{key}]"), Ty::VALUE))
+            }
             other => Err(Error::at(
                 call.method.span(),
                 format!(
                     "context method `{other}` is not supported by the Luau compiler"
                 ),
             )),
+        }
+    }
+
+    /// A strict host query: the direct member call, resolved at build time.
+    fn strict_query(
+        &mut self,
+        method: &str,
+        args: &[&Expr],
+        call: &ExprMethodCall,
+    ) -> Result<(String, Ty), Error> {
+        let root_expr = arg(args, 0, call)?;
+        let Some(root) = literal_string(root_expr) else {
+            return Err(Error::at(
+                root_expr.span(),
+                "strict host resolution needs a literal root",
+            ));
+        };
+        let path_expr = arg(args, 1, call)?;
+        let path = literal_path(path_expr)?;
+        let values = self.expr(arg(args, 2, call)?)?.0;
+        let full = strict::member_path(&root, &path);
+        let Some(kind) = strict::member(&root, &path) else {
+            return Err(Error::at(
+                path_expr.span(),
+                format!("unknown host member `{full}`"),
+            ));
+        };
+        if matches!(
+            kind,
+            strict::MemberKind::Namespace
+                | strict::MemberKind::Node
+                | strict::MemberKind::Void
+        ) {
+            return Err(Error::at(
+                path_expr.span(),
+                format!("`{full}` cannot answer a query"),
+            ));
+        }
+        let text = format!("{full}(table.unpack({values}))");
+        match method {
+            "query_bool" => Ok((format!("({text} == true)"), Ty::BOOL)),
+            "query_value" => Ok((text, Ty::VALUE)),
+            "query_pair" => Ok((text, Ty::VALUE)),
+            _ => {
+                let value = self.temp();
+                let error = self.temp();
+                Ok((
+                    format!(
+                        "(function() local {value}, {error} = {text}; return {{ ok = true, value = {value}, error = {error} }} end)()"
+                    ),
+                    Ty::VALUE,
+                ))
+            }
         }
     }
 

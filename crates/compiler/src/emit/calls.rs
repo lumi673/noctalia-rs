@@ -127,6 +127,11 @@ impl<'a> Emitter<'a> {
                 "SystemTime::now" => {
                     return Ok(("noctalia.nowMs()".to_owned(), Ty::INT));
                 }
+                "ByteBuf::new" | "ByteBuf::from"
+                    if self.strict() && args.len() == 1 =>
+                {
+                    return self.expr(arg(&args, 0, call)?);
+                }
                 _ => {}
             }
             if args.len() == 1
@@ -226,7 +231,15 @@ impl<'a> Emitter<'a> {
             if let Some(variant) = qualified_variant(&name, "ui")
                 && let Some(builder) = ui_marker(variant)
             {
-                let value = self.expr(arg(&args, 0, call)?)?.0;
+                let argument = arg(&args, 0, call)?;
+                if self.strict() {
+                    return self.strict_ui_marker(
+                        variant,
+                        argument,
+                        call.span(),
+                    );
+                }
+                let value = self.expr(argument)?.0;
                 return Ok((format!("{{ {builder} = {value} }}"), Ty::VALUE));
             }
             if let Some(value) = self.std_constructor(call, &args)? {
@@ -242,6 +255,12 @@ impl<'a> Emitter<'a> {
                 self.op_call(call, &op)?;
                 return Ok((String::new(), Ty::VOID));
             }
+            if name == "Op::query" && self.strict() {
+                return Err(Error::at(
+                    call.span(),
+                    "strict op `query` can only be pushed or returned as an Op",
+                ));
+            }
             if let Some(op) = unsupported_op(&name) {
                 return Err(Error::at(call.span(), op));
             }
@@ -256,6 +275,50 @@ impl<'a> Emitter<'a> {
                 "call to `{label}` is not supported by the Luau compiler: no function in the crate matches, and only ops, ui constructors and a small set of std calls are supported"
             ),
         ))
+    }
+
+    /// A real callback value for strict emit.
+    ///
+    /// `ui::callback(id)` becomes a closure that forwards its arguments to the
+    /// host-callback body, and `ui::call(name)` becomes the name of the plugin
+    /// global emitted for that action. A dynamic action name becomes a
+    /// closure that forwards to the shared action dispatcher.
+    fn strict_ui_marker(
+        &mut self,
+        variant: &str,
+        argument: &Expr,
+        span: proc_macro2::Span,
+    ) -> Result<(String, Ty), Error> {
+        match variant {
+            "callback" => {
+                if !self.has_host_callback {
+                    return Err(Error::at(
+                        span,
+                        "ui::callback needs a host_callback branch in strict mode",
+                    ));
+                }
+                let id = self.expr(argument)?.0;
+                self.uses_callback_dispatch = true;
+                Ok((strict::closure(strict::CALLBACK_DISPATCH, &id), Ty::VALUE))
+            }
+            "call" => {
+                if !self.has_action {
+                    return Err(Error::at(
+                        span,
+                        "ui::call needs an action branch in strict mode",
+                    ));
+                }
+                if let Some(name) = literal_string(argument) {
+                    self.actions.insert(name.clone());
+                    let global = strict::action_global(&name);
+                    return Ok((format!("\"{global}\""), Ty::VALUE));
+                }
+                let name = self.expr(argument)?.0;
+                self.uses_action_dispatch = true;
+                Ok((strict::closure(strict::ACTION_DISPATCH, &name), Ty::VALUE))
+            }
+            _ => Err(Error::at(span, "unknown ui marker")),
+        }
     }
 
     fn ui_node(
@@ -317,4 +380,17 @@ fn ui_marker(variant: &str) -> Option<&'static str> {
         "callback" => Some("__host_callback"),
         _ => None,
     }
+}
+
+/// A string literal, optionally behind a reference.
+pub(super) fn literal_string(expr: &Expr) -> Option<String> {
+    let expr = strip_reference(expr);
+    let Expr::Lit(ExprLit {
+        lit: Lit::Str(value),
+        ..
+    }) = expr
+    else {
+        return None;
+    };
+    Some(value.value())
 }

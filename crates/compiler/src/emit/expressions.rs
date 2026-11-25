@@ -640,7 +640,13 @@ impl<'a> Emitter<'a> {
                         .to_owned(),
                     Ty::STR,
                 )),
-                "config" => Ok(("noctalia".to_owned(), Ty::VALUE)),
+                "config" => {
+                    if self.strict() {
+                        self.uses_config_table = true;
+                        return Ok(("CONFIG".to_owned(), Ty::VALUE));
+                    }
+                    Ok(("noctalia".to_owned(), Ty::VALUE))
+                }
                 other => Err(Error::at(
                     field.member.span(),
                     format!(
@@ -1087,7 +1093,13 @@ pub(super) fn is_vec_new(call: &ExprCall) -> bool {
 
 pub(super) fn multi_return(expr: &Expr) -> bool {
     match expr {
-        Expr::MethodCall(call) => call.method.to_string().ends_with("_result"),
+        Expr::MethodCall(call) => {
+            call.method.to_string().ends_with("_result")
+                || matches!(
+                    call.method.to_string().as_str(),
+                    "query_pair" | "query_response"
+                )
+        }
         Expr::Call(call) => path_last_name(&call.func)
             .is_some_and(|name| name.ends_with("_result")),
         _ => false,

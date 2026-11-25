@@ -1188,6 +1188,7 @@ mod tests {
                     strings: &["message"],
                     settings: &["message"],
                     native: compiler::NativeMode::Deny,
+                    strict: None,
                     module: "main",
                     modules: &[],
                 },

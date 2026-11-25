@@ -94,6 +94,9 @@ impl<'a> Emitter<'a> {
                 if op_constructor(&name).is_some() {
                     return self.op_call(call, &variant);
                 }
+                if variant == "query" && self.strict() {
+                    return self.op_query(call);
+                }
                 if let Some(message) = unsupported_op(&name) {
                     return Err(Error::at(call.span(), message));
                 }
@@ -297,8 +300,103 @@ impl<'a> Emitter<'a> {
             }
             other => other,
         };
+        if self.strict() {
+            return Ok(Some(self.strict_callback(inner, inner.span())?));
+        }
         let (text, _) = self.expr(inner)?;
         Ok(Some(format!("{{ __host_callback = {text} }}")))
+    }
+
+    /// Records a notify action global that the host will call by name.
+    fn notify_action(&mut self, options: &Expr) -> Result<(), Error> {
+        let Some(name) = json_action_name(options) else {
+            return Ok(());
+        };
+        if !self.has_action {
+            return Err(Error::at(
+                options.span(),
+                "a notify action needs an action branch in strict mode",
+            ));
+        }
+        if !is_identifier(&name) || is_luau_keyword(&name) {
+            return Err(Error::at(
+                options.span(),
+                format!(
+                    "notify action `{name}` is not a valid Luau global name"
+                ),
+            ));
+        }
+        self.notify_actions.insert(name);
+        Ok(())
+    }
+
+    /// The strict callback value: a real closure for a callback id.
+    pub(super) fn strict_callback(
+        &mut self,
+        inner: &Expr,
+        span: proc_macro2::Span,
+    ) -> Result<String, Error> {
+        if !self.has_host_callback {
+            return Err(Error::at(
+                span,
+                "a callback needs a host_callback branch in strict mode",
+            ));
+        }
+        if is_ui_marker_call(inner, "callback") {
+            return Ok(self.expr(inner)?.0);
+        }
+        let id = self.expr(inner)?.0;
+        self.uses_callback_dispatch = true;
+        Ok(strict::closure(strict::CALLBACK_DISPATCH, &id))
+    }
+
+    /// A strict `Op::query`: the direct member call plus the response envelope.
+    pub(super) fn op_query(&mut self, call: &ExprCall) -> Result<(), Error> {
+        let args = call.args.iter().collect::<Vec<_>>();
+        let root_expr = arg(&args, 1, call)?;
+        let Some(root) = literal_string(root_expr) else {
+            return Err(Error::at(
+                root_expr.span(),
+                "strict host resolution needs a literal root",
+            ));
+        };
+        let path_expr = arg(&args, 2, call)?;
+        let path = literal_path(path_expr)?;
+        let values = self.expr(arg(&args, 3, call)?)?.0;
+        let response = self.expr(arg(&args, 4, call)?)?.0;
+        let full = strict::member_path(&root, &path);
+        let Some(kind) = strict::member(&root, &path) else {
+            return Err(Error::at(
+                path_expr.span(),
+                format!("unknown host member `{full}`"),
+            ));
+        };
+        if matches!(
+            kind,
+            strict::MemberKind::Namespace
+                | strict::MemberKind::Node
+                | strict::MemberKind::Void
+        ) {
+            return Err(Error::at(
+                path_expr.span(),
+                format!("`{full}` cannot answer a query"),
+            ));
+        }
+        let ok = self.temp();
+        let value = self.temp();
+        let error = self.temp();
+        let envelope = self.temp();
+        self.line(&format!(
+            "local {ok}, {value}, {error} = pcall(function() return {full}(table.unpack({values})) end)"
+        ));
+        self.line(&format!("local {envelope}"));
+        self.line(&format!(
+            "if {ok} then {envelope} = {{ ok = true, value = {value}, error = {error} }} else {envelope} = {{ ok = false, error = tostring({value}) }} end"
+        ));
+        self.line(&format!(
+            "noctalia.writeFile({response}, noctalia.json.encode({envelope}))"
+        ));
+        Ok(())
     }
 
     /// The value inside a `Some(...)` argument, or `nil` for `None`.
@@ -345,10 +443,16 @@ impl<'a> Emitter<'a> {
             }
             "state_watch" => {
                 let key = self.expr(arg(&args, 0, call)?)?.0;
-                let id = self.expr(arg(&args, 1, call)?)?.0;
-                self.line(&format!(
-                    "state.watch({key}, {{ __host_callback = {id} }})"
-                ));
+                if self.strict() {
+                    let id = arg(&args, 1, call)?;
+                    let callback = self.strict_callback(id, id.span())?;
+                    self.line(&format!("state.watch({key}, {callback})"));
+                } else {
+                    let id = self.expr(arg(&args, 1, call)?)?.0;
+                    self.line(&format!(
+                        "state.watch({key}, {{ __host_callback = {id} }})"
+                    ));
+                }
             }
             "run" => {
                 let command = self.expr(arg(&args, 0, call)?)?.0;
@@ -413,7 +517,11 @@ impl<'a> Emitter<'a> {
                 let title = self.expr(arg(&args, 0, call)?)?.0;
                 let body = self.expr(arg(&args, 1, call)?)?.0;
                 let options = if name == "notify_with_options" {
-                    self.expr(arg(&args, 2, call)?)?.0
+                    let option_expr = arg(&args, 2, call)?;
+                    if self.strict() {
+                        self.notify_action(option_expr)?;
+                    }
+                    self.expr(option_expr)?.0
                 } else {
                     "nil".to_owned()
                 };
@@ -425,7 +533,11 @@ impl<'a> Emitter<'a> {
                 let title = self.expr(arg(&args, 0, call)?)?.0;
                 let body = self.expr(arg(&args, 1, call)?)?.0;
                 let options = if name == "notify_error_with_options" {
-                    self.expr(arg(&args, 2, call)?)?.0
+                    let option_expr = arg(&args, 2, call)?;
+                    if self.strict() {
+                        self.notify_action(option_expr)?;
+                    }
+                    self.expr(option_expr)?.0
                 } else {
                     "nil".to_owned()
                 };
@@ -445,6 +557,41 @@ impl<'a> Emitter<'a> {
             "open_path" => {
                 let path = self.expr(arg(&args, 0, call)?)?.0;
                 self.line(&format!("noctalia.openPath({path})"));
+            }
+            "query" => {
+                if self.strict() {
+                    self.op_query(call)?;
+                } else {
+                    return Err(Error::at(
+                        call.span(),
+                        "op `query` needs a response path, which compiled Luau cannot allocate",
+                    ));
+                }
+            }
+            "copy_bytes" if self.strict() => {
+                let bytes = self.expr(arg(&args, 0, call)?)?.0;
+                let mime = self.expr(arg(&args, 1, call)?)?.0;
+                self.line(&format!(
+                    "noctalia.copyToClipboard({bytes}, {mime})"
+                ));
+            }
+            "write_file_bytes" if self.strict() => {
+                let path = self.expr(arg(&args, 0, call)?)?.0;
+                let bytes = self.expr(arg(&args, 1, call)?)?.0;
+                self.line(&format!("noctalia.writeFile({path}, {bytes})"));
+            }
+            "http_bytes" if self.strict() => {
+                let request = self.expr(arg(&args, 0, call)?)?.0;
+                let bytes = self.expr(arg(&args, 1, call)?)?.0;
+                let callback = match args.get(2) {
+                    Some(callback) => {
+                        self.strict_callback(callback, callback.span())?
+                    }
+                    None => "nil".to_owned(),
+                };
+                self.line(&format!(
+                    "noctalia.http((function(__r) __r.body = {bytes}; return __r end)({request}), {callback})"
+                ));
             }
             other => {
                 return Err(Error::at(
@@ -500,6 +647,10 @@ pub(super) fn op_constructor(name: &str) -> Option<String> {
         "run_with_timeout",
         "run_stream",
         "http",
+        "copy_bytes",
+        "write_file_bytes",
+        "http_bytes",
+        "query",
     ];
     supported.contains(&variant).then(|| variant.to_owned())
 }
@@ -532,4 +683,36 @@ pub(super) fn is_op_expr(expr: &Expr) -> bool {
             .is_some_and(|name| name == "Op::OpenSettings"),
         _ => false,
     }
+}
+
+/// Whether `expr` is a `ui::<variant>(...)` call.
+pub(super) fn is_ui_marker_call(expr: &Expr, variant: &str) -> bool {
+    let Expr::Call(call) = strip_reference(expr) else {
+        return false;
+    };
+    path_last_name(&call.func).is_some_and(|name| {
+        qualified_variant(&name, "ui").is_some_and(|found| found == variant)
+    })
+}
+
+/// A host path made only of string literals.
+pub(super) fn literal_path(expr: &Expr) -> Result<Vec<String>, Error> {
+    let expr = strip_reference(expr);
+    let Expr::Array(array) = expr else {
+        return Err(Error::at(
+            expr.span(),
+            "strict host resolution needs a literal path",
+        ));
+    };
+    let mut result = Vec::new();
+    for element in &array.elems {
+        let Some(value) = literal_string(element) else {
+            return Err(Error::at(
+                element.span(),
+                "strict host resolution needs a literal path",
+            ));
+        };
+        result.push(value);
+    }
+    Ok(result)
 }

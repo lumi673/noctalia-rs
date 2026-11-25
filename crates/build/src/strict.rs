@@ -90,7 +90,7 @@ impl StrictContext {
     /// The key list comes from the manifest, so the table has exactly the
     /// fields the Rust `Context` carries. Values are read once at load.
     pub fn config_source(&self) -> String {
-        let mut out = String::from("local config = {\n");
+        let mut out = String::from("local CONFIG = {\n");
         for key in &self.config {
             let _ = writeln!(
                 out,
@@ -103,26 +103,32 @@ impl StrictContext {
         out
     }
 
-    /// The translations table embedded at build time.
-    ///
-    /// `Context::tr` looks a dotted path up in the language file, so each
-    /// template is flattened to its dotted key. Nested values that are not
-    /// strings are already invisible to `tr` and are skipped here.
-    pub fn translations_source(&self) -> String {
-        let mut out = String::from("local translations = {\n");
+    /// The nested per-language tables behind `ctx.translations()`.
+    fn languages_source(&self) -> String {
+        let mut out = String::from("local LANGUAGES = {\n");
         for (language, templates) in &self.translations {
             let _ = writeln!(out, "  [{}] = {{", lua_string(language));
-            for (key, template) in templates {
-                let _ = writeln!(
-                    out,
-                    "    [{}] = {},",
-                    lua_string(key),
-                    lua_string(template)
-                );
+            let mut root = serde_json::Map::new();
+            for (key, value) in templates {
+                insert_nested(&mut root, key, value);
             }
+            write_table(&mut out, &root, 4);
             out.push_str("  },\n");
         }
         out.push_str("}\n");
+        out
+    }
+
+    /// The translations table embedded at build time.
+    ///
+    /// `Context::tr` looks a dotted path up in the language file, so each
+    /// template is nested by its dotted key. Values that are not strings are
+    /// already invisible to `tr` and are skipped here.
+    pub fn translations_source(&self) -> String {
+        let mut out = self.languages_source();
+        out.push_str(
+            "local TRANSLATIONS = (function()\n  local locale = noctalia.getSetting(\"shell.lang\") or noctalia.getSetting(\"shell.language\") or \"en\"\n  return LANGUAGES[locale] or LANGUAGES[\"en\"] or {}\nend)()\n",
+        );
         out
     }
 }
@@ -239,6 +245,57 @@ fn flatten(
     }
 }
 
+fn insert_nested(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: &str,
+) {
+    let mut parts = key.split('.').peekable();
+    let mut cursor = root;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            cursor.insert(
+                part.to_owned(),
+                serde_json::Value::String(value.to_owned()),
+            );
+            return;
+        }
+        let entry = cursor.entry(part.to_owned()).or_insert_with(|| {
+            serde_json::Value::Object(serde_json::Map::new())
+        });
+        let serde_json::Value::Object(next) = entry else {
+            return;
+        };
+        cursor = next;
+    }
+}
+
+fn write_table(
+    out: &mut String,
+    map: &serde_json::Map<String, serde_json::Value>,
+    indent: usize,
+) {
+    let pad = " ".repeat(indent);
+    for (key, value) in map {
+        match value {
+            serde_json::Value::Object(inner) => {
+                let _ = writeln!(out, "{pad}[{}] = {{", lua_string(key));
+                write_table(out, inner, indent.saturating_add(2));
+                let _ = writeln!(out, "{pad}}},");
+            }
+            serde_json::Value::String(text) => {
+                let _ = writeln!(
+                    out,
+                    "{pad}[{}] = {},",
+                    lua_string(key),
+                    lua_string(text)
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 fn lua_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -301,8 +358,9 @@ mod tests {
         fs::remove_dir_all(&dir)?;
 
         let source = context.translations_source();
-        assert!(source.contains("[\"action.add\"] = \"Task added.\""));
-        assert!(source.contains("[\"plain\"] = \"Plain\""));
+        assert!(source.contains("[\"action\"] = {"), "{source}");
+        assert!(source.contains("[\"add\"] = \"Task added.\""), "{source}");
+        assert!(source.contains("[\"plain\"] = \"Plain\""), "{source}");
         assert!(!source.contains("count"));
         Ok(())
     }

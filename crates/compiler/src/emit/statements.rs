@@ -210,6 +210,9 @@ impl<'a> Emitter<'a> {
             ty.base = json_base_for_type(hint)?;
         }
         self.line(&format!("local {name} = {text}"));
+        if ty.base == Base::Str {
+            self.values.insert(name.clone(), text.clone());
+        }
         if let Some(kind) = hint.map(static_kind)
             && kind != StaticKind::Value
         {
@@ -253,6 +256,13 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn expr_stmt(&mut self, expr: &Expr) -> Result<(), Error> {
+        if self.strict()
+            && let Expr::Block(block) = expr
+            && self.strict_mode_block(block)?
+        {
+            self.emitted = true;
+            return Ok(());
+        }
         if let Expr::Call(call) = expr
             && !is_ok_call(call)
             && !is_ops_push(self, call)
@@ -1433,5 +1443,171 @@ fn pattern_strings(pattern: &Pat) -> Result<Option<Vec<String>>, Error> {
         }
         Pat::Paren(paren) => pattern_strings(&paren.pat),
         _ => Ok(None),
+    }
+}
+
+impl Emitter<'_> {
+    /// Folds a strict `#[cfg(unix)]` chmod block on a declared asset.
+    ///
+    /// The build already gives the asset the mode the handler asks for, so the
+    /// chmod is a no-op. A path that is not a declared asset fails the build.
+    fn strict_mode_block(
+        &mut self,
+        block: &syn::ExprBlock,
+    ) -> Result<bool, Error> {
+        let unix = block.attrs.iter().any(|attr| {
+            let mut unix = false;
+            let _ = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("unix") {
+                    unix = true;
+                }
+                Ok(())
+            });
+            unix
+        });
+        if !unix {
+            return Ok(false);
+        }
+        let Some(strict) = self.strict else {
+            return Ok(false);
+        };
+        let mut permissions_use = false;
+        let mut condition = None;
+        for stmt in &block.block.stmts {
+            match stmt {
+                Stmt::Item(syn::Item::Use(item)) => {
+                    if use_last_ident(&item.tree).as_deref()
+                        == Some("PermissionsExt")
+                    {
+                        permissions_use = true;
+                    } else {
+                        return Ok(false);
+                    }
+                }
+                Stmt::Expr(Expr::If(item), _) => {
+                    if condition.is_some() {
+                        return Ok(false);
+                    }
+                    condition = Some(item);
+                }
+                _ => return Ok(false),
+            }
+        }
+        let Some(item) = condition else {
+            return Ok(false);
+        };
+        let Expr::Let(binding) = &*item.cond else {
+            return Ok(false);
+        };
+        let Pat::TupleStruct(pattern) = &*binding.pat else {
+            return Ok(false);
+        };
+        if !pattern
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Ok")
+        {
+            return Ok(false);
+        }
+        let Expr::Call(call) = strip_reference(&binding.expr) else {
+            return Ok(false);
+        };
+        if !path_last_name(&call.func)
+            .is_some_and(|name| name.ends_with("metadata"))
+        {
+            return Ok(false);
+        }
+        let arguments = call.args.iter().collect::<Vec<_>>();
+        let Some(path) = arguments
+            .first()
+            .and_then(|argument| self.strict_asset_text(argument))
+        else {
+            return Ok(false);
+        };
+        let Some(requested) = block_mode(&item.then_branch) else {
+            return Ok(false);
+        };
+        let mut matched = false;
+        for (asset, mode) in strict.assets {
+            if path.contains(asset) {
+                matched = true;
+                if mode & requested != requested {
+                    return Err(Error::at(
+                        block.span(),
+                        format!(
+                            "declared asset `{asset}` has mode {mode:o}, which does not include the requested {requested:o}"
+                        ),
+                    ));
+                }
+            }
+        }
+        if !matched {
+            return Err(Error::at(
+                block.span(),
+                "strict emit cannot change the mode of a path that is not a declared asset",
+            ));
+        }
+        let _ = permissions_use;
+        Ok(true)
+    }
+
+    fn strict_asset_text(&self, argument: &Expr) -> Option<String> {
+        match strip_reference(argument) {
+            Expr::Path(path) => {
+                let name = path.path.get_ident()?.to_string();
+                self.values.get(&name).cloned()
+            }
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) => Some(value.value()),
+            _ => None,
+        }
+    }
+}
+
+fn block_mode(block: &syn::Block) -> Option<u32> {
+    block.stmts.iter().find_map(statement_mode)
+}
+
+fn statement_mode(stmt: &Stmt) -> Option<u32> {
+    let Stmt::Expr(expr, _) = stmt else {
+        return None;
+    };
+    expression_mode(expr)
+}
+
+fn expression_mode(expr: &Expr) -> Option<u32> {
+    match expr {
+        Expr::MethodCall(call) => {
+            if call.method == "set_mode"
+                && let Some(Expr::Lit(ExprLit {
+                    lit: Lit::Int(value),
+                    ..
+                })) = call.args.first()
+            {
+                return value.base10_parse().ok();
+            }
+            None
+        }
+        Expr::If(item) => block_mode(&item.then_branch).or_else(|| {
+            item.else_branch
+                .as_ref()
+                .and_then(|(_, branch)| expression_mode(branch))
+        }),
+        Expr::Block(item) => block_mode(&item.block),
+        Expr::Paren(paren) => expression_mode(&paren.expr),
+        Expr::Group(group) => expression_mode(&group.expr),
+        _ => None,
+    }
+}
+
+fn use_last_ident(tree: &syn::UseTree) -> Option<String> {
+    match tree {
+        syn::UseTree::Path(path) => use_last_ident(&path.tree),
+        syn::UseTree::Name(name) => Some(name.ident.to_string()),
+        syn::UseTree::Rename(rename) => Some(rename.rename.to_string()),
+        syn::UseTree::Glob(_) | syn::UseTree::Group(_) => None,
     }
 }

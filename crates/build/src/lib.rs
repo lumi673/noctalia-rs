@@ -67,6 +67,7 @@ struct FileContext<'a> {
 struct CompileContext<'a> {
     source: &'a Path,
     out_dir: &'a Path,
+    root: &'a toml::Table,
     mode: CompileMode,
     state_key: &'a str,
     strings: &'a [&'a str],
@@ -163,6 +164,7 @@ fn generate_with(
         &mut CompileContext {
             source,
             out_dir,
+            root,
             mode,
             state_key: &state_key,
             strings: &strings,
@@ -1416,12 +1418,47 @@ fn compile_entry(
     let source =
         resolve_includes(&site.source, &context.source.join(&site.file))?;
     let display = site.file.to_string_lossy();
-    let mut entry_settings = context.plugin_settings.to_vec();
-    collect_setting_keys(row.get("setting"), &mut entry_settings);
-    let entry_settings = entry_settings
+    let mut entry_settings_owned = context.plugin_settings.to_vec();
+    collect_setting_keys(row.get("setting"), &mut entry_settings_owned);
+    let entry_settings = entry_settings_owned
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let strict_context = if context.mode == CompileMode::Strict {
+        Some(strict::StrictContext::build(
+            context.root,
+            context.source,
+            &entry_settings_owned,
+        )?)
+    } else {
+        None
+    };
+    let strict_config = strict_context
+        .as_ref()
+        .map(strict::StrictContext::config_source)
+        .unwrap_or_default();
+    let strict_translations = strict_context
+        .as_ref()
+        .map(strict::StrictContext::translations_source)
+        .unwrap_or_default();
+    let strict_assets = strict_context
+        .as_ref()
+        .map(|data| {
+            data.assets
+                .iter()
+                .map(|asset| {
+                    (asset.path.as_str(), asset.mode.unwrap_or(0o644) & 0o777)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let strict_options = (context.mode == CompileMode::Strict).then_some(
+        compiler::StrictOptions {
+            config: &strict_config,
+            translations: &strict_translations,
+            assets: &strict_assets,
+        },
+    );
     let result = compiler::compile(
         &source,
         &compiler::Options {
@@ -1437,6 +1474,7 @@ fn compile_entry(
                 CompileMode::Strict => compiler::NativeMode::Deny,
                 _ => compiler::NativeMode::Allow,
             },
+            strict: strict_options,
         },
     );
     let compiled = match result {

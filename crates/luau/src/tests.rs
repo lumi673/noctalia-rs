@@ -1027,3 +1027,19 @@ assert(noctalia.runStream("", function() end) == false)
 "#);
     assert!(values.is_empty(), "{values:?}");
 }
+
+#[test]
+fn strict_response_registry_handles_rename_and_file_exists() {
+    const SOURCE: &str = r#"
+local from = "/data/entry/a.json"
+local to = "/data/entry/b.json"
+assert(noctalia.writeFile(from, "body"))
+assert(noctalia.fileExists(to) == nil)
+assert(noctalia.renameFile(from, to))
+assert(noctalia.fileExists(to) == true)
+assert(noctalia.readFile(from) == nil)
+assert(noctalia.readFile(to) == "body")
+"#;
+    let ctx = context(empty_fixture("update"));
+    dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("strict dispatch");
+}

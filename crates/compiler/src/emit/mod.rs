@@ -8,6 +8,8 @@
 //! `types.rs` the type model.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::strict;
 use std::fmt::Write as _;
 
 use syn::parse::{Parse, ParseStream};
@@ -21,7 +23,7 @@ use syn::{
 use crate::program::{Program, typed_args};
 use crate::{
     Error, NativeFn, NativeMode, NativeParam, NativeParamKind, NativePass,
-    is_context, is_identifier, is_luau_keyword, quote, sanitize,
+    StrictOptions, is_context, is_identifier, is_luau_keyword, quote, sanitize,
 };
 
 mod calls;
@@ -53,6 +55,9 @@ impl<'a> Emitter<'a> {
         module: &str,
         native_mode: NativeMode,
         known_native: &'a BTreeMap<String, NativeFn>,
+        strict: Option<StrictOptions<'a>>,
+        has_action: bool,
+        has_host_callback: bool,
     ) -> Self {
         Self {
             ctx: ctx.to_string(),
@@ -102,7 +107,22 @@ impl<'a> Emitter<'a> {
             uses_native: false,
             uses_native_context: false,
             deferred: 0,
+            strict,
+            values: HashMap::new(),
+            actions: BTreeSet::new(),
+            notify_actions: BTreeSet::new(),
+            uses_config_table: false,
+            uses_translations_table: false,
+            uses_action_dispatch: false,
+            uses_callback_dispatch: false,
+            has_action,
+            has_host_callback,
         }
+    }
+
+    /// Whether the entry is emitted as a standalone strict script.
+    pub(super) fn strict(&self) -> bool {
+        self.strict.is_some()
     }
 
     pub(super) fn statement_block(
@@ -187,6 +207,11 @@ impl<'a> Emitter<'a> {
                 .values()
                 .map(|def| (def.name.clone(), def.init.clone()))
                 .collect(),
+            actions: self.actions,
+            notify_actions: self.notify_actions,
+            uses_action_dispatch: self.uses_action_dispatch,
+            uses_config_table: self.uses_config_table,
+            uses_translations_table: self.uses_translations_table,
         }
     }
 
@@ -278,6 +303,11 @@ pub(crate) struct Body {
     pub uses_native_context: bool,
     pub native: Vec<NativeFn>,
     pub statics: Vec<(String, String)>,
+    pub actions: BTreeSet<String>,
+    pub notify_actions: BTreeSet<String>,
+    pub uses_action_dispatch: bool,
+    pub uses_config_table: bool,
+    pub uses_translations_table: bool,
 }
 
 #[derive(Clone)]
@@ -329,6 +359,16 @@ pub(crate) struct Emitter<'a> {
     uses_native: bool,
     uses_native_context: bool,
     deferred: usize,
+    strict: Option<StrictOptions<'a>>,
+    values: HashMap<String, String>,
+    actions: BTreeSet<String>,
+    notify_actions: BTreeSet<String>,
+    uses_config_table: bool,
+    uses_translations_table: bool,
+    uses_action_dispatch: bool,
+    uses_callback_dispatch: bool,
+    has_action: bool,
+    has_host_callback: bool,
 }
 
 pub(crate) const MAX_INLINE_CALLS: usize = 200;
