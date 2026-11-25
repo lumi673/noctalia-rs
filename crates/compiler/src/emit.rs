@@ -978,7 +978,7 @@ impl<'a> Emitter<'a> {
             for element in &tuple.elems {
                 match element {
                     Pat::Ident(pattern) => {
-                        let name = pattern.ident.to_string();
+                        let name = self.binding_name(pattern)?;
                         self.push(&name, Ty::VALUE);
                         names.push(name);
                     }
@@ -1641,6 +1641,17 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    fn binding_name(&self, pattern: &syn::PatIdent) -> Result<String, Error> {
+        let name = pattern.ident.to_string();
+        if is_luau_keyword(&name) {
+            return Err(Error::at(
+                pattern.span(),
+                format!("identifier `{name}` is a Luau keyword"),
+            ));
+        }
+        Ok(name)
+    }
+
     fn pattern_match(
         &self,
         value: &str,
@@ -1671,7 +1682,7 @@ impl<'a> Emitter<'a> {
                 Ok((format!("({})", conditions.join(" or ")), bindings))
             }
             Pat::Ident(pattern) => {
-                let name = pattern.ident.to_string();
+                let name = self.binding_name(pattern)?;
                 match name.as_str() {
                     "None" | "Null" => {
                         Ok((format!("({value} == nil)"), Vec::new()))
@@ -1810,7 +1821,7 @@ impl<'a> Emitter<'a> {
                     let item = format!("({value})[{}]", index + 1);
                     conditions.push(format!("({item} ~= nil)"));
                     if let Pat::Ident(pattern) = element {
-                        bindings.push((pattern.ident.to_string(), item));
+                        bindings.push((self.binding_name(pattern)?, item));
                     }
                 }
                 Ok((format!("({})", conditions.join(" and ")), bindings))
@@ -1843,7 +1854,7 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), Error> {
         match pattern {
             Pat::Ident(pattern) => {
-                let name = pattern.ident.to_string();
+                let name = self.binding_name(pattern)?;
                 match self.pattern_constant(&name) {
                     Some((text, _)) => {
                         conditions.push(format!("({value} == {text})"));
@@ -1983,13 +1994,13 @@ impl<'a> Emitter<'a> {
         let mut bindings: Vec<Option<String>> = Vec::new();
         match &*item.pat {
             Pat::Ident(pattern) => {
-                bindings.push(Some(pattern.ident.to_string()))
+                bindings.push(Some(self.binding_name(pattern)?))
             }
             Pat::Tuple(tuple) => {
                 for element in &tuple.elems {
                     match element {
                         Pat::Ident(pattern) => {
-                            bindings.push(Some(pattern.ident.to_string()))
+                            bindings.push(Some(self.binding_name(pattern)?))
                         }
                         Pat::Wild(_) => bindings.push(None),
                         other => {
@@ -2132,7 +2143,9 @@ impl<'a> Emitter<'a> {
             for name in bindings.iter().flatten() {
                 self.push(name, Ty::VALUE);
             }
-            self.line(&format!("for {first}, {second} in pairs({source}) do"));
+            self.line(&format!(
+                "for {first}, {second} in pairs(type({source}) == \"table\" and {source} or {{}}) do"
+            ));
             self.indent = self.indent.saturating_add(1);
             self.statement_block(&item.body)?;
             self.indent = self.indent.saturating_sub(1);
@@ -3242,6 +3255,14 @@ impl<'a> Emitter<'a> {
                     "position after an iterator adaptor is not supported by the Luau compiler",
                 ));
             }
+            if has_flatten_adaptor(&call.receiver) {
+                return Err(Error::at(
+                    call.method.span(),
+                    format!(
+                        "{method} after `flatten` is not supported by the Luau compiler"
+                    ),
+                ));
+            }
             let result = self.temp();
             self.line(&format!("local {result}"));
             let index = (method == "position").then(|| {
@@ -3744,6 +3765,12 @@ impl<'a> Emitter<'a> {
                 ),
                 Ty::BOOL,
             )),
+            "is_ascii_hexdigit" if ty.base == Base::Int => Ok((
+                format!(
+                    "(function() local __byte = {receiver}; return (__byte >= 48 and __byte <= 57) or (__byte >= 65 and __byte <= 70) or (__byte >= 97 and __byte <= 102) end)()"
+                ),
+                Ty::BOOL,
+            )),
             "is_ascii_hexdigit" => Ok((
                 format!("(string.find({receiver}, \"^[0-9A-Fa-f]$\") ~= nil)"),
                 Ty::BOOL,
@@ -3798,7 +3825,12 @@ impl<'a> Emitter<'a> {
                 if ty.optional {
                     Ok((format!("({receiver} or {{}})"), Ty::LIST))
                 } else {
-                    Ok((receiver, Ty::LIST))
+                    Ok((
+                        format!(
+                            "(function() local __out = {{}}; local __lists = {receiver}; for __i = 1, #__lists do local __inner = __lists[__i]; if type(__inner) == \"table\" then for __j = 1, #__inner do __out[#__out + 1] = __inner[__j] end end end; __out.__next = 1; return __out end)()"
+                        ),
+                        Ty::LIST,
+                    ))
                 }
             }
             "skip" if ty.base == Base::List && !ty.optional => {
@@ -4971,7 +5003,6 @@ impl<'a> Emitter<'a> {
             parts.last().copied().unwrap_or("")
         };
         match variant {
-            "Vec" | "VecDeque" => Ok(Some(("{}".to_owned(), Ty::LIST))),
             "HashMap" | "BTreeMap" | "Map" => {
                 Ok(Some(("{}".to_owned(), Ty::TABLE)))
             }
@@ -5290,6 +5321,17 @@ impl<'a> Emitter<'a> {
         let member = match &field.member {
             Member::Named(name) => name.to_string(),
             Member::Unnamed(index) => {
+                if index.index == 0
+                    && let Expr::Call(call) = strip_reference(&field.base)
+                    && call.args.len() == 1
+                    && path_last_name(&call.func).is_some_and(|name| {
+                        self.program.is_newtype(&self.module, &name)
+                    })
+                {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let (value, _) = self.expr(arg(&args, 0, call)?)?;
+                    return Ok((value, Ty::VALUE));
+                }
                 let (base, _) = self.expr(&field.base)?;
                 if index.index == 0
                     && self.class_of_receiver(&field.base).is_some_and(
@@ -7297,6 +7339,15 @@ fn is_iterator_adaptor(expr: &Expr) -> bool {
             | "flatten"
             | "rsplit"
     )
+}
+
+/// `flatten` opens an inner loop, so a `break` in the callback would only
+/// leave that inner loop.
+fn has_flatten_adaptor(expr: &Expr) -> bool {
+    let Expr::MethodCall(call) = strip_reference(expr) else {
+        return false;
+    };
+    call.method == "flatten" || has_flatten_adaptor(&call.receiver)
 }
 
 type IfChain<'a> = (Vec<(&'a Expr, &'a syn::Block)>, Option<&'a Expr>);

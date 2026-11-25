@@ -4146,3 +4146,156 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(error.message.contains("Luau keyword"), "{}", error.message);
     assert!(error.line > 0 && error.column > 0, "{error:?}");
 }
+
+#[test]
+fn guards_tuple_loops_over_json_null() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = serde_json::Value::Null;
+    let mut total = 0;
+    for (key, value) in rows {
+        total += value.as_i64().unwrap_or(0) + key.len();
+    }
+    Ok(vec![Op::log(format!("{total}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(
+        generated.contains("in pairs(type(__t1) == \"table\" and __t1 or {})"),
+        "{generated}"
+    );
+}
+
+#[test]
+fn flattens_a_list_of_lists_into_one_list() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let nested: Vec<Vec<i64>> = vec![vec![1, 2], vec![3]];
+    let mut total = 0;
+    for value in nested.into_iter().flatten() {
+        total += value;
+    }
+    Ok(vec![Op::log(format!("{total}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(
+        generated.contains("for __j = 1, #__inner do"),
+        "{generated}"
+    );
+    assert!(generated.contains("__out.__next = 1"), "{generated}");
+}
+
+#[test]
+fn bails_on_find_after_flatten() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let nested: Vec<Vec<i64>> = vec![vec![1, 2], vec![3]];
+    let found = nested.iter().flatten().find(|value| **value == 3).is_some();
+    Ok(vec![Op::log(format!("{found}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bail");
+    assert!(error.message.contains("flatten"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn bails_on_luau_keywords_in_loop_and_tuple_bindings() {
+    for handler in [
+        r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows: Vec<i64> = vec![1];
+    for end in rows {
+        let _ = end;
+    }
+    Ok(vec![])
+}
+"#,
+        r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let pair = (1, 2);
+    let (end, value) = pair;
+    Ok(vec![Op::log(format!("{}{}", end, value))])
+}
+"#,
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.state.get("value");
+    let Some(end) = value else {
+        return Ok(vec![]);
+    };
+    Ok(vec![Op::log(format!("{end}"))])
+}
+"#,
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("bail");
+        assert!(error.message.contains("Luau keyword"), "{}", error.message);
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
+fn unwraps_newtype_field_access_on_a_constructor_call() {
+    let handler = r#"
+struct Score(pub i64);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = Score(4).0;
+    Ok(vec![Op::log(format!("{value}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("local value = 4"), "{generated}");
+    assert!(!generated.contains("[1]"), "{generated}");
+}
+
+#[test]
+fn checks_hex_digits_on_byte_receivers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let byte = 65_u8;
+    let hex = byte.is_ascii_hexdigit();
+    Ok(vec![Op::log(format!("{hex}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("local __byte = byte"), "{generated}");
+    assert!(generated.contains("__byte >= 48"), "{generated}");
+    assert!(!generated.contains("string.find(byte"), "{generated}");
+}
+
+#[test]
+fn compiles_vector_constructors_with_capacity() {
+    let handler = r#"
+use std::collections::VecDeque;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut list = Vec::<i64>::with_capacity(4);
+    list.push(1);
+    let queue = VecDeque::<i64>::with_capacity(2);
+    let sizes = (list.len(), queue.len());
+    Ok(vec![Op::log(format!("{}{}", sizes.0, sizes.1))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("local list = {}"), "{generated}");
+    assert!(generated.contains("local queue = {}"), "{generated}");
+}
