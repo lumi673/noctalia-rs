@@ -2024,3 +2024,150 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compiled.source
     );
 }
+
+#[test]
+fn helper_return_shape_comes_from_the_inlined_value() {
+    for body in [
+        r#"let pair = (json!(1), Value::Null); pair"#,
+        r#"(json!(1), Value::Null)"#,
+    ] {
+        let handler = format!(
+            r#"
+use serde_json::Map;
+fn make() -> (Value, Value) {{ {body} }}
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {{
+    let (_, value) = make();
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}}
+"#
+        );
+        let error =
+            compile(&source(&handler), &options("handler", EntryKind::Service))
+                .expect_err("bails");
+        assert!(error.message.contains("json null"), "{}", error.message);
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
+fn named_field_shape_comes_from_the_initializer() {
+    let handler = r#"
+use serde_json::Map;
+fn make() -> (Value, Value) { (json!(1), Value::Null) }
+struct Holder { pair: (Value, Value) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { pair: make() };
+    let (_, value) = holder.pair;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(
+        error
+            .message
+            .contains("tuple initializer with known element types")
+            || error.message.contains("json null"),
+        "{}",
+        error.message
+    );
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn reassignment_refreshes_tuple_shapes() {
+    let handler = r#"
+use serde_json::Map;
+struct Holder { pair: (Value, Value) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { pair: (json!(1), json!(2)) };
+    let other = Holder { pair: (json!(3), Value::Null) };
+    let copy = holder;
+    let copy = other;
+    let (_, value) = copy.pair;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("json null"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn tuple_struct_element_shapes_are_read_by_index() {
+    let handler = r#"
+use serde_json::Map;
+struct Pair(Value, Value);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let pair = Pair(json!(1), Value::Null);
+    let mut map = Map::new();
+    map.insert("k".to_owned(), pair.1);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("json null"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn unknown_static_tuple_fails_at_destructuring() {
+    let handler = r#"
+use serde_json::Map;
+static PAIR: (Value, Value) = (Value::Null, Value::Null);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (_, value) = PAIR;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("json null"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn round_eight_non_null_controls_compile() {
+    let handler = r#"
+use serde_json::Map;
+fn make() -> (Value, Value) { let pair = (json!(1), json!(2)); pair }
+struct Holder { pair: (Value, Value) }
+struct Pair(Value, Value);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (_, from_helper) = make();
+    let holder = Holder { pair: (json!(5), json!(6)) };
+    let (_, from_field) = holder.pair;
+    let pair = Pair(json!(3), json!(4));
+    let copy = pair;
+    let mut map = Map::new();
+    map.insert("a".to_owned(), from_helper);
+    map.insert("b".to_owned(), from_field);
+    map.insert("c".to_owned(), copy.1);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    for key in ["a", "b", "c"] {
+        assert!(
+            compiled.source.contains(&format!("map[\"{key}\"] =")),
+            "{}",
+            compiled.source
+        );
+    }
+}

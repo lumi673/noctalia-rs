@@ -280,28 +280,8 @@ impl<'a> Emitter<'a> {
         }
         let check = self.check_inline(&helper, mode, returns, &span)?;
         let saved = self.clone();
-        let tuple_return = match &helper.function.sig.output {
-            syn::ReturnType::Type(_, ty) => match &**ty {
-                Type::Tuple(items) => Some(
-                    items
-                        .elems
-                        .iter()
-                        .map(|item| TupleShape::Leaf(type_hint(item)))
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            },
-            _ => None,
-        };
         match self.inline(&helper, bindings.clone(), mode, returns, check) {
-            Ok(value) => {
-                if let Some(shapes) = tuple_return {
-                    self.tuple_expr_shapes
-                        .entry(value.0.clone())
-                        .or_insert(shapes);
-                }
-                Ok(Some(value))
-            }
+            Ok(value) => Ok(Some(value)),
             Err(error) => {
                 *self = saved;
                 if error.fatal {

@@ -151,10 +151,15 @@ impl<'a> Emitter<'a> {
                 == Some(args.len())
             {
                 let mut values = Vec::new();
+                let mut shapes = Vec::new();
                 for argument in &args {
-                    values.push(self.expr(argument)?.0);
+                    let (text, ty) = self.expr(argument)?;
+                    shapes.push(TupleShape::Leaf(ty));
+                    values.push(text);
                 }
-                return Ok((format!("{{ {} }}", values.join(", ")), Ty::VALUE));
+                let text = format!("{{ {} }}", values.join(", "));
+                self.tuple_expr_shapes.insert(text.clone(), shapes);
+                return Ok((text, Ty::VALUE));
             }
             match name.as_str() {
                 "Some" => return self.expr(arg(&args, 0, call)?),

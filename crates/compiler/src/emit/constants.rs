@@ -31,6 +31,12 @@ impl<'a> Emitter<'a> {
         let kind = static_kind(&item.ty);
         let init = self.static_init(&item.expr, kind)?;
         let lua_name = format!("__static_{}", sanitize(&key));
+        if let Expr::Tuple(items) = item.expr.as_ref() {
+            let shapes = self.tuple_shapes(
+                &items.elems.iter().cloned().collect::<Vec<_>>(),
+            )?;
+            self.tuple_expr_shapes.insert(lua_name.clone(), shapes);
+        }
         let def = StaticDef {
             name: lua_name,
             kind,
@@ -45,6 +51,22 @@ impl<'a> Emitter<'a> {
         expr: &Expr,
         kind: StaticKind,
     ) -> Result<String, Error> {
+        if let Expr::Tuple(items) = expr {
+            let shapes = self.tuple_shapes(
+                &items.elems.iter().cloned().collect::<Vec<_>>(),
+            )?;
+            let text = format!(
+                "{{ {} }}",
+                items
+                    .elems
+                    .iter()
+                    .map(|item| self.expr(item).map(|value| value.0))
+                    .collect::<Result<Vec<_>, Error>>()?
+                    .join(", ")
+            );
+            self.tuple_expr_shapes.insert(text.clone(), shapes);
+            return Ok(text);
+        }
         if let Some((text, _)) = constant(expr) {
             return Ok(text);
         }

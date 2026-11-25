@@ -1065,3 +1065,36 @@ fn native_tuple_paths(_ctx: &Context) -> Vec<Op> {
         Op::state("newtype", json!("newtype")),
     ]
 }
+
+#[test]
+fn round_eight_tuple_paths_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder { pair: (Value, Value) }
+struct Pair(Value, Value);
+fn make() -> (Value, Value) { let pair = (json!(1), json!("a")); pair }
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (_, from_helper) = make();
+    let holder = Holder { pair: (json!(5), json!(6)) };
+    let (_, from_field) = holder.pair;
+    let pair = Pair(json!(2), json!("b"));
+    Ok(vec![Op::state("helper", json!(from_helper)),
+            Op::state("field", json!(from_field)),
+            Op::state("pair", json!(pair.1))])
+}
+"#;
+    let source = compiled_source("tuple_round8", handler, EntryKind::Service);
+    let ctx = context("tuple_round8", "load", json!({}), json!({}));
+    assert_eq!(
+        ops("tuple_round8", &source, &ctx),
+        rust_ops(native_tuple_round8(&ctx))
+    );
+}
+
+fn native_tuple_round8(_ctx: &Context) -> Vec<Op> {
+    vec![
+        Op::state("helper", json!("a")),
+        Op::state("field", json!(6)),
+        Op::state("pair", json!("b")),
+    ]
+}

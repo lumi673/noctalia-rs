@@ -638,7 +638,24 @@ impl<'a> Emitter<'a> {
                     self.newtype_types.insert(base.clone(), ty);
                     return Ok((base, ty));
                 }
-                return Ok((format!("{base}[{}]", index.index + 1), Ty::VALUE));
+                let key = self
+                    .tuple_expr_text
+                    .get(&base)
+                    .cloned()
+                    .unwrap_or_else(|| base.clone());
+                let ty = self
+                    .tuple_expr_shapes
+                    .get(&key)
+                    .and_then(|shapes| shapes.get(index.index as usize))
+                    .map(|shape| match shape {
+                        TupleShape::Leaf(ty) => *ty,
+                        TupleShape::Tuple(parts) => Ty {
+                            null: parts.iter().any(TupleShape::any_null),
+                            ..Ty::VALUE
+                        },
+                    })
+                    .unwrap_or(Ty::VALUE);
+                return Ok((format!("{base}[{}]", index.index + 1), ty));
             }
         };
         if self.is_ctx_expr(&field.base) {
@@ -713,20 +730,13 @@ impl<'a> Emitter<'a> {
         let mut field_ty = field_ty;
         if let Some(shapes) = self.tuple_expr_shapes.get(&text).cloned() {
             self.last_tuple_shape = Some(shapes);
-        } else if let Some(Type::Tuple(items)) = declared.as_ref() {
-            if items.elems.iter().any(|item| {
+        } else if let Some(Type::Tuple(items)) = declared.as_ref()
+            && items.elems.iter().any(|item| {
                 matches!(item, Type::Path(path)
                     if path.path.segments.last().is_some_and(|s| s.ident == "Value"))
-            }) {
-                self.unknown_value_tuple = true;
-            }
-            let shapes = items
-                .elems
-                .iter()
-                .map(|item| TupleShape::Leaf(type_hint(item)))
-                .collect::<Vec<_>>();
-            self.tuple_expr_shapes.insert(text.clone(), shapes.clone());
-            self.last_tuple_shape = Some(shapes);
+            })
+        {
+            self.unknown_value_tuple = true;
         }
         if let Some(name) = path_ident(strip_reference(&field.base))
             && self

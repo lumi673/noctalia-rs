@@ -76,7 +76,15 @@ impl<'a> Emitter<'a> {
                                     .cloned()
                                     .collect::<Vec<_>>(),
                             )?;
-                            self.tuple_expr_shapes.insert(target, shapes);
+                            self.tuple_expr_shapes
+                                .insert(target.clone(), shapes);
+                        } else if let Some(source) =
+                            path_ident(strip_reference(expr))
+                            && let Some(shapes) =
+                                self.tuple_types.get(&source).cloned()
+                        {
+                            self.tuple_expr_shapes
+                                .insert(target.clone(), shapes);
                         }
                     } else {
                         self.line(&format!("return {text}"));
@@ -1641,7 +1649,7 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    fn tuple_shapes(
+    pub(super) fn tuple_shapes(
         &mut self,
         items: &[Expr],
     ) -> Result<Vec<TupleShape>, Error> {
@@ -1687,6 +1695,27 @@ impl<'a> Emitter<'a> {
         }
         self.line(&format!("{target} {op} {text}"));
         if is_local && let Some(name) = path_ident(strip_reference(left)) {
+            self.tuple_types.remove(&name);
+            self.tuple_expr_text.remove(&name);
+            let prefix = format!("{name}.");
+            let stale = self
+                .tuple_expr_shapes
+                .keys()
+                .filter(|key| {
+                    key.starts_with(&prefix) || *key == &name || *key == &text
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in stale {
+                self.tuple_expr_shapes.remove(&key);
+            }
+            if let Expr::Tuple(items) = strip_reference(right) {
+                let shapes = self.tuple_shapes(
+                    &items.elems.iter().cloned().collect::<Vec<_>>(),
+                )?;
+                self.tuple_types.insert(name.clone(), shapes.clone());
+                self.tuple_expr_shapes.insert(name.clone(), shapes);
+            }
             self.push(&name, ty);
         }
         Ok(())
