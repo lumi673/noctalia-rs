@@ -933,7 +933,21 @@ impl<'a> Emitter<'a> {
                 Ok(Some((String::new(), Ty::VOID)))
             }
             Inline::Tail => {
-                if let Some(target) = self.tail_target.clone() {
+                if item.result {
+                    // The stub returns `value, error`, so a tail call must not
+                    // drop the error on the way to the parent's value.
+                    let value = self.temp();
+                    let error = self.temp();
+                    self.line(&format!("local {value}, {error} = {call}"));
+                    self.line(&format!(
+                        "if {error} ~= nil then error(tostring({error})) end"
+                    ));
+                    if let Some(target) = self.tail_target.clone() {
+                        self.line(&format!("{target} = {value}"));
+                    } else {
+                        self.line(&format!("return {value}"));
+                    }
+                } else if let Some(target) = self.tail_target.clone() {
                     self.line(&format!("{target} = {call}"));
                 } else {
                     self.line(&format!("return {call}"));
@@ -7364,7 +7378,9 @@ pub(crate) fn native_runtime(
       request_dir = line.spool
       local queued = pending
       pending = {}
-      for _, request in ipairs(queued) do write(request) end
+      for _, request in ipairs(queued) do
+        if not write(request) then pending[#pending + 1] = request end
+      end
       if active ~= nil
         and active.request ~= nil
         and active.request.boot ~= boot then

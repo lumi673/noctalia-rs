@@ -4987,3 +4987,44 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(body.contains("__t1 = __native_fn_main__label()"), "{body}");
     assert!(body.contains("noctalia.log"), "{body}");
 }
+
+#[test]
+fn a_tail_native_result_keeps_its_error() {
+    let handler = r#"
+#[native]
+fn label() -> Result<String> {
+    Ok("hi".to_owned())
+}
+
+fn helper() -> Result<String> {
+    label()
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = helper()?;
+    Ok(vec![Op::log(value)])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+    let body = compiled
+        .source
+        .lines()
+        .skip_while(|line| !line.starts_with("local function body_render"))
+        .take_while(|line| *line != "end")
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        body.contains(", __t3 = __native_fn_main__label()"),
+        "{body}"
+    );
+    assert!(
+        body.contains("if __t3 ~= nil then error(tostring(__t3)) end"),
+        "{body}"
+    );
+    assert!(body.contains("__t1 = __t2"), "{body}");
+    assert!(body.contains("noctalia.log(value)"), "{body}");
+}
