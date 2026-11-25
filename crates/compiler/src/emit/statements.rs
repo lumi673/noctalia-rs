@@ -987,14 +987,12 @@ impl<'a> Emitter<'a> {
             Pat::Tuple(tuple) => tuple
                 .elems
                 .iter()
-                .enumerate()
-                .map(|(index, element)| {
+                .map(|element| {
                     let inner = Ty {
                         optional: false,
                         result: false,
                         ..outer
                     };
-                    let _ = index;
                     self.binding_ty(element, name, inner)
                 })
                 .find(|ty| *ty != Ty::VALUE)
