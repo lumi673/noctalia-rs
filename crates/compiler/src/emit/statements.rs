@@ -303,12 +303,32 @@ impl<'a> Emitter<'a> {
                 &items.elems.iter().cloned().collect::<Vec<_>>(),
             )?;
             self.tuple_types.insert(name.clone(), element_types);
+        } else if let Some(shapes) = self.last_tuple_shape.take() {
+            self.tuple_types.insert(name.clone(), shapes.clone());
+            self.tuple_expr_shapes.insert(name.clone(), shapes);
+        } else if let Some(shapes) = self.tuple_expr_shapes.get(&text).cloned()
+        {
+            self.tuple_types.insert(name.clone(), shapes.clone());
+            self.tuple_expr_shapes.insert(name.clone(), shapes);
         } else if let Expr::Struct(item) = strip_reference(&init.expr)
             && let Some(class) =
                 self.class_of_receiver(&init.expr).or_else(|| {
                     item.path.segments.last().map(|s| s.ident.to_string())
                 })
         {
+            let prefix = format!("{class}.");
+            let inherited = self
+                .tuple_expr_shapes
+                .iter()
+                .filter_map(|(key, shapes)| {
+                    key.strip_prefix(&prefix)
+                        .map(|field| (field.to_owned(), shapes.clone()))
+                })
+                .collect::<Vec<_>>();
+            for (field, shapes) in inherited {
+                self.tuple_expr_shapes
+                    .insert(format!("{name}.{field}"), shapes);
+            }
             for field in &item.fields {
                 if let syn::Member::Named(member) = &field.member
                     && let Expr::Tuple(items) = strip_reference(&field.expr)
@@ -1713,6 +1733,57 @@ impl<'a> Emitter<'a> {
                 let shapes = self.tuple_shapes(
                     &items.elems.iter().cloned().collect::<Vec<_>>(),
                 )?;
+                self.tuple_types.insert(name.clone(), shapes.clone());
+                self.tuple_expr_shapes.insert(name.clone(), shapes);
+            } else if let Expr::Struct(item) = strip_reference(right)
+                && let Some(class) =
+                    item.path.segments.last().map(|s| s.ident.to_string())
+            {
+                let prefix = format!("{class}.");
+                let inherited = self
+                    .tuple_expr_shapes
+                    .iter()
+                    .filter_map(|(key, shapes)| {
+                        key.strip_prefix(&prefix)
+                            .map(|field| (field.to_owned(), shapes.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (field, shapes) in inherited {
+                    self.tuple_expr_shapes
+                        .insert(format!("{name}.{field}"), shapes);
+                }
+                for field in &item.fields {
+                    if let syn::Member::Named(member) = &field.member
+                        && let Expr::Tuple(items) = strip_reference(&field.expr)
+                    {
+                        let shapes = self.tuple_shapes(
+                            &items.elems.iter().cloned().collect::<Vec<_>>(),
+                        )?;
+                        self.tuple_expr_shapes
+                            .insert(format!("{name}.{member}"), shapes);
+                    }
+                }
+            } else if let Some(source) = path_ident(strip_reference(right)) {
+                if let Some(shapes) = self.tuple_types.get(&source).cloned() {
+                    self.tuple_types.insert(name.clone(), shapes.clone());
+                    self.tuple_expr_shapes.insert(name.clone(), shapes);
+                }
+                let prefix = format!("{source}.");
+                let fields = self
+                    .tuple_expr_shapes
+                    .iter()
+                    .filter_map(|(key, shapes)| {
+                        key.strip_prefix(&prefix)
+                            .map(|field| (field.to_owned(), shapes.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                for (field, shapes) in fields {
+                    self.tuple_expr_shapes
+                        .insert(format!("{name}.{field}"), shapes);
+                }
+            } else if let Some(shapes) =
+                self.tuple_expr_shapes.get(&text).cloned()
+            {
                 self.tuple_types.insert(name.clone(), shapes.clone());
                 self.tuple_expr_shapes.insert(name.clone(), shapes);
             }

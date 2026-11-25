@@ -1098,3 +1098,39 @@ fn native_tuple_round8(_ctx: &Context) -> Vec<Op> {
         Op::state("pair", json!("b")),
     ]
 }
+
+#[test]
+fn round_nine_chains_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder { pair: (Value, Value) }
+fn make() -> (Value, Value) { (json!(1), json!("a")) }
+fn passthrough(t: (Value, Value)) -> (Value, Value) { t }
+static PAIR: (Value, Value) = (json!(2), json!("s"));
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let t = make();
+    let (_, from_local) = t;
+    let (_, from_helper) = passthrough(make());
+    let mut holder = Holder { pair: make() };
+    holder = Holder { pair: (json!(3), json!(4)) };
+    let (_, from_field) = holder.pair;
+    let (_, from_static) = PAIR;
+    Ok(vec![Op::state("local", json!(from_local)),
+            Op::state("helper", json!(from_helper)),
+            Op::state("field", json!(from_field)),
+            Op::state("static", json!(from_static))])
+}
+"#;
+    let source = compiled_source("chain9", handler, EntryKind::Service);
+    let ctx = context("chain9", "load", json!({}), json!({}));
+    assert_eq!(ops("chain9", &source, &ctx), rust_ops(native_chain9(&ctx)));
+}
+
+fn native_chain9(_ctx: &Context) -> Vec<Op> {
+    vec![
+        Op::state("local", json!("a")),
+        Op::state("helper", json!("a")),
+        Op::state("field", json!(4)),
+        Op::state("static", json!("s")),
+    ]
+}

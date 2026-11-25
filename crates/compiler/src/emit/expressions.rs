@@ -226,6 +226,14 @@ impl<'a> Emitter<'a> {
                 ));
             };
             let (value, value_ty) = self.expr(&field.expr)?;
+            eprintln!(
+                "STRUCT FIELD {class}.{name} value={value} keys={:?}",
+                self.tuple_expr_shapes.keys().collect::<Vec<_>>()
+            );
+            if let Some(shapes) = self.tuple_expr_shapes.get(&value).cloned() {
+                self.tuple_expr_shapes
+                    .insert(format!("{class}.{name}"), shapes);
+            }
             if value_ty.null {
                 null_fields.insert(name.to_string());
             }
