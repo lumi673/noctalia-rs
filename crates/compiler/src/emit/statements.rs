@@ -227,6 +227,9 @@ impl<'a> Emitter<'a> {
         if let Some(class) = self.pending_class.take() {
             self.classes.insert(name.clone(), class);
         }
+        if text == "nil" {
+            ty.null = true;
+        }
         self.push(&name, ty);
         Ok(())
     }
@@ -989,7 +992,12 @@ impl<'a> Emitter<'a> {
                     .map(|segment| segment.ident.to_string())
                     .unwrap_or_default();
                 let inner = match kind.as_str() {
-                    "Some" | "Ok" | "Err" => outer,
+                    "Some" | "Ok" | "Err" => {
+                        // The pattern matched a present, non-null value.
+                        let mut present = outer;
+                        present.null = false;
+                        present
+                    }
                     "String" => Ty::STR,
                     "Bool" => Ty::BOOL,
                     // An integral double is an integer in Luau, so number
@@ -1233,7 +1241,24 @@ impl<'a> Emitter<'a> {
                 "`enumerate()` needs a two-element tuple binding",
             ));
         }
+        let is_iterator = false;
         let (text, ty) = self.expr(iterable)?;
+        if is_iterator {
+            let values = self.temp();
+            self.line(&format!(
+                "local {values} = (function() local __cursor = ({text}); local __meta = getmetatable(__cursor); local __out = {{}}; while true do local __position = (__meta and __meta.{CURSOR_MARKER} or (__cursor.__next or 0)) + 1; local __value = __cursor[__position]; if __value == nil then break end; __out[#__out + 1] = __value; if __meta and __meta.{CURSOR_MARKER} ~= nil then __meta.{CURSOR_MARKER} = __position end end; return __out end)()"
+            ));
+            let source = self.temp();
+            self.line(&format!("local {source} = {values}"));
+            let name = bindings[0].clone().unwrap_or_default();
+            self.push(&name, Ty::STR);
+            self.line(&format!("for _, {name} in ipairs({source}) do"));
+            self.indent = self.indent.saturating_add(1);
+            self.statement_block(&item.body)?;
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            return Ok(());
+        }
         if ty.base != Base::List
             && ty.base != Base::Value
             && ty.base != Base::Table
@@ -1310,21 +1335,55 @@ impl<'a> Emitter<'a> {
                 .iter()
                 .map(|name| name.clone().unwrap_or_else(|| "_".to_owned()))
                 .collect::<Vec<_>>();
-            let head = match names.as_slice() {
-                [name] => format!("_, {name}"),
-                [first, second] => format!("{first}, {second}"),
+            let keys = self.temp();
+            let position = self.temp();
+            self.line(&format!("local {keys} = {{}}"));
+            self.line(&format!(
+                "for __key in pairs({source}) do {keys}[#({keys}) + 1] = __key end"
+            ));
+            self.line(&format!(
+                "table.sort({keys}, function(a, b) return tostring(a) < tostring(b) end)"
+            ));
+            self.line(&format!("for {position} = 1, #{keys} do"));
+            self.indent = self.indent.saturating_add(1);
+            match names.as_slice() {
+                [name] => {
+                    self.push(name, Ty::STR);
+                    self.line(&format!("local {name} = {keys}[{position}]"));
+                }
+                [first, second] => {
+                    self.push(first, Ty::STR);
+                    self.push(second, Ty::VALUE);
+                    self.line(&format!("local {first} = {keys}[{position}]"));
+                    self.line(&format!("local {second} = {source}[{first}]"));
+                }
                 _ => {
                     return Err(Error::at(
                         item.pat.span(),
                         "map loops take one or two bindings",
                     ));
                 }
-            };
-            for name in bindings.iter().flatten() {
-                self.push(name, Ty::VALUE);
             }
-            self.line(&format!("for {head} in pairs({source}) do"));
+            self.statement_block(&item.body)?;
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            return Ok(());
+        }
+        if ty.base == Base::Table && bindings.len() == 1 {
+            let name = bindings[0].clone().unwrap_or_default();
+            let keys = self.temp();
+            let index = self.temp();
+            self.line(&format!("local {keys} = {{}}"));
+            self.line(&format!(
+                "for __key in pairs({source}) do {keys}[#({keys}) + 1] = __key end"
+            ));
+            self.line(&format!(
+                "table.sort({keys}, function(a, b) return tostring(a) < tostring(b) end)"
+            ));
+            self.line(&format!("for {index} = 1, #{keys} do"));
             self.indent = self.indent.saturating_add(1);
+            self.push(&name, Ty::VALUE);
+            self.line(&format!("local {name} = {source}[{keys}[{index}]]"));
             self.statement_block(&item.body)?;
             self.indent = self.indent.saturating_sub(1);
             self.line("end");

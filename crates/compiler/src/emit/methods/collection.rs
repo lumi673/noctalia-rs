@@ -228,7 +228,7 @@ impl<'a> Emitter<'a> {
                 let cursor = self.temp();
                 self.line(&format!("local {meta} = getmetatable({receiver})"));
                 self.line(&format!(
-                    "local {cursor} = ((type({meta}) == \"table\" and {meta}.{CURSOR_MARKER}) or {receiver}.__next or 0) + 1"
+                    "local {cursor} = ((type({meta}) == \"table\" and {meta}.{CURSOR_MARKER} ~= nil and {meta}.{CURSOR_MARKER}) or (type({meta}) == \"table\" and {meta}.__noctalia_array and 0) or {receiver}.__next or 0) + 1"
                 ));
                 self.line(&format!("local {value} = {receiver}[{cursor}]"));
                 self.line(&format!("if {value} ~= nil then"));
@@ -406,10 +406,13 @@ impl<'a> Emitter<'a> {
                 self.line(&format!(
                     "if {value} == nil then {result} = {default} end"
                 ));
-                Ok((result, Ty::new(wider(ty, default_ty).base)))
+                let mut out = Ty::new(wider(ty, default_ty).base);
+                out.null = default == "nil" && ty.null;
+                Ok((result, out))
             }
             "unwrap_or_default" => {
-                let default = if ty.base == Base::Value {
+                let nil_default = ty.base == Base::Value;
+                let default = if nil_default {
                     "nil".to_owned()
                 } else {
                     ty.default_literal().ok_or_else(|| {
@@ -428,7 +431,9 @@ impl<'a> Emitter<'a> {
                     self.line(&format!(
                         "if {error} ~= nil then {result} = {default} end"
                     ));
-                    return Ok(Some((result, Ty::new(ty.base))));
+                    let mut out = Ty::new(ty.base);
+                    out.null = nil_default && ty.null;
+                    return Ok(Some((result, out)));
                 }
                 let value = self.temp();
                 let result = self.temp();
@@ -437,7 +442,9 @@ impl<'a> Emitter<'a> {
                 self.line(&format!(
                     "if {value} == nil then {result} = {default} end"
                 ));
-                Ok((result, Ty::new(ty.base)))
+                let mut out = Ty::new(ty.base);
+                out.null = nil_default && ty.null;
+                Ok((result, out))
             }
             "len" => Ok((format!("#{receiver}"), Ty::INT)),
             "is_empty" if ty.base == Base::Table => {

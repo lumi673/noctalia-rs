@@ -900,3 +900,91 @@ fn native_json_iterators(_ctx: &Context) -> Vec<Op> {
     )));
     ops
 }
+
+#[test]
+fn json_null_flags_and_map_chains_match_the_native_handler() {
+    let handler = r#"
+use serde_json::Map;
+
+fn put(map: &mut Map, value: Value) {
+    map.insert("v".to_owned(), value);
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    let keys: Vec<String> = map.keys().cloned().collect();
+    let pair_keys: Vec<String> = map.iter().map(|(key, _)| key.clone()).collect();
+    let vals: Vec<Value> = map.values().take(1).cloned().collect();
+    let filtered: Vec<String> = map
+        .iter()
+        .filter(|(_, value)| value.as_i64().unwrap_or(0) > 1)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let skipped: Vec<String> = map.keys().skip(1).cloned().collect();
+    let mut plain = Vec::new();
+    for (key, value) in &map {
+        plain.push(format!("{key}={value}"));
+    }
+    let one: Vec<String> = map.keys().cloned().collect();
+    let flag = json!(false).as_bool().unwrap_or(true);
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{}|{flag}",
+        keys.join(","),
+        pair_keys.join(","),
+        vals.len(),
+        filtered.join(","),
+        skipped.join(","),
+        plain.join(","),
+        one.join(",")
+    )));
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("json_chains", handler, EntryKind::Service);
+    assert!(source.contains(noctalia_rs_luau::ARRAY_MARKER));
+    let state = json!({});
+    let ctx = context("json_chains", "load", json!({}), state);
+    assert_eq!(
+        ops("json_chains", &source, &ctx),
+        rust_ops(native_json_chains(&ctx))
+    );
+}
+
+fn native_json_chains(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    let mut ops = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    let keys: Vec<String> = map.keys().cloned().collect();
+    let pair_keys: Vec<String> =
+        map.iter().map(|(key, _)| key.clone()).collect();
+    let vals: Vec<Value> = map.values().take(1).cloned().collect();
+    let filtered: Vec<String> = map
+        .iter()
+        .filter(|(_, value)| value.as_i64().unwrap_or(0) > 1)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let skipped: Vec<String> = map.keys().skip(1).cloned().collect();
+    let mut plain = Vec::new();
+    for (key, value) in &map {
+        plain.push(format!("{key}={value}"));
+    }
+    let one: Vec<String> = map.keys().cloned().collect();
+    let flag = json!(false).as_bool().unwrap_or(true);
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{}|{flag}",
+        keys.join(","),
+        pair_keys.join(","),
+        vals.len(),
+        filtered.join(","),
+        skipped.join(","),
+        plain.join(","),
+        one.join(",")
+    )));
+    ops
+}

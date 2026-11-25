@@ -439,9 +439,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled
-            .source
-            .contains("for name, value in pairs(__t1) do"),
+        compiled.source.contains("for __t3 = 1, #__t2 do"),
         "{}",
         compiled.source
     );

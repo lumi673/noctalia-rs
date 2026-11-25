@@ -296,11 +296,14 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("local {result} = {value}"));
                 self.line(&format!("if {value} == nil then"));
                 self.indent = self.indent.saturating_add(1);
-                let (text, fallback_ty) = self.fallback(closure, ty)?;
+                let (text, mut fallback_ty) = self.fallback(closure, ty)?;
                 self.line(&format!("{result} = {text}"));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
-                return Ok(Some((result, wider(ty, fallback_ty))));
+                // The branch that produced a value ran the fallback, so the
+                // receiver's nullness cannot reach the result.
+                fallback_ty.null = false;
+                return Ok(Some((result, fallback_ty)));
             }
             "ok_or" => {
                 let message = arg(args, 0, call)?;
@@ -557,13 +560,14 @@ impl<'a> Emitter<'a> {
                         &format!("string.split({text}, {separator})"),
                         false,
                         false,
+                        None,
                         body,
                     );
                 }
                 "split_whitespace" => {
                     let (text, _) = self.expr(&call.receiver)?;
                     let words = self.whitespace_split(&text);
-                    return self.emit_table(&words, false, false, body);
+                    return self.emit_table(&words, false, false, None, body);
                 }
                 "chars" | "bytes" => {
                     let (text, _) = self.expr(&call.receiver)?;
@@ -571,18 +575,28 @@ impl<'a> Emitter<'a> {
                         &format!("string.split({text}, \"\")"),
                         false,
                         false,
+                        None,
                         body,
                     );
                 }
                 "lines" => {
                     let (text, _) = self.expr(&call.receiver)?;
                     let lines = self.split_lines(&text);
-                    return self.emit_table(&lines, false, false, body);
+                    return self.emit_table(&lines, false, false, None, body);
                 }
                 "iter" | "into_iter" | "values" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     let map = ty.base == Base::Table;
-                    return self.emit_table(&source, false, map, body);
+                    return self.emit_table(
+                        &source,
+                        false,
+                        map,
+                        Some(
+                            call.method.to_string().as_str() == "iter"
+                                || call.method == "into_iter",
+                        ),
+                        body,
+                    );
                 }
                 "copied" | "cloned" => {
                     return self.emit_iter(&call.receiver, body);
@@ -590,7 +604,13 @@ impl<'a> Emitter<'a> {
                 "keys" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     let map = ty.base == Base::Table;
-                    return self.emit_table(&source, true, map, body);
+                    return self.emit_table(
+                        &source,
+                        true,
+                        map,
+                        Some(false),
+                        body,
+                    );
                 }
                 "skip" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -634,6 +654,7 @@ impl<'a> Emitter<'a> {
                             &format!("({source} or {{}})"),
                             false,
                             false,
+                            None,
                             body,
                         );
                     }
@@ -642,7 +663,8 @@ impl<'a> Emitter<'a> {
                             |emitter: &mut Self,
                              value: &str|
                              -> Result<(), Error> {
-                                emitter.emit_table(value, false, false, body)
+                                emitter
+                                    .emit_table(value, false, false, None, body)
                             };
                         return self.emit_iter(&call.receiver, &inner);
                     }
@@ -652,13 +674,13 @@ impl<'a> Emitter<'a> {
                     let (text, _) = self.expr(&call.receiver)?;
                     let separator = self.expr(arg(&args, 0, call)?)?.0;
                     let parts = Self::reverse_split(&text, &separator);
-                    return self.emit_table(&parts, false, false, body);
+                    return self.emit_table(&parts, false, false, None, body);
                 }
                 _ => {}
             },
             other => {
                 let (source, _) = self.expr(other)?;
-                return self.emit_table(&source, false, false, body);
+                return self.emit_table(&source, false, false, None, body);
             }
         }
         Err(Error::at(
@@ -676,6 +698,7 @@ impl<'a> Emitter<'a> {
         source: &str,
         keys: bool,
         map: bool,
+        pairs: Option<bool>,
         body: &dyn Fn(&mut Self, &str) -> Result<(), Error>,
     ) -> Result<(), Error> {
         if map {
@@ -692,6 +715,16 @@ impl<'a> Emitter<'a> {
             self.indent = self.indent.saturating_add(1);
             let result = if keys {
                 body(self, &format!("{order}[{index}]"))
+            } else if pairs == Some(true) {
+                // `iter`/`into_iter` yield a (key, value) pair, so a closure
+                // tuple binding reads `[1]` and `[2]` as Rust expects.
+                let key = self.temp();
+                self.line(&format!("local {key} = {order}[{index}]"));
+                let pair = self.temp();
+                self.line(&format!(
+                    "local {pair} = {{ {key}, {source}[{key}] }}"
+                ));
+                body(self, &pair)
             } else {
                 let key = self.temp();
                 self.line(&format!("local {key} = {order}[{index}]"));

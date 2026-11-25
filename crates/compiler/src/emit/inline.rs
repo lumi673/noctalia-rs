@@ -201,6 +201,7 @@ impl<'a> Emitter<'a> {
             ));
         }
         let (text, value) = self.expr(argument)?;
+        let argument_null = value.null || text == "nil";
         let declared = type_hint(ty);
         let mut value = if declared.base == Base::Value {
             Ty {
@@ -210,9 +211,10 @@ impl<'a> Emitter<'a> {
         } else {
             value
         };
-        // A parameter holds whatever the call site passed, and the argument
-        // text carries a null through the inlined body, so the flag stops here.
-        value.null = false;
+        value.null = argument_null && declared.base == Base::Value;
+        if value.null {
+            value.element = None;
+        }
         let kind = static_kind(ty);
         if kind != StaticKind::Value
             && let Expr::Path(path) = strip_reference(argument)

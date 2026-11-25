@@ -122,7 +122,7 @@ impl<'a> Emitter<'a> {
             "keys" => {
                 let keys = self.temp();
                 self.line(&format!(
-                    "local {keys} = (function() local __keys = {{}} for __key in pairs({receiver}) do __keys[#__keys + 1] = __key end table.sort(__keys, function(a, b) return tostring(a) < tostring(b) end) setmetatable(__keys, {{ {ARRAY_MARKER} = true, {CURSOR_MARKER} = 0 }}) return __keys end)()"
+                    "local {keys} = (function() local __keys = {{}} for __key in pairs({receiver}) do __keys[#__keys + 1] = __key end table.sort(__keys, function(a, b) return tostring(a) < tostring(b) end) setmetatable(__keys, {{ {CURSOR_MARKER} = 0 }}) return __keys end)()"
                 ));
                 Ok((keys, Ty::STRING_LIST))
             }

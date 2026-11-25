@@ -1562,3 +1562,77 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(source.contains("for __key in pairs(map) do"), "{source}");
     assert!(source.contains("local key = __t"), "{source}");
 }
+
+#[test]
+fn null_flag_follows_value_parameters_and_defaults() {
+    for handler in [
+        r#"
+use serde_json::Map;
+fn put(map: &mut Map, value: Value) {
+    map.insert("k".to_owned(), value);
+}
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    let value = Value::Null;
+    put(&mut map, value);
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    let value = None.unwrap_or_default();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+use serde_json::Map;
+fn text(_value: &str) {}
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    let value = Value::Null;
+    text(value.as_str().unwrap_or_default());
+    map.insert("k".to_owned(), json!(1));
+    Ok(vec![Op::log("done")])
+}
+"#,
+    ] {
+        let result =
+            compile(&source(handler), &options("handler", EntryKind::Service));
+        if handler.contains("fn put")
+            || handler.contains("let value = None.unwrap_or_default()")
+        {
+            let error = result.expect_err("bails");
+            assert!(error.message.contains("json null"), "{}", error.message);
+            assert!(error.line > 0 && error.column > 0, "{error:?}");
+        } else {
+            result.expect("compiles");
+        }
+    }
+}
+
+#[test]
+fn a_non_null_fallback_clears_the_null_flag() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut items = Vec::new();
+    let fallback = None.unwrap_or_else(|| json!(1));
+    items.push(fallback);
+    let chosen = if false { json!(null) } else { Value::Null }
+        .unwrap_or_else(|| json!(2));
+    items.push(chosen);
+    Ok(vec![Op::log(format!("{}", items.len()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("table.insert(items, fallback)")
+            && compiled.source.contains("table.insert(items, chosen)"),
+        "{}",
+        compiled.source
+    );
+}
