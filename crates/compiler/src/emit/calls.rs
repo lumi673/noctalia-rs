@@ -1,0 +1,320 @@
+use super::*;
+
+impl<'a> Emitter<'a> {
+    /// A `unwrap_or_else` fallback, which may be `Default::default` itself.
+    pub(super) fn fallback(
+        &mut self,
+        expr: &Expr,
+        ty: Ty,
+    ) -> Result<(String, Ty), Error> {
+        if is_default_path(expr) {
+            let ty = Ty::new(ty.base);
+            let literal = ty
+                .default_literal()
+                .ok_or_else(|| bare_default_error(expr.span()))?;
+            return Ok((literal.to_owned(), ty));
+        }
+        self.invoke_arg(expr, &[])
+    }
+
+    /// Inlines a crate function used as a callback value, such as
+    /// `map(lua_text)` or `unwrap_or_else(default_snapshot)`.
+    pub(super) fn function_reference(
+        &mut self,
+        expr: &Expr,
+        values: &[String],
+    ) -> Result<OptionalValue, Error> {
+        let Expr::Path(path) = strip_reference(expr) else {
+            return Ok(None);
+        };
+        let Some(segments) = path_segments(&path.path) else {
+            return Ok(None);
+        };
+        let Some(resolved) = self.program.resolve(&self.module, &segments)
+        else {
+            return Ok(None);
+        };
+        let helper = Helper {
+            module: resolved.module.clone(),
+            name: segments.join("::"),
+            function: resolved.function.clone(),
+            class: None,
+        };
+        let params = typed_args(&helper.function);
+        if params.len() != values.len() {
+            return Err(Error::at(
+                expr.span(),
+                format!(
+                    "`{}` takes {} arguments but {} were passed",
+                    helper.name,
+                    params.len(),
+                    values.len()
+                ),
+            ));
+        }
+        let mut bindings = Vec::new();
+        for ((pattern, _), value) in params.iter().zip(values) {
+            let Pat::Ident(pattern) = pattern else {
+                return Err(Error::at(
+                    expr.span(),
+                    "helper parameters must be plain identifiers",
+                ));
+            };
+            bindings.push(Binding::Local {
+                name: pattern.ident.to_string(),
+                text: value.clone(),
+                ty: Ty::VALUE,
+                container: StaticKind::Value,
+            });
+        }
+        self.inline_resolved(helper, Inline::Value, expr.span(), bindings)
+    }
+
+    pub(super) fn call(
+        &mut self,
+        call: &ExprCall,
+    ) -> Result<(String, Ty), Error> {
+        if let Some(name) = path_last_name(&call.func) {
+            let args = call.args.iter().collect::<Vec<_>>();
+            if !name.contains("::")
+                && self.lookup(&name).is_some()
+                && !self.is_ctx_expr(&call.func)
+            {
+                let mut values = Vec::new();
+                for argument in &args {
+                    values.push(self.expr(argument)?.0);
+                }
+                return Ok((
+                    format!("{name}({})", values.join(", ")),
+                    Ty::VALUE,
+                ));
+            }
+            match name.as_str() {
+                "Some" => return self.expr(arg(&args, 0, call)?),
+                "drop" => {
+                    let _ = self.expr(arg(&args, 0, call)?)?;
+                    return Ok((String::new(), Ty::VOID));
+                }
+                "String::new" => return Ok(("\"\"".to_owned(), Ty::STR)),
+                "Default::default" => {
+                    return Err(bare_default_error(call.span()));
+                }
+                "Vec::new" | "VecDeque::new" => {
+                    return Ok(("{}".to_owned(), Ty::LIST));
+                }
+                "Vec::with_capacity" | "VecDeque::with_capacity" => {
+                    return Ok(("{}".to_owned(), Ty::LIST));
+                }
+                "String::with_capacity" => {
+                    return Ok(("\"\"".to_owned(), Ty::STR));
+                }
+                "std::cmp::max" | "cmp::max" => {
+                    let left = self.expr(arg(&args, 0, call)?)?.0;
+                    let right = self.expr(arg(&args, 1, call)?)?.0;
+                    return Ok((
+                        format!("math.max({left}, {right})"),
+                        Ty::VALUE,
+                    ));
+                }
+                "std::cmp::min" | "cmp::min" => {
+                    let left = self.expr(arg(&args, 0, call)?)?.0;
+                    let right = self.expr(arg(&args, 1, call)?)?.0;
+                    return Ok((
+                        format!("math.min({left}, {right})"),
+                        Ty::VALUE,
+                    ));
+                }
+                "SystemTime::now" => {
+                    return Ok(("noctalia.nowMs()".to_owned(), Ty::INT));
+                }
+                _ => {}
+            }
+            if args.len() == 1
+                && let Some(name) = path_last_name(&call.func)
+                && self.program.is_newtype(&self.module, &name)
+            {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                self.pending_class = Some(name.to_owned());
+                return Ok((value, Ty::VALUE));
+            }
+            let identity = name.ends_with("::try_from")
+                || name.ends_with("::from_utf8_lossy")
+                || name.ends_with("::from")
+                || name.ends_with("::Borrowed")
+                || name.ends_with("::uninit")
+                || name == "serde_json::from_value"
+                || name.ends_with("Value::Object")
+                || name.ends_with("Value::Array")
+                || name.ends_with("Value::String")
+                || name.ends_with("Value::Bool")
+                || name.ends_with("Value::Number")
+                || name == "Arc::new";
+            if identity && args.len() == 1 {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((text, Ty::VALUE));
+            }
+            if name == "env::var" || name == "std::env::var" {
+                let key = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((format!("noctalia.getenv({key})"), Ty::OPT_STR));
+            }
+            if name.ends_with("Number::from_f64") && args.len() == 1 {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((
+                    format!(
+                        "(function() local __value = {value}; if __value == __value and __value ~= math.huge and __value ~= -math.huge then return __value end end)()"
+                    ),
+                    Ty::OPT_FLOAT,
+                ));
+            }
+            if let Some(class) = name.strip_suffix("::default")
+                && class != "Default"
+            {
+                let class = if class == "Self" {
+                    self.self_class.clone().unwrap_or_else(|| class.to_owned())
+                } else {
+                    class.to_owned()
+                };
+                let ty: Type = syn::parse_str(&class).map_err(|error| {
+                    Error::at(
+                        call.span(),
+                        format!("invalid default type: {error}"),
+                    )
+                })?;
+                if let Some((module, function)) =
+                    self.program.resolve_method(&self.module, &class, "default")
+                {
+                    let helper = Helper {
+                        module,
+                        name: format!("{class}::default"),
+                        function: function.clone(),
+                        class: Some(class.to_owned()),
+                    };
+                    let returns = return_kind(&helper.function)?;
+                    let check = self.check_inline(
+                        &helper,
+                        Inline::Value,
+                        returns,
+                        &call.span(),
+                    )?;
+                    return self.inline(
+                        &helper,
+                        Vec::new(),
+                        Inline::Value,
+                        returns,
+                        check,
+                    );
+                }
+                return Ok((default_value(self, &ty, call.span())?, Ty::VALUE));
+            }
+            if name == "from_str" || name == "serde_json::from_str" {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                let base = json_parse_base(call)?;
+                return Ok((format!("json.decode({text})"), Ty::result(base)));
+            }
+            if name == "serde_json::to_string" {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((format!("json.encode({text})"), Ty::STR));
+            }
+            if name.ends_with("::from_str_radix") {
+                let text = self.expr(arg(&args, 0, call)?)?.0;
+                let radix = self.expr(arg(&args, 1, call)?)?.0;
+                return Ok((
+                    format!("tonumber({text}, {radix})"),
+                    Ty::result(Base::Int),
+                ));
+            }
+            if let Some(variant) = qualified_variant(&name, "ui")
+                && let Some(builder) = ui_marker(variant)
+            {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((format!("{{ {builder} = {value} }}"), Ty::VALUE));
+            }
+            if let Some(value) = self.std_constructor(call, &args)? {
+                return Ok(value);
+            }
+            if let Some(kind) = ui_constructor(&name) {
+                return self.ui_node(call, kind);
+            }
+            if let Some(value) = self.associated_call(call, &args)? {
+                return Ok(value);
+            }
+            if let Some(op) = op_constructor(&name) {
+                self.op_call(call, &op)?;
+                return Ok((String::new(), Ty::VOID));
+            }
+            if let Some(op) = unsupported_op(&name) {
+                return Err(Error::at(call.span(), op));
+            }
+        }
+        if let Some(value) = self.inline_call(call, Inline::Value)? {
+            return Ok(value);
+        }
+        let label = path_last_name(&call.func).unwrap_or_default();
+        Err(Error::at(
+            call.span(),
+            format!(
+                "call to `{label}` is not supported by the Luau compiler: no function in the crate matches, and only ops, ui constructors and a small set of std calls are supported"
+            ),
+        ))
+    }
+
+    fn ui_node(
+        &mut self,
+        call: &ExprCall,
+        kind: &str,
+    ) -> Result<(String, Ty), Error> {
+        let args = call.args.iter().collect::<Vec<_>>();
+        let props = match args.first() {
+            Some(expr) => self.expr(expr)?.0,
+            None => "{}".to_owned(),
+        };
+        let children = match args.get(1) {
+            Some(expr) => {
+                let expr = strip_reference(expr);
+                if let Expr::Call(vec) = expr
+                    && is_vec_new(vec)
+                {
+                    "{}".to_owned()
+                } else if let Expr::Macro(mac) = expr
+                    && macro_name(mac) == "vec"
+                {
+                    let items = parse_vec(mac)?;
+                    self.list(&items)?.0
+                } else {
+                    self.expr(expr)?.0
+                }
+            }
+            None => "{}".to_owned(),
+        };
+        Ok((
+            format!(
+                "{{ kind = {}, props = {props}, children = {children} }}",
+                quote(kind)
+            ),
+            Ty::NODE,
+        ))
+    }
+}
+
+pub(super) fn ui_constructor(name: &str) -> Option<&'static str> {
+    let variant = qualified_variant(name, "ui")?;
+    match variant {
+        "column" => Some("column"),
+        "row" => Some("row"),
+        "scroll" => Some("scroll"),
+        "label" => Some("label"),
+        "button" => Some("button"),
+        "input" => Some("input"),
+        "progress" => Some("progress"),
+        _ => None,
+    }
+}
+
+/// The marker key for `ui::call` and `ui::callback`.
+fn ui_marker(variant: &str) -> Option<&'static str> {
+    match variant {
+        "call" => Some("__call"),
+        "callback" => Some("__host_callback"),
+        _ => None,
+    }
+}
