@@ -27,16 +27,16 @@
       "updatedAt": "2026-11-24T04:44:26.093Z"
     },
     "luau_vm_creation": {
-      "sha": "522faec3b4b0581498d0cd6883bfecb6e7438f05",
+      "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
       "method": 1,
-      "medianMs": 0.144511,
-      "worstMedianMs": 0.1498795,
-      "p95Ms": 0.18051,
-      "worstP95Ms": 0.184476,
-      "p99Ms": 0.184346,
-      "worstP99Ms": 0.19341,
+      "medianMs": 0.1099955,
+      "worstMedianMs": 0.11110650000000001,
+      "p95Ms": 0.131484,
+      "worstP95Ms": 0.141172,
+      "p99Ms": 0.160961,
+      "worstP99Ms": 0.18591300000000002,
       "budgetMs": 5,
-      "updatedAt": "2026-11-23T21:44:29.693Z"
+      "updatedAt": "2026-11-25T02:49:36.582Z"
     },
     "luau_vm_cache_reuse": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -339,16 +339,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_als_brightness_luau": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
       "method": 1,
-      "medianMs": 0.18732350000000003,
-      "worstMedianMs": 0.1886505,
-      "p95Ms": 0.206177,
-      "worstP95Ms": 0.226047,
-      "p99Ms": 0.210233,
-      "worstP99Ms": 0.29673099999999997,
+      "medianMs": 0.1843075,
+      "worstMedianMs": 0.1866075,
+      "p95Ms": 0.19513000000000003,
+      "worstP95Ms": 0.197456,
+      "p99Ms": 0.197051,
+      "worstP99Ms": 0.201487,
       "budgetMs": 2,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-25T02:49:36.582Z"
     },
     "plugin_als_brightness_rust": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -375,16 +375,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_mihomo_control_rust": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
       "method": 1,
-      "medianMs": 0.918926,
-      "worstMedianMs": 0.9296034999999999,
-      "p95Ms": 0.938136,
-      "worstP95Ms": 0.9486509999999999,
-      "p99Ms": 0.9712940000000001,
-      "worstP99Ms": 1.016182,
+      "medianMs": 0.892991,
+      "worstMedianMs": 0.896407,
+      "p95Ms": 0.9104,
+      "worstP95Ms": 0.920159,
+      "p99Ms": 0.9246810000000001,
+      "worstP99Ms": 0.93377,
       "budgetMs": 4,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-25T02:49:36.582Z"
     },
     "plugin_file_search_luau": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
