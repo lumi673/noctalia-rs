@@ -1886,6 +1886,7 @@ impl<'a> Emitter<'a> {
                 };
                 let value = self.temp();
                 self.line(&format!("local {value} = {line}"));
+                self.emitted = true;
                 Ok((format!("({value})"), Ty::BOOL))
             }
             "run_async_start" | "run_stream_start" | "http_start" => {

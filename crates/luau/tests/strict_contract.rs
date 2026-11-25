@@ -615,3 +615,113 @@ fn normalize(value: &Value) -> Value {
         other => other.clone(),
     }
 }
+
+fn position_handler(method: &str, position: usize) -> String {
+    let call = match method {
+        "run_async_start" => "ctx.run_async_start(\"x\", \"cb\", None)",
+        "run_stream_start" => "ctx.run_stream_start(\"x\", \"cb\")",
+        _ => "ctx.http_start(\"x\", \"cb\")",
+    };
+    let body = match position {
+        1 => format!(
+            "if !{call} {{ return Ok(Vec::new()); }}\n        return Ok(Vec::new());"
+        ),
+        2 => format!("return Ok(vec![Op::log({call}.to_string())]);"),
+        3 => format!(
+            "let name = if {call} {{ \"on\" }} else {{ \"off\" }};\n        return Ok(vec![Op::log(name)]);"
+        ),
+        4 => format!(
+            "let name = match {call} {{ true => \"on\", false => \"off\" }};\n        return Ok(vec![Op::log(name)]);"
+        ),
+        _ => format!("{call};\n        return Ok(Vec::new());"),
+    };
+    format!(
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> {{\n    if ctx.event == \"render\" {{\n        {body}\n    }}\n    if ctx.event == \"host_callback\" {{\n        return Ok(vec![Op::log(\"callback\")]);\n    }}\n    Ok(Vec::new())\n}}\n"
+    )
+}
+
+fn compile_auto(handler: &str) -> Result<String, String> {
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::{{Value, json}};\n\n{handler}\n"
+    );
+    compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "strict",
+            state_key: "strict.state",
+            kind: EntryKind::Widget,
+            strings: &[],
+            settings: &[],
+            module: "main",
+            modules: &[],
+            native: NativeMode::Allow,
+            strict: None,
+        },
+    )
+    .map(|compiled| compiled.source)
+    .map_err(|error| error.render("strict.rs"))
+}
+
+#[test]
+fn strict_start_positions_emit_or_error_at_the_span() {
+    for method in ["run_async_start", "run_stream_start", "http_start"] {
+        let host_call = match method {
+            "run_async_start" => "noctalia.runAsync",
+            "run_stream_start" => "noctalia.runStream",
+            _ => "noctalia.http",
+        };
+        for position in 1..=5 {
+            let handler = position_handler(method, position);
+            let strict = compile_mode(&handler, true);
+            assert!(
+                strict.contains(host_call),
+                "{method} position {position} has no {host_call}:\n{strict}"
+            );
+            let strict_ops = noctalia_rs_luau::dispatch_strict(
+                &context("render", json!({})),
+                &[("strict", &strict)],
+            )
+            .unwrap_or_else(|error| {
+                panic!("{method} position {position} strict dispatch: {error}")
+            });
+            let strict_ops = normalized(
+                &strict_ops
+                    .iter()
+                    .map(|op| serde_json::to_value(op).expect("serialize"))
+                    .collect::<Vec<_>>(),
+            );
+            let auto = match compile_auto(&handler) {
+                Ok(source) => source,
+                Err(error) => {
+                    assert!(
+                        error.contains("must be discarded"),
+                        "{method} position {position} auto failed for another reason: {error}"
+                    );
+                    assert!(
+                        error.contains("strict.rs:"),
+                        "{method} position {position} auto has no position: {error}"
+                    );
+                    continue;
+                }
+            };
+            let auto_ops = noctalia_rs_luau::dispatch(
+                &context("render", json!({})),
+                &[("strict", &auto)],
+            )
+            .unwrap_or_else(|error| {
+                panic!("{method} position {position} auto dispatch: {error}")
+            });
+            let auto_ops = normalized(
+                &auto_ops
+                    .iter()
+                    .map(|op| serde_json::to_value(op).expect("serialize"))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                strict_ops, auto_ops,
+                "{method} position {position} ops differ\nstrict:\n{strict}\nauto:\n{auto}"
+            );
+        }
+    }
+}
