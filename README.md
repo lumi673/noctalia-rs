@@ -121,8 +121,8 @@ compile = "auto"
 into native calls, and bridges only the entries it cannot split. The build
 prints one `cargo:warning` per function that crossed the boundary and one per
 entry that kept the bridge stub, each with the entry id and the reason.
-`strict` fails the build on the first function it cannot translate and emits no
-bridge, so it measures pure-Luau coverage. It also rejects entries without a
+`strict` fails the build on the first function it cannot translate, ignores
+`#[native]`, and emits no bridge, so it measures pure-Luau coverage. It also rejects entries without a
 handler. `off` skips the compiler and bridges every entry.
 
 The handler signature is `fn handler(ctx: &Context) -> Result<Vec<Op>>`. The
@@ -190,8 +190,11 @@ Arbitrary trait iterators, dynamic dispatch, trait methods without a Luau
 equivalent, and ops that need a response path are never approximated. In
 `auto` they move the whole function to the plugin binary and the rest of the
 handler still compiles; in `strict` they fail the build with
-`file:line:column`. `BASELINE.md` has the per-stage adoption table for the
-community corpus.
+`file:line:column`. `BASELINE.md` has the per-stage adoption table for the community corpus: 195
+fully compiled entries, 41 hybrid entries, and 831 that still bridge the whole
+handler. The largest remaining blocker is that a candidate helper must be
+`pub(crate)`; the next is `&mut` parameters, which cannot cross without
+silently dropping the writes.
 
 ## Native functions
 
@@ -205,8 +208,10 @@ A handler compiles in one of three tiers:
   running, then the handler continues in Luau.
 - **Bridged**: the entry cannot be split, so the whole handler runs in the
   helper through `bridge.luau` as before. This happens when the handler body
-  itself contains a construct with no faithful translation, or when a module
-  initializer needs native code.
+  itself contains a construct with no faithful translation, when a module
+  initializer needs native code, or when a helper that returns
+  `Result<Vec<Op>>` is called in tail position. Move the untranslatable work
+  into a value-returning helper in the last case.
 
 The split point is always a whole function, never inside one. A helper that
 calls a native function still compiles: the call becomes a call to the stub.
@@ -216,6 +221,12 @@ The build prints one line per function that crossed the boundary, for example:
 ```
 entry widget: native `git::fetch_prs` (cache 0 ms): call to `reqwest::blocking::get` is not supported by the Luau compiler
 ```
+
+A native function must be visible from the crate root, because the generated
+dispatch table lives there. Functions at the crate root can stay private.
+A helper inside `src/other.rs` or a module needs `pub(crate)`. `auto` bridges
+the entry and names the function when it is not; `#[native]` fails the build
+with the same message.
 
 ### Attributes
 
@@ -260,21 +271,45 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 the unchanged function, and the build script reads them from the source text.
 `#[native]` and `#[native(cache_ms = ...)]` skip the translation attempt
 entirely. `#[luau]` turns a would-be split into a build error, even in `auto`.
+`strict` has no boundary, so it ignores `#[native]` and compiles the function
+instead; `#[luau]` keeps its meaning.
 
 ### Signature requirement
 
 The arguments and the result cross as JSON. A native function must:
 
-- take plain identifier parameters with owned types (`String`, `usize`,
-  `Vec<Row>`, `serde_json::Value`). References, `self`, generics and
+- take plain identifier parameters: owned values (`String`, `usize`,
+  `Vec<Row>`, `serde_json::Value`), or borrowed forms the dispatcher can
+  recreate from an owned value: `&str`, `&String`, `&Path`, `&PathBuf`,
+  `&Vec<T>`, `&[T]`, `Option<&...>` of those, and `&T` or `Option<&T>` for a
+  type that implements `Deserialize`. `&mut`, `self`, generics and
   `impl Trait` are rejected with `file:line:column`,
-- implement `serde::de::DeserializeOwned` for every parameter type,
-- return `T: serde::Serialize`, or `Result<T, E>` where `T: Serialize` and
-  `E: std::fmt::Display`.
+- implement `serde::de::DeserializeOwned` for every parameter type (the owned
+  form of a borrowed parameter),
+- return `T: serde::Serialize` (a returned reference is fine), or
+  `Result<T, E>` where `T: Serialize` and `E: std::fmt::Display`.
 
-The build cannot prove the serde bounds, so it writes the dispatch table to
-`$OUT_DIR/native.rs` and `rustc` reports the missing trait on the exact
-parameter or return type.
+`auto` only splits a function whose signature it can prove: parameters and the
+success type must be scalars, strings, `serde_json::Value`, paths, standard
+containers of those, or a local struct with the matching `Serialize` or
+`Deserialize` derive. Anything else keeps the bridge and names the type. That
+keeps `auto` from breaking a build on a type that cannot cross.
+
+`#[native]` skips that proof and asks `rustc` instead: the build writes the
+dispatch table to `$OUT_DIR/native.rs`, and a missing `Serialize`,
+`Deserialize` or `Display` is reported on the exact type.
+
+### Handler context
+
+A native function may take `&Context` at any position. Only calls to functions
+that declare it pay for it. Before the request is written, the compiled script
+rebuilds the same snapshot `bridge.luau` sends: entry, event, payload, every
+declared config key, the entry's state, and the fixed host reads (time, theme
+colors, bar, clipboard, media, stats, nightlight, and so on). The helper turns
+that back into a real `Context`. Two values can differ from a bridge request:
+`now_ms` is sampled when the native call happens, and state written earlier in
+the same handler invocation is already visible. The context is part of the cache
+key, so a call from a click never reuses a render result.
 
 ### Calling semantics
 
@@ -297,7 +332,8 @@ on the existing stdout stream and the coroutine resumes where it stopped.
 ### Caching
 
 `#[native]` always calls the helper. `#[native(cache_ms = 30_000)]` caches the
-result for the key `(function name, encoded arguments)` for 30 seconds. The
+result for the key `(function name, encoded arguments)`, plus the invocation
+context when the function takes `&Context`, for 30 seconds. The
 compiled script keeps a bounded in-memory cache (128 entries, oldest first) and
 the helper keeps the same bound as a backstop shared by every Luau session. A
 cached call performs no round trip at all.

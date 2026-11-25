@@ -4386,7 +4386,7 @@ fn auto_mode_splits_at_the_function_boundary() {
     assert!(native.reason.contains("std::fs"), "{}", native.reason);
     assert!(
         compiled.source.contains(
-            "local function __native_fn_main__load__rows()\n  return __native.call(\"main::load_rows\", {}, 0, false)\nend"
+            "local function __native_fn_main__load__rows()\n  return __native.call(\"main::load_rows\", {}, 0, false, true)\nend"
         ),
         "{}",
         compiled.source
@@ -4712,7 +4712,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(
         compiled
             .source
-            .contains("local function __native_fn_main__describe()\n  return __native.call(\"main::describe\", {}, 0, true)\nend"),
+            .contains("local function __native_fn_main__describe()\n  return __native.call(\"main::describe\", {}, 0, true, true)\nend"),
         "{}",
         compiled.source
     );
@@ -4840,4 +4840,150 @@ fn native_options_with<'a>(
         modules,
         native: NativeMode::Allow,
     }
+}
+
+#[test]
+fn strict_ignores_the_native_attribute() {
+    let handler = r#"
+#[native]
+fn label(value: usize) -> String {
+    format!("{value} items")
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(label(2))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("strict compiles the function instead of crossing");
+    assert!(compiled.native.is_empty());
+    assert!(!compiled.source.contains("__native"), "{}", compiled.source);
+}
+
+#[test]
+fn a_luau_requirement_is_not_swallowed_by_an_outer_split() {
+    let handler = r#"
+#[luau]
+fn inner() -> Result<String> {
+    let text = std::fs::read_to_string("/tmp/x")?;
+    Ok(text)
+}
+
+fn outer() -> Result<String> {
+    let text = inner()?;
+    Ok(text)
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(outer()?)])
+}
+"#;
+    let error = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect_err("the fatal requirement must reach the build");
+    assert!(error.fatal, "{error:?}");
+    assert!(error.message.contains("#[luau]"), "{error}");
+}
+
+#[test]
+fn native_borrowed_container_and_path_parameters() {
+    let handler = r#"
+fn summary(items: &Vec<String>, path: Option<&Path>, buf: Option<&PathBuf>) -> String {
+    let text = std::fs::read_to_string("/tmp/x").unwrap_or_default();
+    format!("{}{}{}{}", items.len(), path.is_some(), buf.is_some(), text)
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(summary(&vec!["a".to_owned()], None, None))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+    let params = &compiled.native[0].params;
+    assert_eq!(params[0].owned, None);
+    assert_eq!(params[0].pass, crate::NativePass::Ref);
+    assert_eq!(params[1].owned.as_deref(), Some("Option<PathBuf>"));
+    assert_eq!(params[1].pass, crate::NativePass::AsDeref);
+    assert_eq!(params[2].owned.as_deref(), Some("Option<PathBuf>"));
+    assert_eq!(params[2].pass, crate::NativePass::AsRef);
+}
+
+#[test]
+fn a_native_result_keeps_the_error_path_for_unwrap() {
+    let handler = r#"
+fn label() -> Result<String> {
+    let text = std::fs::read_to_string("/tmp/x")?;
+    Ok(text)
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = label().unwrap_or_default();
+    Ok(vec![Op::log(value)])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+    assert!(
+        compiled.source.contains(
+            "return __native.call(\"main::label\", {}, 0, false, true)"
+        ),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local __t1, __t2 = __native_fn_main__label()"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("if __t2 ~= nil then __t3 = \"\" end"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn a_tail_native_call_lands_in_the_parent_value() {
+    let handler = r#"
+#[native]
+fn label() -> String {
+    "hi".to_owned()
+}
+
+fn helper() -> String {
+    label()
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = helper();
+    Ok(vec![Op::log(value)])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+    let body = compiled
+        .source
+        .lines()
+        .skip_while(|line| !line.starts_with("local function body_render"))
+        .take_while(|line| *line != "end")
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(body.contains("__t1 = __native_fn_main__label()"), "{body}");
+    assert!(body.contains("noctalia.log"), "{body}");
 }

@@ -164,7 +164,7 @@ impl<W: Write> Serve<'_, W> {
             format!(
                 "{}\0{}",
                 native_key(&name, &args),
-                canonical_json(&request.context)
+                canonical_json(&stable_context(&request.context))
             )
         } else {
             native_key(&name, &args)
@@ -440,6 +440,15 @@ fn request_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
         .map_or_else(|| "unknown".to_owned(), str::to_owned)
+}
+
+/// Drops reads that change on every request, so a cached context call can hit.
+fn stable_context(context: &Value) -> Value {
+    let mut stable = context.clone();
+    if let Some(host) = stable.get_mut("host").and_then(Value::as_object_mut) {
+        host.remove("now_ms");
+    }
+    stable
 }
 
 fn native_key(name: &str, args: &Value) -> String {
@@ -1210,8 +1219,13 @@ mod tests {
         second["id"] = json!("second");
         // Same arguments, different event: the context is part of the cache key.
         second["context"]["event"] = json!("render");
+        let mut third = first.clone();
+        third["id"] = json!("third");
+        // Only the clock moved: that is not part of the key.
+        third["context"]["host"]["now_ms"] = json!(1_700_000_999);
         spool.write("000000000001.json", &first);
         spool.write("000000000002.json", &second);
+        spool.write("000000000003.json", &third);
         let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
             .with_native(dispatch);
 
@@ -1221,7 +1235,7 @@ mod tests {
             spool: &spool.spool,
             boot: "boot-native-context",
             stale: BTreeSet::new(),
-            stop_after: 3,
+            stop_after: 4,
         }
         .run();
         let lines = writer.lines();
@@ -1233,12 +1247,13 @@ mod tests {
             .filter(|line| line.contains("native_result"))
             .map(|line| serde_json::from_str(line).expect("json"))
             .collect();
-        assert_eq!(results.len(), 2, "{lines:?}");
+        assert_eq!(results.len(), 3, "{lines:?}");
         assert_eq!(results[0]["value"]["event"], "click");
         assert_eq!(results[0]["value"]["payload"]["id"], "a");
         assert_eq!(results[0]["value"]["config"]["message"], "hi");
         assert_eq!(results[0]["value"]["state"]["count"], 2);
         assert_eq!(results[0]["value"]["now_ms"], 1_700_000_000_i64);
         assert_eq!(results[1]["value"]["event"], "render");
+        assert_eq!(results[2]["value"]["now_ms"], 1_700_000_000_i64);
     }
 }

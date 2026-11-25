@@ -87,7 +87,20 @@ fn stream_id(values: &[Value]) -> String {
 }
 
 fn line(stream: &str, message: Value) -> Value {
-    json!({ "id": stream, "args": [message] })
+    // The host delivers stream lines as JSON text, not as a table.
+    json!({ "id": stream, "args": [message.to_string()] })
+}
+
+fn spool_writes(values: &[Value]) -> usize {
+    values
+        .iter()
+        .filter(|value| {
+            value.get("op").and_then(Value::as_str) == Some("log")
+                && value.get("message").and_then(Value::as_str).is_some_and(
+                    |message| message.contains("spool write failed"),
+                )
+        })
+        .count()
 }
 
 fn bar_text(values: &[Value]) -> Option<String> {
@@ -144,6 +157,10 @@ fn a_cached_native_call_resumes_in_one_round_trip() {
             .all(|value| bar_text(std::slice::from_ref(value)).is_none()),
         "{ready:?}"
     );
+    // The load-time invocation parked before the helper answered, so the ready
+    // line flushes exactly one request. A second write would run the function
+    // twice for every hybrid entry's first call.
+    assert_eq!(spool_writes(&ready), 1, "{ready:?}");
 
     let resumed = dispatch(
         "cached",
@@ -151,7 +168,7 @@ fn a_cached_native_call_resumes_in_one_round_trip() {
         "host_callback",
         line(
             &stream,
-            json!({ "control": "native_result", "id": "1", "value": ["a", "b"], "error": null }),
+            json!({ "control": "native_result", "id": "000000000001", "value": ["a", "b"], "error": null }),
         ),
     );
     assert_eq!(
@@ -197,7 +214,7 @@ fn an_uncached_native_call_always_takes_a_round_trip() {
         "host_callback",
         line(
             &stream,
-            json!({ "control": "native_result", "id": "1", "value": ["a"], "error": null }),
+            json!({ "control": "native_result", "id": "000000000001", "value": ["a"], "error": null }),
         ),
     );
     assert!(bar_text(&first).is_none(), "{first:?}");
@@ -208,7 +225,7 @@ fn an_uncached_native_call_always_takes_a_round_trip() {
         "host_callback",
         line(
             &stream,
-            json!({ "control": "native_result", "id": "2", "value": ["b"], "error": null }),
+            json!({ "control": "native_result", "id": "000000000002", "value": ["b"], "error": null }),
         ),
     );
     assert_eq!(bar_text(&second).as_deref(), Some("a|b"), "{second:?}");
@@ -241,7 +258,7 @@ fn a_native_error_surfaces_as_a_lua_error() {
                 &stream,
                 json!({
                     "control": "native_result",
-                    "id": "1",
+                    "id": "000000000001",
                     "value": null,
                     "error": "permission denied"
                 }),
@@ -297,7 +314,7 @@ fn one_event_while_parked_is_queued_and_drained_in_order() {
         "host_callback",
         line(
             &stream,
-            json!({ "control": "native_result", "id": "1", "value": ["load"], "error": null }),
+            json!({ "control": "native_result", "id": "000000000001", "value": ["load"], "error": null }),
         ),
     );
     assert_eq!(bar_text(&load).as_deref(), Some("render|load"), "{load:?}");
@@ -308,7 +325,7 @@ fn one_event_while_parked_is_queued_and_drained_in_order() {
         "host_callback",
         line(
             &stream,
-            json!({ "control": "native_result", "id": "2", "value": ["update"], "error": null }),
+            json!({ "control": "native_result", "id": "000000000002", "value": ["update"], "error": null }),
         ),
     );
     assert_eq!(
@@ -323,7 +340,7 @@ fn one_event_while_parked_is_queued_and_drained_in_order() {
         "host_callback",
         line(
             &stream,
-            json!({ "control": "native_result", "id": "3", "value": ["click"], "error": null }),
+            json!({ "control": "native_result", "id": "000000000003", "value": ["click"], "error": null }),
         ),
     );
     assert_eq!(
@@ -348,7 +365,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn a_native_function_that_takes_the_context_resumes() {
     let source = compile("context", CONTEXT_CALL);
     assert!(
-        source.contains("__native.call(\"main::describe\", {}, 0, true)"),
+        source.contains("__native.call(\"main::describe\", {}, 0, true, true)"),
         "{source}"
     );
     assert!(
@@ -377,7 +394,7 @@ fn a_native_function_that_takes_the_context_resumes() {
         "host_callback",
         line(
             &stream,
-            json!({ "control": "native_result", "id": "1", "value": "render:rows", "error": null }),
+            json!({ "control": "native_result", "id": "000000000001", "value": "render:rows", "error": null }),
         ),
     );
     assert_eq!(

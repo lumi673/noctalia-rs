@@ -661,9 +661,17 @@ impl<'a> Emitter<'a> {
         let returns = return_kind(&helper.function)?;
         let key = native_key(&helper);
         if let Some(known) = self.known_native.get(&key).cloned() {
-            return self.native_call(&known, mode, span, &bindings);
+            return self.native_call(
+                &known,
+                value_type(returns),
+                mode,
+                span,
+                &bindings,
+            );
         }
-        if let Some(cache_ms) = forced_native(&helper.function)? {
+        if self.native_mode == NativeMode::Allow
+            && let Some(cache_ms) = forced_native(&helper.function)?
+        {
             let item = self.register_native(
                 &helper,
                 cache_ms,
@@ -671,7 +679,13 @@ impl<'a> Emitter<'a> {
                 "marked `#[native]`",
                 span,
             )?;
-            return self.native_call(&item, mode, span, &bindings);
+            return self.native_call(
+                &item,
+                value_type(returns),
+                mode,
+                span,
+                &bindings,
+            );
         }
         let check = self.check_inline(&helper, mode, returns, &span)?;
         let saved = self.clone();
@@ -679,6 +693,9 @@ impl<'a> Emitter<'a> {
             Ok(value) => Ok(Some(value)),
             Err(error) => {
                 *self = saved;
+                if error.fatal {
+                    return Err(error);
+                }
                 let demotable = self.native_mode == NativeMode::Allow
                     && mode == Inline::Value
                     && matches!(returns, Returns::Value(_));
@@ -692,7 +709,13 @@ impl<'a> Emitter<'a> {
                     &native_reason(&error),
                     span,
                 )?;
-                self.native_call(&item, mode, span, &bindings)
+                self.native_call(
+                    &item,
+                    value_type(returns),
+                    mode,
+                    span,
+                    &bindings,
+                )
             }
         }
     }
@@ -853,6 +876,7 @@ impl<'a> Emitter<'a> {
     fn native_call(
         &mut self,
         item: &NativeFn,
+        value_ty: Ty,
         mode: Inline,
         span: proc_macro2::Span,
         bindings: &[Binding],
@@ -894,14 +918,26 @@ impl<'a> Emitter<'a> {
         let call =
             format!("{}({})", native_local(&item.name), values.join(", "));
         self.uses_native = true;
+        let ty = if item.result {
+            Ty::result(value_ty.base)
+        } else {
+            Ty {
+                result: false,
+                ..value_ty
+            }
+        };
         match mode {
-            Inline::Value => Ok(Some((call, Ty::VALUE))),
+            Inline::Value => Ok(Some((call, ty))),
             Inline::Statement => {
                 self.line(&call);
                 Ok(Some((String::new(), Ty::VOID)))
             }
             Inline::Tail => {
-                self.line(&format!("return {call}"));
+                if let Some(target) = self.tail_target.clone() {
+                    self.line(&format!("{target} = {call}"));
+                } else {
+                    self.line(&format!("return {call}"));
+                }
                 Ok(Some((String::new(), Ty::VOID)))
             }
             Inline::Ops => unreachable!("ops mode is rejected above"),
@@ -7004,6 +7040,13 @@ fn return_kind(function: &ItemFn) -> Result<Returns, Error> {
     Ok(Returns::Value(type_hint(ty)))
 }
 
+fn value_type(returns: Returns) -> Ty {
+    match returns {
+        Returns::Value(ty) => ty,
+        Returns::Ops | Returns::VecOps | Returns::Unit => Ty::VALUE,
+    }
+}
+
 /// Dispatch key for a native function. Unique per crate.
 fn native_key(helper: &Helper) -> String {
     let name = helper.function.sig.ident.to_string();
@@ -7062,11 +7105,12 @@ pub(crate) fn stub_source(item: &NativeFn) -> String {
     let mut out = String::new();
     let _ = write!(
         out,
-        "local function {}({})\n  return __native.call({}, {args}, {}, {needs_context})\nend\n\n",
+        "local function {}({})\n  return __native.call({}, {args}, {}, {needs_context}, {})\nend\n\n",
         native_local(&item.name),
         declared.join(", "),
         quote(&item.name),
-        item.cache_ms
+        item.cache_ms,
+        item.result
     );
     out
 }
@@ -7164,16 +7208,22 @@ pub(crate) fn native_runtime(
     local target = request_dir .. "/" .. name .. ".json"
     request.boot = boot
     request.entry = ENTRY
+    request.id = name
     local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(request))
     if ok then ok, err = noctalia.renameFile(temporary, target) end
     if not ok then
       noctalia.removeFile(temporary)
-      noctalia.log("noctalia native: spool write failed: " .. tostring(err))
+      noctalia.log("noctalia native: spool write failed for " .. name .. ": " .. tostring(err))
+      return false
     end
+    return true
   end
 
   function M.send(request)
-    if boot then write(request) else pending[#pending + 1] = request end
+    if boot and write(request) then return true end
+    -- Keep the request for the next ready line: a helper restart retries it.
+    pending[#pending + 1] = request
+    return true
   end
 
   local function remember(key, value)
@@ -7203,6 +7253,7 @@ pub(crate) fn native_runtime(
 
   local function snapshot(descriptor)
     if descriptor == nil then return nil end
+    if descriptor.snapshot ~= nil then return descriptor.snapshot end
     local host = {
       now_ms = invoke(noctalia, "nowMs") or 0,
       dark = invoke(noctalia, "isDarkMode"),
@@ -7224,7 +7275,7 @@ pub(crate) fn native_runtime(
     for _, role in ipairs(COLOR_ROLES) do host.colors[role] = invoke(noctalia, "getColor", role) end
     local config = {}
     for _, key in ipairs(CONFIG_KEYS) do config[key] = noctalia.getConfig(key) end
-    return {
+    descriptor.snapshot = {
       entry = ENTRY,
       event = descriptor.event,
       payload = descriptor.payload or {},
@@ -7232,16 +7283,34 @@ pub(crate) fn native_runtime(
       state = noctalia.state.get(STATE_KEY) or {},
       host = host,
     }
+    return descriptor.snapshot
   end
 
-  function M.call(name, args, cache_ms, needs_context)
+  -- Volatile reads must not defeat the cache. Every other field matches the
+  -- helper's key, which drops the same field.
+  local function stable(context)
+    local host = {}
+    for key, value in pairs(context.host) do
+      if key ~= "now_ms" then host[key] = value end
+    end
+    return {
+      entry = context.entry,
+      event = context.event,
+      payload = context.payload,
+      config = context.config,
+      state = context.state,
+      host = host,
+    }
+  end
+
+  function M.call(name, args, cache_ms, needs_context, as_result)
     local context = nil
     if needs_context then context = snapshot(current) end
     local encoded = nil
     if cache_ms and cache_ms > 0 then
       encoded = name .. string.char(0) .. noctalia.json.encode(args)
       if context ~= nil then
-        encoded = encoded .. string.char(0) .. noctalia.json.encode(context)
+        encoded = encoded .. string.char(0) .. noctalia.json.encode(stable(context))
       end
       local hit = cache[encoded]
       if hit and noctalia.nowMs() - hit.at < cache_ms then return hit.value end
@@ -7253,8 +7322,12 @@ pub(crate) fn native_runtime(
       cache_ms = cache_ms or 0,
       context = context,
     })
-    if failure ~= nil then error(tostring(failure), 0) end
+    if failure ~= nil then
+      if as_result then return nil, tostring(failure) end
+      error(tostring(failure), 0)
+    end
     if encoded ~= nil then remember(encoded, value) end
+    if as_result then return value, nil end
     return value
   end
 
@@ -7280,6 +7353,11 @@ pub(crate) fn native_runtime(
   end
 
   local function on_line(line)
+    if type(line) == "string" then
+      local ok, decoded = pcall(noctalia.json.decode, line)
+      if not ok or type(decoded) ~= "table" then return end
+      line = decoded
+    end
     if type(line) ~= "table" then return end
     if line.control == "ready" then
       boot = line.boot
@@ -7287,10 +7365,23 @@ pub(crate) fn native_runtime(
       local queued = pending
       pending = {}
       for _, request in ipairs(queued) do write(request) end
-      if active ~= nil and active.request ~= nil then write(active.request) end
+      if active ~= nil
+        and active.request ~= nil
+        and active.request.boot ~= boot then
+        write(active.request)
+      end
       return
     end
     if line.control ~= "native_result" or active == nil then return end
+    if active.request ~= nil
+      and active.request.id ~= nil
+      and line.id ~= active.request.id then
+      noctalia.log(
+        "noctalia native: stale result " .. tostring(line.id)
+        .. " for " .. tostring(active.request.id)
+      )
+      return
+    end
     local co = active.co
     current = active.context
     active = nil
@@ -7592,7 +7683,7 @@ fn optional_reference_local(inner: &Type) -> (Option<String>, NativePass) {
     match inner {
         Type::Slice(_) => (Some("Vec<_>".to_owned()), NativePass::AsDeref),
         _ => match type_text(inner).as_str() {
-            "str" | "Path" | "PathBuf" => {
+            "str" | "Path" => {
                 let owned = if type_text(inner) == "str" {
                     "String"
                 } else {
@@ -7601,7 +7692,7 @@ fn optional_reference_local(inner: &Type) -> (Option<String>, NativePass) {
                 (Some(owned.to_owned()), NativePass::AsDeref)
             }
             "String" => (Some("String".to_owned()), NativePass::AsRef),
-            "Vec" => (Some("Vec<_>".to_owned()), NativePass::AsRef),
+            "PathBuf" => (Some("PathBuf".to_owned()), NativePass::AsRef),
             _ => (None, NativePass::AsRef),
         },
     }
@@ -7615,12 +7706,11 @@ fn reference_local(inner: &Type) -> (Option<String>, NativePass) {
             "str" => Some("String".to_owned()),
             "String" => Some("String".to_owned()),
             "Path" | "PathBuf" => Some("PathBuf".to_owned()),
-            "Vec" => Some("Vec<_>".to_owned()),
             _ => None,
         },
     };
-    let pass = match (inner, owned.as_deref()) {
-        (Type::Slice(_), _) | (_, Some("Vec<_>")) => NativePass::Slice,
+    let pass = match inner {
+        Type::Slice(_) => NativePass::Slice,
         _ => NativePass::Ref,
     };
     (owned, pass)

@@ -386,3 +386,114 @@ as an object value or a blocking query result. A Luau table cannot distinguish a
 absent key from a null value without a representation change, and compiled entries
 have no synchronous host response path without a new host API. Both would require
 changes outside the compiler.
+
+## Hybrid entries after stage 6
+
+Stage 6 splits the helper boundary at the function instead of the entry. A
+handler the compiler cannot translate as a whole can now keep the untranslatable
+functions in the plugin binary and compile the rest to Luau. Three tiers exist:
+
+- fully compiled: every reached function translates, no helper, byte-identical
+  to stage 5 (generated sizes stay 2,405 / 2,938 / 3,174 bytes),
+- hybrid: only the untranslatable functions cross, one round trip per uncached
+  call,
+- bridged: the handler body itself cannot be split, or a native candidate has a
+  signature that cannot cross JSON, so the entry keeps the whole-entry bridge.
+
+`strict` denies the boundary and reports the same errors as stage 5. `auto`
+allows it. `off` is unchanged.
+
+### Corpus adoption
+
+The scan runs the same `noctalia_rs_compiler::compile` call the build uses over
+all 1,067 entries in 366 plugins. A second scan builds every plugin with the new
+build script against a local path dependency and restores the corpus.
+
+| Stage | Compiled | Hybrid | No whole-entry bridge | Bridged |
+| :-- | --: | --: | --: | --: |
+| stage 5 record | 197 | 0 | 197 / 1,067 (18.46%) | 870 |
+| base `346b3de`, re-measured | 195 | 0 | 195 / 1,067 (18.27%) | 872 |
+| stage 6 | 195 | 41 | 236 / 1,067 (22.12%) | 831 |
+
+The same scan runs against base `346b3de` and stage 6: all 195 base scripts are
+byte-identical by md5, and stage 6 adds 41 hybrid scripts. Nothing that
+compiled before changed.
+
+No base entry moved to bridged, and no base entry moved to hybrid. The 41
+hybrid entries were bridged before.
+
+The 366-plugin build scan has one failure, `github-prs` at
+`src/main.rs:1034` E0283. It fails on base `main` too and is unrelated to this
+stage. Every other plugin builds with the generated `native.rs`.
+
+The 60% no-whole-entry-bridge target is not reachable inside the decided
+design. The measured blockers, counted by the first error in each bridged entry:
+
+| Blocker | Entries |
+| :-- | --: |
+| native candidate is not visible from the crate root (`pub(crate)` needed) | 109 |
+| native candidate takes `&mut`, whose writes would be lost | 78 |
+| native candidate returns a type that cannot be serialized | 76 |
+| unsupported method in the handler body itself | 66 |
+| blocking host-start acceptance read inside the handler body | 60 |
+| unknown local inside the handler body | 60 |
+| native candidate takes a type that cannot be deserialized | 43 |
+| unresolved call inside the handler body | 32 |
+| `vec!` of ops outside `Ok(...)` or a let | 31 |
+| unsupported expression in the handler body | 31 |
+
+The first three are signature gates, not missing translations. Supporting
+`&mut` would silently drop the writes. A `&Context` parameter is supported, but
+109 candidates sit in modules and are private, so the generated dispatch at the
+crate root cannot call them. The rest fail inside the handler body, where no
+function-level split can help.
+
+### Native call cost
+
+The native round trip was measured against a real hybrid helper: a small plugin
+with one `#[native] fn add(u64) -> u64`, driven by a request writer that mirrors
+the Luau side (write, rename, wait for the `native_result` line).
+
+| Surface | Round 1 | Round 2 | Round 3 |
+| :-- | --: | --: | --: |
+| uncached native call, median | 51.44 us | 49.12 us | 50.32 us |
+| uncached native call, p95 | 84.19 us | 71.88 us | 79.78 us |
+| helper cache hit (`cache_ms = 1000`), median | 52.50 us | 52.50 us | 52.50 us |
+
+A cached call on the Luau side performs no round trip at all. That is proven by
+`crates/luau/tests/native_boundary.rs`: two identical calls with `cache_ms`
+resume the handler from a single `native_result`. The helper cache still pays
+the transport when the Luau cache misses; it only avoids recomputing the
+function.
+
+For comparison, `spool_dispatch` (a whole bridged entry) measured 81.0 us and
+82.0 us in the same session. A hybrid handler with one uncached call therefore
+costs about 50 us on top of the compiled path, and a hybrid handler whose calls
+are cached runs at the fully compiled cost.
+
+### Runtime benchmark
+
+Three rounds of 300 samples, 30 warmups, same harness as stage 5.
+
+| Surface | Round 1 | Round 2 | Round 3 | Hand-written |
+| :-- | --: | --: | --: | --: |
+| `generated_hello_bar` compiled | 1.924 us | 1.873 us | 1.894 us | 1.883 / 1.873 / 1.894 us |
+| `generated_ui_panel` compiled | 10.800 us | 9.873 us | 9.744 us | 17.067 / 17.052 / 16.952 us |
+| `generated_event` compiled | 3.657 us | 3.647 us | 3.697 us | 3.922 / 3.627 / 3.577 us |
+| `spool_dispatch` | 82.0 us | 82.0 us | 81.0 us | |
+
+Ratios are 0.98x-1.00x / 1.58x-1.74x / 0.97x-1.07x. Generated source sizes are
+unchanged from stage 5, so the fully compiled path is byte-identical and the
+movement is host noise.
+
+### Exact commands
+
+```sh
+nix develop --command cargo run --release -p noctalia-bench --offline -- \
+  --samples 300 --warmup 30 --build-samples 1 --build-warmup 0 \
+  --report .tmp/stage6-round-1.json
+```
+
+The corpus is treated as read-only. The scan and its scratch files live in
+`.tmp`, and the corpus manifest, lock file, and every tracked file are restored
+and checked by md5 before the scan ends.
