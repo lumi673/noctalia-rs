@@ -3168,7 +3168,7 @@ impl<'a> Emitter<'a> {
         let method = call.method.to_string();
         if !matches!(
             method.as_str(),
-            "any" | "all" | "sum" | "count" | "for_each"
+            "any" | "all" | "sum" | "count" | "for_each" | "find" | "position"
         ) {
             return Ok(None);
         }
@@ -3180,6 +3180,44 @@ impl<'a> Emitter<'a> {
             }
             return Ok(None);
         };
+        if matches!(method.as_str(), "find" | "position")
+                && matches!(closure, Expr::Closure(_))
+            {
+            if method == "position" && is_iterator_adaptor(&call.receiver) {
+                return Err(Error::at(
+                    call.method.span(),
+                    "position after an iterator adaptor is not supported by the Luau compiler",
+                ));
+            }
+            let result = self.temp();
+            self.line(&format!("local {result}"));
+            let index = (method == "position").then(|| {
+                let index = self.temp();
+                self.line(&format!("local {index} = 0"));
+                index
+            });
+            let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                if let Some(index) = &index {
+                    emitter.line(&format!("{index} = {index} + 1"));
+                }
+                let (text, _) = emitter
+                    .invoke_arg(closure, std::slice::from_ref(&value.to_owned()))?;
+                emitter.line(&format!("if {text} then"));
+                emitter.indent = emitter.indent.saturating_add(1);
+                let found = index.as_deref().unwrap_or(value);
+                emitter.line(&format!("{result} = {found}"));
+                emitter.line("break");
+                emitter.indent = emitter.indent.saturating_sub(1);
+                emitter.line("end");
+                Ok(())
+            };
+            self.emit_iter(&call.receiver, &body)?;
+            let ty = if index.is_some() { Ty::OPT_INT } else { Ty::OPT_VALUE };
+            return Ok(Some((result, ty)));
+        }
+        if matches!(method.as_str(), "find" | "position") {
+            return Ok(None);
+        }
         let result = self.temp();
         let initial = match method.as_str() {
             "all" => "true",
@@ -3349,10 +3387,68 @@ impl<'a> Emitter<'a> {
                     let map = ty.base == Base::Table;
                     return self.emit_table(&source, false, map, body);
                 }
+                "copied" | "cloned" => {
+                    return self.emit_iter(&call.receiver, body);
+                }
                 "keys" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     let map = ty.base == Base::Table;
                     return self.emit_table(&source, true, map, body);
+                }
+                "skip" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let (count, _) = self.expr(arg(&args, 0, call)?)?;
+                    let remaining = self.temp();
+                    self.line(&format!("local {remaining} = {count}"));
+                    let inner = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                        emitter.line(&format!("if {remaining} > 0 then"));
+                        emitter.indent = emitter.indent.saturating_add(1);
+                        emitter.line(&format!("{remaining} = {remaining} - 1"));
+                        emitter.indent = emitter.indent.saturating_sub(1);
+                        emitter.line("else");
+                        emitter.indent = emitter.indent.saturating_add(1);
+                        body(emitter, value)?;
+                        emitter.indent = emitter.indent.saturating_sub(1);
+                        emitter.line("end");
+                        Ok(())
+                    };
+                    return self.emit_iter(&call.receiver, &inner);
+                }
+                "take" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let (count, _) = self.expr(arg(&args, 0, call)?)?;
+                    let left = self.temp();
+                    self.line(&format!("local {left} = {count}"));
+                    let inner = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                        emitter.line(&format!("if {left} <= 0 then break end"));
+                        emitter.line(&format!("{left} = {left} - 1"));
+                        body(emitter, value)
+                    };
+                    return self.emit_iter(&call.receiver, &inner);
+                }
+                "flatten" => {
+                    let (source, ty) = self.expr(&call.receiver)?;
+                    if ty.optional {
+                        return self.emit_table(
+                            &format!("({source} or {{}})"),
+                            false,
+                            false,
+                            body,
+                        );
+                    }
+                    if ty.base == Base::List {
+                        let inner = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                            emitter.emit_table(value, false, false, body)
+                        };
+                        return self.emit_iter(&call.receiver, &inner);
+                    }
+                }
+                "rsplit" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let (text, _) = self.expr(&call.receiver)?;
+                    let separator = self.expr(arg(&args, 0, call)?)?.0;
+                    let parts = Self::reverse_split(&text, &separator);
+                    return self.emit_table(&parts, false, false, body);
                 }
                 _ => {}
             },
@@ -3407,6 +3503,12 @@ impl<'a> Emitter<'a> {
             "(function() local __words = {{}}; for __word in string.gmatch({text}, \"%S+\") do __words[#__words + 1] = __word end; __words.__next = 1; return __words end)()"
         )
     }
+
+fn reverse_split(text: &str, separator: &str) -> String {
+    format!(
+        "(function() local __parts = string.split({text}, {separator}); local __out = {{}}; for __i = #__parts, 1, -1 do __out[#__out + 1] = __parts[__i] end; __out.__next = 1; return __out end)()"
+    )
+}
 
     fn split_lines(&self, text: &str) -> String {
         format!(
@@ -3567,6 +3669,185 @@ impl<'a> Emitter<'a> {
                 let other = self.expr(arg(&args, 0, call)?)?.0;
                 Ok((format!("math.floor({receiver} / {other})"), Ty::INT))
             }
+            "sin" | "cos" => Ok((format!("math.{method}({receiver})"), Ty::FLOAT)),
+            "is_infinite" => Ok((
+                format!(
+                    "({receiver} == math.huge or {receiver} == -math.huge)"
+                ),
+                Ty::BOOL,
+            )),
+            "is_ascii_hexdigit" => Ok((
+                format!("(string.find({receiver}, \"^[0-9A-Fa-f]$\") ~= nil)"),
+                Ty::BOOL,
+            )),
+            "rfind" => {
+                let needle = self.expr(arg(&args, 0, call)?)?.0;
+                if ty.base != Base::Str {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "rfind() needs a string receiver",
+                    ));
+                }
+                Ok((
+                    format!(
+                        "(function() local __s = {receiver}; local __i = string.find(__s, {needle}, 1, true); local __last; while __i do __last = __i - 1; __i = string.find(__s, {needle}, __i + 1, true) end; return __last end)()"
+                    ),
+                    Ty::OPT_INT,
+                ))
+            }
+            "split_once" => {
+                let separator = self.expr(arg(&args, 0, call)?)?.0;
+                if ty.base != Base::Str {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "split_once() needs a string receiver",
+                    ));
+                }
+                Ok((
+                    format!(
+                        "(function() local __s = {receiver}; local __at = string.find(__s, {separator}, 1, true); if not __at then return nil end; return {{ string.sub(__s, 1, __at - 1), string.sub(__s, __at + #{separator}) }} end)()"
+                    ),
+                    Ty::opt(Base::List),
+                ))
+            }
+            "rsplit" => {
+                let separator = self.expr(arg(&args, 0, call)?)?.0;
+                if ty.base != Base::Str {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "rsplit() needs a string receiver",
+                    ));
+                }
+                Ok((Self::reverse_split(&receiver, &separator), Ty::LIST))
+            }
+            "flatten" if ty.optional || ty.base == Base::List => {
+                if ty.optional && ty.base != Base::List {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "flatten() needs an optional list or a list of lists",
+                    ));
+                }
+                if ty.optional {
+                    Ok((format!("({receiver} or {{}})"), Ty::LIST))
+                } else {
+                    Ok((receiver, Ty::LIST))
+                }
+            }
+            "skip" if ty.base == Base::List && !ty.optional => {
+                let count = self.expr(arg(&args, 0, call)?)?.0;
+                Ok((
+                    format!(
+                        "(function() local __out = {{}}; local __n = math.max(0, {count}); for __i = __n + 1, #{receiver} do __out[#__out + 1] = {receiver}[__i] end; __out.__next = 1; return __out end)()"
+                    ),
+                    Ty::LIST,
+                ))
+            }
+            "take" if ty.base == Base::List && !ty.optional => {
+                let count = self.expr(arg(&args, 0, call)?)?.0;
+                Ok((
+                    format!(
+                        "(function() local __out = {{}}; local __n = math.min(math.max(0, {count}), #{receiver}); for __i = 1, __n do __out[#__out + 1] = {receiver}[__i] end; __out.__next = 1; return __out end)()"
+                    ),
+                    Ty::LIST,
+                ))
+            }
+            "extend_from_slice" => {
+                let (value, _) = self.expr(arg(&args, 0, call)?)?;
+                let item = self.temp();
+                self.line(&format!(
+                    "for _, {item} in ipairs({value}) do table.insert({receiver}, {item}) end"
+                ));
+                Ok((String::new(), Ty::VOID))
+            }
+            "trunc" => Ok((
+                format!(
+                    "(({receiver} >= 0) and math.floor({receiver}) or math.ceil({receiver}))"
+                ),
+                Ty::FLOAT,
+            )),
+            "truncate" if ty.base == Base::List && !ty.optional => {
+                let length = self.expr(arg(&args, 0, call)?)?.0;
+                self.line(&format!(
+                    "for __i = #{receiver}, ({length}) + 1, -1 do table.remove({receiver}, __i) end"
+                ));
+                Ok((String::new(), Ty::VOID))
+            }
+            "match_indices" if ty.base == Base::Str => {
+                let needle = self.expr(arg(&args, 0, call)?)?.0;
+                Ok((
+                    format!(
+                        "(function() local __s, __needle = {receiver}, {needle}; local __out = {{}}; local __at = string.find(__s, __needle, 1, true); while __at do __out[#__out + 1] = {{ __at - 1, string.sub(__s, __at, __at + #__needle - 1) }}; __at = string.find(__s, __needle, __at + 1, true) end; return __out end)()"
+                    ),
+                    Ty::LIST,
+                ))
+            }
+            "retain" => {
+                let closure = arg(&args, 0, call)?;
+                let arity = match closure {
+                    Expr::Closure(closure) => closure.inputs.len(),
+                    _ => 1,
+                };
+                if ty.base == Base::Table {
+                    if arity != 2 {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "retain() on a map needs a closure with key and value",
+                        ));
+                    }
+                    let key = self.temp();
+                    let value = self.temp();
+                    self.line(&format!(
+                        "for {key}, {value} in pairs({receiver}) do"
+                    ));
+                    self.indent = self.indent.saturating_add(1);
+                    let (text, _) = self.invoke_arg(
+                        closure,
+                        &[key.clone(), value.clone()],
+                    )?;
+                    self.line(&format!(
+                        "if not ({text}) then {receiver}[{key}] = nil end"
+                    ));
+                    self.indent = self.indent.saturating_sub(1);
+                    self.line("end");
+                } else if ty.base == Base::List {
+                    if arity != 1 {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "retain() on a list needs a closure with one argument",
+                        ));
+                    }
+                    let index = self.temp();
+                    self.line(&format!(
+                        "for {index} = #{receiver}, 1, -1 do"
+                    ));
+                    self.indent = self.indent.saturating_add(1);
+                    let item = self.temp();
+                    self.line(&format!("local {item} = {receiver}[{index}]"));
+                    let (text, _) =
+                        self.invoke_arg(closure, std::slice::from_ref(&item))?;
+                    self.line(&format!(
+                        "if not ({text}) then table.remove({receiver}, {index}) end"
+                    ));
+                    self.indent = self.indent.saturating_sub(1);
+                    self.line("end");
+                } else {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "retain() needs a list or map receiver",
+                    ));
+                }
+                Ok((String::new(), Ty::VOID))
+            }
+            "sort_by" | "sort_unstable_by" | "sort_by_key" => {
+                Err(Error::at(
+                    call.method.span(),
+                    format!("`{method}` needs a Rust comparator and is not supported by the Luau compiler"),
+                ))
+            }
+            "entry" => Err(Error::at(
+                call.method.span(),
+                "HashMap entry API is not supported by the Luau compiler",
+            )),
             "round" => Ok((format!("math.round({receiver})"), Ty::FLOAT)),
             "then_some" => {
                 let value = self.expr(arg(&args, 0, call)?)?.0;
@@ -6876,6 +7157,16 @@ fn strip_reference(expr: &Expr) -> &Expr {
         Expr::Group(group) => strip_reference(&group.expr),
         other => other,
     }
+}
+
+fn is_iterator_adaptor(expr: &Expr) -> bool {
+    let Expr::MethodCall(call) = strip_reference(expr) else {
+        return false;
+    };
+    matches!(
+        call.method.to_string().as_str(),
+        "map" | "filter" | "filter_map" | "take" | "skip" | "flatten" | "rsplit"
+    )
 }
 
 type IfChain<'a> = (Vec<(&'a Expr, &'a syn::Block)>, Option<&'a Expr>);

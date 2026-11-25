@@ -3915,3 +3915,89 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let condition = source.find("if ready then return __t1").expect("guard");
     assert!(value < condition, "{source}");
 }
+
+#[test]
+fn compiles_exact_iterator_and_string_methods() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let values = vec![1, 2, 3];
+    let found = values.iter().find(|value| **value == 2).is_some();
+    let position = values.iter().position(|value| **value == 3).unwrap_or(0);
+    let tail: Vec<i64> = values.iter().skip(1).take(1).copied().collect();
+    let parts: Vec<&str> = "a/b/c".rsplit('/').collect();
+    let pair = "name=value".split_once('=').is_some();
+    let last = "left:right".rfind(':').unwrap_or(0);
+    let mut header = vec!["a".to_owned()];
+    header.extend_from_slice(&["b".to_owned()]);
+    let tail_len = tail.len();
+    let parts_len = parts.len();
+    let header_len = header.len();
+    Ok(vec![Op::log(format!("{found} {position} {tail_len} {parts_len} {pair} {last} {header_len}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("break"), "{}", compiled.source);
+    assert!(compiled.source.contains("string.split"), "{}", compiled.source);
+    assert!(compiled.source.contains("table.insert"), "{}", compiled.source);
+}
+
+#[test]
+fn compiles_flatten_math_and_character_methods() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let nested: Option<Vec<i64>> = Some(vec![1, 2]);
+    let mut total = 0;
+    for value in nested.into_iter().flatten() {
+        total += value;
+    }
+    let text = "abc";
+    let hex = text.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let wave = (1.0_f64).sin() + (1.0_f64).cos();
+    let infinite = wave.is_infinite();
+    let whole = wave.trunc();
+    let mut rows = vec![1, 2, 3];
+    rows.retain(|value| *value > 1);
+    rows.truncate(1);
+    let rows_len = rows.len();
+    Ok(vec![Op::log(format!("{total} {hex} {infinite} {whole} {rows_len}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("math.sin"), "{}", compiled.source);
+    assert!(compiled.source.contains("math.cos"), "{}", compiled.source);
+    assert!(compiled.source.contains("table.remove"), "{}", compiled.source);
+}
+
+#[test]
+fn compiles_match_indices_in_a_tuple_loop() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut found = 0;
+    for (index, text) in "one\ntwo".match_indices('\n') {
+        found += index + text.len();
+    }
+    Ok(vec![Op::log(format!("{found}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("string.find"), "{}", compiled.source);
+}
+
+#[test]
+fn bails_on_comparators_and_type_erased_maps() {
+    for handler in [
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let mut values = vec![2, 1]; values.sort_by(|a, b| a.cmp(b)); Ok(vec![]) }",
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let cell = once_cell(); cell.get_or_init(|| 1); Ok(vec![]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("bail");
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
