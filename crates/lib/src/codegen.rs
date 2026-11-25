@@ -59,7 +59,12 @@ pub fn emit(plugin: &Plugin, dir: &Path, helper: &str) -> io::Result<()> {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(target, content)?;
+        fs::write(&target, content)?;
+        #[cfg(unix)]
+        if let Some(mode) = plugin.asset_modes.get(path) {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(*mode))?;
+        }
     }
     if plugin
         .entries
@@ -955,6 +960,26 @@ mod tests {
 
         assert!(russian.contains("Привет"));
         assert_eq!(icon, b"<svg />");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_emit_preserves_an_asset_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            env::temp_dir().join(format!("noctalia-mode-{}", process::id()));
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .asset_with_mode("tools/run.sh", b"#!/bin/sh\n", 0o755);
+
+        emit(&plugin, &dir, "helper").expect("emit");
+        let mode = fs::metadata(dir.join("tools/run.sh"))
+            .expect("asset")
+            .permissions()
+            .mode();
+        fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert_eq!(mode & 0o777, 0o755);
     }
     #[test]
     fn test_plugin_level_settings_use_root_table() {

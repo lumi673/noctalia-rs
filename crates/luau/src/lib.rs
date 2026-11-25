@@ -27,13 +27,22 @@ struct Runtime {
 }
 
 impl Runtime {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the strict flag travels with the entry"
+    )]
     fn start(
         ctx: &Context,
         sources: &[(&str, &str)],
         script: (&str, &str),
+        strict: bool,
     ) -> Result<(Self, Vec<Op>)> {
         let (name, source) = script;
-        let host = Arc::new(Host::new(ctx, sources));
+        let host = Arc::new(if strict {
+            Host::new_strict(ctx, sources)
+        } else {
+            Host::new(ctx, sources)
+        });
         let lua = Lua::new();
         lua.set_app_data(Arc::clone(&host));
         register_sources(&lua, sources)?;
@@ -42,7 +51,12 @@ impl Runtime {
         if let Err(error) = lua.load(source).set_name(name).exec() {
             return Err(format!("{name}: {}", traceback(&lua, &error)).into());
         }
-
+        if strict && defines_host_callback(&lua) {
+            return Err(format!(
+                "{name}: strict emit defines `onHostCallback`, which plugin API 57 does not have"
+            )
+            .into());
+        }
         let runtime = Self {
             host,
             lua,
@@ -140,10 +154,14 @@ fn runtime_cache() -> &'static Mutex<HashMap<String, SharedRuntime>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cache_key(ctx: &Context, name: &str, source: &str) -> String {
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the strict flag keeps strict runtimes out of the auto cache"
+)]
+fn cache_key(ctx: &Context, name: &str, source: &str, strict: bool) -> String {
     let pointer = source.as_ptr() as usize;
     format!(
-        "{}:{}:{name}:{pointer:x}:{}",
+        "{}:{}:{name}:{pointer:x}:{}:{strict}",
         ctx.entry,
         ctx.data_dir.to_string_lossy(),
         source.len()
@@ -185,9 +203,23 @@ fn normalize_require(base: &str, name: &str) -> String {
     }
     parts.join("/")
 }
+fn defines_host_callback(lua: &Lua) -> bool {
+    lua.globals()
+        .get::<LuaValue>("onHostCallback")
+        .is_ok_and(|value| !matches!(value, LuaValue::Nil))
+}
+
 pub fn dispatch(ctx: &Context, sources: &[(&str, &str)]) -> Result<Vec<Op>> {
     let entry = ctx.entry.clone();
-    dispatch_named(ctx, sources, &entry)
+    dispatch_named(ctx, sources, &entry, false)
+}
+
+pub fn dispatch_strict(
+    ctx: &Context,
+    sources: &[(&str, &str)],
+) -> Result<Vec<Op>> {
+    let entry = ctx.entry.clone();
+    dispatch_named(ctx, sources, &entry, true)
 }
 
 pub fn dispatch_entry(
@@ -195,13 +227,26 @@ pub fn dispatch_entry(
     sources: &[(&str, &str)],
     entry: &str,
 ) -> Result<Vec<Op>> {
-    dispatch_named(ctx, sources, entry)
+    dispatch_named(ctx, sources, entry, false)
 }
 
+pub fn dispatch_entry_strict(
+    ctx: &Context,
+    sources: &[(&str, &str)],
+    entry: &str,
+) -> Result<Vec<Op>> {
+    dispatch_named(ctx, sources, entry, true)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the strict flag selects the runtime contract"
+)]
 fn dispatch_named(
     ctx: &Context,
     sources: &[(&str, &str)],
     entry: &str,
+    strict: bool,
 ) -> Result<Vec<Op>> {
     if sources.is_empty() {
         return Ok(Vec::new());
@@ -209,14 +254,15 @@ fn dispatch_named(
     let Some((name, source)) = entry_source(entry, sources) else {
         return Err(format!("unknown entry {entry}").into());
     };
-    let key = cache_key(ctx, name, source);
+    let key = cache_key(ctx, name, source, strict);
     let cache = runtime_cache();
     let runtime = {
         let mut cache = locked(cache);
         if let Some(runtime) = cache.get(&key) {
             Arc::clone(runtime)
         } else {
-            let (runtime, ops) = Runtime::start(ctx, sources, (name, source))?;
+            let (runtime, ops) =
+                Runtime::start(ctx, sources, (name, source), strict)?;
             let runtime = Arc::new(Mutex::new(runtime));
             cache.insert(key, Arc::clone(&runtime));
             return Ok(ops);

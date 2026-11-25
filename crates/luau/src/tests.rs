@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::callback::{callback_args, callback_for_event};
 use crate::dispatch;
+use crate::dispatch_strict;
 use crate::host::Host;
 use noctalia_rs::{Context, Parts, api};
 use serde_json::{Value, json};
@@ -889,4 +890,140 @@ end
 "#);
     let results = find(&values, "launcher_results");
     assert_eq!(results["rows"], json!([]));
+}
+
+fn strict_error(source: &str) -> String {
+    let ctx = context(empty_fixture("update"));
+    dispatch_strict(&ctx, &[("entry", source)])
+        .expect_err("strict dispatch fails")
+        .to_string()
+}
+
+#[test]
+fn strict_emit_rejects_a_marker_table_where_a_function_is_required() {
+    let error = strict_error(
+        r#"
+noctalia.http({ url = "https://example.invalid/" }, { __host_callback = "onResponse" })
+"#,
+    );
+    assert!(error.contains("API 57 takes a function"), "{error}");
+}
+
+#[test]
+fn strict_emit_rejects_the_compiler_marker_table() {
+    let error = strict_error(
+        r#"
+noctalia.runAsync({ "echo", "hi" }, { __call = "onDone" })
+"#,
+    );
+    assert!(error.contains("API 57 takes a function"), "{error}");
+}
+
+#[test]
+fn strict_emit_rejects_a_marker_table_on_a_generic_member() {
+    let error = strict_error(
+        r#"
+noctalia.idle.watch("idle", { __host_callback = "onIdle" })
+"#,
+    );
+    assert!(error.contains("marker table"), "{error}");
+}
+
+#[test]
+fn strict_emit_rejects_on_host_callback() {
+    let error = strict_error(
+        r#"
+function onHostCallback(payload)
+  noctalia.log(payload.id)
+end
+"#,
+    );
+    assert!(error.contains("onHostCallback"), "{error}");
+}
+
+#[test]
+fn auto_keeps_accepting_marker_tables() {
+    let values = run(r#"
+noctalia.runStream({ "tail", "-f" }, { __host_callback = "watch" })
+"#);
+    let stream = find(&values, "host_call");
+    assert_eq!(stream["args"][1]["__host_callback"], "watch");
+}
+
+#[test]
+fn strict_accepts_a_real_closure_and_the_later_event_reaches_it() {
+    const SOURCE: &str = r#"
+noctalia.http({ url = "https://example.invalid/" }, function(response)
+    noctalia.log(response.body)
+end)
+"#;
+    let ctx = context(empty_fixture("update"));
+    let ops =
+        dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("strict dispatch");
+    let value = serde_json::to_value(&ops[0]).expect("serialize");
+    let id = value["args"][1]["__host_callback"]
+        .as_str()
+        .expect("callback id")
+        .to_owned();
+
+    let mut callback = empty_fixture("host_callback");
+    callback.payload = json!({ "id": id, "args": [{ "body": "later" }] });
+    let ctx = context(callback);
+    let ops =
+        dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("callback dispatch");
+    let log = serde_json::to_value(&ops[0]).expect("serialize");
+    assert_eq!(log["op"], "log");
+    assert_eq!(log["message"], "later");
+}
+
+#[test]
+fn strict_response_registry_serves_read_and_remove() {
+    const SOURCE: &str = r#"
+local path = "/data/entry/reply.json"
+assert(noctalia.writeFile(path, "{\"ok\":true}"))
+local text = noctalia.readFile(path)
+assert(text == "{\"ok\":true}", tostring(text))
+assert(noctalia.removeFile(path))
+assert(noctalia.readFile(path) == nil)
+"#;
+    let ctx = context(empty_fixture("update"));
+    dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("strict dispatch");
+}
+
+#[test]
+fn auto_does_not_use_the_strict_response_registry() {
+    const SOURCE: &str = r#"
+local path = "/data/entry/reply.json"
+local ok = noctalia.writeFile(path, "body")
+assert(ok == nil, tostring(ok))
+assert(noctalia.readFile(path) == nil)
+"#;
+    let ctx = context(empty_fixture("update"));
+    dispatch(&ctx, &[("entry", SOURCE)]).expect("auto dispatch");
+}
+
+#[test]
+fn http_reports_offline_mode_and_emits_no_request() {
+    let mut fixture = empty_fixture("update");
+    fixture.host = json!({ "setting": { "shell.offline_mode": true } });
+    let ctx = context(fixture);
+    let ops = dispatch(
+        &ctx,
+        &[(
+            "entry",
+            r#"assert(noctalia.http({ url = "https://example.invalid/" }, function() end) == false)"#,
+        )],
+    )
+    .expect("dispatch");
+    assert!(ops.is_empty(), "{ops:?}");
+}
+
+#[test]
+fn run_start_rejects_a_command_it_cannot_describe() {
+    let values = run(r#"
+assert(noctalia.runAsync({}) == false)
+assert(noctalia.runAsync({ "echo", 3 }) == false)
+assert(noctalia.runStream("", function() end) == false)
+"#);
+    assert!(values.is_empty(), "{values:?}");
 }
