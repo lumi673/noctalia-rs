@@ -11,8 +11,8 @@ use syn::{
 
 use crate::program::{Program, typed_args};
 use crate::{
-    Error, NativeFn, NativeMode, NativeParam, NativeParamKind, is_context,
-    is_identifier, is_luau_keyword, quote, sanitize,
+    Error, NativeFn, NativeMode, NativeParam, NativeParamKind, NativePass,
+    is_context, is_identifier, is_luau_keyword, quote, sanitize,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -730,6 +730,30 @@ impl<'a> Emitter<'a> {
                 return Err(error);
             }
         };
+        let exported = matches!(
+            helper.function.vis,
+            syn::Visibility::Public(_) | syn::Visibility::Restricted(_)
+        );
+        if !exported && helper.module != self.program.root() {
+            let mut error = Error::at(
+                helper.function.sig.ident.span(),
+                format!(
+                    "native function `{}` must be `pub(crate)` so the generated dispatch can call it",
+                    helper.function.sig.ident
+                ),
+            );
+            error.fatal = forced;
+            if helper.module != self.home {
+                error = error.with_file(&helper.module);
+            }
+            return Err(error);
+        }
+        if !forced && let Err(mut error) = self.json_ready(helper) {
+            if helper.module != self.home {
+                error = error.with_file(&helper.module);
+            }
+            return Err(error);
+        }
         let item = NativeFn {
             name: native_key(helper),
             module: helper.module.clone(),
@@ -745,6 +769,85 @@ impl<'a> Emitter<'a> {
         };
         self.native_found.insert(item.name.clone(), item.clone());
         Ok(item)
+    }
+
+    /// Auto-splitting only crosses types the build can prove are JSON-ready.
+    /// `#[native]` skips this and leaves the trait check to `rustc`.
+    fn json_ready(&self, helper: &Helper) -> Result<(), Error> {
+        for (pattern, ty) in typed_args(&helper.function) {
+            if is_context(ty) {
+                continue;
+            }
+            let ready = match ty {
+                Type::Reference(reference) => json_ready_type(
+                    self.program,
+                    &helper.module,
+                    &reference.elem,
+                    Direction::Deserialize,
+                ),
+                Type::Path(path)
+                    if path
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|segment| segment.ident == "Option") =>
+                {
+                    match generic_arg(ty) {
+                        Some(Type::Reference(reference)) => json_ready_type(
+                            self.program,
+                            &helper.module,
+                            &reference.elem,
+                            Direction::Deserialize,
+                        ),
+                        _ => json_ready_type(
+                            self.program,
+                            &helper.module,
+                            ty,
+                            Direction::Deserialize,
+                        ),
+                    }
+                }
+                _ => json_ready_type(
+                    self.program,
+                    &helper.module,
+                    ty,
+                    Direction::Deserialize,
+                ),
+            };
+            if !ready {
+                return Err(Error::at(
+                    pattern.span(),
+                    format!(
+                        "native function `{}` has a parameter type `{}` that cannot be proven to deserialize from JSON; derive `Deserialize` or mark the function `#[native]`",
+                        helper.function.sig.ident,
+                        type_text(ty)
+                    ),
+                ));
+            }
+        }
+        if let syn::ReturnType::Type(_, ty) = &helper.function.sig.output {
+            let success = if is_result(ty) {
+                generic_arg(ty).unwrap_or(ty)
+            } else {
+                ty
+            };
+            if !json_ready_type(
+                self.program,
+                &helper.module,
+                success,
+                Direction::Serialize,
+            ) {
+                return Err(Error::at(
+                    ty.span(),
+                    format!(
+                        "native function `{}` has a return type `{}` that cannot be proven to serialize to JSON; derive `Serialize` or mark the function `#[native]`",
+                        helper.function.sig.ident,
+                        type_text(success)
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn native_call(
@@ -7330,6 +7433,83 @@ fn native_signature(function: &ItemFn) -> Result<Vec<NativeParam>, Error> {
     Ok(params)
 }
 
+#[derive(Clone, Copy)]
+enum Direction {
+    Serialize,
+    Deserialize,
+}
+
+/// Conservative check that a type can cross the JSON boundary.
+fn json_ready_type(
+    program: &Program,
+    module: &str,
+    ty: &Type,
+    direction: Direction,
+) -> bool {
+    const SCALARS: &[&str] = &[
+        "String", "str", "bool", "char", "i8", "i16", "i32", "i64", "i128",
+        "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
+        "Value", "PathBuf", "Path", "OsString", "OsStr",
+    ];
+    const CONTAINERS: &[&str] = &[
+        "Vec", "VecDeque", "Option", "HashMap", "BTreeMap", "HashSet",
+        "BTreeSet", "Box", "Arc", "Rc", "Cow", "Result",
+    ];
+    match ty {
+        Type::Path(path) => {
+            let Some(segment) = path.path.segments.last() else {
+                return false;
+            };
+            let name = segment.ident.to_string();
+            if SCALARS.contains(&name.as_str()) {
+                return true;
+            }
+            if CONTAINERS.contains(&name.as_str()) {
+                let PathArguments::AngleBracketed(arguments) =
+                    &segment.arguments
+                else {
+                    return name == "Vec" || name == "Option";
+                };
+                return arguments.args.iter().all(|argument| {
+                    let syn::GenericArgument::Type(inner) = argument else {
+                        return matches!(
+                            argument,
+                            syn::GenericArgument::Lifetime(_)
+                        );
+                    };
+                    json_ready_type(program, module, inner, direction)
+                });
+            }
+            program
+                .struct_def(module, &name)
+                .is_some_and(|def| match direction {
+                    Direction::Serialize => def.derives_serialize,
+                    Direction::Deserialize => def.derives_deserialize,
+                })
+        }
+        Type::Slice(slice) => {
+            json_ready_type(program, module, &slice.elem, direction)
+        }
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .all(|item| json_ready_type(program, module, item, direction)),
+        Type::Paren(paren) => {
+            json_ready_type(program, module, &paren.elem, direction)
+        }
+        Type::Group(group) => {
+            json_ready_type(program, module, &group.elem, direction)
+        }
+        // A returned reference serializes; a deserialized one cannot.
+        Type::Reference(reference)
+            if matches!(direction, Direction::Serialize) =>
+        {
+            json_ready_type(program, module, &reference.elem, direction)
+        }
+        _ => false,
+    }
+}
+
 /// Maps one declared parameter to the local the dispatch needs.
 fn native_param(
     name: String,
@@ -7340,61 +7520,110 @@ fn native_param(
         name,
         kind: NativeParamKind::Value,
         owned: None,
-        borrow: false,
-        slice: false,
+        pass: NativePass::Value,
     };
     if is_context(ty) {
         param.kind = NativeParamKind::Context;
         return Ok(param);
     }
-    let Type::Reference(reference) = ty else {
-        if matches!(ty, Type::ImplTrait(_)) {
-            return Err(Error::at(
-                ty.span(),
-                format!(
-                    "native function `{function}` parameters cannot be `impl Trait`; name the type"
-                ),
-            ));
+    if matches!(ty, Type::ImplTrait(_)) {
+        return Err(Error::at(
+            ty.span(),
+            format!(
+                "native function `{function}` parameters cannot be `impl Trait`; name the type"
+            ),
+        ));
+    }
+    if let Type::Path(path) = ty
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Option")
+        && let Some(inner) = generic_arg(ty)
+    {
+        if let Type::Reference(reference) = inner {
+            if reference.mutability.is_some() {
+                return Err(mutable_reference(ty, function));
+            }
+            if matches!(&*reference.elem, Type::Reference(_)) {
+                return Err(nested_reference(ty, function));
+            }
+            let (owned, pass) = optional_reference_local(&reference.elem);
+            param.owned = owned.map(|ty| format!("Option<{ty}>"));
+            param.pass = pass;
+            return Ok(param);
         }
+        return Ok(param);
+    }
+    let Type::Reference(reference) = ty else {
         return Ok(param);
     };
     if reference.mutability.is_some() {
-        return Err(Error::at(
-            ty.span(),
-            format!(
-                "native function `{function}` cannot take `&mut` parameters; changes would be lost"
-            ),
-        ));
+        return Err(mutable_reference(ty, function));
     }
     if matches!(&*reference.elem, Type::Reference(_)) {
-        return Err(Error::at(
-            ty.span(),
-            format!(
-                "native function `{function}` cannot take nested references"
-            ),
-        ));
+        return Err(nested_reference(ty, function));
     }
-    param.borrow = true;
-    let owned = match &*reference.elem {
-        Type::Slice(_) => {
-            param.slice = true;
-            Some("Vec<_>".to_owned())
-        }
-        inner => match type_text(inner).as_str() {
-            "str" | "String" => Some("String".to_owned()),
-            "Path" | "PathBuf" => Some("PathBuf".to_owned()),
-            "Vec" => {
-                param.slice = true;
-                Some("Vec<_>".to_owned())
+    let (owned, pass) = reference_local(&reference.elem);
+    param.owned = owned;
+    param.pass = pass;
+    Ok(param)
+}
+
+fn mutable_reference(ty: &Type, function: &str) -> Error {
+    Error::at(
+        ty.span(),
+        format!(
+            "native function `{function}` cannot take `&mut` parameters; changes would be lost"
+        ),
+    )
+}
+
+fn nested_reference(ty: &Type, function: &str) -> Error {
+    Error::at(
+        ty.span(),
+        format!("native function `{function}` cannot take nested references"),
+    )
+}
+
+/// The owned local and pass mode for the inner `&T` of `Option<&T>`.
+fn optional_reference_local(inner: &Type) -> (Option<String>, NativePass) {
+    match inner {
+        Type::Slice(_) => (Some("Vec<_>".to_owned()), NativePass::AsDeref),
+        _ => match type_text(inner).as_str() {
+            "str" | "Path" | "PathBuf" => {
+                let owned = if type_text(inner) == "str" {
+                    "String"
+                } else {
+                    "PathBuf"
+                };
+                (Some(owned.to_owned()), NativePass::AsDeref)
             }
+            "String" => (Some("String".to_owned()), NativePass::AsRef),
+            "Vec" => (Some("Vec<_>".to_owned()), NativePass::AsRef),
+            _ => (None, NativePass::AsRef),
+        },
+    }
+}
+
+/// The owned local and pass mode for a `&T` parameter.
+fn reference_local(inner: &Type) -> (Option<String>, NativePass) {
+    let owned = match inner {
+        Type::Slice(_) => Some("Vec<_>".to_owned()),
+        _ => match type_text(inner).as_str() {
+            "str" => Some("String".to_owned()),
+            "String" => Some("String".to_owned()),
+            "Path" | "PathBuf" => Some("PathBuf".to_owned()),
+            "Vec" => Some("Vec<_>".to_owned()),
             _ => None,
         },
     };
-    param.owned = owned;
-    if param.slice {
-        param.borrow = false;
-    }
-    Ok(param)
+    let pass = match (inner, owned.as_deref()) {
+        (Type::Slice(_), _) | (_, Some("Vec<_>")) => NativePass::Slice,
+        _ => NativePass::Ref,
+    };
+    (owned, pass)
 }
 
 #[derive(Default)]

@@ -4632,11 +4632,10 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert_eq!(params.len(), 2);
     assert_eq!(params[0].name, "path");
     assert_eq!(params[0].owned.as_deref(), Some("String"));
-    assert!(params[0].borrow);
+    assert_eq!(params[0].pass, crate::NativePass::Ref);
     assert_eq!(params[1].name, "items");
     assert_eq!(params[1].owned.as_deref(), Some("Vec<_>"));
-    assert!(params[1].slice);
-    assert!(!params[1].borrow);
+    assert_eq!(params[1].pass, crate::NativePass::Slice);
 }
 
 #[test]
@@ -4743,4 +4742,102 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "{}",
         compiled.source
     );
+}
+
+#[test]
+fn native_optional_references_use_owned_optionals() {
+    let handler = r#"
+fn truthy(value: Option<&Value>) -> bool {
+    let _ = std::fs::read_to_string("/tmp/x");
+    value.is_some()
+}
+
+fn text(value: Option<&str>) -> String {
+    let _ = std::fs::read_to_string("/tmp/x");
+    value.unwrap_or("").to_owned()
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = truthy(ctx.payload.get("value"));
+    let label = text(ctx.payload.get("label").and_then(|item| item.as_str()));
+    Ok(vec![Op::log(format!("{flag}{label}"))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    let truthy = compiled
+        .native
+        .iter()
+        .find(|item| item.name == "main::truthy")
+        .expect("truthy native");
+    assert_eq!(truthy.params[0].owned, None);
+    assert_eq!(truthy.params[0].pass, crate::NativePass::AsRef);
+
+    let text = compiled
+        .native
+        .iter()
+        .find(|item| item.name == "main::text")
+        .expect("text native");
+    assert_eq!(text.params[0].owned.as_deref(), Some("Option<String>"));
+    assert_eq!(text.params[0].pass, crate::NativePass::AsDeref);
+}
+
+#[test]
+fn a_private_module_helper_needs_crate_visibility_to_split() {
+    let main = r#"
+mod widget;
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(widget::load())])
+}
+"#;
+    let widget = r#"
+fn load() -> String {
+    let text = std::fs::read_to_string("/tmp/x").unwrap_or_default();
+    text
+}
+"#;
+    let modules = [Module {
+        path: "widget",
+        source: widget,
+    }];
+    let error = compile(
+        &source(main),
+        &native_options_with("handler", EntryKind::Widget, &modules),
+    )
+    .expect_err("private helpers cannot be called from the crate root");
+    assert!(error.message.contains("pub(crate)"), "{error}");
+
+    let public = widget.replace("fn load()", "pub(crate) fn load()");
+    let modules = [Module {
+        path: "widget",
+        source: &public,
+    }];
+    let compiled = compile(
+        &source(main),
+        &native_options_with("handler", EntryKind::Widget, &modules),
+    )
+    .expect("visible helper splits");
+    assert_eq!(compiled.native[0].name, "widget::load");
+}
+
+fn native_options_with<'a>(
+    handler: &'a str,
+    kind: EntryKind,
+    modules: &'a [Module<'a>],
+) -> Options<'a> {
+    Options {
+        handler,
+        entry: "widget",
+        state_key: "hello.state",
+        kind,
+        strings: &["message", "name"],
+        settings: &["message", "name"],
+        module: "main",
+        modules,
+        native: NativeMode::Allow,
+    }
 }

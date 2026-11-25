@@ -775,6 +775,16 @@ fn write_native(
     path: &Path,
     natives: &std::collections::BTreeMap<String, compiler::NativeFn>,
 ) -> Result<(), BoxError> {
+    let needs_pathbuf = natives.values().any(|item| {
+        item.params
+            .iter()
+            .any(|param| param.owned.as_deref() == Some("PathBuf"))
+    });
+    let needs_option_ref = natives.values().any(|item| {
+        item.params
+            .iter()
+            .any(|param| param.pass == compiler::NativePass::AsRef)
+    });
     let mut out = String::from(concat!(
         "// Native functions that run in the helper process.\n",
         "//\n",
@@ -783,19 +793,19 @@ fn write_native(
         "// implement `Display`.\n",
         "mod __noctalia_native {\n",
         "    use serde_json::Value;\n",
-        "\n",
-        "    fn argument<T: serde::de::DeserializeOwned>(\n",
-        "        args: &Value,\n",
-        "        name: &str,\n",
-        "    ) -> Result<T, String> {\n",
-        "        let value = args.get(name).cloned().unwrap_or(Value::Null);\n",
-        "        serde_json::from_value(value)\n",
-        "            .map_err(|error| format!(\"{name}: {error}\"))\n",
-        "    }\n",
-        "\n",
-        "    fn value<T: serde::Serialize>(value: T) -> Result<Value, String> {\n",
-        "        serde_json::to_value(value).map_err(|error| error.to_string())\n",
-        "    }\n",
+    ));
+    if needs_pathbuf {
+        out.push_str("    use std::path::PathBuf;\n");
+    }
+    if needs_option_ref {
+        out.push_str(concat!(
+            "\n",
+            "    fn option_ref<T>(value: &Option<T>) -> Option<&T> {\n",
+            "        value.as_ref()\n",
+            "    }\n",
+        ));
+    }
+    out.push_str(concat!(
         "\n",
         "    pub(crate) fn dispatch(\n",
         "        name: &str,\n",
@@ -805,11 +815,6 @@ fn write_native(
         "        let _ = context;\n",
         "        match name {\n",
     ));
-    let needs_pathbuf = natives.values().any(|item| {
-        item.params
-            .iter()
-            .any(|param| param.owned.as_deref() == Some("PathBuf"))
-    });
     for item in natives.values() {
         let mut rust_path = String::from("crate::");
         if item.module != "main" {
@@ -830,12 +835,12 @@ fn write_native(
                 continue;
             }
             let name = &param.name;
-            args.push(if param.slice {
-                format!("&{name}[..]")
-            } else if param.borrow {
-                format!("&{name}")
-            } else {
-                name.clone()
+            args.push(match param.pass {
+                compiler::NativePass::Value => name.clone(),
+                compiler::NativePass::Ref => format!("&{name}"),
+                compiler::NativePass::Slice => format!("&{name}[..]"),
+                compiler::NativePass::AsRef => format!("option_ref(&{name})"),
+                compiler::NativePass::AsDeref => format!("{name}.as_deref()"),
             });
         }
         let args = args.join(", ");
@@ -852,35 +857,36 @@ fn write_native(
                 continue;
             }
             let name = &param.name;
-            let declared = param.owned.as_deref().unwrap_or("_");
+            let declared = param
+                .owned
+                .as_deref()
+                .map_or_else(String::new, |ty| format!(": {ty} "));
             let _ = writeln!(
                 out,
-                "                let {name}: {declared} = argument(&args, {})?;",
-                quote(name)
+                "                let {name}{declared}= serde_json::from_value(args.get({}).cloned().unwrap_or(Value::Null)).map_err(|error| format!(\"{}: {{error}}\"))?;",
+                quote(name),
+                name
             );
         }
         if item.result {
             let _ =
                 writeln!(out, "                match {rust_path}({args}) {{");
-            let _ =
-                writeln!(out, "                    Ok(value) => value(value),");
+            let _ = writeln!(
+                out,
+                "                    Ok(value) => serde_json::to_value(value).map_err(|error| error.to_string()),"
+            );
             let _ = writeln!(
                 out,
                 "                    Err(error) => Err(error.to_string()),"
             );
             let _ = writeln!(out, "                }}");
         } else {
-            let _ = writeln!(out, "                value({rust_path}({args}))");
+            let _ = writeln!(
+                out,
+                "                serde_json::to_value({rust_path}({args})).map_err(|error| error.to_string())"
+            );
         }
         let _ = writeln!(out, "            }}");
-    }
-    if needs_pathbuf {
-        // Insert the import after the existing `use serde_json::Value;` line.
-        out = out.replacen(
-            "    use serde_json::Value;\n",
-            "    use serde_json::Value;\n    use std::path::PathBuf;\n",
-            1,
-        );
     }
     out.push_str(concat!(
         "            _ => Err(format!(\"unknown native function `{name}`\")),\n",
@@ -2375,7 +2381,10 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         let native = fs::read_to_string(dir.join("native.rs"))?;
         fs::remove_dir_all(&dir)?;
 
-        assert!(native.contains("value(crate::now())"), "{native}");
+        assert!(
+            native.contains("serde_json::to_value(crate::now())"),
+            "{native}"
+        );
         assert!(!native.contains("match crate::now("), "{native}");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         Ok(())

@@ -288,6 +288,21 @@ pub enum NativeParamKind {
     Context,
 }
 
+/// How the dispatch passes a deserialized local to the function.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativePass {
+    /// Pass the local by value.
+    Value,
+    /// Pass `&local`.
+    Ref,
+    /// Pass `&local[..]`.
+    Slice,
+    /// Pass `local.as_ref()`.
+    AsRef,
+    /// Pass `local.as_deref()`.
+    AsDeref,
+}
+
 /// One argument of a native function.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeParam {
@@ -298,10 +313,8 @@ pub struct NativeParam {
     /// Owned type for the local that receives the deserialized value, when the
     /// declared parameter is a reference that needs one (`&str` -> `String`).
     pub owned: Option<String>,
-    /// Pass `&local`.
-    pub borrow: bool,
-    /// Pass `&local[..]`.
-    pub slice: bool,
+    /// How to pass the local to the function.
+    pub pass: NativePass,
 }
 
 /// One function that runs in the helper process instead of in Luau.

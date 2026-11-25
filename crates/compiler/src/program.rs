@@ -13,6 +13,8 @@ pub(crate) struct Resolved<'a> {
 pub(crate) struct StructDef {
     pub fields: Vec<(String, Type)>,
     pub derives_default: bool,
+    pub derives_serialize: bool,
+    pub derives_deserialize: bool,
 }
 
 struct Unit {
@@ -81,6 +83,10 @@ impl Program {
             module
         };
         Ok(program)
+    }
+
+    pub(crate) fn root(&self) -> &str {
+        &self.root
     }
 
     fn insert(&mut self, module: &str, file: &syn::File) {
@@ -481,14 +487,10 @@ fn collect(
             }
             Item::Struct(item_struct) => {
                 if let syn::Fields::Named(fields) = &item_struct.fields {
-                    let derives_default =
-                        item_struct.attrs.iter().any(|attr| {
-                            let syn::Meta::List(list) = &attr.meta else {
-                                return false;
-                            };
-                            list.path.is_ident("derive")
-                                && list.tokens.to_string().contains("Default")
-                        });
+                    let derives = derives(&item_struct.attrs);
+                    let derives_default = derives.contains("Default");
+                    let derives_serialize = derives.contains("Serialize");
+                    let derives_deserialize = derives.contains("Deserialize");
                     let fields = fields
                         .named
                         .iter()
@@ -503,6 +505,8 @@ fn collect(
                         StructDef {
                             fields,
                             derives_default,
+                            derives_serialize,
+                            derives_deserialize,
                         },
                     );
                 } else if let syn::Fields::Unnamed(fields) = &item_struct.fields
@@ -554,6 +558,26 @@ fn collect(
     }
     units.push((module.to_owned(), unit));
     units.append(&mut nested);
+}
+
+fn derives(attrs: &[syn::Attribute]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for attr in attrs {
+        let syn::Meta::List(list) = &attr.meta else {
+            continue;
+        };
+        if !list.path.is_ident("derive") {
+            continue;
+        }
+        for name in list.tokens.to_string().split(',') {
+            let name = name.trim();
+            let name = name.rsplit("::").next().unwrap_or(name);
+            if !name.is_empty() {
+                names.insert(name.to_owned());
+            }
+        }
+    }
+    names
 }
 
 fn collect_use(unit: &mut Unit, tree: &UseTree, prefix: &mut Vec<String>) {
