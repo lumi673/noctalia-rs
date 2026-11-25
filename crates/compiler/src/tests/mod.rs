@@ -8,6 +8,7 @@ mod methods;
 mod native;
 mod ops;
 mod statements;
+mod strict;
 mod types;
 
 fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
@@ -21,6 +22,7 @@ fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         module: "main",
         modules: &[],
         native: NativeMode::Deny,
+        strict: None,
     }
 }
 
@@ -45,6 +47,26 @@ fn module_options<'a>(
         module: "main",
         modules,
         native: NativeMode::Deny,
+        strict: None,
+    }
+}
+
+fn strict_options<'a>(
+    handler: &'a str,
+    kind: EntryKind,
+    strict: crate::StrictOptions<'a>,
+) -> Options<'a> {
+    Options {
+        handler,
+        entry: "widget",
+        state_key: "hello.state",
+        kind,
+        strings: &["message", "name"],
+        settings: &["message", "name"],
+        module: "main",
+        modules: &[],
+        native: NativeMode::Deny,
+        strict: Some(strict),
     }
 }
 
@@ -59,6 +81,7 @@ fn native_options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         module: "main",
         modules: &[],
         native: NativeMode::Allow,
+        strict: None,
     }
 }
 
@@ -91,5 +114,6 @@ fn native_options_with<'a>(
         module: "main",
         modules,
         native: NativeMode::Allow,
+        strict: None,
     }
 }

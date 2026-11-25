@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use notify::event::EventKind;
 use notify::{RecursiveMode, Watcher};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::Result;
 use crate::context::{Context, Parts};
@@ -24,6 +25,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 const IDLE_WAIT: Duration = Duration::from_secs(1);
 
 const NATIVE_CACHE_LIMIT: usize = 128;
+// A request is written in place, so a read can catch a partial payload.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(2);
+// An unparseable request older than this has no writer left to finish it.
+const REQUEST_ABANDONED_AFTER: Duration = Duration::from_secs(2);
 #[derive(Debug, Deserialize)]
 struct Request {
     boot: String,
@@ -50,6 +55,8 @@ struct Request {
     state: Value,
     #[serde(default)]
     host: Value,
+    #[serde(default)]
+    host_fixed: Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +73,7 @@ struct Serve<'a, W: Write> {
     stale: BTreeSet<PathBuf>,
     native_cache: BTreeMap<String, (Instant, Value)>,
     native_cache_order: VecDeque<String>,
+    host_fixed: Value,
     translations: &'a Value,
     out: &'a mut W,
 }
@@ -85,35 +93,63 @@ impl<W: Write> Serve<'_, W> {
         }))
     }
 
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "a payload that is still being written ends the batch"
+    )]
     fn process_batch(&mut self) -> Result<usize> {
         let mut processed = 0usize;
         for path in request_files(self.spool_dir)? {
-            let count = self.process_one(&path)?;
-            processed = processed.saturating_add(count);
+            if self.process_one(&path)? {
+                processed = processed.saturating_add(1);
+            } else {
+                // The next event for this name wakes the loop.
+                return Ok(processed);
+            }
         }
         Ok(processed)
     }
 
-    fn process_one(&mut self, path: &Path) -> Result<usize> {
+    /// Handles one request file. Returns false when the payload is incomplete.
+    fn process_one(&mut self, path: &Path) -> Result<bool> {
         let name = request_name(path);
         if self.stale.contains(path) {
             self.emit_error(&name, "stale boot")?;
             let _ = fs::remove_file(path);
-            return Ok(1);
+            return Ok(true);
         }
 
-        match self.process_request(path) {
+        let Some(request) = read_request(path)? else {
+            return self.settle_unreadable(path, &name);
+        };
+
+        match self.process_request(path, request) {
             Ok(Processed::Entry) => self.emit_done(&name)?,
             Ok(Processed::Native) => {}
             Err(error) => self.emit_error(&name, &error.to_string())?,
         }
         let _ = fs::remove_file(path);
-        Ok(1)
+        Ok(true)
     }
 
-    fn process_request(&mut self, path: &Path) -> Result<Processed> {
-        let text = fs::read_to_string(path)?;
-        let request: Request = serde_json::from_str(&text)?;
+    /// Decides what to do with a payload that did not parse. Returns false
+    /// while its writer may still be running.
+    fn settle_unreadable(&mut self, path: &Path, name: &str) -> Result<bool> {
+        if !abandoned(path) {
+            return Ok(false);
+        }
+        if path.exists() {
+            self.emit_error(name, "request payload did not parse")?;
+            let _ = fs::remove_file(path);
+        }
+        Ok(true)
+    }
+
+    fn process_request(
+        &mut self,
+        path: &Path,
+        mut request: Request,
+    ) -> Result<Processed> {
         if request.boot != self.boot {
             return Err(format!(
                 "stale boot {} (expected {})",
@@ -126,13 +162,17 @@ impl<W: Write> Serve<'_, W> {
             return Ok(Processed::Native);
         }
 
+        if request.host_fixed.is_object() {
+            self.host_fixed = mem::take(&mut request.host_fixed);
+        }
+        let host = request_host(&self.host_fixed, request.host);
         let parts = Parts {
             entry: request.entry,
             event: request.event,
             payload: request.payload,
             config: request.config,
             state: request.state,
-            host: request.host,
+            host,
             data_dir: self.data_dir.to_path_buf(),
         };
         let mut context = Context::new(parts, self.translations.clone());
@@ -297,19 +337,31 @@ fn wait_for_work(watched: Option<&(Receiver<()>, notify::RecommendedWatcher)>) {
     }
 }
 
+/// Wakes the serve loop only for work it can read.
+///
+/// Reading the spool emits access events and deleting a handled request emits
+/// a removal. Waking for those costs a full wakeup cycle per request and never
+/// finds work, so only a request name that was created, modified, or reported
+/// as `Any` wakes the loop. Events without a path still wake it: that is the
+/// rescan notify emits when it lost events.
+fn wakes_serve(event: &notify::Event) -> bool {
+    if event.paths.is_empty() {
+        return true;
+    }
+    let request = matches!(
+        event.kind,
+        EventKind::Any | EventKind::Create(_) | EventKind::Modify(_)
+    );
+    request && event.paths.iter().any(|path| is_request_name(path))
+}
+
 fn watch_spool(
     spool_dir: &Path,
 ) -> Option<(Receiver<()>, notify::RecommendedWatcher)> {
     let (sender, receiver) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(
         move |event: notify::Result<notify::Event>| {
-            // Reading the spool directory emits access events. Ignore those
-            // so the helper does not wake itself up; everything else wakes it,
-            // including the rescan notify emits when it loses events.
-            let relevant = matches!(
-                event,
-                Ok(change) if !matches!(change.kind, EventKind::Access(_))
-            );
+            let relevant = event.is_ok_and(|change| wakes_serve(&change));
             if relevant {
                 let _ = sender.send(());
             }
@@ -394,6 +446,7 @@ fn serve(plugin: &Plugin, data_dir: &Path, spool_dir: &Path) -> Result<()> {
         stale,
         native_cache: BTreeMap::new(),
         native_cache_order: VecDeque::new(),
+        host_fixed: Value::Object(Map::new()),
         translations: &translations,
         out: &mut out,
     };
@@ -429,11 +482,78 @@ fn request_files(spool_dir: &Path) -> Result<BTreeSet<PathBuf>> {
 }
 
 fn is_request(path: &Path) -> bool {
-    let json = path
-        .extension()
+    is_request_name(path) && path.is_file()
+}
+
+fn is_request_name(path: &Path) -> bool {
+    path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
-    json && path.is_file()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+}
+
+/// Builds the host snapshot a request carries.
+///
+/// The bridge sends the per-event values in `host` and the fixed values
+/// (settings, colors, paths) in `host_fixed` only when they changed, so the
+/// cached fixed part is merged under the live one. A request that sends one
+/// complete `host` overrides every cached key.
+fn request_host(fixed: &Value, live: Value) -> Value {
+    let Some(mut host) = fixed.as_object().cloned() else {
+        return live;
+    };
+    if let Some(values) = live.as_object() {
+        host.extend(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+    }
+    Value::Object(host)
+}
+
+/// Reads a request, retrying while the writer is still filling it.
+///
+/// The bridge writes a request in place, so a wake can land mid-write. A
+/// partial payload never parses as JSON, and bytes cut inside a multi-byte
+/// character do not even decode as text, so any parse failure is retried until
+/// the deadline. Returns None when the payload is still incomplete.
+fn read_request(path: &Path) -> Result<Option<Request>> {
+    read_request_within(path, REQUEST_READ_TIMEOUT)
+}
+
+fn read_request_within(
+    path: &Path,
+    timeout: Duration,
+) -> Result<Option<Request>> {
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(request) => return Ok(Some(request)),
+            Err(_) if deadline.is_some_and(|end| Instant::now() < end) => {
+                thread::yield_now();
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+}
+
+/// A request file that stopped changing and still does not parse will never
+/// parse: its writer is gone. A missing file counts as abandoned.
+fn abandoned(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return true;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_none_or(|age| age > REQUEST_ABANDONED_AFTER)
 }
 
 fn request_name(path: &Path) -> String {
@@ -485,6 +605,122 @@ mod tests {
     use std::process;
     use std::result::Result as StdResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use notify::event::{
+        AccessKind, CreateKind, ModifyKind, RemoveKind, RenameMode,
+    };
+
+    fn event(kind: EventKind, paths: &[&str]) -> notify::Event {
+        let mut event = notify::Event::new(kind);
+        for path in paths {
+            event = event.add_path(PathBuf::from(path));
+        }
+        event
+    }
+
+    #[test]
+    fn test_wakes_serve_only_for_new_request_files() {
+        let create = EventKind::Create(CreateKind::File);
+        let modify = EventKind::Modify(ModifyKind::Name(RenameMode::To));
+        let remove = EventKind::Remove(RemoveKind::File);
+        let access = EventKind::Access(AccessKind::Read);
+
+        assert!(wakes_serve(&event(create, &["/spool/000000000001.json"])));
+        assert!(wakes_serve(&event(modify, &["/spool/000000000001.json"])));
+        assert!(!wakes_serve(&event(remove, &["/spool/000000000001.json"])));
+        assert!(!wakes_serve(&event(access, &["/spool/000000000001.json"])));
+        assert!(!wakes_serve(&event(
+            create,
+            &["/spool/000000000001.pending"]
+        )));
+        assert!(!wakes_serve(&event(modify, &["/spool"])));
+        assert!(wakes_serve(&event(EventKind::Any, &["/spool/1.json"])));
+        assert!(!wakes_serve(&event(EventKind::Any, &["/spool"])));
+        assert!(wakes_serve(&event(EventKind::Other, &[])));
+    }
+
+    fn finish_later(path: &Path, tail: &[u8]) -> thread::JoinHandle<()> {
+        let writer = path.to_path_buf();
+        let rest = tail.to_vec();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(writer)
+                .expect("open request");
+            file.write_all(&rest).expect("finish request");
+        })
+    }
+
+    #[test]
+    fn test_read_request_waits_for_an_in_place_write() {
+        let spool = TestSpool::new("read-partial");
+        let path = spool.spool.join("000000000001.json");
+        let text = request("boot-1", "render").to_string();
+        let split = text.len().div_euclid(2);
+        fs::write(&path, &text[..split]).expect("partial write");
+        let writer = finish_later(&path, &text.as_bytes()[split..]);
+
+        let read = read_request_within(&path, Duration::from_secs(5))
+            .expect("retried request")
+            .expect("finished request");
+        writer.join().expect("writer");
+        spool.cleanup();
+
+        assert_eq!(read.boot, "boot-1");
+        assert_eq!(read.event, "render");
+    }
+
+    #[test]
+    fn test_read_request_retries_a_character_cut_in_half() {
+        let spool = TestSpool::new("read-utf8");
+        let path = spool.spool.join("000000000001.json");
+        let text = request("boot-1", "r\u{e9}nder").to_string();
+        let cut = text.find('\u{e9}').expect("multi-byte event") + 1;
+        fs::write(&path, &text.as_bytes()[..cut]).expect("partial write");
+        let writer = finish_later(&path, &text.as_bytes()[cut..]);
+
+        let read = read_request_within(&path, Duration::from_secs(5))
+            .expect("retried request")
+            .expect("finished request");
+        writer.join().expect("writer");
+        spool.cleanup();
+
+        assert_eq!(read.event, "r\u{e9}nder");
+    }
+
+    #[test]
+    fn test_serve_keeps_a_request_that_is_still_being_written() {
+        let spool = TestSpool::new("serve-defer");
+        let path = spool.spool.join("000000000001.json");
+        let text = request("boot-1", "render").to_string();
+        fs::write(&path, &text[..text.len().div_euclid(2)]).expect("partial");
+        let plugin = plugin();
+        let translations = Value::Null;
+        let mut out: Vec<u8> = Vec::new();
+        let processed = {
+            let mut server = Serve {
+                plugin: &plugin,
+                data_dir: &spool.data,
+                spool_dir: &spool.spool,
+                boot: "boot-1",
+                stale: BTreeSet::new(),
+                native_cache: BTreeMap::new(),
+                native_cache_order: VecDeque::new(),
+                host_fixed: Value::Object(Map::new()),
+                translations: &translations,
+                out: &mut out,
+            };
+            server.process_batch().expect("batch")
+        };
+        let lines = String::from_utf8_lossy(&out).to_string();
+        let kept = path.exists();
+        spool.cleanup();
+
+        assert_eq!(processed, 0, "{lines}");
+        assert!(kept, "a partial request must stay for the next event");
+        assert!(!lines.contains("\"error\""), "{lines}");
+    }
 
     fn plugin() -> Plugin {
         fn handler(ctx: &Context) -> crate::Result<Vec<Op>> {
@@ -640,6 +876,7 @@ mod tests {
             stale: config.stale,
             native_cache: BTreeMap::new(),
             native_cache_order: VecDeque::new(),
+            host_fixed: Value::Object(Map::new()),
             translations: &Value::Null,
             out: writer,
         };
@@ -742,6 +979,70 @@ mod tests {
         assert!(ops.get(2).is_some_and(|line| line.contains("third")));
 
         spool.cleanup();
+    }
+
+    #[test]
+    fn test_serve_merges_the_fixed_host_snapshot() {
+        #[expect(clippy::unnecessary_wraps, reason = "handlers return Result")]
+        fn handler(ctx: &Context) -> crate::Result<Vec<Op>> {
+            let value =
+                |path: &str| ctx.host(path).cloned().unwrap_or(Value::Null);
+            Ok(vec![Op::log(format!(
+                "{}|{}|{}",
+                ctx.setting("shell.font")
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+                value("colors.primary").as_str().unwrap_or(""),
+                value("now_ms").as_i64().unwrap_or_default()
+            ))])
+        }
+
+        let spool = TestSpool::new("serve-host-fixed");
+        let boot = "boot-host";
+        spool.write(
+            "000000000001.json",
+            &json!({
+                "boot": boot,
+                "entry": "service",
+                "event": "render",
+                "host": { "now_ms": 1 },
+                "host_fixed": {
+                    "setting": { "shell.font": "sans" },
+                    "colors": { "primary": "#fff" },
+                },
+            }),
+        );
+        spool.write(
+            "000000000002.json",
+            &json!({
+                "boot": boot,
+                "entry": "service",
+                "event": "render",
+                "host": { "now_ms": 2, "clipboard": "clip" },
+            }),
+        );
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .service("service", handler);
+
+        let writer = Capture {
+            plugin: &plugin,
+            data: &spool.data,
+            spool: &spool.spool,
+            boot,
+            stale: BTreeSet::new(),
+            stop_after: 4,
+        }
+        .run();
+        let lines = writer.lines();
+        spool.cleanup();
+
+        let logs: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("\"log\""))
+            .collect();
+        assert_eq!(logs.len(), 2, "{lines:?}");
+        assert!(logs[0].contains("sans|#fff|1"), "{}", logs[0]);
+        assert!(logs[1].contains("sans|#fff|2"), "{}", logs[1]);
     }
 
     #[test]
@@ -1164,6 +1465,7 @@ mod tests {
             stale: BTreeSet::new(),
             native_cache: BTreeMap::new(),
             native_cache_order: VecDeque::new(),
+            host_fixed: Value::Object(Map::new()),
             translations: &translations,
             out: &mut out,
         };

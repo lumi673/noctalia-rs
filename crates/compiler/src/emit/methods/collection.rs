@@ -20,6 +20,7 @@ impl<'a> Emitter<'a> {
                 self.uses_deep_clone = true;
                 Ok((format!("deep_clone({receiver})"), ty))
             }
+            "into_vec" if self.strict() => Ok((receiver.to_owned(), ty)),
             "into_owned" | "to_owned" | "clone" | "as_ref" | "as_deref"
             | "cloned" | "into_inner" | "into" | "as_mut" | "as_slice"
             | "as_bytes" | "into_bytes" | "copied" | "peekable"

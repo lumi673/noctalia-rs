@@ -438,3 +438,26 @@ impl JsonNode {
         }
     }
 }
+
+/// The global name in a `json!` object's `onAction` field, when literal.
+pub(super) fn json_action_name(expr: &Expr) -> Option<String> {
+    let Expr::Macro(mac) = strip_reference(expr) else {
+        return None;
+    };
+    if macro_name(mac) != "json" {
+        return None;
+    }
+    let node: JsonNode = syn::parse2(mac.mac.tokens.clone()).ok()?;
+    let JsonNode::Object(entries) = node else {
+        return None;
+    };
+    entries.into_iter().find_map(|(key, value)| {
+        if key != "onAction" {
+            return None;
+        }
+        let JsonNode::Expr(expr) = value else {
+            return None;
+        };
+        literal_string(&expr)
+    })
+}

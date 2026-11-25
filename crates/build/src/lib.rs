@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use noctalia_rs_compiler as compiler;
 use toml::Value;
 
+pub mod strict;
+
 type BoxError = Box<dyn Error>;
 type EntryScripts = Vec<(String, String)>;
 
@@ -59,11 +61,13 @@ struct FileContext<'a> {
     source: &'a Path,
     out_dir: &'a Path,
     root: &'a toml::Table,
+    mode: CompileMode,
 }
 
 struct CompileContext<'a> {
     source: &'a Path,
     out_dir: &'a Path,
+    root: &'a toml::Table,
     mode: CompileMode,
     state_key: &'a str,
     strings: &'a [&'a str],
@@ -160,6 +164,7 @@ fn generate_with(
         &mut CompileContext {
             source,
             out_dir,
+            root,
             mode,
             state_key: &state_key,
             strings: &strings,
@@ -188,6 +193,7 @@ fn generate_with(
             source,
             out_dir,
             root,
+            mode,
         };
         write_files(&mut context).map_err(|error| format!("files: {error}"))?;
     }
@@ -1412,12 +1418,47 @@ fn compile_entry(
     let source =
         resolve_includes(&site.source, &context.source.join(&site.file))?;
     let display = site.file.to_string_lossy();
-    let mut entry_settings = context.plugin_settings.to_vec();
-    collect_setting_keys(row.get("setting"), &mut entry_settings);
-    let entry_settings = entry_settings
+    let mut entry_settings_owned = context.plugin_settings.to_vec();
+    collect_setting_keys(row.get("setting"), &mut entry_settings_owned);
+    let entry_settings = entry_settings_owned
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
+    let strict_context = if context.mode == CompileMode::Strict {
+        Some(strict::StrictContext::build(
+            context.root,
+            context.source,
+            &entry_settings_owned,
+        )?)
+    } else {
+        None
+    };
+    let strict_config = strict_context
+        .as_ref()
+        .map(strict::StrictContext::config_source)
+        .unwrap_or_default();
+    let strict_translations = strict_context
+        .as_ref()
+        .map(strict::StrictContext::translations_source)
+        .unwrap_or_default();
+    let strict_assets = strict_context
+        .as_ref()
+        .map(|data| {
+            data.assets
+                .iter()
+                .map(|asset| {
+                    (asset.path.as_str(), asset.mode.unwrap_or(0o644) & 0o777)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let strict_options = (context.mode == CompileMode::Strict).then_some(
+        compiler::StrictOptions {
+            config: &strict_config,
+            translations: &strict_translations,
+            assets: &strict_assets,
+        },
+    );
     let result = compiler::compile(
         &source,
         &compiler::Options {
@@ -1433,6 +1474,7 @@ fn compile_entry(
                 CompileMode::Strict => compiler::NativeMode::Deny,
                 _ => compiler::NativeMode::Allow,
             },
+            strict: strict_options,
         },
     );
     let compiled = match result {
@@ -1733,6 +1775,11 @@ fn declared_luau_sources(root: &toml::Table) -> Result<Vec<String>, BoxError> {
 }
 
 fn write_assets(context: &mut FileContext<'_>) -> Result<(), BoxError> {
+    let modes = if context.mode == CompileMode::Strict {
+        strict::asset_modes(context.root, context.source)?
+    } else {
+        Vec::new()
+    };
     for name in optional_string_list(context.root, "assets")? {
         let relative = safe_relative_path(&name, "asset")?;
         let key = relative.to_string_lossy().replace('\\', "/");
@@ -1743,13 +1790,28 @@ fn write_assets(context: &mut FileContext<'_>) -> Result<(), BoxError> {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(context.source.join(relative), &target)
+        fs::copy(context.source.join(&relative), &target)
             .map_err(|error| format!("copy asset {key}: {error}"))?;
-        let _ = writeln!(
-            context.generated.body,
-            "    plugin = plugin.asset({}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/assets/{key}\")));",
-            quote(&key)
-        );
+        let mode = modes
+            .iter()
+            .find(|item| item.path == key)
+            .and_then(|item| strict::mode_differs(item.mode));
+        match mode {
+            Some(mode) => {
+                let _ = writeln!(
+                    context.generated.body,
+                    "    plugin = plugin.asset_with_mode({}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/assets/{key}\")), {mode});",
+                    quote(&key)
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    context.generated.body,
+                    "    plugin = plugin.asset({}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/assets/{key}\")));",
+                    quote(&key)
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1855,6 +1917,39 @@ mod tests {
         assert!(generated.contains("\"service.luau\""));
         assert!(!generated.contains("src/main.rs"));
         assert!(!generated.contains("README.md"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_to_keeps_an_executable_asset_mode() -> Result<(), BoxError> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("noctalia-build-mode-{nanos}"));
+        fs::create_dir_all(dir.join("tools"))?;
+        fs::write(
+            dir.join("noctalia.toml"),
+            "id = \"me/test\"\nname = \"Test\"\nassets = [\"tools/run.sh\"]\n",
+        )?;
+        fs::write(dir.join("tools/run.sh"), "#!/bin/sh\n")?;
+        fs::set_permissions(
+            dir.join("tools/run.sh"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+
+        generate_with(&dir.join("noctalia.toml"), &dir, Some("strict"))?;
+        let generated = fs::read_to_string(dir.join("generated.rs"))?;
+        fs::remove_dir_all(&dir)?;
+
+        assert!(
+            generated.contains(
+                "plugin.asset_with_mode(\"tools/run.sh\", include_bytes!"
+            ),
+            "{generated}"
+        );
+        assert!(generated.contains(", 493);"), "{generated}");
         Ok(())
     }
 

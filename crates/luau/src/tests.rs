@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::callback::{callback_args, callback_for_event};
 use crate::dispatch;
+use crate::dispatch_strict;
 use crate::host::Host;
 use noctalia_rs::{Context, Parts, api};
 use serde_json::{Value, json};
@@ -608,6 +609,127 @@ fn embedded_bridge_source_parses() {
         .expect("bridge.luau must parse");
 }
 
+const BRIDGE_STUBS: &str = r#"
+local on_line_sink = nil
+local fail_next_write = false
+noctalia.mkdirAll = function() return true end
+noctalia.runStream = function(_, on_line)
+  on_line_sink = on_line
+  on_line('{"control":"ready","boot":"test","spool":"/spool"}')
+  return true
+end
+noctalia.writeFile = function(_, contents)
+  if fail_next_write then
+    fail_next_write = false
+    return false, "bridge down"
+  end
+  noctalia.log(contents)
+  return true
+end
+noctalia.renameFile = function() return true end
+"#;
+
+fn bridge_requests_from(body: &str) -> Vec<Value> {
+    let bridge = noctalia_rs::bridge::SOURCE
+        .replace("{{HELPER}}", "helper")
+        .replace("{{PREFIX}}", "prefix");
+    let source = format!(
+        "{BRIDGE_STUBS}\nlocal bridge = (function()\n{bridge}\nend)()\n\
+         bridge.setup(\"service\", {{\"name\"}})\n\
+         function update()\n{body}end\n"
+    );
+    let ctx = context(Fixture {
+        event: "update",
+        payload: json!({}),
+        config: json!({ "name": "bench" }),
+        state: json!({}),
+        host: json!({
+            "now_ms": 1_700_000_000_i64,
+            "setting": { "shell.time_format": "time" },
+            "colors": { "primary": "#fff" },
+        }),
+    });
+    let ops = dispatch(&ctx, &[("entry", source.as_str())]).expect("dispatch");
+    let values = ops
+        .iter()
+        .map(|op| serde_json::to_value(op).expect("serialize op"))
+        .collect::<Vec<_>>();
+    values
+        .iter()
+        .filter(|value| value.get("op").and_then(Value::as_str) == Some("log"))
+        .filter_map(|value| value.get("message").and_then(Value::as_str))
+        .filter_map(|message| serde_json::from_str(message).ok())
+        .collect()
+}
+
+fn bridge_requests(events: &[&str]) -> Vec<Value> {
+    let body = events
+        .iter()
+        .map(|event| format!("  bridge.call(\"{event}\", {{}})\n"))
+        .collect::<String>();
+    bridge_requests_from(&body)
+}
+
+#[test]
+fn bridged_requests_resend_the_fixed_host_only_when_it_changes() {
+    let requests = bridge_requests(&["render", "render"]);
+    assert_eq!(requests.len(), 2, "{requests:?}");
+
+    let first = &requests[0];
+    let second = &requests[1];
+    assert_eq!(first["event"], json!("render"));
+    assert_eq!(
+        first["host_fixed"]["setting"]["shell.time_format"],
+        json!("time")
+    );
+    assert_eq!(first["host_fixed"]["colors"]["primary"], json!("#fff"));
+    assert_eq!(first["host"]["now_ms"], json!(1_700_000_000_i64));
+
+    assert_eq!(second["event"], json!("render"));
+    assert!(second.get("host_fixed").is_none(), "{second}");
+    assert_eq!(second["host"]["now_ms"], json!(1_700_000_000_i64));
+    assert!(second["host"].get("setting").is_none());
+}
+
+#[test]
+fn bridged_requests_resend_the_fixed_host_after_a_failed_write() {
+    let requests = bridge_requests_from(
+        "  fail_next_write = true\n\
+         bridge.call(\"render\", {})\n\
+         bridge.call(\"render\", {})\n",
+    );
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].get("host_fixed").is_some(),
+        "a request whose write failed never reached the helper: {}",
+        requests[0]
+    );
+}
+
+#[test]
+fn bridge_host_carries_the_fixed_snapshot_after_setup() {
+    bridge_requests_from(
+        "  assert(bridge.host.setting[\"shell.time_format\"] == \"time\")\n\
+         assert(bridge.host.colors.primary == \"#fff\")\n",
+    );
+}
+
+#[test]
+fn bridged_requests_resend_the_fixed_host_after_a_rejected_request() {
+    let requests = bridge_requests_from(
+        "  bridge.call(\"render\", {})\n\
+         on_line_sink('{\"control\":\"error\",\"message\":\"rejected\"}')\n\
+         bridge.call(\"render\", {})\n",
+    );
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].get("host_fixed").is_some());
+    assert!(
+        requests[1].get("host_fixed").is_some(),
+        "a rejected request must send the fixed host again: {}",
+        requests[1]
+    );
+}
+
 const OFFICIAL_CALLBACKS: &str =
     include_str!("../../lib/tests/fixtures/callbacks.txt");
 
@@ -889,4 +1011,211 @@ end
 "#);
     let results = find(&values, "launcher_results");
     assert_eq!(results["rows"], json!([]));
+}
+
+fn strict_error(source: &str) -> String {
+    let ctx = context(empty_fixture("update"));
+    dispatch_strict(&ctx, &[("entry", source)])
+        .expect_err("strict dispatch fails")
+        .to_string()
+}
+
+#[test]
+fn strict_emit_rejects_a_marker_table_where_a_function_is_required() {
+    let error = strict_error(
+        r#"
+noctalia.http({ url = "https://example.invalid/" }, { __host_callback = "onResponse" })
+"#,
+    );
+    assert!(error.contains("API 57 takes a function"), "{error}");
+}
+
+#[test]
+fn strict_emit_rejects_the_compiler_marker_table() {
+    let error = strict_error(
+        r#"
+noctalia.runAsync({ "echo", "hi" }, { __call = "onDone" })
+"#,
+    );
+    assert!(error.contains("API 57 takes a function"), "{error}");
+}
+
+#[test]
+fn strict_emit_rejects_a_marker_table_on_a_generic_member() {
+    let error = strict_error(
+        r#"
+noctalia.idle.watch("idle", { __host_callback = "onIdle" })
+"#,
+    );
+    assert!(error.contains("marker table"), "{error}");
+}
+
+#[test]
+fn strict_emit_rejects_on_host_callback() {
+    let error = strict_error(
+        r#"
+function onHostCallback(payload)
+  noctalia.log(payload.id)
+end
+"#,
+    );
+    assert!(error.contains("onHostCallback"), "{error}");
+}
+
+#[test]
+fn auto_keeps_accepting_marker_tables() {
+    let values = run(r#"
+noctalia.runStream({ "tail", "-f" }, { __host_callback = "watch" })
+"#);
+    let stream = find(&values, "host_call");
+    assert_eq!(stream["args"][1]["__host_callback"], "watch");
+}
+
+#[test]
+fn strict_accepts_a_real_closure_and_the_later_event_reaches_it() {
+    const SOURCE: &str = r#"
+noctalia.http({ url = "https://example.invalid/" }, function(response)
+    noctalia.log(response.body)
+end)
+"#;
+    let ctx = context(empty_fixture("update"));
+    let ops =
+        dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("strict dispatch");
+    let value = serde_json::to_value(&ops[0]).expect("serialize");
+    let id = value["args"][1]["__host_callback"]
+        .as_str()
+        .expect("callback id")
+        .to_owned();
+
+    let mut callback = empty_fixture("host_callback");
+    callback.payload = json!({ "id": id, "args": [{ "body": "later" }] });
+    let ctx = context(callback);
+    let ops =
+        dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("callback dispatch");
+    let log = serde_json::to_value(&ops[0]).expect("serialize");
+    assert_eq!(log["op"], "log");
+    assert_eq!(log["message"], "later");
+}
+
+#[test]
+fn strict_response_registry_serves_read_and_remove() {
+    const SOURCE: &str = r#"
+local path = "/data/entry/reply.json"
+assert(noctalia.writeFile(path, "{\"ok\":true}"))
+local text = noctalia.readFile(path)
+assert(text == "{\"ok\":true}", tostring(text))
+assert(noctalia.removeFile(path))
+assert(noctalia.readFile(path) == nil)
+"#;
+    let ctx = context(empty_fixture("update"));
+    dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("strict dispatch");
+}
+
+#[test]
+fn auto_does_not_use_the_strict_response_registry() {
+    const SOURCE: &str = r#"
+local path = "/data/entry/reply.json"
+local ok = noctalia.writeFile(path, "body")
+assert(ok == nil, tostring(ok))
+assert(noctalia.readFile(path) == nil)
+"#;
+    let ctx = context(empty_fixture("update"));
+    dispatch(&ctx, &[("entry", SOURCE)]).expect("auto dispatch");
+}
+
+#[test]
+fn http_reports_offline_mode_and_emits_no_request() {
+    let mut fixture = empty_fixture("update");
+    fixture.host = json!({ "setting": { "shell.offline_mode": true } });
+    let ctx = context(fixture);
+    let ops = dispatch_strict(
+        &ctx,
+        &[(
+            "entry",
+            r#"assert(noctalia.http({ url = "https://example.invalid/" }, function() end) == false)"#,
+        )],
+    )
+    .expect("strict dispatch");
+    assert!(ops.is_empty(), "{ops:?}");
+}
+
+#[test]
+fn run_start_rejects_a_command_it_cannot_describe() {
+    let ctx = context(empty_fixture("update"));
+    let ops = dispatch_strict(
+        &ctx,
+        &[(
+            "entry",
+            r#"
+assert(noctalia.runAsync({}) == false)
+assert(noctalia.runAsync({ "echo", 3 }) == false)
+assert(noctalia.runStream("", function() end) == false)
+"#,
+        )],
+    )
+    .expect("strict dispatch");
+    assert!(ops.is_empty(), "{ops:?}");
+}
+
+#[test]
+fn strict_response_registry_handles_rename_and_file_exists() {
+    const SOURCE: &str = r#"
+local from = "/data/entry/a.json"
+local to = "/data/entry/b.json"
+assert(noctalia.writeFile(from, "body"))
+assert(noctalia.fileExists(to) == nil)
+assert(noctalia.renameFile(from, to))
+assert(noctalia.fileExists(to) == true)
+assert(noctalia.readFile(from) == nil)
+assert(noctalia.readFile(to) == "body")
+"#;
+    let ctx = context(empty_fixture("update"));
+    dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("strict dispatch");
+}
+
+#[test]
+fn auto_keeps_http_and_run_calls_unchanged() {
+    let mut fixture = empty_fixture("update");
+    fixture.host = json!({ "setting": { "shell.offline_mode": true } });
+    let ctx = context(fixture);
+    let ops = dispatch(
+        &ctx,
+        &[(
+            "entry",
+            r#"
+assert(noctalia.http({ url = "https://example.invalid/" }, function() end) == true)
+assert(noctalia.runAsync({}) == true)
+assert(noctalia.runStream("", function() end) == true)
+"#,
+        )],
+    )
+    .expect("dispatch");
+    assert_eq!(ops.len(), 3, "{ops:?}");
+}
+
+#[test]
+fn strict_write_file_forwards_when_a_host_is_attached() {
+    let dir = QueryDir::new();
+    dir.respond("noctalia_rs_luau_1", json!(true));
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let ops = dispatch_strict(
+        &ctx,
+        &[(
+            "entry",
+            r#"
+assert(noctalia.writeFile("/sys/led", "1") == true)
+assert(noctalia.readFile("/sys/led") == nil)
+"#,
+        )],
+    )
+    .expect("strict dispatch");
+    let values = ops
+        .iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    let query = values
+        .iter()
+        .find(|value| value["op"] == json!("query"))
+        .expect("write query");
+    assert_eq!(query["path"], json!(["writeFile"]));
 }
