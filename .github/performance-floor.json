@@ -87,16 +87,16 @@
       "updatedAt": "2026-11-24T04:44:26.093Z"
     },
     "json_encode_rust": {
-      "sha": "3d81f62a9c12ce2dec0c0adb1c22a12098b1a98c",
+      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
       "method": 1,
-      "medianMs": 0.00033999999999999997,
-      "worstMedianMs": 0.000364,
-      "p95Ms": 0.00038299999999999993,
-      "worstP95Ms": 0.000404,
-      "p99Ms": 0.000414,
-      "worstP99Ms": 0.000563,
+      "medianMs": 0.00026250000000000004,
+      "worstMedianMs": 0.0002735,
+      "p95Ms": 0.00029900000000000006,
+      "worstP95Ms": 0.000307,
+      "p99Ms": 0.000324,
+      "worstP99Ms": 0.000357,
       "budgetMs": 1,
-      "updatedAt": "2026-11-23T00:53:41.071Z"
+      "updatedAt": "2026-11-25T15:08:54.487Z"
     },
     "json_decode_rust": {
       "sha": "19295f6593bc94438d476f5eff77001c00bd89a2",
@@ -303,16 +303,16 @@
       "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "plugin_color_picker_rust": {
-      "sha": "913db3fe9174122642756ecca98f35c2be996dbf",
+      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
       "method": 1,
-      "medianMs": 0.20588100000000004,
-      "worstMedianMs": 0.20793,
-      "p95Ms": 0.21706,
-      "worstP95Ms": 0.21797400000000003,
-      "p99Ms": 0.218119,
-      "worstP99Ms": 0.221352,
+      "medianMs": 0.20592000000000002,
+      "worstMedianMs": 0.2076085,
+      "p95Ms": 0.21666,
+      "worstP95Ms": 0.222837,
+      "p99Ms": 0.22331900000000002,
+      "worstP99Ms": 0.257167,
       "budgetMs": 2,
-      "updatedAt": "2026-11-24T20:42:09.873Z"
+      "updatedAt": "2026-11-25T15:08:54.487Z"
     },
     "plugin_vietnamese_lunar_calendar_luau": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -339,16 +339,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_als_brightness_luau": {
-      "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
+      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
       "method": 1,
-      "medianMs": 0.1843075,
-      "worstMedianMs": 0.1866075,
-      "p95Ms": 0.19513000000000003,
-      "worstP95Ms": 0.197456,
-      "p99Ms": 0.197051,
-      "worstP99Ms": 0.201487,
+      "medianMs": 0.18428750000000002,
+      "worstMedianMs": 0.1861105,
+      "p95Ms": 0.19526600000000002,
+      "worstP95Ms": 0.20162,
+      "p99Ms": 0.20510299999999998,
+      "worstP99Ms": 0.21252500000000002,
       "budgetMs": 2,
-      "updatedAt": "2026-11-25T02:49:36.582Z"
+      "updatedAt": "2026-11-25T15:08:54.487Z"
     },
     "plugin_als_brightness_rust": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -375,16 +375,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_mihomo_control_rust": {
-      "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
+      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
       "method": 1,
-      "medianMs": 0.892991,
-      "worstMedianMs": 0.896407,
-      "p95Ms": 0.9104,
-      "worstP95Ms": 0.920159,
-      "p99Ms": 0.9246810000000001,
-      "worstP99Ms": 0.93377,
+      "medianMs": 0.894148,
+      "worstMedianMs": 0.900701,
+      "p95Ms": 0.915781,
+      "worstP95Ms": 0.924631,
+      "p99Ms": 0.9302950000000001,
+      "worstP99Ms": 0.9402240000000001,
       "budgetMs": 4,
-      "updatedAt": "2026-11-25T02:49:36.582Z"
+      "updatedAt": "2026-11-25T15:08:54.487Z"
     },
     "plugin_file_search_luau": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -471,16 +471,16 @@
       "updatedAt": "2026-11-24T17:00:24.601Z"
     },
     "generated_event_compiled": {
-      "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
+      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
       "method": 1,
-      "medianMs": 0.0046115,
-      "worstMedianMs": 0.004877,
-      "p95Ms": 0.005193000000000001,
-      "worstP95Ms": 0.005692,
-      "p99Ms": 0.005864,
-      "worstP99Ms": 0.016722,
+      "medianMs": 0.004595500000000001,
+      "worstMedianMs": 0.004633,
+      "p95Ms": 0.004969,
+      "worstP95Ms": 0.005454,
+      "p99Ms": 0.005632,
+      "worstP99Ms": 0.00614,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-24T17:00:24.601Z"
+      "updatedAt": "2026-11-25T15:08:54.487Z"
     }
   }
 }
