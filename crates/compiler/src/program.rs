@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::{Error, Module};
 use syn::{Expr, Item, ItemFn, ItemStatic, Pat, Type, UseTree};
@@ -19,6 +19,7 @@ struct Unit {
     functions: HashMap<String, ItemFn>,
     statics: HashMap<String, ItemStatic>,
     enums: HashMap<String, Vec<String>>,
+    newtypes: BTreeSet<String>,
     structs: HashMap<String, StructDef>,
     impls: HashMap<String, HashMap<String, ItemFn>>,
     constants: HashMap<String, Expr>,
@@ -33,6 +34,7 @@ impl Unit {
             functions: HashMap::new(),
             statics: HashMap::new(),
             enums: HashMap::new(),
+            newtypes: BTreeSet::new(),
             structs: HashMap::new(),
             impls: HashMap::new(),
             constants: HashMap::new(),
@@ -503,6 +505,10 @@ fn collect(
                             derives_default,
                         },
                     );
+                } else if let syn::Fields::Unnamed(fields) = &item_struct.fields
+                    && fields.unnamed.len() == 1
+                {
+                    unit.newtypes.insert(item_struct.ident.to_string());
                 }
             }
             Item::Enum(item_enum) => {
@@ -667,6 +673,12 @@ impl Program {
         found
     }
 
+    pub(crate) fn is_newtype(&self, module: &str, name: &str) -> bool {
+        self.units
+            .get(module)
+            .is_some_and(|unit| unit.newtypes.contains(name))
+            || self.units.values().any(|unit| unit.newtypes.contains(name))
+    }
     pub(crate) fn enum_variant(
         &self,
         module: &str,

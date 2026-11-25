@@ -4963,6 +4963,7 @@ impl<'a> Emitter<'a> {
             parts.last().copied().unwrap_or("")
         };
         match variant {
+            "Vec" | "VecDeque" => Ok(Some(("{}".to_owned(), Ty::LIST))),
             "HashMap" | "BTreeMap" | "Map" => {
                 Ok(Some(("{}".to_owned(), Ty::TABLE)))
             }
@@ -5108,6 +5109,14 @@ impl<'a> Emitter<'a> {
                 }
                 _ => {}
             }
+            if args.len() == 1
+                && path_last_name(&call.func).is_some_and(|name| {
+                    self.program.is_newtype(&self.module, &name)
+                })
+            {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((value, Ty::VALUE));
+            }
             let identity = name.ends_with("::try_from")
                 || name.ends_with("::from_utf8_lossy")
                 || name.ends_with("::from")
@@ -5127,6 +5136,15 @@ impl<'a> Emitter<'a> {
             if name == "env::var" || name == "std::env::var" {
                 let key = self.expr(arg(&args, 0, call)?)?.0;
                 return Ok((format!("noctalia.getenv({key})"), Ty::OPT_STR));
+            }
+            if name.ends_with("Number::from_f64") && args.len() == 1 {
+                let value = self.expr(arg(&args, 0, call)?)?.0;
+                return Ok((
+                    format!(
+                        "(function() local __value = {value}; if __value == __value and __value ~= math.huge and __value ~= -math.huge then return __value end end)()"
+                    ),
+                    Ty::OPT_FLOAT,
+                ));
             }
             if let Some(class) = name.strip_suffix("::default")
                 && class != "Default"
@@ -5265,6 +5283,13 @@ impl<'a> Emitter<'a> {
             Member::Named(name) => name.to_string(),
             Member::Unnamed(index) => {
                 let (base, _) = self.expr(&field.base)?;
+                if index.index == 0
+                    && self.class_of_receiver(&field.base).is_some_and(
+                        |class| self.program.is_newtype(&self.module, &class),
+                    )
+                {
+                    return Ok((base, Ty::VALUE));
+                }
                 return Ok((format!("{base}[{}]", index.index + 1), Ty::VALUE));
             }
         };
