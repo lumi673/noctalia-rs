@@ -2243,7 +2243,7 @@ mod tests {
     const NATIVE_RESULT_SOURCE: &str = r#"use noctalia_rs::{Context, Op, Result};
 
 fn fetch_prs(limit: usize) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/x")?;
+    let text = std::fs::read_link("/tmp/x")?.to_string_lossy().into_owned();
     Ok(vec![format!("{limit} {text}")])
 }
 
@@ -2253,14 +2253,14 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 "#;
 
-    const LUAU_NATIVE_SOURCE: &str = "use noctalia_rs::{Context, Op, Result};\n\n#[luau]\nfn fetch_prs() -> Result<Vec<String>> {\n    let text = std::fs::read_to_string(\"/tmp/x\")?;\n    Ok(vec![text])\n}\n\nfn handler(_ctx: &Context) -> Result<Vec<Op>> {\n    let rows = fetch_prs()?;\n    Ok(vec![Op::log(rows.join(\",\"))])\n}\n";
+    const LUAU_NATIVE_SOURCE: &str = "use noctalia_rs::{Context, Op, Result};\n\n#[luau]\nfn fetch_prs() -> Result<Vec<String>> {\n    let text = std::fs::read_link(\"/tmp/x\")?.to_string_lossy().into_owned();\n    Ok(vec![text])\n}\n\nfn handler(_ctx: &Context) -> Result<Vec<Op>> {\n    let rows = fetch_prs()?;\n    Ok(vec![Op::log(rows.join(\",\"))])\n}\n";
 
     const NATIVE_CONTEXT_MANIFEST: &str = "id = \"me/test\"\nname = \"Test\"\n\n[[setting]]\nkey = \"message\"\ntype = \"string\"\nlabel_key = \"settings.message.label\"\ndefault = \"hi\"\n\n[[widget]]\nid = \"widget\"\nentry = \"widget.luau\"\nhandler = \"handler\"\n";
 
     const NATIVE_CONTEXT_SOURCE: &str = r#"use noctalia_rs::{Context, Op, Result};
 
 fn describe(ctx: &Context) -> Result<String> {
-    let text = std::fs::read_to_string("/tmp/x")?;
+    let text = std::fs::read_link("/tmp/x")?.to_string_lossy().into_owned();
     Ok(format!("{}:{text}", ctx.event))
 }
 

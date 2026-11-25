@@ -196,14 +196,7 @@ impl<'a> Emitter<'a> {
                         Ty::STR,
                     )));
                 }
-                let base = self.temp();
-                self.line(&format!("local {base} = {receiver}"));
-                Ok((
-                    format!(
-                        "({base} .. ((string.sub({base}, -1) == \"/\") and \"\" or \"/\") .. {part})"
-                    ),
-                    Ty::STR,
-                ))
+                Ok((super::path::path_join(receiver, &part), Ty::PATH))
             }
             "iter" | "into_iter" | "values" => Ok((receiver.to_owned(), ty)),
             "next" => {

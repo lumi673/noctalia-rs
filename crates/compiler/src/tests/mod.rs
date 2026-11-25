@@ -2,6 +2,7 @@ use crate::{EntryKind, Module, NativeMode, Options, compile};
 mod calls;
 mod constants;
 mod expressions;
+mod files;
 mod inline;
 mod macros;
 mod methods;
@@ -66,7 +67,7 @@ const NATIVE_HELPER: &str = r#"
 use noctalia_rs::{Context, Op, Result};
 
 fn load_rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 

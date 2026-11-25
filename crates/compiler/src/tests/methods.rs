@@ -196,7 +196,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(compiled.source.contains("math.floor(value)"));
-    assert!(compiled.source.contains("string.sub(__t"));
+    assert!(compiled.source.contains("local __base, __part"));
     assert!(compiled.source.contains("replace_all("));
     assert!(compiled.source.contains("string.gsub("));
     assert!(compiled.source.contains("json.encode("));
@@ -510,7 +510,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compiled.source
     );
     assert!(
-        compiled.source.contains("string.sub(__t"),
+        compiled.source.contains("local __base, __part"),
         "{}",
         compiled.source
     );

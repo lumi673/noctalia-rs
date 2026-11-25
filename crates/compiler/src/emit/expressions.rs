@@ -359,6 +359,9 @@ impl<'a> Emitter<'a> {
         if let Some(segments) = path_segments(&path.path) {
             let last = segments.last().map_or("", String::as_str);
             match last {
+                "MAIN_SEPARATOR" | "MAIN_SEPARATOR_STR" => {
+                    return Ok(("\"/\"".to_owned(), Ty::STR));
+                }
                 "PI" if segments.iter().any(|name| name == "consts") => {
                     return Ok(("math.pi".to_owned(), Ty::FLOAT));
                 }
@@ -545,6 +548,14 @@ impl<'a> Emitter<'a> {
         let (left, left_ty) = self.expr(&binary.left)?;
         let (right, right_ty) = self.expr(&binary.right)?;
         if let Some(operator) = compare_operator(&binary.op) {
+            if let Some(ordering) = path_ordering(&binary.op)
+                && (left_ty.base == Base::Path || right_ty.base == Base::Path)
+            {
+                return Ok((
+                    format!("({} {ordering} 0)", path_compare(&left, &right)),
+                    Ty::BOOL,
+                ));
+            }
             return Ok((format!("({left} {operator} {right})"), Ty::BOOL));
         }
         let integer = left_ty.base == Base::Int && right_ty.base == Base::Int;
@@ -638,7 +649,7 @@ impl<'a> Emitter<'a> {
                 "data_dir" => Ok((
                     "(noctalia.pluginDataDir() or noctalia.pluginDir())"
                         .to_owned(),
-                    Ty::STR,
+                    Ty::PATH,
                 )),
                 "config" => Ok(("noctalia".to_owned(), Ty::VALUE)),
                 other => Err(Error::at(
@@ -649,7 +660,15 @@ impl<'a> Emitter<'a> {
                 )),
             };
         }
-        let (base, _) = self.expr(&field.base)?;
+        let (base, base_ty) = self.expr(&field.base)?;
+        if base_ty.base == Base::Info {
+            return Ok(match member.as_str() {
+                "size" => (format!("{base}.size"), Ty::INT),
+                "mtime" => (format!("{base}.mtime"), Ty::INT),
+                "is_dir" => (format!("{base}.isDir"), Ty::BOOL),
+                _ => (format!("{base}[{}]", quote(&member)), Ty::OPT_VALUE),
+            });
+        }
         Ok((
             if is_identifier(&member) {
                 format!("{base}.{member}")
@@ -1001,6 +1020,26 @@ fn compare_operator(operator: &BinOp) -> Option<&'static str> {
         BinOp::Ge(_) => Some(">="),
         BinOp::And(_) => Some("and"),
         BinOp::Or(_) => Some("or"),
+        _ => None,
+    }
+}
+
+/// `Ord for Path` compares components, so `<` on two paths is not a byte
+/// comparison.
+fn path_compare(left: &str, right: &str) -> String {
+    format!(
+        "(function() local __left, __right = {left}, {right}; __left = string.gsub(__left, \"//+\", \"/\"); __right = string.gsub(__right, \"//+\", \"/\"); while #__left > 1 and string.sub(__left, -1) == \"/\" do __left = string.sub(__left, 1, -2) end; while #__right > 1 and string.sub(__right, -1) == \"/\" do __right = string.sub(__right, 1, -2) end; local __left_root = string.sub(__left, 1, 1) == \"/\"; local __right_root = string.sub(__right, 1, 1) == \"/\"; if __left_root ~= __right_root then return __left_root and -1 or 1 end; local __lefts, __rights = {{}}, {{}}; for __part in string.gmatch(__left, \"[^/]+\") do __lefts[#__lefts + 1] = __part end; for __part in string.gmatch(__right, \"[^/]+\") do __rights[#__rights + 1] = __part end; local __index = 1; while true do local __a, __b = __lefts[__index], __rights[__index]; if __a == nil and __b == nil then return 0 end; if __a == nil then return -1 end; if __b == nil then return 1 end; if __a ~= __b then if __a < __b then return -1 end; return 1 end; __index = __index + 1 end end)()"
+    )
+}
+
+/// `Ord for Path` compares components, so ordering on two paths is not a byte
+/// comparison. Equality stays the string equality of the same bytes.
+fn path_ordering(operator: &BinOp) -> Option<&'static str> {
+    match operator {
+        BinOp::Lt(_) => Some("<"),
+        BinOp::Le(_) => Some("<="),
+        BinOp::Gt(_) => Some(">"),
+        BinOp::Ge(_) => Some(">="),
         _ => None,
     }
 }

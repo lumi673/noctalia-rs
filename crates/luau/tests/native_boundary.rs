@@ -120,7 +120,7 @@ fn bar_text(values: &[Value]) -> Option<String> {
 const TWO_CACHED_CALLS: &str = r#"
 #[native(cache_ms = 60_000)]
 fn rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -181,7 +181,7 @@ fn a_cached_native_call_resumes_in_one_round_trip() {
 const TWO_UNCACHED_CALLS: &str = r#"
 #[native]
 fn rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -234,7 +234,7 @@ fn an_uncached_native_call_always_takes_a_round_trip() {
 const FAILING_CALL: &str = r#"
 #[native]
 fn rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -273,7 +273,7 @@ fn a_native_error_surfaces_as_a_lua_error() {
 const QUEUED_EVENT: &str = r#"
 #[native]
 fn rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -352,7 +352,7 @@ fn one_event_while_parked_is_queued_and_drained_in_order() {
 
 const CONTEXT_CALL: &str = r#"
 fn describe(ctx: &Context) -> Result<String> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(format!("{}:{text}", ctx.event))
 }
 

@@ -872,6 +872,11 @@ impl<'a> Emitter<'a> {
         }
         let method = call.method.to_string();
         let args = call.args.iter().collect::<Vec<_>>();
+        if method == "open"
+            && let Some(value) = self.open_append(call, &args)?
+        {
+            return Ok(value);
+        }
         if let Some(value) = self.entry_method(call, &method, &args)? {
             return Ok(value);
         }
@@ -893,6 +898,12 @@ impl<'a> Emitter<'a> {
             if let Some(value) = self.method_call(call, &receiver, &class)? {
                 return Ok(value);
             }
+            if class == fs::APPEND_HANDLE
+                && let Some(value) =
+                    self.append_method(call, &method, &args, &receiver)?
+            {
+                return Ok(value);
+            }
         }
         let (receiver, ty) = self.expr(&call.receiver)?;
         let receiver = if receiver.starts_with('{') {
@@ -904,6 +915,17 @@ impl<'a> Emitter<'a> {
             self.combinator(call, &method, &args, &receiver, ty)?
         {
             return Ok(value);
+        }
+        if ty.base == Base::Path
+            && let Some((text, ty)) =
+                self.path_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
+        }
+        if let Some((text, ty)) =
+            self.fs_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
         }
         if let Some((text, ty)) =
             self.value_method(call, &method, &args, &receiver, ty)?
@@ -1062,11 +1084,11 @@ impl<'a> Emitter<'a> {
                 Ok(("noctalia.isDarkMode()".to_owned(), Ty::BOOL))
             }
             "plugin_dir" => {
-                Ok(("noctalia.pluginDir()".to_owned(), Ty::STR))
+                Ok(("noctalia.pluginDir()".to_owned(), Ty::PATH))
             }
             "plugin_data_dir" => Ok((
                 "noctalia.pluginDataDir()".to_owned(),
-                Ty::OPT_STR,
+                Ty::OPT_PATH,
             )),
             "time_format" => Ok((
                 "noctalia.getSetting(\"shell.time_format\")".to_owned(),
@@ -1112,7 +1134,7 @@ impl<'a> Emitter<'a> {
             }
             "expand_path" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("noctalia.expandPath({path})"), Ty::STR))
+                Ok((format!("noctalia.expandPath({path})"), Ty::PATH))
             }
             "list_dir" => {
                 let path = self.path_arg(args, 0, call)?;
@@ -1155,10 +1177,10 @@ impl<'a> Emitter<'a> {
             }
             "plugin_data_dir_result" => Ok((
                 "(noctalia.pluginDataDir())".to_owned(),
-                Ty::OPT_STR,
+                Ty::OPT_PATH,
             )),
             "plugin_dir_result" => {
-                Ok(("(noctalia.pluginDir())".to_owned(), Ty::OPT_STR))
+                Ok(("(noctalia.pluginDir())".to_owned(), Ty::OPT_PATH))
             }
             "os_clock" => Ok(("os.clock()".to_owned(), Ty::FLOAT)),
             "os_time" => Ok(("os.time()".to_owned(), Ty::INT)),
@@ -1212,6 +1234,26 @@ impl<'a> Emitter<'a> {
                 let path = self.path_arg(args, 0, call)?;
                 Ok((format!("(noctalia.removeFile({path}))"), Ty::VALUE))
             }
+            "write_file_result" | "write_file_bytes_result" => {
+                let path = self.path_arg(args, 0, call)?;
+                let contents = self.path_arg(args, 1, call)?;
+                Ok((
+                    format!("(noctalia.writeFile({path}, {contents}))"),
+                    Ty::VALUE,
+                ))
+            }
+            "rename_file_result" => {
+                let from = self.path_arg(args, 0, call)?;
+                let to = self.path_arg(args, 1, call)?;
+                Ok((
+                    format!("(noctalia.renameFile({from}, {to}))"),
+                    Ty::VALUE,
+                ))
+            }
+            "read_file_bytes_result" => {
+                let path = self.path_arg(args, 0, call)?;
+                Ok((format!("(noctalia.readFile({path}))"), Ty::VALUE))
+            }
             "math_randomseed" => {
                 let seed = self.expr(arg(args, 0, call)?)?.0;
                 Ok((format!("math.randomseed({seed})"), Ty::VOID))
@@ -1252,7 +1294,7 @@ impl<'a> Emitter<'a> {
             }
             "file_info" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("noctalia.fileInfo({path})"), Ty::VALUE))
+                Ok((format!("noctalia.fileInfo({path})"), Ty::INFO))
             }
             "run_async_start" | "run_stream_start" | "http_start" => {
                 if !self.in_statement {
@@ -1505,7 +1547,7 @@ impl<'a> Emitter<'a> {
     ) -> Result<String, Error> {
         let value = arg(args, index, call)?;
         let (text, ty) = self.expr(value)?;
-        if ty.base == Base::Str {
+        if ty.is_string() {
             return Ok(text);
         }
         Ok(format!("tostring({text})"))

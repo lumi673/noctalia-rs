@@ -343,6 +343,17 @@ impl Program {
 }
 
 impl Program {
+    /// Whether any `impl` block in the crate defines `name`. A method whose
+    /// receiver type the compiler lost is only treated as a `std` call when the
+    /// crate could not have defined it.
+    pub(crate) fn defines_method(&self, name: &str) -> bool {
+        self.units.values().any(|unit| {
+            unit.impls
+                .values()
+                .any(|methods| methods.contains_key(name))
+        })
+    }
+
     pub(crate) fn resolve_method(
         &self,
         module: &str,

@@ -195,6 +195,9 @@ impl<'a> Emitter<'a> {
                 self.pending_class = Some(name.to_owned());
                 return Ok((value, Ty::VALUE));
             }
+            if let Some(value) = self.fs_call(call, &name, &args)? {
+                return Ok(value);
+            }
             let identity = name.ends_with("::try_from")
                 || name.ends_with("::from_utf8_lossy")
                 || name.ends_with("::from")
@@ -342,6 +345,118 @@ impl<'a> Emitter<'a> {
                 "call to `{label}` is not supported by the Luau compiler: no function in the crate matches, and only ops, ui constructors and a small set of std calls are supported"
             ),
         ))
+    }
+
+    /// `std::fs`, `std::path` and the path calls of `std::env`. Every host
+    /// mapping goes through the API 57 members the fixture declares.
+    fn fs_call(
+        &mut self,
+        call: &ExprCall,
+        name: &str,
+        args: &[&Expr],
+    ) -> Result<OptionalValue, Error> {
+        let mut parts = name.rsplit("::");
+        let last = parts.next().unwrap_or_default();
+        let scope = parts.next().unwrap_or_default();
+        match (scope, last) {
+            ("Path", "new")
+            | ("Path", "from")
+            | ("PathBuf", "from")
+            | ("OsStr", "new")
+            | ("OsString", "from") => {
+                if args.is_empty() {
+                    return Ok(Some(("\"\"".to_owned(), Ty::PATH)));
+                }
+                let text = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((text, Ty::PATH)));
+            }
+            ("PathBuf", "new")
+            | ("OsString", "new")
+            | ("PathBuf", "default")
+            | ("OsString", "default") => {
+                return Ok(Some(("\"\"".to_owned(), Ty::PATH)));
+            }
+            ("fs", "read_to_string") | ("fs", "read") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.readFile({path})"),
+                    Ty::result(Base::Str),
+                )));
+            }
+            ("fs", "write") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                let contents = self.expr(arg(args, 1, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.writeFile({path}, {contents})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "create_dir_all") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.mkdirAll({path})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "remove_file") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.removeFile({path})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "rename") => {
+                let from = self.expr(arg(args, 0, call)?)?.0;
+                let to = self.expr(arg(args, 1, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.renameFile({from}, {to})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "read_dir") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.listDir({path})"),
+                    Ty::result(Base::List),
+                )));
+            }
+            ("fs", "metadata") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.fileInfo({path})"),
+                    Ty::result(Base::Info),
+                )));
+            }
+            ("env", "var_os") => {
+                let key = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.getenv({key})"),
+                    Ty::OPT_PATH,
+                )));
+            }
+            ("env", "temp_dir") => {
+                return Err(Error::at(
+                    call.span(),
+                    "`std::env::temp_dir` has no API 57 member; scratch space belongs in `pluginDataDir`",
+                ));
+            }
+            ("env", "split_paths") => {
+                return Err(Error::at(
+                    call.span(),
+                    "`std::env::split_paths` has no API 57 member; `noctalia.commandExists` answers the same question",
+                ));
+            }
+            ("fs", other) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!(
+                        "`std::fs::{other}` has no API 57 mapping: the host exposes readFile, writeFile, mkdirAll, removeFile, renameFile, fileExists, fileInfo and listDir"
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        Ok(None)
     }
 
     fn ui_node(

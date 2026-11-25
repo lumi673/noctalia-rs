@@ -3,6 +3,11 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Base {
     Str,
+    /// A filesystem path. The value is a Luau string, and the base only selects
+    /// component-wise path semantics over string ones.
+    Path,
+    /// A `{ size, mtime, isDir }` table from `fileInfo`.
+    Info,
     Int,
     Float,
     Bool,
@@ -48,6 +53,9 @@ impl Ty {
     }
 
     pub(crate) const STR: Self = Self::new(Base::Str);
+    pub(crate) const PATH: Self = Self::new(Base::Path);
+    pub(crate) const OPT_PATH: Self = Self::opt(Base::Path);
+    pub(crate) const INFO: Self = Self::new(Base::Info);
     pub(crate) const OPT_STR: Self = Self::opt(Base::Str);
     pub(crate) const INT: Self = Self::new(Base::Int);
     pub(crate) const OPT_INT: Self = Self::opt(Base::Int);
@@ -69,17 +77,19 @@ impl Ty {
         matches!(self.base, Base::Int | Base::Float)
     }
 
+    /// Whether the value prints and behaves as text, which includes a path.
     pub(super) fn is_string(self) -> bool {
-        self.base == Base::Str
+        matches!(self.base, Base::Str | Base::Path)
     }
 
     pub(crate) const fn default_literal(self) -> Option<&'static str> {
         match self.base {
-            Base::Str => Some("\"\""),
+            Base::Str | Base::Path => Some("\"\""),
             Base::Int | Base::Float => Some("0"),
             Base::Bool => Some("false"),
             Base::List | Base::Table => Some("{}"),
-            Base::Value
+            Base::Info
+            | Base::Value
             | Base::Node
             | Base::Ops
             | Base::Context
@@ -381,6 +391,9 @@ pub(super) fn type_hint(ty: &Type) -> Ty {
     }
     if text.contains("String") || text == "str" {
         Ty::STR
+    } else if matches!(text.as_str(), "Path" | "PathBuf" | "OsStr" | "OsString")
+    {
+        Ty::PATH
     } else if text == "bool" {
         Ty::BOOL
     } else if text.starts_with("Vec") || text.starts_with("Option<Vec") {

@@ -598,6 +598,53 @@ fn generated_callbacks_have_runtime_mappings() {
 }
 
 #[test]
+fn file_and_path_members_answer_with_the_fixture_shapes() {
+    let dir = QueryDir::new();
+    dir.queue(vec![
+        json!(["/tmp/a.txt", "/tmp/b"]),
+        json!({ "size": 3, "mtime": 10, "isDir": false }),
+        json!("hello"),
+        json!(true),
+        json!(true),
+    ]);
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let source = r#"
+local entries, list_error = noctalia.listDir("/tmp")
+assert(list_error == nil and entries[1] == "/tmp/a.txt")
+local info, info_error = noctalia.fileInfo("/tmp/a.txt")
+assert(info_error == nil and info.size == 3 and info.mtime == 10)
+assert(info.isDir == false)
+local text, read_error = noctalia.readFile("/tmp/a.txt")
+assert(read_error == nil and text == "hello")
+local written, write_error = noctalia.writeFile("/tmp/b.txt", text .. "!")
+assert(written == true and write_error == nil)
+assert(noctalia.fileExists("/tmp/a.txt") == true)
+assert(type(noctalia.mkdirAll) == "function")
+assert(type(noctalia.removeFile) == "function")
+assert(type(noctalia.renameFile) == "function")
+"#;
+    let values = dispatch(&ctx, &[("entry", source)])
+        .expect("dispatch")
+        .into_iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    let query = |path: Value| {
+        values
+            .iter()
+            .find(|value| value["op"] == "query" && value["path"] == path)
+            .unwrap_or_else(|| panic!("missing query {path}: {values:?}"))
+    };
+    assert_eq!(query(json!(["listDir"]))["args"][0], "/tmp");
+    assert_eq!(query(json!(["fileInfo"]))["args"][0], "/tmp/a.txt");
+    assert_eq!(query(json!(["readFile"]))["args"][0], "/tmp/a.txt");
+    assert_eq!(
+        query(json!(["writeFile"]))["args"],
+        json!(["/tmp/b.txt", "hello!"])
+    );
+    assert_eq!(query(json!(["fileExists"]))["args"][0], "/tmp/a.txt");
+}
+
+#[test]
 fn embedded_bridge_source_parses() {
     let lua = mlua::Lua::new();
     let source = noctalia_rs::bridge::SOURCE
@@ -633,6 +680,14 @@ impl QueryDir {
         let body = json!({ "ok": true, "value": value });
         let path = self.0.join(".noctalia-rs/query").join(format!("{id}.json"));
         fs::write(path, body.to_string()).expect("response");
+    }
+
+    /// Answers the first queries in order, for a script that calls more than
+    /// one host member.
+    fn queue(&self, values: Vec<Value>) {
+        for (index, value) in values.into_iter().enumerate() {
+            self.respond(&format!("noctalia_rs_luau_{}", index + 1), value);
+        }
     }
 }
 

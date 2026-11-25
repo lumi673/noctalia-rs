@@ -7,6 +7,8 @@ impl<'a> Emitter<'a> {
     ) -> Result<(String, Ty), Error> {
         match macro_name(mac).as_str() {
             "format" => self.format(mac),
+            "write" => self.write_macro(mac, false),
+            "writeln" => self.write_macro(mac, true),
             "matches" => self.matches_macro(mac),
             "json" => self.json(mac),
             "vec" => {
@@ -33,6 +35,16 @@ impl<'a> Emitter<'a> {
         mac: &ExprMacro,
     ) -> Result<(String, Ty), Error> {
         let parsed: FormatArgs = syn::parse2(mac.mac.tokens.clone())?;
+        let text = self.format_text(mac, &parsed)?;
+        Ok((text, Ty::STR))
+    }
+
+    /// The `format!` body, shared with `write!` and `writeln!`.
+    pub(crate) fn format_text(
+        &mut self,
+        mac: &ExprMacro,
+        parsed: &FormatArgs,
+    ) -> Result<String, Error> {
         let mut pieces = Vec::new();
         let mut text = String::new();
         let mut chars = parsed.literal.chars().peekable();
@@ -118,7 +130,7 @@ impl<'a> Emitter<'a> {
         if pieces.is_empty() {
             pieces.push("\"\"".to_owned());
         }
-        Ok((pieces.join(" .. "), Ty::STR))
+        Ok(pieces.join(" .. "))
     }
 
     pub(super) fn json(
@@ -274,7 +286,7 @@ fn format_specifier(
     }
     format.push_str(rest);
     let conversion = match ty.base {
-        Base::Str => 's',
+        Base::Str | Base::Path => 's',
         Base::Int => 'd',
         Base::Float => {
             if rest.contains('.') {
@@ -284,11 +296,13 @@ fn format_specifier(
             }
         }
         Base::Bool | Base::Value | Base::List | Base::Table | Base::Node => 's',
-        Base::Ops | Base::Context | Base::Void => return Err(unsupported()),
+        Base::Info | Base::Ops | Base::Context | Base::Void => {
+            return Err(unsupported());
+        }
     };
     format.push(conversion);
     let value = match ty.base {
-        Base::Str | Base::Int | Base::Float => value,
+        Base::Str | Base::Path | Base::Int | Base::Float => value,
         _ => format!("tostring({value})"),
     };
     Ok(format!("string.format({}, {value})", quote(&format)))
