@@ -188,7 +188,7 @@ without blocking.
 Arbitrary trait iterators, dynamic dispatch, trait methods without a Luau
 equivalent, and ops that need a response path fail the build with
 `file:line:column` instead of being approximated. The compiler currently covers
-185 of 1,067 entries in the community corpus; see `BASELINE.md` for the
+197 of 1,067 entries in the community corpus; see `BASELINE.md` for the
 per-stage adoption table.
 
 

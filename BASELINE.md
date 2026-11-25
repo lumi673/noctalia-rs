@@ -335,3 +335,54 @@ nix develop --command cargo run --release -p noctalia-bench --offline -- \
 
 The corpus is treated as read-only; the scan and its scratch files live in
 `.tmp` and are deleted after each run.
+
+## Compiler adoption after stage 5
+
+Stage 5 stays inside the compiler. It maps iterator, string, numeric and container
+operations with exact Luau equivalents, broadens tuple loops and closure patterns,
+adds transparent newtypes and finite JSON numbers, and rejects Luau keyword
+identifiers instead of emitting invalid scripts. No Rust API, bridge, compile mode
+or host global changed.
+
+| Stage | Compiled entries | Adoption |
+| :-- | --: | --: |
+| stage 4 | 185 / 1,067 | 17.34% |
+| stage 5, group 1 (method and call mappings) | 188 / 1,067 | 17.62% |
+| stage 5, group 2 (syntax) | 194 / 1,067 | 18.18% |
+| stage 5, group 3 (newtypes and finite numbers) | 198 / 1,067 | 18.56% |
+| stage 5, final after the keyword bail | 197 / 1,067 | 18.46% |
+
+Group 4 (context field and method gaps) found no remaining gap with an exact
+existing global. The 43-entry blocking query group and the 22-entry JSON null group
+were deliberately left alone.
+
+Final per-kind adoption: widget 119/319, shortcut 42/80, panel 18/299, service
+7/265, desktop widget 6/36, launcher provider 5/64, layer 0/4.
+
+The largest final blockers, counted by distinct entries, are unsupported
+expressions (53), blocking host-start acceptance results (36), `vec!` of ops
+outside `Ok(...)` or a let (32), `&mut` helper parameters other than
+`&mut Vec<Op>` (23), unsupported path expressions (23), JSON null inside an object
+(22), Luau keyword identifiers (20), unsupported `Ok` match patterns (20),
+unparsable Rust syntax (19), and unsupported literal arguments (18). Each one
+still fails with `file:line:column` in strict mode.
+
+Examples that now compile end to end include `audio-switcher/launcher`,
+`cider/now-playing`, `cider/osd` and `containers/bar`, all of which use finite
+JSON numbers from `Number::from_f64`. A Luau parse check loaded all 197 final
+compiled scripts with zero failures.
+
+Full workspace tests, `clippy -D warnings`, `fmt --check` and tarpaulin all pass.
+Coverage is 80.87% (7,972 / 9,858 lines). Three rounds of 300 samples measured
+compiled medians of 1.883 / 1.934 / 1.903 us for `generated_hello_bar`,
+9.933 / 9.949 / 10.399 us for `generated_ui_panel` and 3.666 / 3.737 / 3.677 us
+for `generated_event`. Against hand-written Luau the ratios were 0.98x / 0.98x /
+1.01x, 1.72x / 1.68x / 1.62x and 0.98x / 0.96x / 1.24x. The small fixtures stay
+at parity inside host noise and the UI panel keeps its advantage. Generated source
+sizes are unchanged at 2,405, 2,938 and 3,174 bytes.
+
+100% is impossible under these constraints at the first entry that needs JSON null
+as an object value or a blocking query result. A Luau table cannot distinguish an
+absent key from a null value without a representation change, and compiled entries
+have no synchronous host response path without a new host API. Both would require
+changes outside the compiler.
