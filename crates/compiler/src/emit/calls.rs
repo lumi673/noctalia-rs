@@ -271,7 +271,7 @@ impl<'a> Emitter<'a> {
             }
             if name == "serde_json::to_string" {
                 let text = self.expr(arg(&args, 0, call)?)?.0;
-                return Ok((format!("json.encode({text})"), Ty::STR));
+                return Ok((format!("(json.encode({text}))"), Ty::STR));
             }
             if matches!(name.rsplit("::").next(), Some("from_iter"))
                 && args.len() == 1

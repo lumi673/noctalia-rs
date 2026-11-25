@@ -20,6 +20,10 @@ pub(crate) struct Ty {
     pub(crate) base: Base,
     pub(crate) optional: bool,
     pub(crate) result: bool,
+    /// The expression is a JSON null, which a Luau container cannot hold.
+    pub(crate) null: bool,
+    /// Element type of a list that is known, used by `next()`.
+    pub(crate) element: Option<Base>,
 }
 
 impl Ty {
@@ -28,6 +32,8 @@ impl Ty {
             base,
             optional: false,
             result: false,
+            null: false,
+            element: None,
         }
     }
 
@@ -36,6 +42,8 @@ impl Ty {
             base,
             optional: true,
             result: false,
+            null: false,
+            element: None,
         }
     }
 
@@ -44,6 +52,8 @@ impl Ty {
             base,
             optional: false,
             result: true,
+            null: false,
+            element: None,
         }
     }
 
@@ -64,6 +74,20 @@ impl Ty {
     pub(crate) const OPS: Self = Self::new(Base::Ops);
     pub(crate) const CONTEXT: Self = Self::new(Base::Context);
     pub(crate) const VOID: Self = Self::new(Base::Void);
+    pub(crate) const NULL: Self = Self {
+        base: Base::Value,
+        optional: false,
+        result: false,
+        null: true,
+        element: None,
+    };
+    pub(crate) const STRING_LIST: Self = Self {
+        base: Base::List,
+        optional: false,
+        result: false,
+        null: false,
+        element: Some(Base::Str),
+    };
 
     pub(crate) const fn is_numeric(self) -> bool {
         matches!(self.base, Base::Int | Base::Float)

@@ -207,7 +207,7 @@ impl<'a> Emitter<'a> {
                 if let Expr::Path(path) = &**expr
                     && path.path.is_ident("null")
                 {
-                    return Ok(("nil".to_owned(), Ty::VALUE));
+                    return Ok(("nil".to_owned(), Ty::NULL));
                 }
                 let (text, ty) = self.expr(expr)?;
                 if ty.is_numeric() {
@@ -305,7 +305,7 @@ fn format_piece(value: String, ty: Ty) -> String {
     if ty.is_string() || ty.is_numeric() {
         value
     } else if ty.base == Base::Value {
-        format!("json.encode({value})")
+        format!("(json.encode({value}))")
     } else {
         format!("tostring({value})")
     }

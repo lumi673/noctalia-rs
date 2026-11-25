@@ -678,15 +678,25 @@ impl<'a> Emitter<'a> {
         map: bool,
         body: &dyn Fn(&mut Self, &str) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let item = self.temp();
         if map {
-            if keys {
-                self.line(&format!("for {item} in pairs({source}) do"));
-            } else {
-                self.line(&format!("for _, {item} in pairs({source}) do"));
-            }
+            let order = self.temp();
+            let index = self.temp();
+            self.line(&format!("local {order} = {{}}"));
+            self.line(&format!(
+                "for __key in pairs({source}) do {order}[#({order}) + 1] = __key end"
+            ));
+            self.line(&format!(
+                "table.sort({order}, function(a, b) return tostring(a) < tostring(b) end)"
+            ));
+            self.line(&format!("for {index} = 1, #{order} do"));
             self.indent = self.indent.saturating_add(1);
-            let result = body(self, &item);
+            let result = if keys {
+                body(self, &format!("{order}[{index}]"))
+            } else {
+                let key = self.temp();
+                self.line(&format!("local {key} = {order}[{index}]"));
+                body(self, &format!("{source}[{key}]"))
+            };
             self.indent = self.indent.saturating_sub(1);
             self.line("end");
             return result;
@@ -1668,7 +1678,10 @@ fn boolean_check(receiver: &str, ty: Ty) -> String {
     if ty.base == Base::Bool {
         receiver.to_owned()
     } else {
-        format!("(type({receiver}) == \"boolean\" and {receiver} or nil)")
+        // `false or nil` is nil, so a false payload needs the branch form.
+        format!(
+            "(function(__value) if type(__value) == \"boolean\" then return __value end end)({receiver})"
+        )
     }
 }
 
@@ -1711,10 +1724,11 @@ fn integer_check(receiver: &str, ty: Ty, range: (&str, &str)) -> String {
 /// removes the slot, so a computed `Value::Null` would silently disappear.
 pub(super) fn reject_null(
     text: &str,
+    ty: Ty,
     span: proc_macro2::Span,
     construct: &str,
 ) -> Result<(), Error> {
-    if text != "nil" {
+    if text != "nil" && !ty.null {
         return Ok(());
     }
     Err(Error::at(

@@ -305,8 +305,8 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(compiled.source.contains("string.split("));
-    assert!(compiled.source.contains("for _, __t"));
-    assert!(compiled.source.contains("in pairs("));
+    assert!(compiled.source.contains("for __key in pairs("));
+    assert!(compiled.source.contains("table.sort(__t"));
     assert!(compiled.source.contains(".__next or 1, #"));
 }
 
@@ -594,17 +594,13 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains("local __t6 = (__t5)"),
+        compiled.source.contains("if __t5 ~= nil then"),
         "{}",
         compiled.source
     );
     assert!(
-        compiled.source.contains("if __t6 ~= nil then"),
-        "{}",
-        compiled.source
-    );
-    assert!(
-        compiled.source.contains("__t1[#__t1 + 1] = __t6"),
+        compiled.source.contains("if __t5 ~= nil then")
+            && compiled.source.contains("[#__t1 + 1] = __t5"),
         "{}",
         compiled.source
     );
@@ -645,9 +641,8 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled
-            .source
-            .contains("parts.__next = (parts.__next or 1) + 1"),
+        compiled.source.contains("parts[__t3]")
+            && compiled.source.contains("parts.__next = __t3"),
         "{}",
         compiled.source
     );
@@ -1317,7 +1312,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "{generated}"
     );
     assert!(
-        generated.contains("type(value) == \"boolean\""),
+        generated.contains("type(__value) == \"boolean\" then return __value"),
         "{generated}"
     );
     assert!(generated.contains("is_array(value)"), "{generated}");
@@ -1404,6 +1399,33 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn rejects_a_json_null_stored_in_a_container() {
     for handler in [
+        r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let null = Value::Null;
+    let mut map = Map::new();
+    map.insert("a".to_owned(), null);
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let null = json!(null);
+    let mut items = Vec::new();
+    items.push(null);
+    let _ = ctx;
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+use serde_json::Map;
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let picked = if ctx.now_ms > 0 { json!(1) } else { Value::Null };
+    let mut map = Map::new();
+    map.insert("a".to_owned(), picked);
+    Ok(vec![Op::log("done")])
+}
+"#,
         r#"
 use serde_json::Map;
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
@@ -1536,7 +1558,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     let source = &compiled.source;
     assert!(source.contains("table.sort(__keys"), "{source}");
-    assert!(source.contains("__keys.__next = 1"), "{source}");
+    assert!(source.contains("__noctalia_cursor = 0"), "{source}");
     assert!(source.contains("for __key in pairs(map) do"), "{source}");
     assert!(source.contains("local key = __t"), "{source}");
 }

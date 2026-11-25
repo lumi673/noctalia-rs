@@ -13,7 +13,7 @@ impl<'a> Emitter<'a> {
             "to_string"
                 if matches!(ty.base, Base::Value | Base::Int | Base::Float) =>
             {
-                Ok((format!("json.encode({receiver})"), Ty::STR))
+                Ok((format!("(json.encode({receiver}))"), Ty::STR))
             }
             "as_object_mut" => {
                 let test =
@@ -122,9 +122,9 @@ impl<'a> Emitter<'a> {
             "keys" => {
                 let keys = self.temp();
                 self.line(&format!(
-                    "local {keys} = (function() local __keys = {{}} for __key in pairs({receiver}) do __keys[#__keys + 1] = __key end table.sort(__keys, function(a, b) return tostring(a) < tostring(b) end) __keys.__next = 1 return __keys end)()"
+                    "local {keys} = (function() local __keys = {{}} for __key in pairs({receiver}) do __keys[#__keys + 1] = __key end table.sort(__keys, function(a, b) return tostring(a) < tostring(b) end) setmetatable(__keys, {{ {ARRAY_MARKER} = true, {CURSOR_MARKER} = 0 }}) return __keys end)()"
                 ));
-                Ok((keys, Ty::LIST))
+                Ok((keys, Ty::STRING_LIST))
             }
             _ => return Ok(None),
         };

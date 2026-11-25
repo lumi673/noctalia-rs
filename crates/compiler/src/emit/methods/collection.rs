@@ -28,14 +28,14 @@ impl<'a> Emitter<'a> {
             "pop" => Ok((format!("table.remove({receiver})"), Ty::OPT_VALUE)),
             "push_back" => {
                 let item = arg(args, 0, call)?;
-                let (text, _) = self.expr(item)?;
-                reject_null(&text, item.span(), "push_back")?;
+                let (text, value_ty) = self.expr(item)?;
+                reject_null(&text, value_ty, item.span(), "push_back")?;
                 Ok((format!("table.insert({receiver}, {text})"), Ty::VOID))
             }
             "push" if args.len() == 1 && ty.base != Base::Ops => {
                 let item = arg(args, 0, call)?;
-                let (text, _) = self.expr(item)?;
-                reject_null(&text, item.span(), "push")?;
+                let (text, value_ty) = self.expr(item)?;
+                reject_null(&text, value_ty, item.span(), "push")?;
                 Ok((format!("table.insert({receiver}, {text})"), Ty::VOID))
             }
             "flatten" if ty.optional || ty.base == Base::List => {
@@ -223,13 +223,30 @@ impl<'a> Emitter<'a> {
             "iter" | "into_iter" | "values" => Ok((receiver.to_owned(), ty)),
             "next" => {
                 let value = self.temp();
+                let meta = self.temp();
+                let cursor = self.temp();
+                self.line(&format!("local {meta} = getmetatable({receiver})"));
                 self.line(&format!(
-                    "local {value} = {receiver}[{receiver}.__next or 1]"
+                    "local {cursor} = ((type({meta}) == \"table\" and {meta}.{CURSOR_MARKER}) or {receiver}.__next or 0) + 1"
                 ));
+                self.line(&format!("local {value} = {receiver}[{cursor}]"));
+                self.line(&format!("if {value} ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
                 self.line(&format!(
-                    "if {value} ~= nil then {receiver}.__next = ({receiver}.__next or 1) + 1 end"
+                    "if type({meta}) == \"table\" and {meta}.{CURSOR_MARKER} ~= nil then"
                 ));
-                Ok((value, Ty::opt(ty.base)))
+                self.indent = self.indent.saturating_add(1);
+                self.line(&format!("{meta}.{CURSOR_MARKER} = {cursor}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line(&format!("elseif {receiver}.__next ~= nil then"));
+                self.indent = self.indent.saturating_add(1);
+                self.line(&format!("{receiver}.__next = {cursor}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                let element = ty.element.unwrap_or(Base::Value);
+                Ok((value, Ty::opt(element)))
             }
             "as_os_str" | "to_str" | "to_vec" => {
                 Ok((receiver.to_owned(), Ty::VALUE))
@@ -246,8 +263,8 @@ impl<'a> Emitter<'a> {
             "insert" if args.len() == 2 => {
                 let key = self.expr(arg(args, 0, call)?)?.0;
                 let item = arg(args, 1, call)?;
-                let (value, _) = self.expr(item)?;
-                reject_null(&value, item.span(), "insert")?;
+                let (value, value_ty) = self.expr(item)?;
+                reject_null(&value, value_ty, item.span(), "insert")?;
                 if ty.base != Base::Table
                     && key.chars().all(|character| character.is_ascii_digit())
                 {
@@ -449,8 +466,8 @@ impl<'a> Emitter<'a> {
                 if is_op_expr(value) {
                     self.op_expr(value)?;
                 } else {
-                    let (text, _) = self.expr(value)?;
-                    reject_null(&text, value.span(), "push")?;
+                    let (text, value_ty) = self.expr(value)?;
+                    reject_null(&text, value_ty, value.span(), "push")?;
                     self.line(&format!("table.insert({receiver}, {text})"));
                 }
                 Ok((String::new(), Ty::VOID))

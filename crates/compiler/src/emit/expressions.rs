@@ -10,11 +10,11 @@ impl<'a> Emitter<'a> {
         }
         let mut values = Vec::new();
         for item in items {
-            let (text, _) = self.expr(item)?;
+            let (text, item_ty) = self.expr(item)?;
             if text.is_empty() {
                 continue;
             }
-            reject_null(&text, item.span(), "a list literal")?;
+            reject_null(&text, item_ty, item.span(), "a list literal")?;
             values.push(text);
         }
         Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
@@ -106,18 +106,23 @@ impl<'a> Emitter<'a> {
                 };
                 self.line(&format!("if {condition} then"));
                 self.indent = self.indent.saturating_add(1);
-                let (value, ty) = self.block_value(&item.then_branch)?;
+                let (value, then_ty) = self.block_value(&item.then_branch)?;
                 self.line(&format!("{name} = {value}"));
                 self.indent = self.indent.saturating_sub(1);
+                let mut ty = then_ty;
                 if let Some((_, branch)) = &item.else_branch {
                     self.line("else");
                     self.indent = self.indent.saturating_add(1);
-                    let (value, _) = match &**branch {
+                    let (value, else_ty) = match &**branch {
                         Expr::Block(block) => self.block_value(&block.block)?,
                         other => self.expr(other)?,
                     };
+                    ty.null = then_ty.null || else_ty.null;
                     self.line(&format!("{name} = {value}"));
                     self.indent = self.indent.saturating_sub(1);
+                } else {
+                    // Without an else branch the false path leaves nil.
+                    ty.null = true;
                 }
                 self.line("end");
                 Ok((name, ty))
@@ -305,7 +310,7 @@ impl<'a> Emitter<'a> {
             && segments.last().is_some_and(|name| name == "Null")
             && segments.iter().any(|name| name == "Value")
         {
-            return Ok(("nil".to_owned(), Ty::VALUE));
+            return Ok(("nil".to_owned(), Ty::NULL));
         }
         if let Some(segments) = path_segments(&path.path)
             && let Some(variant) =
@@ -487,7 +492,7 @@ impl<'a> Emitter<'a> {
             return Ok((name, Ty::BOOL));
         }
         if name == "None" {
-            return Ok(("nil".to_owned(), Ty::VALUE));
+            return Ok(("nil".to_owned(), Ty::NULL));
         }
         if name == self.ctx {
             return Err(Error::at(
@@ -917,7 +922,7 @@ impl<'a> Emitter<'a> {
                         _ => Ok(("nil".to_owned(), Ty::VALUE)),
                     }
                 }
-                None => Ok(("nil".to_owned(), Ty::VALUE)),
+                None => Ok(("nil".to_owned(), Ty::NULL)),
             },
             body => self.value_or_statement(body),
         };
@@ -1025,13 +1030,16 @@ fn numeric(left: &Ty, right: &Ty) -> Ty {
 }
 
 pub(super) fn wider(left: Ty, right: Ty) -> Ty {
-    if left.base == right.base {
+    let null = left.null || right.null;
+    let mut ty = if left.base == right.base {
         left
     } else if left.is_numeric() && right.is_numeric() {
         Ty::FLOAT
     } else {
         Ty::VALUE
-    }
+    };
+    ty.null = null;
+    ty
 }
 
 pub(super) fn path_last_name(expr: &Expr) -> Option<String> {

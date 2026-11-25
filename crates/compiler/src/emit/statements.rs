@@ -1265,8 +1265,10 @@ impl<'a> Emitter<'a> {
                         ));
                     }
                     [first, second] => {
-                        for name in bindings.iter().flatten() {
-                            self.push(name, Ty::VALUE);
+                        for (position, name) in
+                            bindings.iter().flatten().enumerate()
+                        {
+                            self.push(name, self.key_ty(position));
                         }
                         self.line(&format!("local {first} = {keys}[{index}]"));
                         self.line(&format!(
@@ -1343,8 +1345,8 @@ impl<'a> Emitter<'a> {
             self.indent = self.indent.saturating_add(1);
             let first = bindings[0].clone().unwrap_or_else(|| "_".to_owned());
             let second = bindings[1].clone().unwrap_or_else(|| "_".to_owned());
-            for name in bindings.iter().flatten() {
-                self.push(name, Ty::VALUE);
+            for (position, name) in bindings.iter().flatten().enumerate() {
+                self.push(name, self.key_ty(position));
             }
             self.line(&format!(
                 "for {first}, {second} in pairs(type({source}) == \"table\" and {source} or {{}}) do"
@@ -1367,7 +1369,10 @@ impl<'a> Emitter<'a> {
             };
             let value = if enumerate && position == 0 {
                 format!("({index} - 1)")
-            } else if !enumerate && bindings.len() == 1 {
+            } else if !enumerate
+                && bindings.len() == 1
+                && matches!(&*item.pat, Pat::Ident(_))
+            {
                 format!("{source}[{index}]")
             } else {
                 format!(
@@ -1396,6 +1401,11 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// A map loop's first binding is the key, a string in every JSON object.
+    fn key_ty(&self, position: usize) -> Ty {
+        if position == 0 { Ty::STR } else { Ty::VALUE }
+    }
+
     pub(super) fn assign(
         &mut self,
         left: &Expr,
@@ -1414,7 +1424,7 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         if matches!(strip_reference(left), Expr::Index(_)) {
-            reject_null(&text, right.span(), "an index assignment")?;
+            reject_null(&text, ty, right.span(), "an index assignment")?;
         }
         self.line(&format!("{target} {op} {text}"));
         if is_local && let Some(name) = path_ident(strip_reference(left)) {

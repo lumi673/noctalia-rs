@@ -806,3 +806,95 @@ fn native_json_literals(_ctx: &Context) -> Vec<Op> {
     ops.push(Op::log(shaped.to_string()));
     ops
 }
+
+#[test]
+fn json_iterators_and_scalars_match_the_native_handler() {
+    let handler = r#"
+use serde_json::Map;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut numbers: Vec<Value> = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    map.insert("flag".to_owned(), json!(false));
+    labels.push(json!("one").to_string());
+    labels.push(format!("{}", json!(2)));
+    numbers.push(json!(1));
+    numbers.push(json!(2));
+    let mut keys = map.keys();
+    let first = keys.next().unwrap_or_default();
+    let second = keys.next().unwrap_or_default();
+    let third = keys.next().unwrap_or_default();
+    let exhausted = keys.next().unwrap_or_default();
+    let flag = map.get("flag").and_then(Value::as_bool).unwrap_or(true);
+    let fallback = map.get("missing").cloned().unwrap_or(json!(true));
+    let ordered: Vec<Value> = map.values().take(2).cloned().collect();
+    let mut rendered = Vec::new();
+    for (name, value) in map.iter() {
+        rendered.push(format!("{name}={value}"));
+    }
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{flag}|{fallback}|{}|{}",
+        labels.join(","),
+        numbers.len(),
+        first,
+        second,
+        third,
+        exhausted,
+        ordered.len(),
+        rendered.join(",")
+    )));
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("json_iterators", handler, EntryKind::Service);
+    let state = json!({});
+    let ctx = context("json_iterators", "load", json!({}), state);
+    assert_eq!(
+        ops("json_iterators", &source, &ctx),
+        rust_ops(native_json_iterators(&ctx))
+    );
+}
+
+fn native_json_iterators(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    let mut ops = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut numbers: Vec<Value> = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    map.insert("flag".to_owned(), json!(false));
+    labels.push(json!("one").to_string());
+    labels.push(format!("{}", json!(2)));
+    numbers.push(json!(1));
+    numbers.push(json!(2));
+    let mut keys = map.keys();
+    let first = keys.next().cloned().unwrap_or_default();
+    let second = keys.next().cloned().unwrap_or_default();
+    let third = keys.next().cloned().unwrap_or_default();
+    let exhausted = keys.next().cloned().unwrap_or_default();
+    let flag = map.get("flag").and_then(Value::as_bool).unwrap_or(true);
+    let fallback = map.get("missing").cloned().unwrap_or(json!(true));
+    let ordered: Vec<Value> = map.values().take(2).cloned().collect();
+    let mut rendered = Vec::new();
+    for (name, value) in map.iter() {
+        rendered.push(format!("{name}={value}"));
+    }
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{flag}|{fallback}|{}|{}",
+        labels.join(","),
+        numbers.len(),
+        first,
+        second,
+        third,
+        exhausted,
+        ordered.len(),
+        rendered.join(",")
+    )));
+    ops
+}

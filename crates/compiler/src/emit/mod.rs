@@ -267,6 +267,10 @@ impl<'a> Emitter<'a> {
 /// the pair in `tests`.
 pub(crate) const ARRAY_MARKER: &str = "__noctalia_array";
 
+/// Where a list iterator keeps its position, in the table's metatable so the
+/// elements stay a clean sequence.
+pub(crate) const CURSOR_MARKER: &str = "__noctalia_cursor";
+
 pub(crate) fn empty_array() -> String {
     format!("setmetatable({{}}, {{ {ARRAY_MARKER} = true }})")
 }
