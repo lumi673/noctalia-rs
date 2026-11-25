@@ -1579,13 +1579,13 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let chained = base.clone().and_then(Value::as_str);
     let filtered = base.clone().filter(|value| !value.is_empty());
     let some = base.clone().is_some_and(|value| value == "x");
-    let or = base.clone().map_or("default".to_owned(), |value| value);
+    let either = base.clone().map_or("default".to_owned(), |value| value);
     let or_else = base.clone().map_or_else(|| "fallback".to_owned(), |value| value);
     let fallback = base.clone().unwrap_or_else(|| "none".to_owned());
     let alt = base.clone().or_else(|| Some("alt".to_owned()));
     let result = base.clone().ok_or("missing");
     let result2 = base.clone().ok_or_else(|| "missing");
-    Ok(vec![Op::log(format!("{} {} {} {} {} {} {} {} {} {}", mapped.unwrap_or(""), chained.unwrap_or(""), filtered.unwrap_or(""), some, or, or_else, fallback, alt.unwrap_or(""), result.unwrap_or(""), result2.unwrap_or("")))])
+    Ok(vec![Op::log(format!("{} {} {} {} {} {} {} {} {} {}", mapped.unwrap_or(""), chained.unwrap_or(""), filtered.unwrap_or(""), some, either, or_else, fallback, alt.unwrap_or(""), result.unwrap_or(""), result2.unwrap_or("")))])
 }
 "#;
     let compiled =
@@ -4130,4 +4130,19 @@ fn bails_on_array_initializers_and_comparators_with_positions() {
         );
         assert!(error.message.contains(name), "{}", error.message);
     }
+}
+
+#[test]
+fn bails_on_luau_keyword_identifiers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let end = 1;
+    Ok(vec![Op::log(format!("{end}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bail");
+    assert!(error.message.contains("Luau keyword"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
 }

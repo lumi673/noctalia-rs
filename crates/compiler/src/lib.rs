@@ -825,5 +825,33 @@ pub(crate) fn is_identifier(value: &str) -> bool {
     chars.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
+pub(crate) fn is_luau_keyword(value: &str) -> bool {
+    matches!(
+        value,
+        "and"
+            | "break"
+            | "do"
+            | "else"
+            | "elseif"
+            | "end"
+            | "false"
+            | "for"
+            | "function"
+            | "goto"
+            | "if"
+            | "in"
+            | "local"
+            | "nil"
+            | "not"
+            | "or"
+            | "repeat"
+            | "return"
+            | "then"
+            | "true"
+            | "until"
+            | "while"
+    )
+}
+
 #[cfg(test)]
 mod tests;

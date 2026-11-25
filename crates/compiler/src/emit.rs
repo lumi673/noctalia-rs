@@ -9,7 +9,9 @@ use syn::{
 };
 
 use crate::program::{Program, typed_args};
-use crate::{Error, is_context, is_identifier, quote, sanitize};
+use crate::{
+    Error, is_context, is_identifier, is_luau_keyword, quote, sanitize,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Base {
@@ -1022,6 +1024,12 @@ impl<'a> Emitter<'a> {
                 ));
             }
         };
+        if is_luau_keyword(&name) {
+            return Err(Error::at(
+                local.pat.span(),
+                format!("identifier `{name}` is a Luau keyword"),
+            ));
+        }
         let Some(init) = &local.init else {
             let ty = hint.map_or(Ty::VALUE, type_hint);
             if let Some(kind) = hint.map(static_kind)
@@ -5439,6 +5447,12 @@ impl<'a> Emitter<'a> {
             match input {
                 syn::Pat::Ident(pattern) => {
                     let name = pattern.ident.to_string();
+                    if is_luau_keyword(&name) {
+                        return Err(Error::at(
+                            pattern.span(),
+                            format!("identifier `{name}` is a Luau keyword"),
+                        ));
+                    }
                     self.push(&name, Ty::VALUE);
                     params.push(name);
                 }
@@ -5506,6 +5520,12 @@ impl<'a> Emitter<'a> {
         match pattern {
             Pat::Ident(pattern) => {
                 let name = pattern.ident.to_string();
+                if is_luau_keyword(&name) {
+                    return Err(Error::at(
+                        pattern.span(),
+                        format!("identifier `{name}` is a Luau keyword"),
+                    ));
+                }
                 self.line(&format!("local {name} = {value}"));
                 self.push(&name, Ty::VALUE);
                 Ok(())
