@@ -161,7 +161,39 @@ fn table_marker(table: &Table) -> LuaResult<Option<JsonValue>> {
     Ok(None)
 }
 
+/// The field a table's metatable carries to say the table is a JSON array.
+///
+/// An empty table is the one container shape Luau cannot tell from the other,
+/// so generated code and `json.decode` tag arrays with this marker and
+/// `to_json` honors it.
+pub const ARRAY_MARKER: &str = "__noctalia_array";
+
+pub fn array_marker(lua: &Lua) -> LuaResult<Table> {
+    if let Ok(table) = lua.named_registry_value::<Table>(ARRAY_MARKER) {
+        return Ok(table);
+    }
+    let table = lua.create_table()?;
+    table.raw_set(ARRAY_MARKER, true)?;
+    lua.set_named_registry_value(ARRAY_MARKER, &table)?;
+    Ok(table)
+}
+
+pub fn mark_array(lua: &Lua, table: &Table) -> LuaResult<()> {
+    table.set_metatable(Some(array_marker(lua)?));
+    Ok(())
+}
+
+pub fn is_array(table: &Table) -> bool {
+    table
+        .metatable()
+        .and_then(|meta| meta.raw_get::<bool>(ARRAY_MARKER).ok())
+        .unwrap_or(false)
+}
+
 fn is_sequence(table: &Table, length: usize) -> bool {
+    if is_array(table) {
+        return true;
+    }
     if length == 0 {
         return false;
     }
@@ -203,6 +235,7 @@ pub fn from_json(lua: &Lua, value: &JsonValue) -> LuaResult<LuaValue> {
             for (index, item) in values.iter().enumerate() {
                 table.raw_set(index + 1, from_json(lua, item)?)?;
             }
+            mark_array(lua, &table)?;
             Ok(LuaValue::Table(table))
         }
         JsonValue::Object(values) => {
@@ -229,6 +262,7 @@ pub fn from_json_with_bytes(
             for (index, item) in values.iter().enumerate() {
                 table.raw_set(index + 1, from_json_with_bytes(lua, item)?)?;
             }
+            mark_array(lua, &table)?;
             Ok(LuaValue::Table(table))
         }
         JsonValue::Object(values) => {

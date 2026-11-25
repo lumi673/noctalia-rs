@@ -6,14 +6,16 @@ impl<'a> Emitter<'a> {
         items: &[Expr],
     ) -> Result<(String, Ty), Error> {
         if items.is_empty() {
-            return Ok(("{}".to_owned(), Ty::LIST));
+            return Ok((empty_array(), Ty::LIST));
         }
         let mut values = Vec::new();
         for item in items {
             let (text, _) = self.expr(item)?;
-            if !text.is_empty() {
-                values.push(text);
+            if text.is_empty() {
+                continue;
             }
+            reject_null(&text, item.span(), "a list literal")?;
+            values.push(text);
         }
         Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
     }
@@ -346,14 +348,14 @@ impl<'a> Emitter<'a> {
         }
         if let Some(segments) = path_segments(&path.path)
             && segments.iter().any(|name| name == "Value")
-            && let Some(lua_type) =
+            && let Some((lua_type, ty)) =
                 segments.last().and_then(|name| value_accessor(name))
         {
             return Ok((
                 format!(
                     "(function(__value) if type(__value) == \"{lua_type}\" then return __value end end)"
                 ),
-                Ty::VALUE,
+                ty,
             ));
         }
         if let Some(segments) = path_segments(&path.path) {

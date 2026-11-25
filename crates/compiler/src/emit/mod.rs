@@ -158,18 +158,23 @@ impl<'a> Emitter<'a> {
             source.push_str("  local entry = ENTRY\n");
         }
         if self.uses_array_shape {
-            source.push_str(concat!(
-                "  local function is_array(value)\n",
-                "    if type(value) ~= \"table\" then return false end\n",
-                "    local length = #value\n",
-                "    if length == 0 then return false end\n",
-                "    local count = 0\n",
-                "    for key in pairs(value) do\n",
-                "      if type(key) ~= \"number\" or key % 1 ~= 0 or key < 1 or key > length then return false end\n",
-                "      count = count + 1\n",
-                "    end\n",
-                "    return count == length\n",
-                "  end\n",
+            source.push_str(&format!(
+                concat!(
+                    "  local function is_array(value)\n",
+                    "    if type(value) ~= \"table\" then return false end\n",
+                    "    local meta = getmetatable(value)\n",
+                    "    if type(meta) == \"table\" and meta.{ARRAY_MARKER} then return true end\n",
+                    "    local length = #value\n",
+                    "    if length == 0 then return false end\n",
+                    "    local count = 0\n",
+                    "    for key in pairs(value) do\n",
+                    "      if type(key) ~= \"number\" or key % 1 ~= 0 or key < 1 or key > length then return false end\n",
+                    "      count = count + 1\n",
+                    "    end\n",
+                    "    return count == length\n",
+                    "  end\n",
+                ),
+                ARRAY_MARKER = ARRAY_MARKER,
             ));
         }
         if self.uses_count_keys {
@@ -185,7 +190,7 @@ impl<'a> Emitter<'a> {
             source.push_str(concat!(
                 "  local function deep_clone(value)\n",
                 "    if type(value) ~= \"table\" then return value end\n",
-                "    local copy = {}\n",
+                "    local copy = setmetatable({}, getmetatable(value))\n",
                 "    for key, item in pairs(value) do copy[key] = deep_clone(item) end\n",
                 "    return copy\n",
                 "  end\n",
@@ -252,6 +257,18 @@ impl<'a> Emitter<'a> {
         self.temp = self.temp.saturating_add(1);
         format!("__t{}", self.temp)
     }
+}
+
+/// The Luau expression for an empty JSON array.
+///
+/// An empty table is the one container shape Luau cannot tell from an empty
+/// object, so arrays carry a metatable marker that `noctalia.json.encode` and
+/// `json.decode` honor. `crates/luau` keeps the same field name and asserts
+/// the pair in `tests`.
+pub(crate) const ARRAY_MARKER: &str = "__noctalia_array";
+
+pub(crate) fn empty_array() -> String {
+    format!("setmetatable({{}}, {{ {ARRAY_MARKER} = true }})")
 }
 
 pub(crate) type PayloadParam = (&'static str, &'static str, &'static str);

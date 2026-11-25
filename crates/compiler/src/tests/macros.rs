@@ -17,11 +17,9 @@ fn service(ctx: &Context) -> Result<Vec<Op>> {
 
     assert!(compiled.source.contains("noctalia.setUpdateInterval(1000)"));
     assert!(compiled.source.contains("noctalia.log(name .. \" ready\")"));
-    assert!(
-        compiled.source.contains(
-            "local name = (noctalia.getConfig(\"name\") or \"bench\")"
-        )
-    );
+    assert!(compiled.source.contains("noctalia.getConfig(\"name\")"));
+    assert!(compiled.source.contains("== nil then __t"));
+    assert!(compiled.source.contains("= \"bench\" end"));
     assert!(!compiled.source.contains("body_load"));
     assert!(!compiled.source.contains("noctalia.state.watch(STATE_KEY"));
 }
@@ -48,7 +46,9 @@ fn launcher(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
 
     assert!(compiled.source.contains("local function body_"));
-    assert!(compiled.source.contains("launcher.setResults(text, {})"));
+    assert!(compiled.source.contains(
+        "launcher.setResults(text, setmetatable({}, { __noctalia_array = true }))"
+    ));
     assert!(compiled.source.contains("noctalia.log(id)"));
     assert!(compiled.source.contains("function update() end"));
     assert!(
@@ -62,7 +62,9 @@ fn launcher(ctx: &Context) -> Result<Vec<Op>> {
             .source
             .contains("function onActivate(id) body_activate(")
     );
-    assert!(compiled.source.contains("launcher.setResults(text, {})"));
+    assert!(compiled.source.contains(
+        "launcher.setResults(text, setmetatable({}, { __noctalia_array = true }))"
+    ));
     assert!(compiled.source.contains("last_query"));
     assert_eq!(compiled.events, vec!["activate", "query", "search"]);
 }

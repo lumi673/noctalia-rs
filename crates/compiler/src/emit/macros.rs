@@ -184,7 +184,7 @@ impl<'a> Emitter<'a> {
                     }
                     parts.push(format!("{} = {text}", lua_key(key)));
                 }
-                Ok((format!("{{ {} }}", parts.join(", ")), Ty::TABLE))
+                Ok((format!("{{ {} }}", parts.join(", ")), Ty::VALUE))
             }
             JsonNode::Array(values) => {
                 let mut parts = Vec::new();
@@ -198,7 +198,10 @@ impl<'a> Emitter<'a> {
                     }
                     parts.push(text);
                 }
-                Ok((format!("{{ {} }}", parts.join(", ")), Ty::LIST))
+                if parts.is_empty() {
+                    return Ok((empty_array(), Ty::VALUE));
+                }
+                Ok((format!("{{ {} }}", parts.join(", ")), Ty::VALUE))
             }
             JsonNode::Expr(expr) => {
                 if let Expr::Path(path) = &**expr
@@ -206,7 +209,11 @@ impl<'a> Emitter<'a> {
                 {
                     return Ok(("nil".to_owned(), Ty::VALUE));
                 }
-                self.expr(expr)
+                let (text, ty) = self.expr(expr)?;
+                if ty.is_numeric() {
+                    return Ok((text, ty));
+                }
+                Ok((text, Ty::VALUE))
             }
         }
     }
@@ -297,6 +304,8 @@ fn format_specifier(
 fn format_piece(value: String, ty: Ty) -> String {
     if ty.is_string() || ty.is_numeric() {
         value
+    } else if ty.base == Base::Value {
+        format!("json.encode({value})")
     } else {
         format!("tostring({value})")
     }

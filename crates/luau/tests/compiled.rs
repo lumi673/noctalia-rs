@@ -704,3 +704,105 @@ fn native_json(_ctx: &Context) -> Vec<Op> {
     ops.push(Op::log(describe(json!({ "a": 1 }))));
     ops
 }
+
+#[test]
+fn json_literals_match_the_native_handler() {
+    let handler = r#"
+use serde_json::Map;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let empty = json!([]);
+    let shaped = json!({ "items": [], "meta": {} });
+    let text = json!("hi").to_string();
+    let number = json!(1.5).to_string();
+    let integer = json!(3).to_string();
+    let array = empty.as_array().map(|items| items.len()).unwrap_or(9);
+    let array_kind = empty.is_array();
+    let object_kind = shaped.is_object();
+    let missing = shaped["items"].as_array().map(|items| items.len()).unwrap_or(9);
+    let empty_map = Map::new();
+    let is_empty = empty_map.is_empty();
+    let mut filled = Map::new();
+    filled.insert("b".to_owned(), json!(2));
+    filled.insert("a".to_owned(), json!(1));
+    let keys = filled.keys().next().unwrap_or_default();
+    let first_value = filled.values().next().unwrap_or(Value::Null);
+    let previous = filled.insert("a".to_owned(), json!(3));
+    let previous_text = previous.as_ref().map(|value| value.to_string()).unwrap_or_default();
+    let previous_some = previous.is_some();
+    let mut ordered = Vec::new();
+    for name in filled.keys() {
+        ordered.push(name);
+    }
+    let dotted = format!("{}|{}|{}|{}", json!("x"), json!(1.5), json!([1]), json!({ "a": 1 }));
+    ops.push(Op::log(format!(
+        "{text}|{number}|{integer}|{array}|{array_kind}|{object_kind}|{missing}|{is_empty}|{keys}|{first_value}|{previous_text}|{previous_some}|{}",
+        ordered.join(",")
+    )));
+    ops.push(Op::log(dotted));
+    ops.push(Op::log(shaped.to_string()));
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("json_literals", handler, EntryKind::Service);
+    assert!(
+        source.contains(noctalia_rs_luau::ARRAY_MARKER),
+        "the compiler and the runtime must agree on the array marker"
+    );
+    let state = json!({});
+    let ctx = context("json_literals", "load", json!({}), state);
+    assert_eq!(
+        ops("json_literals", &source, &ctx),
+        rust_ops(native_json_literals(&ctx))
+    );
+}
+
+fn native_json_literals(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    let mut ops = Vec::new();
+    let empty = json!([]);
+    let shaped = json!({ "items": [], "meta": {} });
+    let text = json!("hi").to_string();
+    let number = json!(1.5).to_string();
+    let integer = json!(3).to_string();
+    let array = empty.as_array().map(|items| items.len()).unwrap_or(9);
+    let array_kind = empty.is_array();
+    let object_kind = shaped.is_object();
+    let missing = shaped["items"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(9);
+    let empty_map = Map::new();
+    let is_empty = empty_map.is_empty();
+    let mut filled = Map::new();
+    filled.insert("b".to_owned(), json!(2));
+    filled.insert("a".to_owned(), json!(1));
+    let keys = filled.keys().next().cloned().unwrap_or_default();
+    let first_value = filled.values().next().cloned().unwrap_or(Value::Null);
+    let previous = filled.insert("a".to_owned(), json!(3));
+    let previous_text = previous
+        .as_ref()
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let previous_some = previous.is_some();
+    let mut ordered = Vec::new();
+    for name in filled.keys() {
+        ordered.push(name.clone());
+    }
+    let dotted = format!(
+        "{}|{}|{}|{}",
+        json!("x"),
+        json!(1.5),
+        json!([1]),
+        json!({ "a": 1 })
+    );
+    ops.push(Op::log(format!(
+        "{text}|{number}|{integer}|{array}|{array_kind}|{object_kind}|{missing}|{is_empty}|{keys}|{first_value}|{previous_text}|{previous_some}|{}",
+        ordered.join(",")
+    )));
+    ops.push(Op::log(dotted));
+    ops.push(Op::log(shaped.to_string()));
+    ops
+}

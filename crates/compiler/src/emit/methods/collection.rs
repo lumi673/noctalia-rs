@@ -27,8 +27,16 @@ impl<'a> Emitter<'a> {
             "first" => Ok((format!("({receiver}[1])"), Ty::OPT_VALUE)),
             "pop" => Ok((format!("table.remove({receiver})"), Ty::OPT_VALUE)),
             "push_back" => {
-                let value = self.expr(arg(args, 0, call)?)?.0;
-                Ok((format!("table.insert({receiver}, {value})"), Ty::VOID))
+                let item = arg(args, 0, call)?;
+                let (text, _) = self.expr(item)?;
+                reject_null(&text, item.span(), "push_back")?;
+                Ok((format!("table.insert({receiver}, {text})"), Ty::VOID))
+            }
+            "push" if args.len() == 1 && ty.base != Base::Ops => {
+                let item = arg(args, 0, call)?;
+                let (text, _) = self.expr(item)?;
+                reject_null(&text, item.span(), "push")?;
+                Ok((format!("table.insert({receiver}, {text})"), Ty::VOID))
             }
             "flatten" if ty.optional || ty.base == Base::List => {
                 if ty.optional && ty.base != Base::List {
@@ -205,14 +213,21 @@ impl<'a> Emitter<'a> {
                     Ty::STR,
                 ))
             }
+            "values" if matches!(ty.base, Base::Value | Base::Table) => {
+                let values = self.temp();
+                self.line(&format!(
+                    "local {values} = (function() local __keys = {{}} for __key in pairs({receiver}) do __keys[#__keys + 1] = __key end table.sort(__keys, function(a, b) return tostring(a) < tostring(b) end) local __out = {{}} for __index, __key in ipairs(__keys) do __out[__index] = {receiver}[__key] end return __out end)()"
+                ));
+                Ok((values, Ty::LIST))
+            }
             "iter" | "into_iter" | "values" => Ok((receiver.to_owned(), ty)),
             "next" => {
                 let value = self.temp();
                 self.line(&format!(
-                    "local {value} = {receiver}[{receiver}.__next]"
+                    "local {value} = {receiver}[{receiver}.__next or 1]"
                 ));
                 self.line(&format!(
-                    "if {value} ~= nil then {receiver}.__next = {receiver}.__next + 1 end"
+                    "if {value} ~= nil then {receiver}.__next = ({receiver}.__next or 1) + 1 end"
                 ));
                 Ok((value, Ty::opt(ty.base)))
             }
@@ -230,17 +245,25 @@ impl<'a> Emitter<'a> {
             }
             "insert" if args.len() == 2 => {
                 let key = self.expr(arg(args, 0, call)?)?.0;
-                let value = self.expr(arg(args, 1, call)?)?.0;
+                let item = arg(args, 1, call)?;
+                let (value, _) = self.expr(item)?;
+                reject_null(&value, item.span(), "insert")?;
                 if ty.base != Base::Table
                     && key.chars().all(|character| character.is_ascii_digit())
                 {
                     self.line(&format!(
                         "table.insert({receiver}, ({key}) + 1, {value})"
                     ));
-                } else {
-                    self.line(&format!("{receiver}[{key}] = {value}"));
+                    return Ok(Some((String::new(), Ty::VOID)));
                 }
-                Ok((String::new(), Ty::VOID))
+                if self.in_statement {
+                    self.line(&format!("{receiver}[{key}] = {value}"));
+                    return Ok(Some((String::new(), Ty::VOID)));
+                }
+                let previous = self.temp();
+                self.line(&format!("local {previous} = {receiver}[{key}]"));
+                self.line(&format!("{receiver}[{key}] = {value}"));
+                Ok((previous, Ty::OPT_VALUE))
             }
             "remove" if args.len() == 1 => {
                 let (key, key_ty) = self.expr(arg(args, 0, call)?)?;
@@ -358,10 +381,14 @@ impl<'a> Emitter<'a> {
                         Ty::new(wider(ty, default_ty).base),
                     )));
                 }
-                Ok((
-                    format!("({receiver} or {default})"),
-                    Ty::new(wider(ty, default_ty).base),
-                ))
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result} = {value}"));
+                self.line(&format!(
+                    "if {value} == nil then {result} = {default} end"
+                ));
+                Ok((result, Ty::new(wider(ty, default_ty).base)))
             }
             "unwrap_or_default" => {
                 let default = if ty.base == Base::Value {
@@ -385,9 +412,29 @@ impl<'a> Emitter<'a> {
                     ));
                     return Ok(Some((result, Ty::new(ty.base))));
                 }
-                Ok((format!("({receiver} or {default})"), Ty::new(ty.base)))
+                let value = self.temp();
+                let result = self.temp();
+                self.line(&format!("local {value} = {receiver}"));
+                self.line(&format!("local {result} = {value}"));
+                self.line(&format!(
+                    "if {value} == nil then {result} = {default} end"
+                ));
+                Ok((result, Ty::new(ty.base)))
             }
             "len" => Ok((format!("#{receiver}"), Ty::INT)),
+            "is_empty" if ty.base == Base::Table => {
+                self.uses_count_keys = true;
+                Ok((format!("(count_keys({receiver}) == 0)"), Ty::BOOL))
+            }
+            "is_empty" if ty.base == Base::Value => {
+                self.uses_count_keys = true;
+                Ok((
+                    format!(
+                        "((type({receiver}) == \"table\" and count_keys({receiver}) == 0) or (type({receiver}) == \"string\" and #{receiver} == 0))"
+                    ),
+                    Ty::BOOL,
+                ))
+            }
             "is_empty" => Ok((format!("(#{receiver} == 0)"), Ty::BOOL)),
             "get" | "get_mut" => {
                 let (key, key_ty) = self.expr(arg(args, 0, call)?)?;
@@ -403,6 +450,7 @@ impl<'a> Emitter<'a> {
                     self.op_expr(value)?;
                 } else {
                     let (text, _) = self.expr(value)?;
+                    reject_null(&text, value.span(), "push")?;
                     self.line(&format!("table.insert({receiver}, {text})"));
                 }
                 Ok((String::new(), Ty::VOID))
@@ -414,10 +462,6 @@ impl<'a> Emitter<'a> {
                     "for _, {item} in ipairs({value}) do {receiver}[#({receiver}) + 1] = {item} end"
                 ));
                 Ok((String::new(), Ty::VOID))
-            }
-            "push" => {
-                let (value, _) = self.expr(arg(args, 0, call)?)?;
-                Ok((format!("table.insert({receiver}, {value})"), Ty::VOID))
             }
             _ => return Ok(None),
         };

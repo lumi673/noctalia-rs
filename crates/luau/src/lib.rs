@@ -18,6 +18,8 @@ use crate::callback::{callback_args, callback_for_event};
 use crate::host::Host;
 use crate::value::{from_json, from_json_with_bytes};
 
+pub use value::ARRAY_MARKER;
+
 type SharedRuntime = Arc<Mutex<Runtime>>;
 
 struct Runtime {

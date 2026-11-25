@@ -158,7 +158,7 @@ impl<'a> Emitter<'a> {
                     return Err(bare_default_error(call.span()));
                 }
                 "Vec::new" | "VecDeque::new" => {
-                    return Ok(("{}".to_owned(), Ty::LIST));
+                    return Ok((empty_array(), Ty::LIST));
                 }
                 "Vec::with_capacity" | "VecDeque::with_capacity" => {
                     return Ok(("{}".to_owned(), Ty::LIST));

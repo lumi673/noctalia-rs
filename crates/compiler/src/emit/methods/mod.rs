@@ -1685,22 +1685,59 @@ fn number_check(receiver: &str, ty: Ty) -> String {
 /// bounds is an integer whatever its storage.
 fn integer_test(receiver: &str, ty: Ty, range: (&str, &str)) -> String {
     let (low, high) = range;
-    if ty.base == Base::Int {
-        return "(true)".to_owned();
+    match ty.base {
+        Base::Int => "(true)".to_owned(),
+        // `serde_json` keeps integers and floats apart, and a value that a
+        // float expression produced is a float however it prints.
+        Base::Float => "(false)".to_owned(),
+        _ => format!(
+            "(type({receiver}) == \"number\" and {receiver} % 1 == 0 and {receiver} >= {low} and {receiver} <= {high})"
+        ),
     }
-    format!(
-        "(type({receiver}) == \"number\" and {receiver} % 1 == 0 and {receiver} >= {low} and {receiver} <= {high})"
-    )
 }
 
 fn integer_check(receiver: &str, ty: Ty, range: (&str, &str)) -> String {
-    if ty.base == Base::Int {
-        return receiver.to_owned();
+    match ty.base {
+        Base::Int => receiver.to_owned(),
+        Base::Float => "nil".to_owned(),
+        _ => format!(
+            "({} and {receiver} or nil)",
+            integer_test(receiver, ty, range)
+        ),
     }
-    format!(
-        "({} and {receiver} or nil)",
-        integer_test(receiver, ty, range)
-    )
+}
+
+/// A JSON null has no representation inside a Luau container: writing nil
+/// removes the slot, so a computed `Value::Null` would silently disappear.
+pub(super) fn reject_null(
+    text: &str,
+    span: proc_macro2::Span,
+    construct: &str,
+) -> Result<(), Error> {
+    if text != "nil" {
+        return Ok(());
+    }
+    Err(Error::at(
+        span,
+        format!(
+            "json null cannot be stored by {construct}: a Luau table has no null, so the key or slot would disappear; omit the key or guard the value with is_null()"
+        ),
+    ))
+}
+
+/// `Value::as_object` as a Luau expression. A list is never an object and a
+/// `Map` always is, so only an unknown receiver needs the runtime shape test.
+fn object_test(receiver: &str, ty: Ty, uses_array_shape: &mut bool) -> String {
+    match ty.base {
+        Base::List => "nil".to_owned(),
+        Base::Table => receiver.to_owned(),
+        _ => {
+            *uses_array_shape = true;
+            format!(
+                "(type({receiver}) == \"table\" and not is_array({receiver}) and {receiver} or nil)"
+            )
+        }
+    }
 }
 
 /// The assignable expression behind lock and deref wrappers, so `take()` can

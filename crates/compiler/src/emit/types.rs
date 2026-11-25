@@ -267,12 +267,14 @@ pub(super) fn container_default(name: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn value_accessor(name: &str) -> Option<&'static str> {
+pub(super) fn value_accessor(name: &str) -> Option<(&'static str, Ty)> {
     match name {
-        "as_str" => Some("string"),
-        "as_bool" => Some("boolean"),
-        "as_i64" | "as_u64" | "as_f64" => Some("number"),
-        "as_array" | "as_object" => Some("table"),
+        "as_str" => Some(("string", Ty::OPT_STR)),
+        "as_bool" => Some(("boolean", Ty::OPT_BOOL)),
+        "as_i64" | "as_u64" => Some(("number", Ty::OPT_INT)),
+        "as_f64" => Some(("number", Ty::OPT_FLOAT)),
+        "as_array" => Some(("table", Ty::OPT_LIST)),
+        "as_object" => Some(("table", Ty::OPT_VALUE)),
         _ => None,
     }
 }

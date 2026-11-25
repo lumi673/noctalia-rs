@@ -174,7 +174,7 @@ impl<'a> Emitter<'a> {
         if let Expr::Call(call) = &*init.expr
             && is_vec_new(call)
         {
-            self.line(&format!("local {name} = {{}}"));
+            self.line(&format!("local {name} = {}", empty_array()));
             self.push(&name, Ty::OPS);
             return Ok(());
         }
@@ -973,7 +973,9 @@ impl<'a> Emitter<'a> {
                     "Some" | "Ok" | "Err" => outer,
                     "String" => Ty::STR,
                     "Bool" => Ty::BOOL,
-                    "Number" => Ty::FLOAT,
+                    // An integral double is an integer in Luau, so number
+                    // formatting goes through the JSON encoder instead.
+                    "Number" => Ty::VALUE,
                     "Object" => Ty::TABLE,
                     "Array" => Ty::LIST,
                     _ => Ty::VALUE,
@@ -1231,6 +1233,58 @@ impl<'a> Emitter<'a> {
                     "`enumerate()` needs a list, not a map",
                 ));
             }
+            let sorted = matches!(
+                iterable,
+                Expr::MethodCall(call)
+                    if matches!(
+                        call.method.to_string().as_str(),
+                        "iter" | "into_iter"
+                    )
+            );
+            if sorted {
+                let names = bindings
+                    .iter()
+                    .map(|name| name.clone().unwrap_or_else(|| "_".to_owned()))
+                    .collect::<Vec<_>>();
+                let keys = self.temp();
+                let index = self.temp();
+                self.line(&format!("local {keys} = {{}}"));
+                self.line(&format!(
+                    "for __key in pairs({source}) do {keys}[#({keys}) + 1] = __key end"
+                ));
+                self.line(&format!(
+                    "table.sort({keys}, function(a, b) return tostring(a) < tostring(b) end)"
+                ));
+                self.line(&format!("for {index} = 1, #{keys} do"));
+                self.indent = self.indent.saturating_add(1);
+                match names.as_slice() {
+                    [name] => {
+                        self.push(name, Ty::VALUE);
+                        self.line(&format!(
+                            "local {name} = {source}[{keys}[{index}]]"
+                        ));
+                    }
+                    [first, second] => {
+                        for name in bindings.iter().flatten() {
+                            self.push(name, Ty::VALUE);
+                        }
+                        self.line(&format!("local {first} = {keys}[{index}]"));
+                        self.line(&format!(
+                            "local {second} = {source}[{first}]"
+                        ));
+                    }
+                    _ => {
+                        return Err(Error::at(
+                            item.pat.span(),
+                            "map loops take one or two bindings",
+                        ));
+                    }
+                }
+                self.statement_block(&item.body)?;
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(());
+            }
             let names = bindings
                 .iter()
                 .map(|name| name.clone().unwrap_or_else(|| "_".to_owned()))
@@ -1313,6 +1367,8 @@ impl<'a> Emitter<'a> {
             };
             let value = if enumerate && position == 0 {
                 format!("({index} - 1)")
+            } else if !enumerate && bindings.len() == 1 {
+                format!("{source}[{index}]")
             } else {
                 format!(
                     "{source}[{index}]{}",
@@ -1356,6 +1412,9 @@ impl<'a> Emitter<'a> {
                 self.line(&text);
             }
             return Ok(());
+        }
+        if matches!(strip_reference(left), Expr::Index(_)) {
+            reject_null(&text, right.span(), "an index assignment")?;
         }
         self.line(&format!("{target} {op} {text}"));
         if is_local && let Some(name) = path_ident(strip_reference(left)) {
