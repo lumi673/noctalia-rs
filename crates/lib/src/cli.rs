@@ -27,6 +27,8 @@ const IDLE_WAIT: Duration = Duration::from_secs(1);
 const NATIVE_CACHE_LIMIT: usize = 128;
 // A request is written in place, so a read can catch a partial payload.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_millis(2);
+// An unparseable request older than this has no writer left to finish it.
+const REQUEST_ABANDONED_AFTER: Duration = Duration::from_secs(2);
 #[derive(Debug, Deserialize)]
 struct Request {
     boot: String,
@@ -91,34 +93,63 @@ impl<W: Write> Serve<'_, W> {
         }))
     }
 
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "a payload that is still being written ends the batch"
+    )]
     fn process_batch(&mut self) -> Result<usize> {
         let mut processed = 0usize;
         for path in request_files(self.spool_dir)? {
-            let count = self.process_one(&path)?;
-            processed = processed.saturating_add(count);
+            if self.process_one(&path)? {
+                processed = processed.saturating_add(1);
+            } else {
+                // The next event for this name wakes the loop.
+                return Ok(processed);
+            }
         }
         Ok(processed)
     }
 
-    fn process_one(&mut self, path: &Path) -> Result<usize> {
+    /// Handles one request file. Returns false when the payload is incomplete.
+    fn process_one(&mut self, path: &Path) -> Result<bool> {
         let name = request_name(path);
         if self.stale.contains(path) {
             self.emit_error(&name, "stale boot")?;
             let _ = fs::remove_file(path);
-            return Ok(1);
+            return Ok(true);
         }
 
-        match self.process_request(path) {
+        let Some(request) = read_request(path)? else {
+            return self.settle_unreadable(path, &name);
+        };
+
+        match self.process_request(path, request) {
             Ok(Processed::Entry) => self.emit_done(&name)?,
             Ok(Processed::Native) => {}
             Err(error) => self.emit_error(&name, &error.to_string())?,
         }
         let _ = fs::remove_file(path);
-        Ok(1)
+        Ok(true)
     }
 
-    fn process_request(&mut self, path: &Path) -> Result<Processed> {
-        let mut request = read_request(path)?;
+    /// Decides what to do with a payload that did not parse. Returns false
+    /// while its writer may still be running.
+    fn settle_unreadable(&mut self, path: &Path, name: &str) -> Result<bool> {
+        if !abandoned(path) {
+            return Ok(false);
+        }
+        if path.exists() {
+            self.emit_error(name, "request payload did not parse")?;
+            let _ = fs::remove_file(path);
+        }
+        Ok(true)
+    }
+
+    fn process_request(
+        &mut self,
+        path: &Path,
+        mut request: Request,
+    ) -> Result<Processed> {
         if request.boot != self.boot {
             return Err(format!(
                 "stale boot {} (expected {})",
@@ -317,8 +348,10 @@ fn wakes_serve(event: &notify::Event) -> bool {
     if event.paths.is_empty() {
         return true;
     }
-    let request =
-        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+    let request = matches!(
+        event.kind,
+        EventKind::Any | EventKind::Create(_) | EventKind::Modify(_)
+    );
     request && event.paths.iter().any(|path| is_request_name(path))
 }
 
@@ -478,26 +511,49 @@ fn request_host(fixed: &Value, live: Value) -> Value {
     Value::Object(host)
 }
 
-/// Reads a request, retrying a truncated payload.
+/// Reads a request, retrying while the writer is still filling it.
 ///
-/// The bridge writes a request in place, so a wake can land while the write is
-/// still running. The write finishes in microseconds, which a yield covers, so
-/// only a document that stays truncated is reported.
-fn read_request(path: &Path) -> Result<Request> {
-    let deadline = Instant::now().checked_add(REQUEST_READ_TIMEOUT);
+/// The bridge writes a request in place, so a wake can land mid-write. A
+/// partial payload never parses as JSON, and bytes cut inside a multi-byte
+/// character do not even decode as text, so any parse failure is retried until
+/// the deadline. Returns None when the payload is still incomplete.
+fn read_request(path: &Path) -> Result<Option<Request>> {
+    read_request_within(path, REQUEST_READ_TIMEOUT)
+}
+
+fn read_request_within(
+    path: &Path,
+    timeout: Duration,
+) -> Result<Option<Request>> {
+    let deadline = Instant::now().checked_add(timeout);
     loop {
-        let text = fs::read_to_string(path)?;
-        match serde_json::from_str(&text) {
-            Ok(request) => return Ok(request),
-            Err(error)
-                if error.is_eof()
-                    && deadline.is_some_and(|end| Instant::now() < end) =>
-            {
-                thread::yield_now();
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(None);
             }
             Err(error) => return Err(error.into()),
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(request) => return Ok(Some(request)),
+            Err(_) if deadline.is_some_and(|end| Instant::now() < end) => {
+                thread::yield_now();
+            }
+            Err(_) => return Ok(None),
         }
     }
+}
+
+/// A request file that stopped changing and still does not parse will never
+/// parse: its writer is gone. A missing file counts as abandoned.
+fn abandoned(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return true;
+    };
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_none_or(|age| age > REQUEST_ABANDONED_AFTER)
 }
 
 fn request_name(path: &Path) -> String {
@@ -578,7 +634,22 @@ mod tests {
             &["/spool/000000000001.pending"]
         )));
         assert!(!wakes_serve(&event(modify, &["/spool"])));
+        assert!(wakes_serve(&event(EventKind::Any, &["/spool/1.json"])));
+        assert!(!wakes_serve(&event(EventKind::Any, &["/spool"])));
         assert!(wakes_serve(&event(EventKind::Other, &[])));
+    }
+
+    fn finish_later(path: &Path, tail: &[u8]) -> thread::JoinHandle<()> {
+        let writer = path.to_path_buf();
+        let rest = tail.to_vec();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1));
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(writer)
+                .expect("open request");
+            file.write_all(&rest).expect("finish request");
+        })
     }
 
     #[test]
@@ -588,23 +659,67 @@ mod tests {
         let text = request("boot-1", "render").to_string();
         let split = text.len().div_euclid(2);
         fs::write(&path, &text[..split]).expect("partial write");
-        let writer = path.clone();
-        let tail = text[split..].to_owned();
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(1));
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(writer)
-                .expect("open request");
-            file.write_all(tail.as_bytes()).expect("finish request");
-        });
+        let writer = finish_later(&path, &text.as_bytes()[split..]);
 
-        let read = read_request(&path).expect("retried request");
-        handle.join().expect("writer");
+        let read = read_request_within(&path, Duration::from_secs(5))
+            .expect("retried request")
+            .expect("finished request");
+        writer.join().expect("writer");
         spool.cleanup();
 
         assert_eq!(read.boot, "boot-1");
         assert_eq!(read.event, "render");
+    }
+
+    #[test]
+    fn test_read_request_retries_a_character_cut_in_half() {
+        let spool = TestSpool::new("read-utf8");
+        let path = spool.spool.join("000000000001.json");
+        let text = request("boot-1", "r\u{e9}nder").to_string();
+        let cut = text.find('\u{e9}').expect("multi-byte event") + 1;
+        fs::write(&path, &text.as_bytes()[..cut]).expect("partial write");
+        let writer = finish_later(&path, &text.as_bytes()[cut..]);
+
+        let read = read_request_within(&path, Duration::from_secs(5))
+            .expect("retried request")
+            .expect("finished request");
+        writer.join().expect("writer");
+        spool.cleanup();
+
+        assert_eq!(read.event, "r\u{e9}nder");
+    }
+
+    #[test]
+    fn test_serve_keeps_a_request_that_is_still_being_written() {
+        let spool = TestSpool::new("serve-defer");
+        let path = spool.spool.join("000000000001.json");
+        let text = request("boot-1", "render").to_string();
+        fs::write(&path, &text[..text.len().div_euclid(2)]).expect("partial");
+        let plugin = plugin();
+        let translations = Value::Null;
+        let mut out: Vec<u8> = Vec::new();
+        let processed = {
+            let mut server = Serve {
+                plugin: &plugin,
+                data_dir: &spool.data,
+                spool_dir: &spool.spool,
+                boot: "boot-1",
+                stale: BTreeSet::new(),
+                native_cache: BTreeMap::new(),
+                native_cache_order: VecDeque::new(),
+                host_fixed: Value::Object(Map::new()),
+                translations: &translations,
+                out: &mut out,
+            };
+            server.process_batch().expect("batch")
+        };
+        let lines = String::from_utf8_lossy(&out).to_string();
+        let kept = path.exists();
+        spool.cleanup();
+
+        assert_eq!(processed, 0, "{lines}");
+        assert!(kept, "a partial request must stay for the next event");
+        assert!(!lines.contains("\"error\""), "{lines}");
     }
 
     fn plugin() -> Plugin {
