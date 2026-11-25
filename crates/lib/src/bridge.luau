@@ -332,7 +332,9 @@ local function writeRequest(request)
   sequence += 1
   local target = REQUEST_DIR .. "/" .. string.format("%012d", sequence) .. ".json"
   local host, fixed = snapshot()
-  M.host = host
+  M.host = {}
+  for key, value in pairs(fixed) do M.host[key] = value end
+  for key, value in pairs(host) do M.host[key] = value end
   request.host = host
   if not fixed_sent or not sameValue(fixed, fixed_host) then
     fixed_host = fixed
@@ -375,6 +377,9 @@ local function onLine(line)
     return
   end
   if message.control == "error" then
+    -- The helper may have rejected the request that carried the fixed part,
+    -- so it has to travel again with the next one.
+    fixed_sent = false
     noctalia.log("noctalia bridge: " .. tostring(message.message))
     return
   end

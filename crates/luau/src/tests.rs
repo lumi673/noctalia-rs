@@ -609,8 +609,10 @@ fn embedded_bridge_source_parses() {
 }
 
 const BRIDGE_STUBS: &str = r#"
+local on_line_sink = nil
 noctalia.mkdirAll = function() return true end
 noctalia.runStream = function(_, on_line)
+  on_line_sink = on_line
   on_line('{"control":"ready","boot":"test","spool":"/spool"}')
   return true
 end
@@ -621,18 +623,14 @@ end
 noctalia.renameFile = function() return true end
 "#;
 
-fn bridge_requests(events: &[&str]) -> Vec<Value> {
+fn bridge_requests_from(body: &str) -> Vec<Value> {
     let bridge = noctalia_rs::bridge::SOURCE
         .replace("{{HELPER}}", "helper")
         .replace("{{PREFIX}}", "prefix");
-    let calls = events
-        .iter()
-        .map(|event| format!("  bridge.call(\"{event}\", {{}})\n"))
-        .collect::<String>();
     let source = format!(
         "{BRIDGE_STUBS}\nlocal bridge = (function()\n{bridge}\nend)()\n\
          bridge.setup(\"service\", {{\"name\"}})\n\
-         function update()\n{calls}end\n"
+         function update()\n{body}end\n"
     );
     let ctx = context(Fixture {
         event: "update",
@@ -658,6 +656,14 @@ fn bridge_requests(events: &[&str]) -> Vec<Value> {
         .collect()
 }
 
+fn bridge_requests(events: &[&str]) -> Vec<Value> {
+    let body = events
+        .iter()
+        .map(|event| format!("  bridge.call(\"{event}\", {{}})\n"))
+        .collect::<String>();
+    bridge_requests_from(&body)
+}
+
 #[test]
 fn bridged_requests_resend_the_fixed_host_only_when_it_changes() {
     let requests = bridge_requests(&["render", "render"]);
@@ -677,6 +683,22 @@ fn bridged_requests_resend_the_fixed_host_only_when_it_changes() {
     assert!(second.get("host_fixed").is_none(), "{second}");
     assert_eq!(second["host"]["now_ms"], json!(1_700_000_000_i64));
     assert!(second["host"].get("setting").is_none());
+}
+
+#[test]
+fn bridged_requests_resend_the_fixed_host_after_a_rejected_request() {
+    let requests = bridge_requests_from(
+        "  bridge.call(\"render\", {})\n\
+         on_line_sink('{\"control\":\"error\",\"message\":\"rejected\"}')\n\
+         bridge.call(\"render\", {})\n",
+    );
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(requests[0].get("host_fixed").is_some());
+    assert!(
+        requests[1].get("host_fixed").is_some(),
+        "a rejected request must send the fixed host again: {}",
+        requests[1]
+    );
 }
 
 const OFFICIAL_CALLBACKS: &str =
