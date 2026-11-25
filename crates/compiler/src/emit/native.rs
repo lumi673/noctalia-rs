@@ -317,7 +317,7 @@ pub(crate) fn native_runtime(
 ) -> String {
     // Kept in step with `crates/lib/src/bridge.luau`: a native function that
     // takes `&Context` must see the same host snapshot the bridge sends.
-    pub(crate) const SETTING_PATHS: &[&str] = &[
+    const SETTING_PATHS: &[&str] = &[
         "shell.time_format",
         "shell.date_format",
         "shell.offline_mode",
@@ -336,7 +336,7 @@ pub(crate) fn native_runtime(
         "theme.wallpaper_scheme",
         "system.monitor.network_poll_seconds",
     ];
-    pub(crate) const COLOR_ROLES: &[&str] = &[
+    const COLOR_ROLES: &[&str] = &[
         "primary",
         "on_primary",
         "primary_container",
@@ -732,12 +732,12 @@ fn json_ready_type(
     ty: &Type,
     direction: Direction,
 ) -> bool {
-    pub(crate) const SCALARS: &[&str] = &[
+    const SCALARS: &[&str] = &[
         "String", "str", "bool", "char", "i8", "i16", "i32", "i64", "i128",
         "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
         "Value", "PathBuf", "Path", "OsString", "OsStr",
     ];
-    pub(crate) const CONTAINERS: &[&str] = &[
+    const CONTAINERS: &[&str] = &[
         "Vec", "VecDeque", "Option", "HashMap", "BTreeMap", "HashSet",
         "BTreeSet", "Box", "Arc", "Rc", "Cow", "Result",
     ];

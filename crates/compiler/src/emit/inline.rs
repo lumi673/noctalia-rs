@@ -1,5 +1,6 @@
 use super::*;
 
+const MAX_INLINE_DEPTH: usize = 8;
 impl<'a> Emitter<'a> {
     pub(super) fn helper(&self, call: &ExprCall) -> Option<Helper> {
         let Expr::Path(path) = &*call.func else {

@@ -36,10 +36,12 @@ mod statements;
 mod types;
 
 #[allow(unused_imports)]
-pub(crate) use {
+use {
     calls::*, expressions::*, inline::*, macros::*, methods::*, native::*,
     ops::*, statements::*, types::*,
 };
+
+pub(crate) use native::{native_runtime, stub_source};
 
 impl<'a> Emitter<'a> {
     pub(crate) fn new(
@@ -328,7 +330,5 @@ pub(crate) struct Emitter<'a> {
     uses_native_context: bool,
     deferred: usize,
 }
-
-pub(crate) const MAX_INLINE_DEPTH: usize = 8;
 
 pub(crate) const MAX_INLINE_CALLS: usize = 200;
