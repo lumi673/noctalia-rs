@@ -150,18 +150,10 @@ impl<W: Write> Serve<'_, W> {
     fn process_native(&mut self, request: Request, path: &Path) -> Result<()> {
         let id = request.id.clone().unwrap_or_else(|| request_name(path));
         let Some(name) = request.name else {
-            return self.emit_native_result(
-                &id,
-                None,
-                Some("missing native function name".to_owned()),
-            );
+            return self.emit_native_error(&id, "missing native function name");
         };
         if name.is_empty() {
-            return self.emit_native_result(
-                &id,
-                None,
-                Some("missing native function name".to_owned()),
-            );
+            return self.emit_native_error(&id, "missing native function name");
         }
         let args = request.args;
         let cache_ms = request.cache_ms.unwrap_or(0);
@@ -175,15 +167,14 @@ impl<W: Write> Serve<'_, W> {
             Some(value) => Ok(value),
             None => self.plugin.native(&name, args),
         };
-        match result {
-            Ok(value) => {
-                if cache_ms > 0 {
-                    self.remember_native(key, value.clone());
-                }
-                self.emit_native_result(&id, Some(value), None)
-            }
-            Err(error) => self.emit_native_result(&id, None, Some(error)),
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => return self.emit_native_error(&id, &error),
+        };
+        if cache_ms > 0 {
+            self.remember_native(&key, value.clone());
         }
+        self.emit_native_value(&id, &value)
     }
 
     fn cached_native(&self, key: &str, cache_ms: u64) -> Option<Value> {
@@ -192,29 +183,37 @@ impl<W: Write> Serve<'_, W> {
             .then(|| value.clone())
     }
 
-    fn remember_native(&mut self, key: String, value: Value) {
-        self.native_cache_order.retain(|item| item != &key);
-        self.native_cache_order.push_back(key.clone());
+    fn remember_native(&mut self, key: &str, value: Value) {
+        self.native_cache_order.retain(|item| item != key);
+        self.native_cache_order.push_back(key.to_owned());
         self.native_cache
-            .insert(key.clone(), (Instant::now(), value));
-        while self.native_cache_order.len() > NATIVE_CACHE_LIMIT {
-            let Some(oldest) = self.native_cache_order.pop_front() else {
-                break;
-            };
-            self.native_cache.remove(&oldest);
+            .insert(key.to_owned(), (Instant::now(), value));
+        if self.native_cache_order.len() > NATIVE_CACHE_LIMIT {
+            self.evict_oldest_native();
         }
     }
 
-    fn emit_native_result(
-        &mut self,
-        id: &str,
-        value: Option<Value>,
-        error: Option<String>,
-    ) -> Result<()> {
+    fn evict_oldest_native(&mut self) {
+        let oldest = self.native_cache_order.pop_front();
+        if let Some(oldest_key) = oldest {
+            self.native_cache.remove(&oldest_key);
+        }
+    }
+
+    fn emit_native_value(&mut self, id: &str, value: &Value) -> Result<()> {
         self.emit_json(&json!({
             "control": "native_result",
             "id": id,
             "value": value,
+            "error": Value::Null,
+        }))
+    }
+
+    fn emit_native_error(&mut self, id: &str, error: &str) -> Result<()> {
+        self.emit_json(&json!({
+            "control": "native_result",
+            "id": id,
+            "value": Value::Null,
             "error": error,
         }))
     }
@@ -429,7 +428,9 @@ fn canonical_value(value: &Value) -> Value {
         Value::Array(items) => {
             Value::Array(items.iter().map(canonical_value).collect())
         }
-        _ => value.clone(),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            value.clone()
+        }
     }
 }
 
@@ -438,6 +439,7 @@ mod tests {
     use super::*;
     use crate::{Meta, Op};
     use std::process;
+    use std::result::Result as StdResult;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn plugin() -> Plugin {
@@ -476,6 +478,7 @@ mod tests {
         })
     }
 
+    #[expect(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn native_request(
         boot: &str,
         name: &str,
@@ -818,10 +821,8 @@ mod tests {
     #[test]
     fn test_serve_caches_native_results_without_done() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn dispatch(
-            _name: &str,
-            _args: Value,
-        ) -> std::result::Result<Value, String> {
+        #[expect(clippy::unnecessary_wraps)]
+        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
             CALLS.fetch_add(1, Ordering::Relaxed);
             Ok(json!({ "rows": 1 }))
         }
@@ -889,10 +890,8 @@ mod tests {
     #[test]
     fn test_serve_caches_canonical_args() {
         static CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn dispatch(
-            _name: &str,
-            _args: Value,
-        ) -> std::result::Result<Value, String> {
+        #[expect(clippy::unnecessary_wraps)]
+        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
             CALLS.fetch_add(1, Ordering::Relaxed);
             Ok(json!({ "ok": true }))
         }
@@ -946,10 +945,7 @@ mod tests {
 
     #[test]
     fn test_serve_reports_native_dispatch_error_as_result() {
-        fn dispatch(
-            _name: &str,
-            _args: Value,
-        ) -> std::result::Result<Value, String> {
+        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
             Err("native exploded".to_owned())
         }
 
@@ -1058,10 +1054,8 @@ mod tests {
 
     #[test]
     fn test_serve_keeps_stale_boot_handling_for_native_requests() {
-        fn dispatch(
-            _name: &str,
-            _args: Value,
-        ) -> std::result::Result<Value, String> {
+        #[expect(clippy::unnecessary_wraps)]
+        fn dispatch(_name: &str, _args: Value) -> StdResult<Value, String> {
             Ok(json!({ "rows": 1 }))
         }
 
@@ -1115,9 +1109,9 @@ mod tests {
         };
 
         for index in 0..NATIVE_CACHE_LIMIT {
-            server.remember_native(format!("name-{index}"), json!(index));
+            server.remember_native(&format!("name-{index}"), json!(index));
         }
-        server.remember_native("latest".to_owned(), json!(128));
+        server.remember_native("latest", json!(128));
 
         assert!(!server.native_cache.contains_key("name-0"));
         assert!(server.native_cache.contains_key("name-1"));
