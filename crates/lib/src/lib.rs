@@ -28,7 +28,7 @@ pub use manifest::{
 pub use rng::LuauRng;
 pub use ui::{NodeProps, Props};
 
-pub use noctalia_rs_macros::entry;
+pub use noctalia_rs_macros::{entry, luau, native};
 pub use ops::Op;
 pub use serde_json::Value;
 

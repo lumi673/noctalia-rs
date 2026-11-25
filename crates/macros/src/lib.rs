@@ -60,6 +60,26 @@ fn consume_comma(input: ParseStream<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Keeps a function in the plugin binary and calls it across the native
+/// boundary. Inert: the build script reads the attribute from the source text.
+#[proc_macro_attribute]
+pub fn native(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    unchanged(item)
+}
+
+/// Requires the function to compile to Luau, failing the build otherwise.
+/// Inert: the build script reads the attribute from the source text.
+#[proc_macro_attribute]
+pub fn luau(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    unchanged(item)
+}
+
+/// Marker attributes must leave the item byte-for-byte identical: the build
+/// script parses the source text, not the expanded item.
+const fn unchanged(item: TokenStream) -> TokenStream {
+    item
+}
+
 #[proc_macro_attribute]
 pub fn entry(attr: TokenStream, item: TokenStream) -> TokenStream {
     match expand(attr.into(), item.into()) {
