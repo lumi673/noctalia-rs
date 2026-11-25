@@ -21,6 +21,16 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn expr(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
+        let result = self.expr_inner(expr);
+        if let Ok((text, ty)) = &result
+            && ty.null
+        {
+            self.null_texts.insert(text.clone());
+        }
+        result
+    }
+
+    fn expr_inner(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
         match expr {
             Expr::Lit(lit) => self.literal(lit),
             Expr::Path(path) => self.path(expr, path),
@@ -151,10 +161,15 @@ impl<'a> Emitter<'a> {
             }
             Expr::Tuple(tuple) => {
                 let mut values = Vec::new();
+                let mut types = Vec::new();
                 for element in &tuple.elems {
-                    values.push(self.expr(element)?.0);
+                    let (text, ty) = self.expr(element)?;
+                    types.push(TupleShape::Leaf(ty));
+                    values.push(text);
                 }
-                Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
+                let text = format!("{{ {} }}", values.join(", "));
+                self.tuple_expr_shapes.insert(text.clone(), types);
+                Ok((text, Ty::LIST))
             }
             other => Err(Error::at(
                 other.span(),
@@ -226,6 +241,10 @@ impl<'a> Emitter<'a> {
                 ));
             };
             let (value, value_ty) = self.expr(&field.expr)?;
+            if let Some(shapes) = self.tuple_expr_shapes.get(&value).cloned() {
+                self.tuple_expr_shapes
+                    .insert(format!("{class}.{name}"), shapes);
+            }
             if value_ty.null {
                 null_fields.insert(name.to_string());
             }

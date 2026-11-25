@@ -281,7 +281,11 @@ impl<'a> Emitter<'a> {
         let check = self.check_inline(&helper, mode, returns, &span)?;
         let saved = self.clone();
         match self.inline(&helper, bindings.clone(), mode, returns, check) {
-            Ok(value) => Ok(Some(value)),
+            Ok((text, _)) => {
+                let ty =
+                    self.last_value_ty.take().unwrap_or(value_type(returns));
+                Ok(Some((text, ty)))
+            }
             Err(error) => {
                 *self = saved;
                 if error.fatal {
@@ -380,6 +384,15 @@ impl<'a> Emitter<'a> {
                     }
                     if let Some(class) = self.pending_class.take() {
                         self.classes.insert(name.clone(), class);
+                    }
+                    if let Some(shapes) = self
+                        .tuple_expr_shapes
+                        .get(&text)
+                        .cloned()
+                        .or_else(|| self.last_tuple_shape.take())
+                    {
+                        self.tuple_types.insert(name.clone(), shapes.clone());
+                        self.tuple_expr_shapes.insert(name.clone(), shapes);
                     }
                     self.push(&name, ty);
                 }
