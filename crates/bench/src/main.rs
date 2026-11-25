@@ -786,19 +786,21 @@ fn event_context(data_dir: &Path) -> Context {
     )
 }
 
+/// Builds the bridge into a host double so one sample measures what the bridge
+/// assembles and encodes for an event. The host's own write is not part of it.
 fn bridge_event_source() -> String {
     let bridge = noctalia_rs::bridge::SOURCE
         .replace("{{HELPER}}", "bench-helper")
         .replace("{{PREFIX}}", "bench");
     format!(
-        "local written = 0\n\
+        "local payload_bytes = 0\n\
          noctalia.mkdirAll = function() return true end\n\
          noctalia.runStream = function(_, on_line)\n\
          on_line('{{\"control\":\"ready\",\"boot\":\"bench\",\"spool\":\"/bench/spool\"}}')\n\
          return true\n\
          end\n\
          noctalia.writeFile = function(_, contents)\n\
-         written = #contents\n\
+         payload_bytes = #contents\n\
          return true\n\
          end\n\
          noctalia.renameFile = function() return true end\n\

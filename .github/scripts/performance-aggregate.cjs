@@ -16,7 +16,7 @@ const WORKLOADS = {
   json_roundtrip_luau: ['encode and decode JSON in Luau', 2],
   json_roundtrip_rust: ['encode and decode JSON in Rust', 1],
   bridge_snapshot_reads: ['read the generated snapshot through the bridge', 5],
-  bridge_event: ['write a bridged event request through the bridge', 5],
+  bridge_event: ['build a bridged event request through the bridge', 5],
   json_encode_rust: ['encode a nested JSON value in Rust', 1],
   json_decode_rust: ['decode a nested JSON value in Rust', 1],
   snapshot_reads_rust: ['read config, state, and host values in Rust', 1],
