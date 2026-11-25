@@ -86,6 +86,7 @@ impl<'a> Emitter<'a> {
             pending_null_fields: None,
             null_fields: HashMap::new(),
             tuple_types: HashMap::new(),
+            newtype_types: HashMap::new(),
             value_helper: false,
             in_statement: false,
             value_needed: false,
@@ -308,6 +309,23 @@ pub(crate) fn empty_array() -> String {
     format!("setmetatable({{}}, {{ {ARRAY_MARKER} = true }})")
 }
 
+/// The shape of a tuple value, kept so nested destructuring can carry the
+/// nullness of an inner element through each step.
+#[derive(Clone)]
+pub(crate) enum TupleShape {
+    Leaf(Ty),
+    Tuple(Vec<TupleShape>),
+}
+
+impl TupleShape {
+    pub(crate) fn any_null(&self) -> bool {
+        match self {
+            Self::Leaf(ty) => ty.null,
+            Self::Tuple(shapes) => shapes.iter().any(Self::any_null),
+        }
+    }
+}
+
 pub(crate) type PayloadParam = (&'static str, &'static str, &'static str);
 
 pub(crate) type Constant = (String, Ty);
@@ -405,7 +423,8 @@ pub(crate) struct Emitter<'a> {
     pending_class: Option<String>,
     pending_null_fields: Option<BTreeSet<String>>,
     null_fields: HashMap<String, BTreeSet<String>>,
-    tuple_types: HashMap<String, Vec<Ty>>,
+    tuple_types: HashMap<String, Vec<TupleShape>>,
+    newtype_types: HashMap<String, Ty>,
     value_helper: bool,
     in_statement: bool,
     value_needed: bool,

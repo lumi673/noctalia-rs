@@ -988,3 +988,42 @@ fn native_json_chains(_ctx: &Context) -> Vec<Op> {
     )));
     ops
 }
+
+#[test]
+fn newtype_and_nested_values_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder(Value);
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let nested = ((json!("a"), json!(2)), json!(3));
+    let (inner, _) = nested;
+    let (_, name) = inner;
+    let holder = Holder(name);
+    let mut map = serde_json::Map::new();
+    map.insert("k".to_owned(), holder.0);
+    let value = ctx.setting("flag").unwrap_or(Value::Null);
+    ops_push(value.is_null());
+    Ok(vec![Op::state("seen", json!(map))])
+}
+
+fn ops_push(_flag: bool) {}
+"#;
+    let source = compiled_source("newtype_chain", handler, EntryKind::Service);
+    let state = json!({});
+    let ctx = context("newtype_chain", "load", json!({}), state);
+    assert_eq!(
+        ops("newtype_chain", &source, &ctx),
+        rust_ops(native_newtype_chain(&ctx))
+    );
+}
+
+fn native_newtype_chain(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    let nested = ((json!("a"), json!(2)), json!(3));
+    let (inner, _) = nested;
+    let (_, name) = inner;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), name);
+    vec![Op::state("seen", json!(map))]
+}

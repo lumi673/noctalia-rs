@@ -103,14 +103,23 @@ impl<'a> Emitter<'a> {
                     },
                 )?;
             let multi = multi_return(initializer);
-            let mut element_types = Vec::new();
+            let mut shapes: Vec<TupleShape> = Vec::new();
             let text = if let Expr::Tuple(items) = strip_reference(initializer)
                 && !multi
             {
                 let mut parts = Vec::new();
                 for item in &items.elems {
                     let (value, ty) = self.expr(item)?;
-                    element_types.push(ty);
+                    let shape = if let Expr::Tuple(inner) =
+                        strip_reference(item)
+                    {
+                        TupleShape::Tuple(self.tuple_shapes(
+                            &inner.elems.iter().cloned().collect::<Vec<_>>(),
+                        )?)
+                    } else {
+                        TupleShape::Leaf(ty)
+                    };
+                    shapes.push(shape);
                     parts.push(value);
                 }
                 format!("{{ {} }}", parts.join(", "))
@@ -118,21 +127,39 @@ impl<'a> Emitter<'a> {
                 let (text, _) = self.expr(initializer)?;
                 text
             };
-            if let Some(types) = path_ident(strip_reference(initializer))
-                .and_then(|name| self.tuple_types.get(&name))
-                .filter(|_| element_types.is_empty())
+            if shapes.is_empty()
+                && let Some(types) = path_ident(strip_reference(initializer))
+                    .and_then(|name| self.tuple_types.get(&name))
             {
-                element_types = types.clone();
+                shapes = types.to_vec();
             }
             let element_ty = |index: usize| {
-                element_types.get(index).copied().unwrap_or(Ty::VALUE)
+                let mut ty = match shapes.get(index) {
+                    Some(TupleShape::Leaf(ty)) => *ty,
+                    Some(TupleShape::Tuple(parts)) => Ty {
+                        null: parts.iter().any(TupleShape::any_null),
+                        ..Ty::VALUE
+                    },
+                    None => Ty::VALUE,
+                };
+                if ty.null {
+                    ty.element = None;
+                }
+                ty
             };
             let mut names = Vec::new();
             for element in &tuple.elems {
                 match element {
                     Pat::Ident(pattern) => {
                         let name = self.binding_name(pattern)?;
-                        self.push(&name, element_ty(names.len()));
+                        let index = names.len();
+                        if let Some(TupleShape::Tuple(parts)) =
+                            shapes.get(index)
+                        {
+                            self.tuple_types
+                                .insert(name.clone(), parts.to_vec());
+                        }
+                        self.push(&name, element_ty(index));
                         names.push(name);
                     }
                     Pat::Wild(_) => names.push("_".to_owned()),
@@ -147,6 +174,12 @@ impl<'a> Emitter<'a> {
             if multi {
                 for (index, name) in names.iter().enumerate() {
                     if name != "_" {
+                        if let Some(TupleShape::Tuple(parts)) =
+                            shapes.get(index)
+                        {
+                            self.tuple_types
+                                .insert(name.clone(), parts.to_vec());
+                        }
                         self.push(name, element_ty(index));
                     }
                 }
@@ -234,11 +267,29 @@ impl<'a> Emitter<'a> {
         self.value_needed = saved_value;
         let (text, mut ty) = result?;
         if let Expr::Tuple(items) = strip_reference(&init.expr) {
-            let mut element_types = Vec::new();
-            for item in &items.elems {
-                element_types.push(self.expr(item)?.1);
-            }
+            let element_types = self.tuple_shapes(
+                &items.elems.iter().cloned().collect::<Vec<_>>(),
+            )?;
             self.tuple_types.insert(name.clone(), element_types);
+        } else if let Some(types) = path_ident(strip_reference(&init.expr))
+            .and_then(|source| self.tuple_types.get(&source).cloned())
+        {
+            self.tuple_types.insert(name.clone(), types);
+        }
+        if let Expr::Call(call) = strip_reference(&init.expr)
+            && call.args.len() == 1
+            && path_last_name(&call.func).is_some_and(|newtype| {
+                self.program.is_newtype(&self.module, &newtype)
+            })
+        {
+            let value_ty = self
+                .expr(arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?)?
+                .1;
+            self.newtype_types.insert(name.clone(), value_ty);
+        } else if let Some(ty) = path_ident(strip_reference(&init.expr))
+            .and_then(|source| self.newtype_types.get(&source).copied())
+        {
+            self.newtype_types.insert(name.clone(), ty);
         }
         if ty.result
             && let Some(hint) = hint
@@ -1524,6 +1575,25 @@ impl<'a> Emitter<'a> {
         self.indent = self.indent.saturating_sub(1);
         self.line("end");
         Ok(())
+    }
+
+    fn tuple_shapes(
+        &mut self,
+        items: &[Expr],
+    ) -> Result<Vec<TupleShape>, Error> {
+        let mut shapes = Vec::new();
+        for item in items {
+            let (_, ty) = self.expr(item)?;
+            let shape = if let Expr::Tuple(inner) = strip_reference(item) {
+                TupleShape::Tuple(self.tuple_shapes(
+                    &inner.elems.iter().cloned().collect::<Vec<_>>(),
+                )?)
+            } else {
+                TupleShape::Leaf(ty)
+            };
+            shapes.push(shape);
+        }
+        Ok(shapes)
     }
 
     /// A map loop's first binding is the key, a string in every JSON object.

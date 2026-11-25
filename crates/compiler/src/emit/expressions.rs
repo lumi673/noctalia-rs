@@ -621,8 +621,8 @@ impl<'a> Emitter<'a> {
                     })
                 {
                     let args = call.args.iter().collect::<Vec<_>>();
-                    let (value, _) = self.expr(arg(&args, 0, call)?)?;
-                    return Ok((value, Ty::VALUE));
+                    let (value, value_ty) = self.expr(arg(&args, 0, call)?)?;
+                    return Ok((value, value_ty));
                 }
                 let (base, _) = self.expr(&field.base)?;
                 if index.index == 0
@@ -630,7 +630,10 @@ impl<'a> Emitter<'a> {
                         |class| self.program.is_newtype(&self.module, &class),
                     )
                 {
-                    return Ok((base, Ty::VALUE));
+                    let ty = path_ident(strip_reference(&field.base))
+                        .and_then(|name| self.newtype_types.get(&name).copied())
+                        .unwrap_or(Ty::VALUE);
+                    return Ok((base, ty));
                 }
                 return Ok((format!("{base}[{}]", index.index + 1), Ty::VALUE));
             }
