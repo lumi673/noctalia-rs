@@ -83,7 +83,7 @@ pub fn emit(plugin: &Plugin, dir: &Path, helper: &str) -> io::Result<()> {
         }
         let source = entry.luau_source.as_deref().map_or_else(
             || entry_script(entry, &plugin.settings, script),
-            str::to_owned,
+            |compiled| compiled.replace("{{HELPER}}", helper),
         );
         fs::write(target, source)?;
     }
@@ -1161,6 +1161,7 @@ mod tests {
                     state_key: "template.state",
                     kind: compiled_kind,
                     strings: &["message"],
+                    native: compiler::NativeMode::Deny,
                     module: "main",
                     modules: &[],
                 },
@@ -1183,5 +1184,26 @@ mod tests {
             assert!(!script.contains("bridge."), "{name} calls the bridge");
             assert!(script.len() < 3_000, "{name} is {} bytes", script.len());
         }
+    }
+
+    #[test]
+    fn test_emit_resolves_helper_name_in_compiled_scripts() {
+        let dir = env::temp_dir()
+            .join(format!("noctalia-helper-name-{}", process::id()));
+        let source = "local BIN = noctalia.pluginDir() .. \"/{{HELPER}}\"";
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .entry(compiled_entry("service", EntryKind::Service, source));
+
+        emit(&plugin, &dir, "hello-helper").expect("emit");
+        let service =
+            fs::read_to_string(dir.join("service.luau")).expect("service");
+        let bridged = dir.join("lib/bridge.luau").exists();
+        fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert_eq!(
+            service,
+            "local BIN = noctalia.pluginDir() .. \"/hello-helper\""
+        );
+        assert!(!bridged);
     }
 }
