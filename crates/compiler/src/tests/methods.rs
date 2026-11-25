@@ -1636,3 +1636,117 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compiled.source
     );
 }
+
+#[test]
+fn rejects_a_null_fallback_from_unwrap_or_else() {
+    let handler = r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    let missing: Option<Value> = None;
+    let value = missing.unwrap_or_else(|| Value::Null);
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("json null"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn map_iter_closure_bindings_keep_the_string_key_type() {
+    let handler = r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    map.insert("ab".to_owned(), json!(1));
+    let lens: Vec<usize> = map.iter().map(|(key, _)| key.len()).collect();
+    Ok(vec![Op::log(format!("{}", lens.len()))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("#key")
+            && !compiled.source.contains("count_keys(key)"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn rejects_a_null_from_a_some_null_pattern() {
+    for handler in [
+        r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = Some(Value::Null);
+    let mut map = Map::new();
+    if let Some(inner) = value {
+        map.insert("k".to_owned(), inner);
+    }
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = Some(Value::Null);
+    let mut map = Map::new();
+    match value {
+        Some(Value::Null) => map.insert("k".to_owned(), Value::Null),
+        _ => None,
+    };
+    Ok(vec![Op::log("done")])
+}
+"#,
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("bails");
+        assert!(error.message.contains("json null"), "{}", error.message);
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
+fn rejects_a_null_from_a_tuple_initializer() {
+    let handler = r#"
+use serde_json::Map;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let pair = (json!(1), Value::Null);
+    let (_, value) = pair;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("json null"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn rejects_a_null_from_a_struct_field() {
+    let handler = r#"
+use serde_json::Map;
+struct Holder { value: Value }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { value: Value::Null };
+    let mut map = Map::new();
+    map.insert("k".to_owned(), holder.value);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("bails");
+    assert!(error.message.contains("json null"), "{}", error.message);
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}

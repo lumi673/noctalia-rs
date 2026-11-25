@@ -217,6 +217,7 @@ impl<'a> Emitter<'a> {
                 copied = Some(target);
             }
         }
+        let mut null_fields = BTreeSet::new();
         for field in &item.fields {
             let syn::Member::Named(name) = &field.member else {
                 return Err(Error::at(
@@ -224,7 +225,10 @@ impl<'a> Emitter<'a> {
                     "tuple structs are not supported by the Luau compiler",
                 ));
             };
-            let value = self.expr(&field.expr)?.0;
+            let (value, value_ty) = self.expr(&field.expr)?;
+            if value_ty.null {
+                null_fields.insert(name.to_string());
+            }
             if let Some(target) = &copied {
                 self.line(&format!(
                     "{target}.{} = {value}",
@@ -235,6 +239,9 @@ impl<'a> Emitter<'a> {
             }
         }
         self.pending_class = Some(class);
+        if !null_fields.is_empty() {
+            self.pending_null_fields = Some(null_fields);
+        }
         if let Some(target) = copied {
             return Ok((target, Ty::VALUE));
         }
@@ -672,14 +679,32 @@ impl<'a> Emitter<'a> {
             };
         }
         let (base, _) = self.expr(&field.base)?;
-        Ok((
-            if is_identifier(&member) {
-                format!("{base}.{member}")
-            } else {
-                format!("{base}[{}]", quote(&member))
-            },
-            Ty::OPT_VALUE,
-        ))
+        let class = self.class_of_receiver(&field.base);
+        let field_ty = class
+            .as_deref()
+            .and_then(|class| self.program.struct_def(&self.module, class))
+            .and_then(|def| {
+                def.fields
+                    .iter()
+                    .find(|(name, _)| name == &member)
+                    .map(|(_, ty)| type_hint(ty))
+            })
+            .unwrap_or(Ty::OPT_VALUE);
+        let text = if is_identifier(&member) {
+            format!("{base}.{member}")
+        } else {
+            format!("{base}[{}]", quote(&member))
+        };
+        let mut field_ty = field_ty;
+        if let Some(name) = path_ident(strip_reference(&field.base))
+            && self
+                .null_fields
+                .get(&name)
+                .is_some_and(|nulls| nulls.contains(&member))
+        {
+            field_ty.null = true;
+        }
+        Ok((text, field_ty))
     }
 
     pub(super) fn index(
@@ -862,6 +887,7 @@ impl<'a> Emitter<'a> {
         &mut self,
         pattern: &Pat,
         value: &str,
+        ty: Option<Ty>,
     ) -> Result<(), Error> {
         match pattern {
             Pat::Ident(pattern) => {
@@ -873,20 +899,32 @@ impl<'a> Emitter<'a> {
                     ));
                 }
                 self.line(&format!("local {name} = {value}"));
-                self.push(&name, Ty::VALUE);
+                self.push(&name, ty.unwrap_or(Ty::VALUE));
                 Ok(())
             }
             Pat::Wild(_) => Ok(()),
             Pat::Reference(reference) => {
-                self.bind_closure_pattern(&reference.pat, value)
+                self.bind_closure_pattern(&reference.pat, value, ty)
             }
-            Pat::Paren(paren) => self.bind_closure_pattern(&paren.pat, value),
-            Pat::Type(typed) => self.bind_closure_pattern(&typed.pat, value),
+            Pat::Paren(paren) => {
+                self.bind_closure_pattern(&paren.pat, value, ty)
+            }
+            Pat::Type(typed) => {
+                self.bind_closure_pattern(&typed.pat, value, ty)
+            }
             Pat::Tuple(tuple) => {
                 for (index, element) in tuple.elems.iter().enumerate() {
+                    let item = ty.map(|outer| {
+                        if outer.element == Some(Base::Str) {
+                            if index == 0 { Ty::STR } else { Ty::VALUE }
+                        } else {
+                            outer
+                        }
+                    });
                     self.bind_closure_pattern(
                         element,
                         &format!("{value}[{}]", index + 1),
+                        item,
                     )?;
                 }
                 Ok(())
@@ -903,6 +941,15 @@ impl<'a> Emitter<'a> {
         closure: &syn::ExprClosure,
         args: &[String],
     ) -> Result<(String, Ty), Error> {
+        self.closure_value_typed(closure, args, &[])
+    }
+
+    pub(super) fn closure_value_typed(
+        &mut self,
+        closure: &syn::ExprClosure,
+        args: &[String],
+        types: &[Option<Ty>],
+    ) -> Result<(String, Ty), Error> {
         if closure.inputs.len() != args.len() {
             return Err(Error::at(
                 closure.span(),
@@ -915,12 +962,17 @@ impl<'a> Emitter<'a> {
         }
         self.scopes.push(HashMap::new());
         self.local_statics.push(HashMap::new());
-        for (input, value) in closure.inputs.iter().zip(args) {
+        for ((input, value), ty) in closure
+            .inputs
+            .iter()
+            .zip(args)
+            .zip(types.iter().copied().chain(std::iter::repeat(None)))
+        {
             let input = match input {
                 Pat::Type(typed) => &*typed.pat,
                 other => other,
             };
-            if let Err(error) = self.bind_closure_pattern(input, value) {
+            if let Err(error) = self.bind_closure_pattern(input, value, ty) {
                 self.local_statics.pop();
                 self.scopes.pop();
                 return Err(error);

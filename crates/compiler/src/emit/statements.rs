@@ -103,13 +103,36 @@ impl<'a> Emitter<'a> {
                     },
                 )?;
             let multi = multi_return(initializer);
-            let (text, _) = self.expr(initializer)?;
+            let mut element_types = Vec::new();
+            let text = if let Expr::Tuple(items) = strip_reference(initializer)
+                && !multi
+            {
+                let mut parts = Vec::new();
+                for item in &items.elems {
+                    let (value, ty) = self.expr(item)?;
+                    element_types.push(ty);
+                    parts.push(value);
+                }
+                format!("{{ {} }}", parts.join(", "))
+            } else {
+                let (text, _) = self.expr(initializer)?;
+                text
+            };
+            if let Some(types) = path_ident(strip_reference(initializer))
+                .and_then(|name| self.tuple_types.get(&name))
+                .filter(|_| element_types.is_empty())
+            {
+                element_types = types.clone();
+            }
+            let element_ty = |index: usize| {
+                element_types.get(index).copied().unwrap_or(Ty::VALUE)
+            };
             let mut names = Vec::new();
             for element in &tuple.elems {
                 match element {
                     Pat::Ident(pattern) => {
                         let name = self.binding_name(pattern)?;
-                        self.push(&name, Ty::VALUE);
+                        self.push(&name, element_ty(names.len()));
                         names.push(name);
                     }
                     Pat::Wild(_) => names.push("_".to_owned()),
@@ -122,9 +145,9 @@ impl<'a> Emitter<'a> {
                 }
             }
             if multi {
-                for name in &names {
+                for (index, name) in names.iter().enumerate() {
                     if name != "_" {
-                        self.push(name, Ty::OPT_VALUE);
+                        self.push(name, element_ty(index));
                     }
                 }
                 self.line(&format!("local {} = {text}", names.join(", ")));
@@ -210,6 +233,13 @@ impl<'a> Emitter<'a> {
         let result = self.expr(&init.expr);
         self.value_needed = saved_value;
         let (text, mut ty) = result?;
+        if let Expr::Tuple(items) = strip_reference(&init.expr) {
+            let mut element_types = Vec::new();
+            for item in &items.elems {
+                element_types.push(self.expr(item)?.1);
+            }
+            self.tuple_types.insert(name.clone(), element_types);
+        }
         if ty.result
             && let Some(hint) = hint
         {
@@ -226,6 +256,9 @@ impl<'a> Emitter<'a> {
         }
         if let Some(class) = self.pending_class.take() {
             self.classes.insert(name.clone(), class);
+        }
+        if let Some(nulls) = self.pending_null_fields.take() {
+            self.null_fields.insert(name.clone(), nulls);
         }
         if text == "nil" {
             ty.null = true;
@@ -980,6 +1013,15 @@ impl<'a> Emitter<'a> {
                 .map(|case| self.binding_ty(case, name, outer))
                 .find(|ty| *ty != Ty::VALUE)
                 .unwrap_or(Ty::VALUE),
+            Pat::Path(path) => {
+                let last = path
+                    .path
+                    .segments
+                    .last()
+                    .map(|segment| segment.ident.to_string())
+                    .unwrap_or_default();
+                if last == "Null" { Ty::NULL } else { Ty::VALUE }
+            }
             Pat::Paren(paren) => self.binding_ty(&paren.pat, name, outer),
             Pat::Reference(reference) => {
                 self.binding_ty(&reference.pat, name, outer)
@@ -993,9 +1035,13 @@ impl<'a> Emitter<'a> {
                     .unwrap_or_default();
                 let inner = match kind.as_str() {
                     "Some" | "Ok" | "Err" => {
-                        // The pattern matched a present, non-null value.
+                        // A matched Some/Ok/Err holds a present value; the
+                        // Option's own nullness describes None, not the inner
+                        // value. A nested `Null` pattern reintroduces null.
                         let mut present = outer;
-                        present.null = false;
+                        if present.optional {
+                            present.null = false;
+                        }
                         present
                     }
                     "String" => Ty::STR,
@@ -1003,6 +1049,7 @@ impl<'a> Emitter<'a> {
                     // An integral double is an integer in Luau, so number
                     // formatting goes through the JSON encoder instead.
                     "Number" => Ty::VALUE,
+                    "Null" => Ty::NULL,
                     "Object" => Ty::TABLE,
                     "Array" => Ty::LIST,
                     _ => Ty::VALUE,
@@ -1010,7 +1057,7 @@ impl<'a> Emitter<'a> {
                 item.elems
                     .iter()
                     .map(|element| self.binding_ty(element, name, inner))
-                    .find(|ty| *ty != Ty::VALUE)
+                    .find(|ty| ty.null || *ty != Ty::VALUE)
                     .unwrap_or(Ty::VALUE)
             }
             Pat::Tuple(tuple) => tuple

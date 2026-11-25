@@ -81,6 +81,13 @@ impl Ty {
         null: true,
         element: None,
     };
+    pub(crate) const LIST_OF_KEYS: Self = Self {
+        base: Base::List,
+        optional: false,
+        result: false,
+        null: false,
+        element: Some(Base::Str),
+    };
     pub(crate) const STRING_LIST: Self = Self {
         base: Base::List,
         optional: false,

@@ -165,6 +165,45 @@ impl<'a> Emitter<'a> {
         Ok((format!("({text})({})", values.join(", ")), ty))
     }
 
+    /// Whether an iterator chain yields `(key, value)` pairs.
+    fn pair_source(&self, expr: &Expr) -> bool {
+        match strip_reference(expr) {
+            Expr::MethodCall(call) => match call.method.to_string().as_str() {
+                "iter" | "into_iter" => match strip_reference(&call.receiver) {
+                    Expr::Path(path) => path
+                        .path
+                        .get_ident()
+                        .and_then(|name| self.lookup(&name.to_string()))
+                        .is_some_and(|ty| ty.base == Base::Table),
+                    _ => false,
+                },
+                "map" | "filter" | "filter_map" | "take" | "skip"
+                | "flatten" | "copied" | "cloned" => {
+                    self.pair_source(&call.receiver)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Invoke a closure whose argument is a `(key, value)` pair, typing the
+    /// first tuple element as a string.
+    fn invoke_pair_arg(
+        &mut self,
+        arg: &Expr,
+        value: &str,
+    ) -> Result<(String, Ty), Error> {
+        if let Expr::Closure(closure) = arg {
+            return self.closure_value_typed(
+                closure,
+                std::slice::from_ref(&value.to_owned()),
+                &[Some(Ty::LIST_OF_KEYS)],
+            );
+        }
+        self.invoke_arg(arg, std::slice::from_ref(&value.to_owned()))
+    }
+
     fn combinator(
         &mut self,
         call: &ExprMethodCall,
@@ -300,9 +339,12 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("{result} = {text}"));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
-                // The branch that produced a value ran the fallback, so the
-                // receiver's nullness cannot reach the result.
-                fallback_ty.null = false;
+                // Only a real fallback value clears the receiver's nullness;
+                // a fallback that is itself null must reach the insertion
+                // check like any other null.
+                if text != "nil" && !fallback_ty.null {
+                    fallback_ty.null = false;
+                }
                 return Ok(Some((result, fallback_ty)));
             }
             "ok_or" => {
@@ -407,7 +449,7 @@ impl<'a> Emitter<'a> {
                 emitter.line("end");
                 Ok(())
             };
-            self.emit_iter(&call.receiver, &body)?;
+            self.emit_iter(&call.receiver, false, &body)?;
             let ty = if index.is_some() {
                 Ty::OPT_INT
             } else {
@@ -436,7 +478,7 @@ impl<'a> Emitter<'a> {
                 }
                 Ok(())
             };
-            self.emit_iter(&call.receiver, &body)?;
+            self.emit_iter(&call.receiver, false, &body)?;
             return Ok(Some((String::new(), Ty::VOID)));
         }
         self.line(&format!("local {result} = {initial}"));
@@ -469,7 +511,7 @@ impl<'a> Emitter<'a> {
             }
             Ok(())
         };
-        self.emit_iter(&call.receiver, &body)?;
+        self.emit_iter(&call.receiver, false, &body)?;
         let ty = match method.as_str() {
             "any" | "all" => Ty::BOOL,
             "count" => Ty::INT,
@@ -488,7 +530,7 @@ impl<'a> Emitter<'a> {
             emitter.line(&format!("{result}[#{result} + 1] = {value}"));
             Ok(())
         };
-        self.emit_iter(&method.receiver, &insert)?;
+        self.emit_iter(&method.receiver, false, &insert)?;
         Ok(Some((result, Ty::LIST)))
     }
 
@@ -499,23 +541,33 @@ impl<'a> Emitter<'a> {
     fn emit_iter(
         &mut self,
         expr: &Expr,
+        pair: bool,
         body: &dyn Fn(&mut Self, &str) -> Result<(), Error>,
     ) -> Result<(), Error> {
         match strip_reference(expr) {
-            Expr::Paren(paren) => return self.emit_iter(&paren.expr, body),
-            Expr::Group(group) => return self.emit_iter(&group.expr, body),
+            Expr::Paren(paren) => {
+                return self.emit_iter(&paren.expr, pair, body);
+            }
+            Expr::Group(group) => {
+                return self.emit_iter(&group.expr, pair, body);
+            }
             Expr::MethodCall(call) => match call.method.to_string().as_str() {
                 "map" | "filter_map" => {
+                    let pair = self.pair_source(&call.receiver);
                     let skip_nil = call.method == "filter_map";
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
-                        let (text, _) = emitter.invoke_arg(
-                            closure,
-                            std::slice::from_ref(&value.to_owned()),
-                        )?;
+                        let (text, _) = if pair {
+                            emitter.invoke_pair_arg(closure, value)?
+                        } else {
+                            emitter.invoke_arg(
+                                closure,
+                                std::slice::from_ref(&value.to_owned()),
+                            )?
+                        };
                         if text.is_empty() {
                             return Ok(());
                         }
@@ -531,18 +583,23 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "filter" => {
+                    let pair = self.pair_source(&call.receiver);
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
-                        let (condition, _) = emitter.invoke_arg(
-                            closure,
-                            std::slice::from_ref(&value.to_owned()),
-                        )?;
+                        let (condition, _) = if pair {
+                            emitter.invoke_pair_arg(closure, value)?
+                        } else {
+                            emitter.invoke_arg(
+                                closure,
+                                std::slice::from_ref(&value.to_owned()),
+                            )?
+                        };
                         emitter.line(&format!("if {condition} then"));
                         emitter.indent = emitter.indent.saturating_add(1);
                         body(emitter, value)?;
@@ -550,7 +607,7 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "split" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -587,6 +644,7 @@ impl<'a> Emitter<'a> {
                 "iter" | "into_iter" | "values" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     let map = ty.base == Base::Table;
+                    let _ = pair;
                     return self.emit_table(
                         &source,
                         false,
@@ -599,7 +657,7 @@ impl<'a> Emitter<'a> {
                     );
                 }
                 "copied" | "cloned" => {
-                    return self.emit_iter(&call.receiver, body);
+                    return self.emit_iter(&call.receiver, pair, body);
                 }
                 "keys" => {
                     let (source, ty) = self.expr(&call.receiver)?;
@@ -631,7 +689,7 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "take" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -645,7 +703,7 @@ impl<'a> Emitter<'a> {
                         emitter.line(&format!("{left} = {left} - 1"));
                         body(emitter, value)
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "flatten" => {
                     let (source, ty) = self.expr(&call.receiver)?;
@@ -666,7 +724,7 @@ impl<'a> Emitter<'a> {
                                 emitter
                                     .emit_table(value, false, false, None, body)
                             };
-                        return self.emit_iter(&call.receiver, &inner);
+                        return self.emit_iter(&call.receiver, pair, &inner);
                     }
                 }
                 "rsplit" => {
@@ -724,7 +782,13 @@ impl<'a> Emitter<'a> {
                 self.line(&format!(
                     "local {pair} = {{ {key}, {source}[{key}] }}"
                 ));
-                body(self, &pair)
+                let saved_pair = self.lookup(&key);
+                self.push(&key, Ty::STR);
+                let result = body(self, &pair);
+                if let Some(ty) = saved_pair {
+                    self.push(&key, ty);
+                }
+                result
             } else {
                 let key = self.temp();
                 self.line(&format!("local {key} = {order}[{index}]"));
