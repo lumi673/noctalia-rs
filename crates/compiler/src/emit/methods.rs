@@ -1884,11 +1884,9 @@ impl<'a> Emitter<'a> {
                 } else {
                     format!("{head}({request}, {callback})")
                 };
-                if self.in_statement {
-                    self.line(&line);
-                    return Ok((String::new(), Ty::VOID));
-                }
-                Ok((line, Ty::BOOL))
+                let value = self.temp();
+                self.line(&format!("local {value} = {line}"));
+                Ok((format!("({value})"), Ty::BOOL))
             }
             "run_async_start" | "run_stream_start" | "http_start" => {
                 if !self.in_statement {
@@ -2012,7 +2010,8 @@ impl<'a> Emitter<'a> {
                 format!("`{full}` cannot answer a query"),
             ));
         }
-        let text = format!("{full}(table.unpack({values}))");
+        self.uses_unpack = true;
+        let text = format!("{full}(__unpack({values}))");
         match method {
             "query_bool" => Ok((format!("({text} == true)"), Ty::BOOL)),
             "query_value" => Ok((text, Ty::VALUE)),

@@ -157,6 +157,7 @@ impl Runtime<'_> {
         args: Vec<JsonValue>,
     ) -> LuaResult<MultiValue> {
         if self.host.strict()
+            && self.host.query_dir().is_none()
             && let Some(result) = self.strict_response(root, path, &args)?
         {
             return Ok(result);
@@ -435,6 +436,9 @@ fn to_json(
 
 fn ui_node(lua: &Lua, value: LuaValue) -> LuaResult<noctalia_rs::ui::UiNode> {
     let host = host(lua)?;
+    if host.strict() {
+        return host_converter(lua, &host).ui_node(value);
+    }
     call_converter(lua, &host).ui_node(value)
 }
 
@@ -756,11 +760,12 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let values = args.to_vec();
         let request = json_arg(lua, &values, 0)?;
         let callback = callback_marker(lua, &values, 1)?;
-        if host
-            .snapshot
-            .setting("shell.offline_mode")
-            .as_bool()
-            .unwrap_or_default()
+        if host.strict()
+            && host
+                .snapshot
+                .setting("shell.offline_mode")
+                .as_bool()
+                .unwrap_or_default()
         {
             return Ok(LuaValue::Boolean(false));
         }
@@ -810,7 +815,7 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         } else {
             lua.coerce_number(timeout).ok().flatten()
         };
-        if !command_accepted(&command) {
+        if host.strict() && !command_accepted(&command) {
             return Ok(LuaValue::Boolean(false));
         }
         host.collector.emit(Op::run_with_timeout(
@@ -825,7 +830,7 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let values = args.to_vec();
         let command = json_arg(lua, &values, 0)?;
         let id = callback_id(lua, &values, 1)?;
-        if !command_accepted(&command) {
+        if host.strict() && !command_accepted(&command) {
             return Ok(LuaValue::Boolean(false));
         }
         host.collector.emit(Op::run_stream(command, &id));

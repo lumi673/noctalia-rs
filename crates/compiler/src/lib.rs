@@ -638,6 +638,14 @@ fn compile_once(
             "end\n",
         ));
     }
+    if options.strict.is_some() {
+        if bodies.iter().any(|slot| slot.body.uses_unpack) {
+            out.push_str("local __unpack = table.unpack\n");
+        }
+        if bodies.iter().any(|slot| slot.body.uses_pcall) {
+            out.push_str("local __pcall = pcall\n");
+        }
+    }
     if let Some(strict) = &options.strict {
         let uses_config = bodies.iter().any(|slot| slot.body.uses_config_table);
         let uses_translations =

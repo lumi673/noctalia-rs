@@ -1468,10 +1468,10 @@ impl Emitter<'_> {
         if !unix {
             return Ok(false);
         }
+        let mut permissions_use = false;
         let Some(strict) = self.strict else {
             return Ok(false);
         };
-        let mut permissions_use = false;
         let mut condition = None;
         for stmt in &block.block.stmts {
             match stmt {
@@ -1492,6 +1492,12 @@ impl Emitter<'_> {
                 }
                 _ => return Ok(false),
             }
+        }
+        if !permissions_use {
+            return Err(Error::at(
+                block.span(),
+                "the strict chmod fold needs `use std::os::unix::fs::PermissionsExt`",
+            ));
         }
         let Some(item) = condition else {
             return Ok(false);
@@ -1530,7 +1536,7 @@ impl Emitter<'_> {
         };
         let mut matched = false;
         for (asset, mode) in strict.assets {
-            if path.contains(asset) {
+            if asset_at_boundary(&path, asset) {
                 matched = true;
                 if mode & requested != requested {
                     return Err(Error::at(
@@ -1548,7 +1554,6 @@ impl Emitter<'_> {
                 "strict emit cannot change the mode of a path that is not a declared asset",
             ));
         }
-        let _ = permissions_use;
         Ok(true)
     }
 
@@ -1610,4 +1615,17 @@ fn use_last_ident(tree: &syn::UseTree) -> Option<String> {
         syn::UseTree::Rename(rename) => Some(rename.rename.to_string()),
         syn::UseTree::Glob(_) | syn::UseTree::Group(_) => None,
     }
+}
+
+/// Whether `asset` appears in `text` as a whole path, not as a prefix.
+fn asset_at_boundary(text: &str, asset: &str) -> bool {
+    text.match_indices(asset).any(|(index, _)| {
+        let before =
+            index.checked_sub(1).and_then(|at| text.as_bytes().get(at));
+        let after = text.as_bytes().get(index.saturating_add(asset.len()));
+        let before_ok =
+            before.is_none_or(|byte| *byte == b'/' || *byte == b'"');
+        let after_ok = after.is_none_or(|byte| *byte == b'"' || *byte == b'/');
+        before_ok && after_ok
+    })
 }

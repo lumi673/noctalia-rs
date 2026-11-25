@@ -113,6 +113,8 @@ impl<'a> Emitter<'a> {
             notify_actions: BTreeSet::new(),
             uses_config_table: false,
             uses_translations_table: false,
+            uses_unpack: false,
+            uses_pcall: false,
             uses_action_dispatch: false,
             uses_callback_dispatch: false,
             has_action,
@@ -212,6 +214,8 @@ impl<'a> Emitter<'a> {
             uses_action_dispatch: self.uses_action_dispatch,
             uses_config_table: self.uses_config_table,
             uses_translations_table: self.uses_translations_table,
+            uses_unpack: self.uses_unpack,
+            uses_pcall: self.uses_pcall,
         }
     }
 
@@ -308,6 +312,8 @@ pub(crate) struct Body {
     pub uses_action_dispatch: bool,
     pub uses_config_table: bool,
     pub uses_translations_table: bool,
+    pub uses_unpack: bool,
+    pub uses_pcall: bool,
 }
 
 #[derive(Clone)]
@@ -365,6 +371,8 @@ pub(crate) struct Emitter<'a> {
     notify_actions: BTreeSet<String>,
     uses_config_table: bool,
     uses_translations_table: bool,
+    uses_unpack: bool,
+    uses_pcall: bool,
     uses_action_dispatch: bool,
     uses_callback_dispatch: bool,
     has_action: bool,

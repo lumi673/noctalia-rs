@@ -21,29 +21,6 @@ type BoxError = Box<dyn Error>;
 /// Translation templates per language, flattened to dotted keys.
 pub type TranslationTables = BTreeMap<String, BTreeMap<String, String>>;
 
-/// The host reads the bridge used to snapshot, now as direct member calls.
-///
-/// The names match `Context::host` paths, so the emitter can answer a
-/// `ctx.host(path)` read without a runtime snapshot table.
-pub const HOST_SNAPSHOT: &[(&str, &str)] = &[
-    ("now_ms", "noctalia.nowMs()"),
-    ("dark", "noctalia.isDarkMode()"),
-    ("outputs", "noctalia.outputs()"),
-    ("focused_output_name", "noctalia.focusedOutputName()"),
-    ("pluginDir", "noctalia.pluginDir()"),
-    ("pluginDataDir", "noctalia.pluginDataDir()"),
-    ("clipboard", "noctalia.clipboardText()"),
-    ("calendar", "noctalia.calendarEvents()"),
-    ("media", "noctalia.mediaPlayer()"),
-    ("stats", "noctalia.systemStats()"),
-    ("nightlight", "noctalia.nightlight.state"),
-    ("compositor", "{ name = noctalia.compositor.name }"),
-    (
-        "bar",
-        "{ vertical = barWidget.isVertical(), output_name = barWidget.outputName() }",
-    ),
-];
-
 /// One declared asset and the mode the build preserves for it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AssetMode {
@@ -127,21 +104,10 @@ impl StrictContext {
     pub fn translations_source(&self) -> String {
         let mut out = self.languages_source();
         out.push_str(
-            "local TRANSLATIONS = (function()\n  local locale = noctalia.getSetting(\"shell.lang\") or noctalia.getSetting(\"shell.language\") or \"en\"\n  return LANGUAGES[locale] or LANGUAGES[\"en\"] or {}\nend)()\n",
+            "local TRANSLATIONS = (function()\n  local locale = noctalia.getSetting(\"shell.lang\") or noctalia.getSetting(\"shell.language\") or noctalia.getSetting(\"general.language\") or \"en\"\n  return LANGUAGES[locale] or LANGUAGES[\"en\"] or {}\nend)()\n",
         );
         out
     }
-}
-
-/// The fixed host snapshot, as direct member calls.
-#[must_use]
-pub fn host_snapshot_source() -> String {
-    let mut out = String::from("local host = {\n");
-    for (field, call) in HOST_SNAPSHOT {
-        let _ = writeln!(out, "  [{}] = {call},", lua_string(field));
-    }
-    out.push_str("}\n");
-    out
 }
 
 /// Declared assets with the mode their source file has.
@@ -204,7 +170,8 @@ fn translations(source: &Path) -> Result<TranslationTables, BoxError> {
         else {
             continue;
         };
-        if !name.to_ascii_lowercase().ends_with(".json")
+        let lower = name.to_ascii_lowercase();
+        if !lower.ends_with(".json")
             || name.contains('/')
             || name.contains("..")
         {
@@ -216,7 +183,7 @@ fn translations(source: &Path) -> Result<TranslationTables, BoxError> {
             .map_err(|error| format!("parse translation {name}: {error}"))?;
         let mut templates = BTreeMap::new();
         flatten(&value, "", &mut templates);
-        let language = name.trim_end_matches(".json").to_owned();
+        let language = name[..name.len().saturating_sub(5)].to_owned();
         result.insert(language, templates);
     }
     Ok(result)
@@ -306,6 +273,9 @@ fn lua_string(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            other if (other as u32) < 0x20 || other as u32 == 0x7f => {
+                let _ = write!(out, "\\{:03}", other as u32);
+            }
             other => out.push(other),
         }
     }
@@ -366,16 +336,6 @@ mod tests {
     }
 
     #[test]
-    fn host_snapshot_uses_direct_member_calls() {
-        let source = host_snapshot_source();
-        assert!(source.contains("[\"now_ms\"] = noctalia.nowMs()"));
-        assert!(
-            source.contains("[\"bar\"] = { vertical = barWidget.isVertical()")
-        );
-        assert!(!source.contains("invoke("));
-    }
-
-    #[test]
     fn asset_modes_record_the_source_mode() -> Result<(), BoxError> {
         let dir = scratch();
         fs::create_dir_all(dir.join("tools"))?;
@@ -411,5 +371,36 @@ mod tests {
             );
         }
         Ok(())
+    }
+    #[test]
+    fn translations_use_the_bridge_locale_fallbacks() {
+        let context = StrictContext::default();
+        let source = context.translations_source();
+        assert!(source.contains("general.language"), "{source}");
+        assert!(source.contains("shell.language"), "{source}");
+    }
+
+    #[test]
+    fn translation_files_normalize_the_language_suffix() -> Result<(), BoxError>
+    {
+        let dir = scratch();
+        fs::create_dir_all(dir.join("translations"))?;
+        fs::write(dir.join("translations/EN.JSON"), r#"{"key":"Value"}"#)?;
+        let root: toml::Table = "id = \"me/test\"\n".parse()?;
+        let context = StrictContext::build(&root, &dir, &[])?;
+        fs::remove_dir_all(&dir)?;
+
+        assert!(
+            context.translations.contains_key("EN"),
+            "{:?}",
+            context.translations
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lua_string_escapes_control_bytes() {
+        let text = lua_string("a\0b\u{7}c");
+        assert_eq!(text, "\"a\\000b\\007c\"");
     }
 }

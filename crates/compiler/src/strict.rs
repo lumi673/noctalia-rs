@@ -325,8 +325,14 @@ pub fn action_global(name: &str) -> String {
 }
 
 /// A closure that forwards its arguments to a dispatcher global.
+///
+/// The id is bound once as an IIFE parameter, so a local the caller later
+/// reassigns is captured at registration, the way Rust and the bridge capture
+/// their callback name.
 pub fn closure(dispatcher: &str, id: &str) -> String {
-    format!("function(...) {dispatcher}({id}, ...) end")
+    format!(
+        "(function(__captured) return function(...) {dispatcher}(__captured, ...) end end)({id})"
+    )
 }
 
 #[cfg(test)]

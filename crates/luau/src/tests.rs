@@ -1007,25 +1007,33 @@ fn http_reports_offline_mode_and_emits_no_request() {
     let mut fixture = empty_fixture("update");
     fixture.host = json!({ "setting": { "shell.offline_mode": true } });
     let ctx = context(fixture);
-    let ops = dispatch(
+    let ops = dispatch_strict(
         &ctx,
         &[(
             "entry",
             r#"assert(noctalia.http({ url = "https://example.invalid/" }, function() end) == false)"#,
         )],
     )
-    .expect("dispatch");
+    .expect("strict dispatch");
     assert!(ops.is_empty(), "{ops:?}");
 }
 
 #[test]
 fn run_start_rejects_a_command_it_cannot_describe() {
-    let values = run(r#"
+    let ctx = context(empty_fixture("update"));
+    let ops = dispatch_strict(
+        &ctx,
+        &[(
+            "entry",
+            r#"
 assert(noctalia.runAsync({}) == false)
 assert(noctalia.runAsync({ "echo", 3 }) == false)
 assert(noctalia.runStream("", function() end) == false)
-"#);
-    assert!(values.is_empty(), "{values:?}");
+"#,
+        )],
+    )
+    .expect("strict dispatch");
+    assert!(ops.is_empty(), "{ops:?}");
 }
 
 #[test]
@@ -1042,4 +1050,51 @@ assert(noctalia.readFile(to) == "body")
 "#;
     let ctx = context(empty_fixture("update"));
     dispatch_strict(&ctx, &[("entry", SOURCE)]).expect("strict dispatch");
+}
+
+#[test]
+fn auto_keeps_http_and_run_calls_unchanged() {
+    let mut fixture = empty_fixture("update");
+    fixture.host = json!({ "setting": { "shell.offline_mode": true } });
+    let ctx = context(fixture);
+    let ops = dispatch(
+        &ctx,
+        &[(
+            "entry",
+            r#"
+assert(noctalia.http({ url = "https://example.invalid/" }, function() end) == true)
+assert(noctalia.runAsync({}) == true)
+assert(noctalia.runStream("", function() end) == true)
+"#,
+        )],
+    )
+    .expect("dispatch");
+    assert_eq!(ops.len(), 3, "{ops:?}");
+}
+
+#[test]
+fn strict_write_file_forwards_when_a_host_is_attached() {
+    let dir = QueryDir::new();
+    dir.respond("noctalia_rs_luau_1", json!(true));
+    let ctx = context_in(empty_fixture("update"), dir.path());
+    let ops = dispatch_strict(
+        &ctx,
+        &[(
+            "entry",
+            r#"
+assert(noctalia.writeFile("/sys/led", "1") == true)
+assert(noctalia.readFile("/sys/led") == nil)
+"#,
+        )],
+    )
+    .expect("strict dispatch");
+    let values = ops
+        .iter()
+        .map(|op| serde_json::to_value(op).expect("serialize"))
+        .collect::<Vec<_>>();
+    let query = values
+        .iter()
+        .find(|value| value["op"] == json!("query"))
+        .expect("write query");
+    assert_eq!(query["path"], json!(["writeFile"]));
 }

@@ -37,9 +37,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 "#;
     let output = compile_strict(handler, &[]).expect("compile");
     assert!(
-        output.contains(
-            "noctalia.flatpakAppInstalled(table.unpack({ \"app\" }))"
-        )
+        output.contains("noctalia.flatpakAppInstalled(__unpack({ \"app\" }))")
     );
     assert!(
         output.contains("noctalia.writeFile(response, noctalia.json.encode(")
@@ -214,6 +212,8 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 "#;
     let output = compile_strict(handler, &[]).expect("compile");
     assert!(output.contains("noctalia.copyToClipboard("), "{output}");
+    assert!(output.contains("string.char(1, 2)"), "{output}");
+    assert!(output.contains("string.char(3)"), "{output}");
     assert!(
         output.contains("noctalia.writeFile(\"/tmp/x\","),
         "{output}"
@@ -240,9 +240,10 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 "#;
     let output = compile_strict(handler, &[]).expect("compile");
-    assert!(output.contains("if noctalia.runStream("), "{output}");
-    assert!(output.contains("if noctalia.runAsync("), "{output}");
-    assert!(output.contains("local http = noctalia.http("), "{output}");
+    assert!(output.contains("local __t"), "{output}");
+    assert!(output.contains("= noctalia.runStream("), "{output}");
+    assert!(output.contains("= noctalia.runAsync("), "{output}");
+    assert!(output.contains("= noctalia.http("), "{output}");
 }
 
 #[test]
@@ -258,15 +259,12 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 "#;
     let output = compile_strict(handler, &[]).expect("compile");
     assert!(
-        output.contains("noctalia.pluginDataDir(table.unpack({}))"),
+        output.contains("noctalia.pluginDataDir(__unpack({}))"),
         "{output}"
     );
+    assert!(output.contains("noctalia.getSetting(__unpack("), "{output}");
     assert!(
-        output.contains("noctalia.getSetting(table.unpack("),
-        "{output}"
-    );
-    assert!(
-        output.contains("(noctalia.outputs(table.unpack({})) == true)"),
+        output.contains("(noctalia.outputs(__unpack({})) == true)"),
         "{output}"
     );
     assert!(output.contains("return { ok = true, value ="), "{output}");
@@ -296,15 +294,83 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 "#;
     let output = compile_strict(handler, &[]).expect("compile");
     assert!(
-        output.contains("function(...) __strict_action(name, ...)"),
+        output.contains("__strict_action(__captured, ...)"),
         "{output}"
     );
     assert!(
-        output.contains("function(...) __strict_callback(id, ...)"),
+        output.contains("__strict_callback(__captured, ...)"),
         "{output}"
     );
     assert!(
         output.contains("function __strict_action(name, ...)"),
         "{output}"
     );
+}
+
+#[test]
+fn strict_reuses_an_inlined_acceptance_result() {
+    let handler = r#"
+fn start(ctx: &Context) -> bool {
+    ctx.run_stream_start(json!(["tail", "-f"]), "stream")
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let streaming = start(ctx);
+        return Ok(vec![Op::log(streaming.to_string())]);
+    }
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("local streaming = __t"), "{output}");
+    assert!(!output.contains("local streaming = \n"), "{output}");
+    assert!(output.contains("= noctalia.runStream("), "{output}");
+}
+
+#[test]
+fn strict_rejects_a_notify_action_that_collides_with_a_handler() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        return Ok(vec![Op::notify_with_options("T", "B", json!({ "onAction": "update" }))]);
+    }
+    if ctx.event == "action" {
+        return Ok(vec![Op::log("action")]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("collision");
+    assert!(
+        error.contains("collides with a generated handler"),
+        "{error}"
+    );
+}
+
+#[test]
+fn strict_chmod_needs_a_whole_asset_path() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let path = "/plugins/tools/tool.bak";
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            if permissions.mode() & 0o111 == 0 {
+                permissions.set_mode(0o755);
+                let _ = fs::set_permissions(path, permissions);
+            }
+        }
+    }
+    Ok(vec![Op::log(path)])
+}
+"#;
+    let error = compile_strict(handler, &[("tools/tool", 0o755)])
+        .expect_err("prefix is not the asset");
+    assert!(error.contains("not a declared asset"), "{error}");
 }

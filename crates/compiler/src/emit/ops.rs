@@ -326,6 +326,20 @@ impl<'a> Emitter<'a> {
                 ),
             ));
         }
+        let reserved = name == "update"
+            || name == "onHostCallback"
+            || name.starts_with("__strict_")
+            || crate::CALLBACKS
+                .iter()
+                .any(|callback| callback.function == name);
+        if reserved {
+            return Err(Error::at(
+                options.span(),
+                format!(
+                    "notify action `{name}` collides with a generated handler global"
+                ),
+            ));
+        }
         self.notify_actions.insert(name);
         Ok(())
     }
@@ -386,8 +400,10 @@ impl<'a> Emitter<'a> {
         let value = self.temp();
         let error = self.temp();
         let envelope = self.temp();
+        self.uses_unpack = true;
+        self.uses_pcall = true;
         self.line(&format!(
-            "local {ok}, {value}, {error} = pcall(function() return {full}(table.unpack({values})) end)"
+            "local {ok}, {value}, {error} = __pcall(function() return {full}(__unpack({values})) end)"
         ));
         self.line(&format!("local {envelope}"));
         self.line(&format!(

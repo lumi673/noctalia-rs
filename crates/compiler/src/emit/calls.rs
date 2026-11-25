@@ -130,7 +130,7 @@ impl<'a> Emitter<'a> {
                 "ByteBuf::new" | "ByteBuf::from"
                     if self.strict() && args.len() == 1 =>
                 {
-                    return self.expr(arg(&args, 0, call)?);
+                    return self.byte_string(arg(&args, 0, call)?);
                 }
                 _ => {}
             }
@@ -275,6 +275,44 @@ impl<'a> Emitter<'a> {
                 "call to `{label}` is not supported by the Luau compiler: no function in the crate matches, and only ops, ui constructors and a small set of std calls are supported"
             ),
         ))
+    }
+
+    /// A byte string for a strict `ByteBuf`.
+    ///
+    /// A byte array becomes `string.char(...)` so it stays a Lua string. Any
+    /// other expression (a `String`, `&str`, or a value already carrying
+    /// bytes) is used as is.
+    fn byte_string(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
+        let inner = strip_reference(expr);
+        let items = match inner {
+            Expr::Macro(mac) if macro_name(mac) == "vec" => parse_vec(mac)?,
+            Expr::Array(array) => {
+                array.elems.iter().cloned().collect::<Vec<_>>()
+            }
+            _ => return self.expr(expr),
+        };
+        let mut values = Vec::new();
+        let mut all_literals = true;
+        for item in &items {
+            let Expr::Lit(ExprLit {
+                lit: Lit::Int(value),
+                ..
+            }) = strip_reference(item)
+            else {
+                all_literals = false;
+                break;
+            };
+            values.push(value.base10_parse::<u32>()?.to_string());
+        }
+        if all_literals {
+            return Ok((
+                format!("string.char({})", values.join(", ")),
+                Ty::STR,
+            ));
+        }
+        let list = self.list(&items)?.0;
+        self.uses_unpack = true;
+        Ok((format!("string.char(__unpack({list}))"), Ty::STR))
     }
 
     /// A real callback value for strict emit.
