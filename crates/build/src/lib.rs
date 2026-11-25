@@ -191,7 +191,7 @@ fn generate_with(
     let plugin = if natives.is_empty() {
         "    plugin\n}}\n"
     } else {
-        "    plugin.with_native(__noctalia_native_dispatch)\n}}\n"
+        "    plugin.with_native(__noctalia_native::dispatch)\n}}\n"
     };
     let _ = write!(generated.body, "{plugin}");
     let defaults = default_entry_scripts(root)?;
@@ -777,26 +777,27 @@ fn write_native(
         "// Every parameter type must implement `serde::de::DeserializeOwned` and\n",
         "// every success type must implement `serde::Serialize`. Error types must\n",
         "// implement `Display`.\n",
+        "mod __noctalia_native {\n",
+        "    use serde_json::Value;\n",
         "\n",
-        "fn __noctalia_native_arg<T: serde::de::DeserializeOwned>(\n",
-        "    args: &serde_json::Value,\n",
-        "    name: &str,\n",
-        ") -> Result<T, String> {\n",
-        "    let value = args.get(name).cloned().unwrap_or(serde_json::Value::Null);\n",
-        "    serde_json::from_value(value).map_err(|error| format!(\"{name}: {error}\"))\n",
-        "}\n",
+        "    fn argument<T: serde::de::DeserializeOwned>(\n",
+        "        args: &Value,\n",
+        "        name: &str,\n",
+        "    ) -> Result<T, String> {\n",
+        "        let value = args.get(name).cloned().unwrap_or(Value::Null);\n",
+        "        serde_json::from_value(value)\n",
+        "            .map_err(|error| format!(\"{name}: {error}\"))\n",
+        "    }\n",
         "\n",
-        "fn __noctalia_native_value<T: serde::Serialize>(\n",
-        "    value: T,\n",
-        ") -> Result<serde_json::Value, String> {\n",
-        "    serde_json::to_value(value).map_err(|error| error.to_string())\n",
-        "}\n",
+        "    fn value<T: serde::Serialize>(value: T) -> Result<Value, String> {\n",
+        "        serde_json::to_value(value).map_err(|error| error.to_string())\n",
+        "    }\n",
         "\n",
-        "fn __noctalia_native_dispatch(\n",
-        "    name: &str,\n",
-        "    args: serde_json::Value,\n",
-        ") -> Result<serde_json::Value, String> {\n",
-        "    match name {\n",
+        "    pub(crate) fn dispatch(\n",
+        "        name: &str,\n",
+        "        args: Value,\n",
+        "    ) -> Result<Value, String> {\n",
+        "        match name {\n",
     ));
     for item in natives.values() {
         let mut rust_path = String::from("crate::");
@@ -810,39 +811,39 @@ fn write_native(
         }
         rust_path.push_str(&item.function);
         let args = item.params.join(", ");
-        let _ = writeln!(out, "        {} => {{", quote(&item.name));
+        let _ = writeln!(out, "            {} => {{", quote(&item.name));
         for param in &item.params {
             let _ = writeln!(
                 out,
-                "            let {param}: _ = __noctalia_native_arg(&args, {})?;",
+                "                let {param}: _ = argument(&args, {})?;",
                 quote(param)
             );
         }
         if item.result {
-            let _ = writeln!(out, "            match {rust_path}({args}) {{");
+            let _ =
+                writeln!(out, "                match {rust_path}({args}) {{");
+            let _ =
+                writeln!(out, "                    Ok(value) => value(value),");
             let _ = writeln!(
                 out,
-                "                Ok(value) => __noctalia_native_value(value),"
+                "                    Err(error) => Err(error.to_string()),"
             );
-            let _ = writeln!(
-                out,
-                "                Err(error) => Err(error.to_string()),"
-            );
-            let _ = writeln!(out, "            }}");
+            let _ = writeln!(out, "                }}");
         } else {
-            let _ = writeln!(
-                out,
-                "            __noctalia_native_value({rust_path}({args}))"
-            );
+            let _ = writeln!(out, "                value({rust_path}({args}))");
         }
-        let _ = writeln!(out, "        }}");
+        let _ = writeln!(out, "            }}");
     }
-    out.push_str(
-        "        _ => Err(format!(\"unknown native function `{name}`\")),\n    }\n}\n",
-    );
+    out.push_str(concat!(
+        "            _ => Err(format!(\"unknown native function `{name}`\")),\n",
+        "        }\n",
+        "    }\n",
+        "}\n",
+    ));
     fs::write(path, out)?;
     Ok(())
 }
+
 fn entry_expression(
     row: &toml::Table,
     kind: &str,
@@ -2200,7 +2201,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             "{generated}"
         );
         assert!(
-            generated.contains(".with_native(__noctalia_native_dispatch)"),
+            generated.contains(".with_native(__noctalia_native::dispatch)"),
             "{generated}"
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -2280,10 +2281,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         let native = fs::read_to_string(dir.join("native.rs"))?;
         fs::remove_dir_all(&dir)?;
 
-        assert!(
-            native.contains("__noctalia_native_value(crate::now())"),
-            "{native}"
-        );
+        assert!(native.contains("value(crate::now())"), "{native}");
         assert!(!native.contains("match crate::now("), "{native}");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         Ok(())
