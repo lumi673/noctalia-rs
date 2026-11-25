@@ -15,16 +15,16 @@
       "updatedAt": "2026-11-23T00:53:41.071Z"
     },
     "spool_dispatch": {
-      "sha": "e4a6593112c61211c5a41c0c3151a15837abb3ab",
+      "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
       "method": 1,
-      "medianMs": 0.0407275,
-      "worstMedianMs": 0.0476145,
-      "p95Ms": 0.052814,
-      "worstP95Ms": 0.061336,
-      "p99Ms": 0.066307,
-      "worstP99Ms": 0.106405,
+      "medianMs": 0.041691500000000006,
+      "worstMedianMs": 0.042465499999999996,
+      "p95Ms": 0.056708,
+      "worstP95Ms": 0.068773,
+      "p99Ms": 0.081712,
+      "worstP99Ms": 0.10489699999999999,
       "budgetMs": 10,
-      "updatedAt": "2026-11-25T18:05:25.582Z"
+      "updatedAt": "2026-11-25T19:55:25.262Z"
     },
     "luau_vm_creation": {
       "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
@@ -87,16 +87,16 @@
       "updatedAt": "2026-11-24T04:44:26.093Z"
     },
     "json_encode_rust": {
-      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
+      "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
       "method": 1,
-      "medianMs": 0.00026250000000000004,
-      "worstMedianMs": 0.0002735,
-      "p95Ms": 0.00029900000000000006,
-      "worstP95Ms": 0.000307,
-      "p99Ms": 0.000324,
-      "worstP99Ms": 0.000357,
+      "medianMs": 0.000252,
+      "worstMedianMs": 0.0002705,
+      "p95Ms": 0.000282,
+      "worstP95Ms": 0.00029499999999999996,
+      "p99Ms": 0.000314,
+      "worstP99Ms": 0.00035,
       "budgetMs": 1,
-      "updatedAt": "2026-11-25T15:08:54.487Z"
+      "updatedAt": "2026-11-25T19:55:25.262Z"
     },
     "json_decode_rust": {
       "sha": "19295f6593bc94438d476f5eff77001c00bd89a2",
@@ -243,16 +243,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "service_update_luau": {
-      "sha": "19295f6593bc94438d476f5eff77001c00bd89a2",
+      "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
       "method": 1,
-      "medianMs": 0.013648500000000003,
-      "worstMedianMs": 0.013705,
-      "p95Ms": 0.016446000000000002,
-      "worstP95Ms": 0.017204999999999998,
-      "p99Ms": 0.022418000000000004,
-      "worstP99Ms": 0.024622,
+      "medianMs": 0.0106175,
+      "worstMedianMs": 0.01067,
+      "p95Ms": 0.013181,
+      "worstP95Ms": 0.014401,
+      "p99Ms": 0.023048000000000003,
+      "worstP99Ms": 0.026695,
       "budgetMs": 10,
-      "updatedAt": "2026-11-24T23:55:42.123Z"
+      "updatedAt": "2026-11-25T19:55:25.262Z"
     },
     "service_update_rust": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -481,6 +481,18 @@
       "worstP99Ms": 0.00614,
       "budgetMs": 0.1,
       "updatedAt": "2026-11-25T15:08:54.487Z"
+    },
+    "bridge_event": {
+      "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
+      "method": 1,
+      "medianMs": 0.10372650000000001,
+      "worstMedianMs": 0.1046515,
+      "p95Ms": 0.117031,
+      "worstP95Ms": 0.12245400000000001,
+      "p99Ms": 0.12988799999999998,
+      "worstP99Ms": 0.133177,
+      "budgetMs": 5,
+      "updatedAt": "2026-11-25T19:55:25.262Z"
     }
   }
 }
