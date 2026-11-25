@@ -1880,3 +1880,147 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(error.message.contains("json null"), "{}", error.message);
     assert!(error.line > 0 && error.column > 0, "{error:?}");
 }
+
+#[test]
+fn tuple_shapes_from_fields_and_helpers_keep_nullness() {
+    for handler in [
+        r#"
+use serde_json::Map;
+struct Holder { pair: (Value, Value) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { pair: (json!(1), Value::Null) };
+    let (_, value) = holder.pair;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+use serde_json::Map;
+fn make() -> (Value, Value) {
+    (json!(1), Value::Null)
+}
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (_, value) = make();
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+use serde_json::Map;
+struct Holder { pair: (Value, Value) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { pair: (json!(1), (json!(2), Value::Null)) };
+    let copy = holder;
+    let (_, inner) = copy.pair;
+    let (_, value) = inner;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), value);
+    Ok(vec![Op::log("done")])
+}
+"#,
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("bails");
+        assert!(error.message.contains("json null"), "{}", error.message);
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
+fn tuple_fields_and_helpers_without_null_still_compile() {
+    let handler = r#"
+use serde_json::Map;
+struct Holder { pair: (Value, Value) }
+fn make() -> (Value, Value) { (json!(1), json!(2)) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { pair: (json!(1), json!(2)) };
+    let (_, from_field) = holder.pair;
+    let (_, from_helper) = make();
+    let mut map = Map::new();
+    map.insert("a".to_owned(), from_field);
+    map.insert("b".to_owned(), from_helper);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("map[\"a\"] ="),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("map[\"b\"] ="),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn nested_newtype_field_keeps_nullness() {
+    for handler in [
+        r#"
+use serde_json::Map;
+struct Inner(Value);
+struct Outer(Inner);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut map = Map::new();
+    map.insert("k".to_owned(), Outer(Inner(Value::Null)).0.0);
+    Ok(vec![Op::log("done")])
+}
+"#,
+        r#"
+use serde_json::Map;
+struct Inner(Value);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Inner(Value::Null);
+    let inner = holder;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), inner.0);
+    Ok(vec![Op::log("done")])
+}
+"#,
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("bails");
+        assert!(error.message.contains("json null"), "{}", error.message);
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
+fn nested_newtype_and_tuple_struct_controls_compile() {
+    let handler = r#"
+use serde_json::Map;
+struct Inner(Value);
+struct Outer(Inner);
+struct Pair(Value, Value);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let outer = Outer(Inner(json!(1)));
+    let inner = outer.0;
+    let pair = Pair(json!(2), json!(3));
+    let mut map = Map::new();
+    map.insert("a".to_owned(), inner.0);
+    map.insert("b".to_owned(), pair.0);
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("map[\"a\"] ="),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("map[\"b\"] ="),
+        "{}",
+        compiled.source
+    );
+}

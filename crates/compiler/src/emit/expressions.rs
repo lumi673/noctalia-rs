@@ -622,17 +622,20 @@ impl<'a> Emitter<'a> {
                 {
                     let args = call.args.iter().collect::<Vec<_>>();
                     let (value, value_ty) = self.expr(arg(&args, 0, call)?)?;
+                    self.newtype_types.insert(value.clone(), value_ty);
                     return Ok((value, value_ty));
                 }
-                let (base, _) = self.expr(&field.base)?;
+                let (base, base_ty) = self.expr(&field.base)?;
                 if index.index == 0
-                    && self.class_of_receiver(&field.base).is_some_and(
+                    && (self.class_of_receiver(&field.base).is_some_and(
                         |class| self.program.is_newtype(&self.module, &class),
-                    )
+                    ) || self.newtype_types.contains_key(&base))
                 {
                     let ty = path_ident(strip_reference(&field.base))
                         .and_then(|name| self.newtype_types.get(&name).copied())
-                        .unwrap_or(Ty::VALUE);
+                        .or_else(|| self.newtype_types.get(&base).copied())
+                        .unwrap_or(base_ty);
+                    self.newtype_types.insert(base.clone(), ty);
                     return Ok((base, ty));
                 }
                 return Ok((format!("{base}[{}]", index.index + 1), Ty::VALUE));
@@ -683,6 +686,15 @@ impl<'a> Emitter<'a> {
         }
         let (base, _) = self.expr(&field.base)?;
         let class = self.class_of_receiver(&field.base);
+        let declared = class
+            .as_deref()
+            .and_then(|class| self.program.struct_def(&self.module, class))
+            .and_then(|def| {
+                def.fields
+                    .iter()
+                    .find(|(name, _)| name == &member)
+                    .map(|(_, ty)| ty.clone())
+            });
         let field_ty = class
             .as_deref()
             .and_then(|class| self.program.struct_def(&self.module, class))
@@ -699,6 +711,23 @@ impl<'a> Emitter<'a> {
             format!("{base}[{}]", quote(&member))
         };
         let mut field_ty = field_ty;
+        if let Some(shapes) = self.tuple_expr_shapes.get(&text).cloned() {
+            self.last_tuple_shape = Some(shapes);
+        } else if let Some(Type::Tuple(items)) = declared.as_ref() {
+            if items.elems.iter().any(|item| {
+                matches!(item, Type::Path(path)
+                    if path.path.segments.last().is_some_and(|s| s.ident == "Value"))
+            }) {
+                self.unknown_value_tuple = true;
+            }
+            let shapes = items
+                .elems
+                .iter()
+                .map(|item| TupleShape::Leaf(type_hint(item)))
+                .collect::<Vec<_>>();
+            self.tuple_expr_shapes.insert(text.clone(), shapes.clone());
+            self.last_tuple_shape = Some(shapes);
+        }
         if let Some(name) = path_ident(strip_reference(&field.base))
             && self
                 .null_fields

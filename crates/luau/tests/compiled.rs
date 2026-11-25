@@ -1027,3 +1027,41 @@ fn native_newtype_chain(_ctx: &Context) -> Vec<Op> {
     map.insert("k".to_owned(), name);
     vec![Op::state("seen", json!(map))]
 }
+
+#[test]
+fn tuple_fields_helpers_and_newtypes_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder { pair: (Value, Value) }
+struct Inner(Value);
+struct Outer(Inner);
+
+fn make() -> (Value, Value) { (json!("a"), json!(2)) }
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { pair: (json!("field"), json!(1)) };
+    let (_, from_field) = holder.pair;
+    let (_, from_helper) = make();
+    let outer = Outer(Inner(json!("newtype")));
+    let value = ctx.setting("flag").unwrap_or(Value::Null);
+    let _ = value;
+    Ok(vec![Op::state("field", json!(from_field)),
+            Op::state("helper", json!(from_helper)),
+            Op::state("newtype", json!(outer.0.0))])
+}
+"#;
+    let source = compiled_source("tuple_paths", handler, EntryKind::Service);
+    let state = json!({});
+    let ctx = context("tuple_paths", "load", json!({}), state);
+    assert_eq!(
+        ops("tuple_paths", &source, &ctx),
+        rust_ops(native_tuple_paths(&ctx))
+    );
+}
+
+fn native_tuple_paths(_ctx: &Context) -> Vec<Op> {
+    vec![
+        Op::state("field", json!(1)),
+        Op::state("helper", json!(2)),
+        Op::state("newtype", json!("newtype")),
+    ]
+}
