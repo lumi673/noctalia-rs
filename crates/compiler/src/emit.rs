@@ -732,6 +732,10 @@ impl<'a> Emitter<'a> {
             module: helper.module.clone(),
             function: helper.function.sig.ident.to_string(),
             class: helper.class.clone(),
+            result: matches!(
+                &helper.function.sig.output,
+                syn::ReturnType::Type(_, ty) if is_result(ty)
+            ),
             params,
             cache_ms,
             reason: reason.to_owned(),
@@ -778,7 +782,8 @@ impl<'a> Emitter<'a> {
             };
             values.push(text.clone());
         }
-        let call = format!("{}({})", native_local(&item.name), values.join(", "));
+        let call =
+            format!("{}({})", native_local(&item.name), values.join(", "));
         self.uses_native = true;
         match mode {
             Inline::Value => Ok(Some((call, Ty::VALUE))),
@@ -7099,15 +7104,17 @@ fn forced_native(function: &ItemFn) -> Result<Option<u64>, Error> {
 }
 
 fn is_luau_attr(function: &ItemFn) -> bool {
-    function.attrs.iter().any(|attr| attr.path().is_ident("luau"))
+    function
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("luau"))
 }
 
 fn native_reason(error: &Error) -> String {
     match &error.file {
-        Some(file) if error.line != 0 => format!(
-            "{file}:{}:{}: {}",
-            error.line, error.column, error.message
-        ),
+        Some(file) if error.line != 0 => {
+            format!("{file}:{}:{}: {}", error.line, error.column, error.message)
+        }
         _ => error.message.clone(),
     }
 }
@@ -7182,7 +7189,9 @@ fn native_signature(function: &ItemFn) -> Result<Vec<String>, Error> {
         if is_result(ty) && generic_arg(ty).is_none() {
             return Err(Error::at(
                 ty.span(),
-                format!("native function `{name}` returns an incomplete `Result`"),
+                format!(
+                    "native function `{name}` returns an incomplete `Result`"
+                ),
             ));
         }
     }

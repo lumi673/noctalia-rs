@@ -289,6 +289,8 @@ pub struct NativeFn {
     pub params: Vec<String>,
     /// Implementing type for an inherent method.
     pub class: Option<String>,
+    /// Whether the declared return type is `Result<...>`.
+    pub result: bool,
     /// In-helper cache lifetime in milliseconds, `0` for no cache.
     pub cache_ms: u64,
     /// Why the function crossed the boundary.
@@ -584,7 +586,9 @@ fn compile_once(
     let mut natives = known.clone();
     for slot in &bodies {
         for item in &slot.body.native {
-            natives.entry(item.name.clone()).or_insert_with(|| item.clone());
+            natives
+                .entry(item.name.clone())
+                .or_insert_with(|| item.clone());
         }
     }
     if !natives.is_empty() {
@@ -624,7 +628,11 @@ fn compile_once(
             false,
             &update_event,
         );
-        let _ = writeln!(out, "function update() {} end", invoke(&slot.body, &slot.name, &args));
+        let _ = writeln!(
+            out,
+            "function update() {} end",
+            invoke(&slot.body, &slot.name, &args)
+        );
     } else {
         out.push_str("function update() end\n");
     }
