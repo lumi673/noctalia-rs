@@ -1752,3 +1752,51 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     );
     assert!(emitted.contains("table.sort(words, function"), "{emitted}");
 }
+
+#[test]
+fn accepts_known_typed_string_arguments() {
+    let handler = r#"
+struct State { name: String }
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let state = State { name: ctx.config_str("message").unwrap_or_default() };
+    if ctx.command_exists(&state.name) {
+        return Ok(vec![Op::log(state.name)]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled
+            .source
+            .contains("noctalia.commandExists(state.name)"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn rejects_string_arguments_without_a_known_type() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let names = vec!["a".to_owned()];
+    if ctx.command_exists(&names[0]) {
+        return Ok(vec![Op::log("yes")]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("unknown string type bails");
+    assert!(
+        error
+            .message
+            .contains("expected a string argument with a known type"),
+        "{}",
+        error.message
+    );
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}

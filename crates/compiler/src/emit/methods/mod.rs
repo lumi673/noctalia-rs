@@ -1204,7 +1204,7 @@ impl<'a> Emitter<'a> {
                 Ok((format!("noctalia.getColor({role})"), Ty::OPT_VALUE))
             }
             "host" => {
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.string_literal_arg(args, 0, call)?;
                 Ok((host_path(&unquote(&path))?.to_owned(), Ty::OPT_VALUE))
             }
             "clipboard" => Ok((
@@ -1523,6 +1523,56 @@ impl<'a> Emitter<'a> {
         Ok(format!("{{ {} }}", parts.join(", ")))
     }
 
+    fn class_name_of(&self, expr: &Expr) -> Option<String> {
+        if let Some(class) = self.class_of_receiver(expr) {
+            return Some(class);
+        }
+        let Expr::Call(call) = strip_reference(expr) else {
+            return None;
+        };
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let segments = path_segments(&path.path)?;
+        let resolved = self.program.resolve(&self.module, &segments)?;
+        match &resolved.function.sig.output {
+            syn::ReturnType::Type(_, ty) => Some(type_text(ty)),
+            syn::ReturnType::Default => None,
+        }
+        .filter(|name| !name.is_empty())
+    }
+
+    fn known_string_ty(&self, expr: &Expr) -> Option<Ty> {
+        let expr = strip_reference(expr);
+        match expr {
+            Expr::Field(field) => {
+                let Member::Named(member) = &field.member else {
+                    return None;
+                };
+                let class = self.class_name_of(&field.base)?;
+                let def = self.program.struct_def(&self.module, &class)?;
+                let (_, ty) = def
+                    .fields
+                    .iter()
+                    .find(|(name, _)| name == &member.to_string())?;
+                (type_hint(ty).base == Base::Str).then_some(Ty::STR)
+            }
+            Expr::Call(call) => {
+                let Expr::Path(path) = &*call.func else {
+                    return None;
+                };
+                let segments = path_segments(&path.path)?;
+                let resolved = self.program.resolve(&self.module, &segments)?;
+                match &resolved.function.sig.output {
+                    syn::ReturnType::Type(_, ty) => {
+                        (type_hint(ty).base == Base::Str).then_some(Ty::STR)
+                    }
+                    syn::ReturnType::Default => None,
+                }
+            }
+            _ => None,
+        }
+    }
     fn string_arg(
         &mut self,
         args: &[&Expr],
@@ -1531,7 +1581,23 @@ impl<'a> Emitter<'a> {
     ) -> Result<String, Error> {
         let value = arg(args, index, call)?;
         let (text, ty) = self.expr(value)?;
-        if ty.base != Base::Str {
+        if ty.base != Base::Str && self.known_string_ty(value).is_none() {
+            return Err(Error::at(
+                value.span(),
+                "expected a string argument with a known type",
+            ));
+        }
+        Ok(text)
+    }
+    fn string_literal_arg(
+        &mut self,
+        args: &[&Expr],
+        index: usize,
+        call: &ExprMethodCall,
+    ) -> Result<String, Error> {
+        let value = arg(args, index, call)?;
+        let text = self.string_arg(args, index, call)?;
+        if !text.starts_with('"') {
             return Err(Error::at(
                 value.span(),
                 "expected a string literal argument",
