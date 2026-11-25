@@ -15,16 +15,16 @@
       "updatedAt": "2026-11-23T00:53:41.071Z"
     },
     "spool_dispatch": {
-      "sha": "ae1ca0fa7e63ebdc874927b8638520c2317bcf27",
+      "sha": "e4a6593112c61211c5a41c0c3151a15837abb3ab",
       "method": 1,
-      "medianMs": 0.047888,
-      "worstMedianMs": 0.047906000000000004,
-      "p95Ms": 0.057231000000000004,
-      "worstP95Ms": 0.06399200000000001,
-      "p99Ms": 0.075211,
-      "worstP99Ms": 0.117805,
+      "medianMs": 0.0407275,
+      "worstMedianMs": 0.0476145,
+      "p95Ms": 0.052814,
+      "worstP95Ms": 0.061336,
+      "p99Ms": 0.066307,
+      "worstP99Ms": 0.106405,
       "budgetMs": 10,
-      "updatedAt": "2026-11-24T04:44:26.093Z"
+      "updatedAt": "2026-11-25T18:05:25.582Z"
     },
     "luau_vm_creation": {
       "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
@@ -279,16 +279,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_case_convert_rust": {
-      "sha": "a412da4b62a6ab4bb501534b5b961c0d127c3ec2",
+      "sha": "e4a6593112c61211c5a41c0c3151a15837abb3ab",
       "method": 1,
-      "medianMs": 0.025003,
-      "worstMedianMs": 0.025188,
-      "p95Ms": 0.027024,
-      "worstP95Ms": 0.029346999999999998,
-      "p99Ms": 0.03460100000000001,
-      "worstP99Ms": 0.044001,
+      "medianMs": 0.025447000000000004,
+      "worstMedianMs": 0.0257615,
+      "p95Ms": 0.027915999999999996,
+      "worstP95Ms": 0.031182,
+      "p99Ms": 0.033860999999999995,
+      "worstP99Ms": 0.039810000000000005,
       "budgetMs": 0.5,
-      "updatedAt": "2026-11-24T02:57:10.701Z"
+      "updatedAt": "2026-11-25T18:05:25.582Z"
     },
     "plugin_color_picker_luau": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -411,16 +411,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "generated_hello_bar_handwritten": {
-      "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
+      "sha": "e4a6593112c61211c5a41c0c3151a15837abb3ab",
       "method": 1,
-      "medianMs": 0.002258,
-      "worstMedianMs": 0.0023245000000000006,
-      "p95Ms": 0.002349,
-      "worstP95Ms": 0.002471,
-      "p99Ms": 0.0024230000000000002,
-      "worstP99Ms": 0.0036959999999999996,
+      "medianMs": 0.0022744999999999996,
+      "worstMedianMs": 0.0022960000000000003,
+      "p95Ms": 0.0023819999999999996,
+      "worstP95Ms": 0.002418,
+      "p99Ms": 0.0024269999999999995,
+      "worstP99Ms": 0.006987999999999999,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-24T17:00:24.601Z"
+      "updatedAt": "2026-11-25T18:05:25.582Z"
     },
     "generated_hello_bar_compiled": {
       "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
@@ -447,16 +447,16 @@
       "updatedAt": "2026-11-24T17:00:24.601Z"
     },
     "generated_ui_panel_compiled": {
-      "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
+      "sha": "e4a6593112c61211c5a41c0c3151a15837abb3ab",
       "method": 1,
-      "medianMs": 0.0128985,
-      "worstMedianMs": 0.013474999999999999,
-      "p95Ms": 0.016338,
-      "worstP95Ms": 0.01643,
-      "p99Ms": 0.022913,
-      "worstP99Ms": 0.028439999999999997,
+      "medianMs": 0.012882999999999999,
+      "worstMedianMs": 0.013086000000000002,
+      "p95Ms": 0.015847,
+      "worstP95Ms": 0.017,
+      "p99Ms": 0.023036,
+      "worstP99Ms": 0.024777999999999998,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-24T17:00:24.601Z"
+      "updatedAt": "2026-11-25T18:05:25.582Z"
     },
     "generated_event_handwritten": {
       "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
