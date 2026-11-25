@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
@@ -10,7 +11,8 @@ use syn::{
 
 use crate::program::{Program, typed_args};
 use crate::{
-    Error, is_context, is_identifier, is_luau_keyword, quote, sanitize,
+    Error, NativeFn, NativeMode, is_context, is_identifier, is_luau_keyword,
+    quote, sanitize,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +154,8 @@ pub(crate) struct Body {
     pub uses_source: bool,
     pub params: Vec<&'static str>,
     pub is_empty: bool,
+    pub uses_native: bool,
+    pub native: Vec<NativeFn>,
     pub statics: Vec<(String, String)>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +176,7 @@ struct StaticDef {
     init: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct Emitter<'a> {
     ctx: String,
     out: String,
@@ -214,6 +219,11 @@ pub(crate) struct Emitter<'a> {
     uses_source: bool,
     emitted: bool,
     temp: usize,
+    native_mode: NativeMode,
+    known_native: &'a BTreeMap<String, NativeFn>,
+    native_found: BTreeMap<String, NativeFn>,
+    uses_native: bool,
+    deferred: usize,
 }
 
 const MAX_INLINE_DEPTH: usize = 8;
@@ -227,6 +237,8 @@ impl<'a> Emitter<'a> {
         payload_params: &'static [PayloadParam],
         program: &'a Program,
         module: &str,
+        native_mode: NativeMode,
+        known_native: &'a BTreeMap<String, NativeFn>,
     ) -> Self {
         Self {
             ctx: ctx.to_string(),
@@ -270,6 +282,11 @@ impl<'a> Emitter<'a> {
             uses_source: false,
             emitted: false,
             temp: 0,
+            native_mode,
+            known_native,
+            native_found: BTreeMap::new(),
+            uses_native: false,
+            deferred: 0,
         }
     }
 
@@ -415,6 +432,7 @@ impl<'a> Emitter<'a> {
             module: resolved.module.clone(),
             function: resolved.function.clone(),
             name: segments.join("::"),
+            class: None,
         })
     }
 
@@ -638,9 +656,142 @@ impl<'a> Emitter<'a> {
         bindings: Vec<Binding>,
     ) -> Result<Inlined, Error> {
         let returns = return_kind(&helper.function)?;
+        let key = native_key(&helper);
+        if let Some(known) = self.known_native.get(&key).cloned() {
+            return self.native_call(&known, mode, span, &bindings);
+        }
+        if let Some(cache_ms) = forced_native(&helper.function)? {
+            let item = self.register_native(
+                &helper,
+                cache_ms,
+                true,
+                "marked `#[native]`",
+                span,
+            )?;
+            return self.native_call(&item, mode, span, &bindings);
+        }
         let check = self.check_inline(&helper, mode, returns, &span)?;
-        let value = self.inline(&helper, bindings, mode, returns, check)?;
-        Ok(Some(value))
+        let saved = self.clone();
+        match self.inline(&helper, bindings.clone(), mode, returns, check) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                *self = saved;
+                let demotable = self.native_mode == NativeMode::Allow
+                    && mode == Inline::Value
+                    && matches!(returns, Returns::Value(_));
+                if !demotable {
+                    return Err(error);
+                }
+                let item = self.register_native(
+                    &helper,
+                    0,
+                    false,
+                    &native_reason(&error),
+                    span,
+                )?;
+                self.native_call(&item, mode, span, &bindings)
+            }
+        }
+    }
+
+    /// Records `helper` as a native function and validates that its signature
+    /// can cross the JSON boundary.
+    fn register_native(
+        &mut self,
+        helper: &Helper,
+        cache_ms: u64,
+        forced: bool,
+        reason: &str,
+        _span: proc_macro2::Span,
+    ) -> Result<NativeFn, Error> {
+        if is_luau_attr(&helper.function) {
+            let mut error = Error::fatal(
+                helper.function.sig.ident.span(),
+                format!(
+                    "`{}` is marked `#[luau]` but cannot be compiled to Luau: {reason}",
+                    helper.function.sig.ident
+                ),
+            );
+            if helper.module != self.home {
+                error = error.with_file(&helper.module);
+            }
+            return Err(error);
+        }
+        let params = match native_signature(&helper.function) {
+            Ok(params) => params,
+            Err(mut error) => {
+                error.fatal = forced;
+                if helper.module != self.home {
+                    error = error.with_file(&helper.module);
+                }
+                return Err(error);
+            }
+        };
+        let item = NativeFn {
+            name: native_key(helper),
+            module: helper.module.clone(),
+            function: helper.function.sig.ident.to_string(),
+            class: helper.class.clone(),
+            params,
+            cache_ms,
+            reason: reason.to_owned(),
+        };
+        self.native_found.insert(item.name.clone(), item.clone());
+        Ok(item)
+    }
+
+    fn native_call(
+        &mut self,
+        item: &NativeFn,
+        mode: Inline,
+        span: proc_macro2::Span,
+        bindings: &[Binding],
+    ) -> Result<Inlined, Error> {
+        if self.deferred > 0 {
+            return Err(Error::at(
+                span,
+                format!(
+                    "native function `{}` cannot run inside a closure or callback; call it from the handler body or a helper",
+                    item.name
+                ),
+            ));
+        }
+        if mode == Inline::Ops {
+            return Err(Error::at(
+                span,
+                format!(
+                    "native function `{}` does not build a `Vec<Op>`",
+                    item.name
+                ),
+            ));
+        }
+        let mut values = Vec::new();
+        for binding in bindings {
+            let Binding::Local { text, .. } = binding else {
+                return Err(Error::at(
+                    span,
+                    format!(
+                        "native function `{}` cannot take the context or an ops vector",
+                        item.name
+                    ),
+                ));
+            };
+            values.push(text.clone());
+        }
+        let call = format!("{}({})", native_local(&item.name), values.join(", "));
+        self.uses_native = true;
+        match mode {
+            Inline::Value => Ok(Some((call, Ty::VALUE))),
+            Inline::Statement => {
+                self.line(&call);
+                Ok(Some((String::new(), Ty::VOID)))
+            }
+            Inline::Tail => {
+                self.line(&format!("return {call}"));
+                Ok(Some((String::new(), Ty::VOID)))
+            }
+            Inline::Ops => unreachable!("ops mode is rejected above"),
+        }
     }
 
     fn ops_body(&mut self, block: &syn::Block) -> Result<(), Error> {
@@ -842,6 +993,8 @@ impl<'a> Emitter<'a> {
                 .map(|(_, body_param, _)| *body_param)
                 .collect(),
             is_empty: !self.emitted,
+            uses_native: self.uses_native,
+            native: self.native_found.into_values().collect(),
             statics: self
                 .statics
                 .values()
@@ -3018,6 +3171,7 @@ impl<'a> Emitter<'a> {
             module: resolved.module.clone(),
             name: segments.join("::"),
             function: resolved.function.clone(),
+            class: None,
         };
         let params = typed_args(&helper.function);
         if params.len() != values.len() {
@@ -3629,6 +3783,7 @@ impl<'a> Emitter<'a> {
             module,
             name: format!("{class}::{}", call.method),
             function,
+            class: Some(class.to_owned()),
         };
         let returns = return_kind(&helper.function)?;
         let mode = match returns {
@@ -5069,6 +5224,7 @@ impl<'a> Emitter<'a> {
             module,
             name: format!("{class}::{method}"),
             function,
+            class: Some(class.to_owned()),
         };
         let mut bindings = Vec::new();
         let params = typed_args(&helper.function);
@@ -5206,6 +5362,7 @@ impl<'a> Emitter<'a> {
                         module,
                         name: format!("{class}::default"),
                         function: function.clone(),
+                        class: Some(class.to_owned()),
                     };
                     let returns = return_kind(&helper.function)?;
                     let check = self.check_inline(
@@ -5476,6 +5633,8 @@ impl<'a> Emitter<'a> {
         let saved_out = std::mem::take(&mut self.out);
         let saved_indent = self.indent;
         let saved_target = self.tail_target.clone();
+        let saved_deferred = self.deferred;
+        self.deferred = self.deferred.saturating_add(1);
         self.indent = 0;
         self.tail_target = None;
         self.scopes.push(HashMap::new());
@@ -5490,6 +5649,12 @@ impl<'a> Emitter<'a> {
                 syn::Pat::Ident(pattern) => {
                     let name = pattern.ident.to_string();
                     if is_luau_keyword(&name) {
+                        self.local_statics.pop();
+                        self.scopes.pop();
+                        self.out = saved_out;
+                        self.indent = saved_indent;
+                        self.tail_target = saved_target;
+                        self.deferred = saved_deferred;
                         return Err(Error::at(
                             pattern.span(),
                             format!("identifier `{name}` is a Luau keyword"),
@@ -5505,6 +5670,7 @@ impl<'a> Emitter<'a> {
                     self.out = saved_out;
                     self.indent = saved_indent;
                     self.tail_target = saved_target;
+                    self.deferred = saved_deferred;
                     return Err(Error::at(
                         other.span(),
                         "closure parameters must be plain identifiers",
@@ -5526,6 +5692,7 @@ impl<'a> Emitter<'a> {
         self.scopes.pop();
         self.indent = saved_indent;
         self.tail_target = saved_target;
+        self.deferred = saved_deferred;
         result?;
         Ok((text, Ty::VALUE))
     }
@@ -6407,8 +6574,10 @@ struct Helper {
     module: String,
     function: ItemFn,
     name: String,
+    class: Option<String>,
 }
 
+#[derive(Clone)]
 enum Binding {
     Context(String),
     Ops(String),
@@ -6718,6 +6887,306 @@ fn return_kind(function: &ItemFn) -> Result<Returns, Error> {
         return Ok(Returns::Unit);
     }
     Ok(Returns::Value(type_hint(ty)))
+}
+
+/// Dispatch key for a native function. Unique per crate.
+fn native_key(helper: &Helper) -> String {
+    let name = helper.function.sig.ident.to_string();
+    match &helper.class {
+        Some(class) => format!("{}::{class}::{name}", helper.module),
+        None => format!("{}::{name}", helper.module),
+    }
+}
+
+/// The Luau local that names a native function's stub.
+pub(crate) fn native_local(name: &str) -> String {
+    let mut out = String::from("__native_fn_");
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            out.push(character);
+        } else if character == '_' {
+            out.push_str("__");
+        } else {
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Renders the Luau stub that calls a native function through `__native`.
+pub(crate) fn stub_source(item: &NativeFn) -> String {
+    let mut declared = Vec::new();
+    let mut fields = Vec::new();
+    for (index, name) in item.params.iter().enumerate() {
+        let local = if is_luau_keyword(name) {
+            format!("{name}_{}", index + 1)
+        } else {
+            (*name).clone()
+        };
+        declared.push(local.clone());
+        let key = if is_identifier(name) && !is_luau_keyword(name) {
+            (*name).clone()
+        } else {
+            format!("[{}]", quote(name))
+        };
+        fields.push(format!("{key} = {local}"));
+    }
+    let args = if fields.is_empty() {
+        "{}".to_owned()
+    } else {
+        format!("{{ {} }}", fields.join(", "))
+    };
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "local function {}({})\n  return __native.call({}, {args}, {})\nend\n\n",
+        native_local(&item.name),
+        declared.join(", "),
+        quote(&item.name),
+        item.cache_ms
+    );
+    out
+}
+
+/// The Luau side of the native boundary: request writing, caching, and the
+/// coroutine that parks while the helper computes.
+pub(crate) fn native_runtime(entry: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "local __native = (function()");
+    out.push_str(&NATIVE_RUNTIME_BODY.replace("__ENTRY__", &quote(entry)));
+    out.push_str("end)()\n\n");
+    out
+}
+
+const NATIVE_RUNTIME_BODY: &str = concat!(
+    "  local ENTRY = __ENTRY__\n",
+    "  local BIN = noctalia.pluginDir() .. \"/{{HELPER}}\"\n",
+    "  local DATA_DIR = noctalia.pluginDataDir() or noctalia.pluginDir()\n",
+    "  local RUNTIME_ID = (tostring({}):gsub(\"[^%w_%-]\", \"_\"))\n",
+    "  local SPOOL_DIR = DATA_DIR .. \"/.noctalia-rs/native/\" .. ENTRY:gsub(\"[^%w_]\", \"_\") .. \"-\" .. RUNTIME_ID\n",
+    "  local CACHE_LIMIT = 128\n",
+    "  local M = {}\n",
+    "  local queue, active = {}, nil\n",
+    "  local pending, boot, request_dir, sequence = {}, nil, nil, 0\n",
+    "  local cache, order = {}, {}\n",
+    "\n",
+    "  local function shellQuote(value)\n",
+    "    return \"'\" .. tostring(value):gsub(\"'\", \"'\\\\''\") .. \"'\"\n",
+    "  end\n",
+    "\n",
+    "  local function write(request)\n",
+    "    sequence += 1\n",
+    "    local name = string.format(\"%012d\", sequence)\n",
+    "    local temporary = request_dir .. \"/\" .. name .. \".pending\"\n",
+    "    local target = request_dir .. \"/\" .. name .. \".json\"\n",
+    "    request.boot = boot\n",
+    "    request.entry = ENTRY\n",
+    "    local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(request))\n",
+    "    if ok then ok, err = noctalia.renameFile(temporary, target) end\n",
+    "    if not ok then\n",
+    "      noctalia.removeFile(temporary)\n",
+    "      noctalia.log(\"noctalia native: spool write failed: \" .. tostring(err))\n",
+    "    end\n",
+    "  end\n",
+    "\n",
+    "  function M.send(request)\n",
+    "    if boot then write(request) else pending[#pending + 1] = request end\n",
+    "  end\n",
+    "\n",
+    "  local function remember(key, value)\n",
+    "    if cache[key] == nil then order[#order + 1] = key end\n",
+    "    cache[key] = { at = noctalia.nowMs(), value = value }\n",
+    "    while #order > CACHE_LIMIT do\n",
+    "      cache[table.remove(order, 1)] = nil\n",
+    "    end\n",
+    "  end\n",
+    "\n",
+    "  function M.call(name, args, cache_ms)\n",
+    "    local key = name .. string.char(0) .. noctalia.json.encode(args)\n",
+    "    if cache_ms and cache_ms > 0 then\n",
+    "      local hit = cache[key]\n",
+    "      if hit and noctalia.nowMs() - hit.at < cache_ms then return hit.value end\n",
+    "    end\n",
+    "    local value, failure = coroutine.yield({ __native = name, args = args })\n",
+    "    if failure ~= nil then error(tostring(failure), 0) end\n",
+    "    if cache_ms and cache_ms > 0 then remember(key, value) end\n",
+    "    return value\n",
+    "  end\n",
+    "\n",
+    "  local function park(co, yielded)\n",
+    "    active = { co = co }\n",
+    "    M.send({ kind = \"native\", name = yielded.__native, args = yielded.args or {}, cache_ms = yielded.cache_ms or 0 })\n",
+    "  end\n",
+    "\n",
+    "  function M.pump()\n",
+    "    while active == nil and #queue > 0 do\n",
+    "      local job = table.remove(queue, 1)\n",
+    "      local co = coroutine.create(job.fn)\n",
+    "      local ok, yielded = coroutine.resume(co, table.unpack(job.args))\n",
+    "      if not ok then error(yielded, 0) end\n",
+    "      if type(yielded) == \"table\" and yielded.__native ~= nil then park(co, yielded) end\n",
+    "    end\n",
+    "  end\n",
+    "\n",
+    "  function M.run(fn, ...)\n",
+    "    queue[#queue + 1] = { fn = fn, args = { ... } }\n",
+    "    M.pump()\n",
+    "  end\n",
+    "\n",
+    "  local function on_line(line)\n",
+    "    if type(line) ~= \"table\" then return end\n",
+    "    if line.control == \"ready\" then\n",
+    "      boot = line.boot\n",
+    "      request_dir = line.spool\n",
+    "      local queued = pending\n",
+    "      pending = {}\n",
+    "      for _, request in ipairs(queued) do write(request) end\n",
+    "      return\n",
+    "    end\n",
+    "    if line.control ~= \"native_result\" or active == nil then return end\n",
+    "    local co = active.co\n",
+    "    active = nil\n",
+    "    local ok, yielded = coroutine.resume(co, line.value, line.error)\n",
+    "    if not ok then error(yielded, 0) end\n",
+    "    if type(yielded) == \"table\" and yielded.__native ~= nil then\n",
+    "      park(co, yielded)\n",
+    "      return\n",
+    "    end\n",
+    "    M.pump()\n",
+    "  end\n",
+    "\n",
+    "  function M.setup()\n",
+    "    if noctalia.mkdirAll then noctalia.mkdirAll(SPOOL_DIR) end\n",
+    "    local command = shellQuote(BIN) .. \" serve \" .. shellQuote(DATA_DIR) .. \" \" .. shellQuote(SPOOL_DIR)\n",
+    "    local loop = \"while kill -0 \\\"$PPID\\\" 2>/dev/null; do \" .. command .. \"; sleep 0.2; done\"\n",
+    "    if not noctalia.runStream(loop, on_line) then\n",
+    "      noctalia.log(\"noctalia native: could not start the persistent helper\")\n",
+    "    end\n",
+    "  end\n",
+    "\n",
+    "  M.setup()\n",
+    "  return M\n",
+);
+
+/// Parses `#[native]` and `#[native(cache_ms = 30_000)]`.
+fn forced_native(function: &ItemFn) -> Result<Option<u64>, Error> {
+    for attr in &function.attrs {
+        if !attr.path().is_ident("native") {
+            continue;
+        }
+        return match &attr.meta {
+            syn::Meta::Path(_) => Ok(Some(0)),
+            syn::Meta::List(list) => {
+                let mut cache_ms = 0u64;
+                list.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("cache_ms") {
+                        let value: syn::LitInt = meta.value()?.parse()?;
+                        cache_ms = value.base10_parse::<u64>()?;
+                        return Ok(());
+                    }
+                    Err(meta.error("unknown `#[native]` option"))
+                })
+                .map_err(|error| Error::at(error.span(), error.to_string()))?;
+                Ok(Some(cache_ms))
+            }
+            syn::Meta::NameValue(_) => Err(Error::at(
+                attr.span(),
+                "`#[native]` takes `cache_ms` in parentheses",
+            )),
+        };
+    }
+    Ok(None)
+}
+
+fn is_luau_attr(function: &ItemFn) -> bool {
+    function.attrs.iter().any(|attr| attr.path().is_ident("luau"))
+}
+
+fn native_reason(error: &Error) -> String {
+    match &error.file {
+        Some(file) if error.line != 0 => format!(
+            "{file}:{}:{}: {}",
+            error.line, error.column, error.message
+        ),
+        _ => error.message.clone(),
+    }
+}
+
+/// Checks the JSON-crossable signature a native function needs.
+fn native_signature(function: &ItemFn) -> Result<Vec<String>, Error> {
+    let name = function.sig.ident.to_string();
+    if !function.sig.generics.params.is_empty() {
+        return Err(Error::at(
+            function.sig.ident.span(),
+            format!("native function `{name}` cannot be generic"),
+        ));
+    }
+    for input in &function.sig.inputs {
+        if let syn::FnArg::Receiver(receiver) = input {
+            return Err(Error::at(
+                receiver.span(),
+                format!(
+                    "native function `{name}` cannot take `self`; use an associated function"
+                ),
+            ));
+        }
+    }
+    let mut params = Vec::new();
+    for (pattern, ty) in typed_args(function) {
+        let Pat::Ident(pattern) = pattern else {
+            return Err(Error::at(
+                pattern.span(),
+                format!(
+                    "native function `{name}` parameters must be plain identifiers"
+                ),
+            ));
+        };
+        if pattern.by_ref.is_some() || pattern.subpat.is_some() {
+            return Err(Error::at(
+                pattern.span(),
+                format!(
+                    "native function `{name}` parameters must be plain identifiers"
+                ),
+            ));
+        }
+        match ty {
+            Type::Reference(_) => {
+                return Err(Error::at(
+                    ty.span(),
+                    format!(
+                        "native function `{name}` parameters cannot be references; take owned values"
+                    ),
+                ));
+            }
+            Type::ImplTrait(_) => {
+                return Err(Error::at(
+                    ty.span(),
+                    format!(
+                        "native function `{name}` parameters cannot be `impl Trait`; name the type"
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        params.push(pattern.ident.to_string());
+    }
+    if let syn::ReturnType::Type(_, ty) = &function.sig.output {
+        if matches!(&**ty, Type::Reference(_) | Type::ImplTrait(_)) {
+            return Err(Error::at(
+                ty.span(),
+                format!(
+                    "native function `{name}` must return an owned value or `Result<T, E>`"
+                ),
+            ));
+        }
+        if is_result(ty) && generic_arg(ty).is_none() {
+            return Err(Error::at(
+                ty.span(),
+                format!("native function `{name}` returns an incomplete `Result`"),
+            ));
+        }
+    }
+    Ok(params)
 }
 
 #[derive(Default)]

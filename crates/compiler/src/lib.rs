@@ -2,6 +2,7 @@ mod emit;
 mod error;
 mod program;
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use syn::spanned::Spanned;
@@ -261,12 +262,45 @@ pub struct Options<'a> {
     pub module: &'a str,
     /// The rest of the crate, so calls into sibling modules can be inlined.
     pub modules: &'a [Module<'a>],
+    /// Whether a function the compiler cannot translate may cross into the
+    /// helper process as a native call. `strict` denies it.
+    pub native: NativeMode,
+}
+
+/// Whether functions may cross into the helper process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeMode {
+    /// Demote an untranslatable function to a native call and keep compiling.
+    Allow,
+    /// Fail on the first untranslatable function, as `strict` does.
+    Deny,
+}
+
+/// One function that runs in the helper process instead of in Luau.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeFn {
+    /// Dispatch key, such as `main::fetch_prs` or `main::Git::load`.
+    pub name: String,
+    /// Module that defines the function, such as `main` or `git::api`.
+    pub module: String,
+    /// Function identifier.
+    pub function: String,
+    /// Parameter names, in declaration order.
+    pub params: Vec<String>,
+    /// Implementing type for an inherent method.
+    pub class: Option<String>,
+    /// In-helper cache lifetime in milliseconds, `0` for no cache.
+    pub cache_ms: u64,
+    /// Why the function crossed the boundary.
+    pub reason: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct Compiled {
     pub source: String,
     pub events: Vec<String>,
+    /// Functions that cross into the helper process.
+    pub native: Vec<NativeFn>,
 }
 
 /// Compiles one handler in `source` into a complete Luau entry script.
@@ -277,12 +311,51 @@ pub struct Compiled {
 pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let program = Program::new(options.module, source, options.modules)?;
     let handler = program.handler(options.module, options.handler)?;
-    let module = handler.module.to_owned();
-    let function = handler.function;
-    let context = context_name(function)?;
+    let mut known: BTreeMap<String, NativeFn> = BTreeMap::new();
+    loop {
+        let (compiled, found) = compile_once(
+            &program,
+            handler.function,
+            &handler.module,
+            options,
+            &known,
+        )?;
+        let mut grew = false;
+        for (name, item) in found {
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                known.entry(name)
+            {
+                slot.insert(item);
+                grew = true;
+            }
+        }
+        if !grew {
+            return Ok(compiled);
+        }
+    }
+}
 
-    let mut discovery =
-        Emitter::new(context, None, options.strings, &[], &program, &module);
+type CompiledOnce = (Compiled, BTreeMap<String, NativeFn>);
+
+fn compile_once(
+    program: &Program,
+    function: &syn::ItemFn,
+    module: &str,
+    options: &Options<'_>,
+    known: &BTreeMap<String, NativeFn>,
+) -> Result<CompiledOnce, Error> {
+    let module = module.to_owned();
+    let context = context_name(function)?;
+    let mut discovery = Emitter::new(
+        context,
+        None,
+        options.strings,
+        &[],
+        program,
+        &module,
+        options.native,
+        known,
+    );
     discovery.constants();
     discovery.block(&function.block)?;
     let discovery_body = discovery.finish();
@@ -316,8 +389,10 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             Some(label.clone()),
             options.strings,
             emit::payload_params(label),
-            &program,
+            program,
             &module,
+            options.native,
+            known,
         );
         emitter.constants();
         emitter.block(&function.block)?;
@@ -506,6 +581,18 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             "end\n",
         ));
     }
+    let mut natives = known.clone();
+    for slot in &bodies {
+        for item in &slot.body.native {
+            natives.entry(item.name.clone()).or_insert_with(|| item.clone());
+        }
+    }
+    if !natives.is_empty() {
+        out.push_str(&emit::native_runtime(options.entry));
+        for item in natives.values() {
+            out.push_str(&emit::stub_source(item));
+        }
+    }
     for (name, init) in &statics {
         let _ = writeln!(out, "{name} = {init}");
     }
@@ -537,7 +624,7 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             false,
             &update_event,
         );
-        let _ = writeln!(out, "function update() {}({args}) end", slot.name);
+        let _ = writeln!(out, "function update() {} end", invoke(&slot.body, &slot.name, &args));
     } else {
         out.push_str("function update() end\n");
     }
@@ -555,8 +642,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         );
         let _ = writeln!(
             out,
-            "function onHostCallback(payload) {}({args}) end",
-            slot.name
+            "function onHostCallback(payload) {} end",
+            invoke(&slot.body, &slot.name, &args)
         );
     }
 
@@ -584,13 +671,13 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         );
         let _ = writeln!(
             out,
-            "local last_query = nil\nfunction onQuery(text) last_query = text; {}({payload}) end",
-            slot.name
+            "local last_query = nil\nfunction onQuery(text) last_query = text; {} end",
+            invoke(&slot.body, &slot.name, &payload)
         );
         let _ = writeln!(
             out,
-            "state.watch(STATE_KEY, function() if last_query then {}({state_payload}) end end)",
-            slot.name
+            "state.watch(STATE_KEY, function() if last_query then {} end end)",
+            invoke(&slot.body, &slot.name, &state_payload)
         );
     }
     for callback in CALLBACKS {
@@ -622,8 +709,10 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         );
         let _ = writeln!(
             out,
-            "function {}({}) {}({args}) end",
-            callback.function, callback.params, slot.name
+            "function {}({}) {} end",
+            callback.function,
+            callback.params,
+            invoke(&slot.body, &slot.name, &args)
         );
     }
     out.push('\n');
@@ -641,8 +730,8 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
         );
         let _ = writeln!(
             out,
-            "state.watch(STATE_KEY, function() {}({args}) end)",
-            slot.name
+            "state.watch(STATE_KEY, function() {} end)",
+            invoke(&slot.body, &slot.name, &args)
         );
     }
     if options.kind == EntryKind::Panel {
@@ -658,13 +747,30 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             false,
             load_label,
         );
-        let _ = writeln!(out, "{}({args})", slot.name);
+        let _ = writeln!(out, "{}", invoke(&slot.body, &slot.name, &args));
     }
 
-    Ok(Compiled {
-        source: out,
-        events: positive,
-    })
+    Ok((
+        Compiled {
+            source: out,
+            events: positive,
+            native: natives.values().cloned().collect(),
+        },
+        natives,
+    ))
+}
+
+/// Calls a body directly, or through the native coroutine driver when the body
+/// reaches a native function.
+fn invoke(body: &emit::Body, name: &str, args: &str) -> String {
+    if !body.uses_native {
+        return format!("{name}({args})");
+    }
+    if args.is_empty() {
+        format!("__native.run({name})")
+    } else {
+        format!("__native.run({name}, {args})")
+    }
 }
 
 pub(crate) fn sanitize(value: &str) -> String {

@@ -9,6 +9,8 @@ pub struct Error {
     pub column: usize,
     /// Module path the position belongs to, when it is not the compiled file.
     pub file: Option<String>,
+    /// Set when the error must stop the build even in `auto` mode.
+    pub fatal: bool,
 }
 
 impl Error {
@@ -19,7 +21,14 @@ impl Error {
             line: start.line,
             column: start.column.saturating_add(1),
             file: None,
+            fatal: false,
         }
+    }
+
+    pub(crate) fn fatal(span: Span, message: impl Into<String>) -> Self {
+        let mut error = Self::at(span, message);
+        error.fatal = true;
+        error
     }
 
     pub(crate) fn plain(message: impl Into<String>) -> Self {
@@ -28,6 +37,7 @@ impl Error {
             line: 0,
             column: 0,
             file: None,
+            fatal: false,
         }
     }
 

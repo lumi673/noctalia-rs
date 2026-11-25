@@ -1,4 +1,4 @@
-use crate::{EntryKind, Module, Options, compile};
+use crate::{EntryKind, Module, NativeMode, Options, compile};
 
 fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
     Options {
@@ -9,6 +9,7 @@ fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         strings: &["message", "name"],
         module: "main",
         modules: &[],
+        native: NativeMode::Deny,
     }
 }
 
@@ -781,6 +782,7 @@ fn module_options<'a>(
         strings: &["message", "name"],
         module: "main",
         modules,
+        native: NativeMode::Deny,
     }
 }
 
@@ -4298,4 +4300,268 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let generated = &compiled.source;
     assert!(generated.contains("local list = {}"), "{generated}");
     assert!(generated.contains("local queue = {}"), "{generated}");
+}
+
+fn native_options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
+    Options {
+        handler,
+        entry: "widget",
+        state_key: "hello.state",
+        kind,
+        strings: &["message", "name"],
+        module: "main",
+        modules: &[],
+        native: NativeMode::Allow,
+    }
+}
+
+const NATIVE_HELPER: &str = r#"
+use noctalia_rs::{Context, Op, Result};
+
+fn load_rows() -> Result<Vec<String>> {
+    let text = std::fs::read_to_string("/tmp/rows")?;
+    Ok(vec![text])
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = load_rows()?;
+    Ok(vec![Op::log(rows.join(","))])
+}
+"#;
+
+#[test]
+fn auto_mode_splits_at_the_function_boundary() {
+    let compiled = compile(
+        &source(NATIVE_HELPER),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    assert_eq!(compiled.native.len(), 1, "{:?}", compiled.native);
+    let native = &compiled.native[0];
+    assert_eq!(native.name, "main::load_rows");
+    assert_eq!(native.params, Vec::<String>::new());
+    assert!(native.reason.contains("std::fs"), "{}", native.reason);
+    assert!(
+        compiled.source.contains(
+            "local function __native_fn_main__load__rows()\n  return __native.call(\"main::load_rows\", {}, 0)\nend"
+        ),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("local function body_render("),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__native.run(body_"),
+        "{}",
+        compiled.source
+    );
+    assert!(!compiled.source.contains("std::fs"), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("local __native = (function()"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn strict_mode_still_rejects_the_same_handler() {
+    let error = compile(
+        &source(NATIVE_HELPER),
+        &options("handler", EntryKind::Widget),
+    )
+    .expect_err("strict rejects");
+    assert!(error.message.contains("std::fs"), "{error}");
+    assert!(!error.fatal);
+}
+
+#[test]
+fn fully_compiled_handlers_never_mention_the_native_boundary() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(ctx.config_str("message").unwrap_or_default().into_owned())])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    assert!(compiled.native.is_empty());
+    for forbidden in ["__native", "coroutine", "require(", "bridge."] {
+        assert!(
+            !compiled.source.contains(forbidden),
+            "{forbidden} leaked into a fully compiled entry:\n{}",
+            compiled.source
+        );
+    }
+}
+
+#[test]
+fn native_attribute_forces_a_stub_and_records_the_cache() {
+    let handler = r#"
+fn digest(value: String) -> String {
+    let mut out = String::new();
+    for character in value.chars() {
+        out.push(character);
+    }
+    out
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = digest("a".to_owned());
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled = compile(
+        &source(&handler.replace(
+            "fn digest(",
+            "#[native(cache_ms = 30_000)]\nfn digest(",
+        )),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    assert_eq!(compiled.native.len(), 1);
+    assert_eq!(compiled.native[0].cache_ms, 30_000);
+    assert_eq!(compiled.native[0].params, vec!["value".to_owned()]);
+    assert!(compiled.source.contains("{ value = value }, 30000"), "{}", compiled.source);
+    assert!(compiled.source.contains("local function __native_fn_main__digest(value)"), "{}", compiled.source);
+}
+
+#[test]
+fn luau_attribute_turns_a_split_into_a_fatal_error() {
+    let handler = r#"
+#[luau]
+fn load_rows() -> Result<Vec<String>> {
+    let text = std::fs::read_to_string("/tmp/rows")?;
+    Ok(vec![text])
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = load_rows()?;
+    Ok(vec![Op::log(rows.join(","))])
+}
+"#;
+    let error = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect_err("#[luau] fails the build");
+    assert!(error.fatal, "{error:?}");
+    assert!(error.message.contains("#[luau]"), "{error}");
+}
+
+#[test]
+fn native_signatures_reject_references_and_self() {
+    let reference = r#"
+fn load_rows(path: &str) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(vec![text])
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = load_rows("/tmp/rows")?;
+    Ok(vec![Op::log(rows.join(","))])
+}
+"#;
+    let error = compile(
+        &source(reference),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect_err("references cannot cross the boundary");
+    assert!(error.message.contains("cannot be references"), "{error}");
+
+    let receiver = r#"
+struct Store {
+    value: i64,
+}
+impl Store {
+    fn load_rows(&self) -> Result<Vec<String>> {
+        let text = std::fs::read_to_string("/tmp/rows")?;
+        Ok(vec![text])
+    }
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let store = Store { value: 1 };
+    let rows = store.load_rows()?;
+    Ok(vec![Op::log(rows.join(","))])
+}
+"#;
+    let error = compile(
+        &source(receiver),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect_err("methods with self cannot cross the boundary");
+    assert!(
+        error.message.contains("cannot take `self`")
+            || error.message.contains("not supported"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_calls_inside_closures_are_rejected() {
+    let handler = r#"
+fn load_rows() -> Result<Vec<String>> {
+    let text = std::fs::read_to_string("/tmp/rows")?;
+    Ok(vec![text])
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let callback = |_value: i64| -> i64 {
+        let _ = load_rows();
+        1
+    };
+    let rows = callback(1);
+    Ok(vec![Op::log(format!("{rows}"))])
+}
+"#;
+    let error = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect_err("closures cannot yield");
+    assert!(error.message.contains("closure"), "{error}");
+}
+
+#[test]
+fn a_native_function_is_emitted_once_per_script() {
+    let handler = r#"
+fn load_rows() -> Result<Vec<String>> {
+    let text = std::fs::read_to_string("/tmp/rows")?;
+    Ok(vec![text])
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let rows = load_rows()?;
+        Ok(vec![Op::log(rows.join(","))])
+    } else if ctx.event == "click" {
+        let rows = load_rows()?;
+        Ok(vec![Op::log(rows.join(","))])
+    } else {
+        Ok(Vec::new())
+    }
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+    assert_eq!(compiled.native.len(), 1);
+    assert_eq!(
+        compiled.source.matches("local function __native_fn_main__load__rows").count(),
+        1,
+        "{}",
+        compiled.source
+    );
 }
