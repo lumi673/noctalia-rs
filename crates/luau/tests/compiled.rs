@@ -1527,14 +1527,99 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn u32_wrapping_add_returns_zero_at_32_bits() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let b = 1_u32;
-    let value = 4294967295_u32.wrapping_add(b);
+    let a = 4294967295_u32;
+    let value = a.wrapping_add(1_u32);
     Ok(vec![Op::log(format!("{}", value))])
 }
 "#;
     let source = compiled_source("u32_wrap", handler, EntryKind::Service);
     let ctx = context("u32_wrap", "render", json!({}), json!({}));
     let luau = ops("u32_wrap", &source, &ctx);
+    let native = duplicated(vec![Op::log("0".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn wrapping_underflow_reduces_modulo_width() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = 0_u32.wrapping_sub(1);
+    let d = 4096_u64;
+    let b = 0_u64.wrapping_sub(d);
+    let c = i32::MIN.wrapping_sub(1);
+    let ok = a == 4294967295_u32 && b > 9223372036854775808_u64 && c == 2147483647_i32;
+    Ok(vec![Op::log(format!("{}", ok))])
+}
+"#;
+    let source = compiled_source("wrap_under", handler, EntryKind::Service);
+    let ctx = context("wrap_under", "render", json!({}), json!({}));
+    let luau = ops("wrap_under", &source, &ctx);
+    let native = duplicated(vec![Op::log("true".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn runtime_min_divided_by_negative_one_overflows() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let d = -1_i64;
+    let value = i64::MIN.div_ceil(d);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_overflow", handler, EntryKind::Service);
+    let ctx = context("div_overflow", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("div_overflow", &source)])
+        .expect_err("runtime division overflow must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("div_ceil overflows"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn marker_character_in_operand_stays_intact() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = "\u{e004}".len().div_ceil(2);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("marker_operand", handler, EntryKind::Service);
+    let ctx = context("marker_operand", "render", json!({}), json!({}));
+    let luau = ops("marker_operand", &source, &ctx);
+    let native = duplicated(vec![Op::log("2".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn helper_does_not_shadow_caller_locals() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let __B = 2_i64;
+    let value = 7_i64.div_ceil(__B);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("helper_scope", handler, EntryKind::Service);
+    let ctx = context("helper_scope", "render", json!({}), json!({}));
+    let luau = ops("helper_scope", &source, &ctx);
+    let native = duplicated(vec![Op::log("4".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn unsigned_saturating_sub_stays_at_zero() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let b = 7_u8;
+    let value = 5_u8.saturating_sub(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("sat_sub", handler, EntryKind::Service);
+    let ctx = context("sat_sub", "render", json!({}), json!({}));
+    let luau = ops("sat_sub", &source, &ctx);
     let native = duplicated(vec![Op::log("0".to_owned())]);
     assert_eq!(luau, native);
 }

@@ -2421,8 +2421,8 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(emitted.contains("local clamped = (-2)"), "{emitted}");
     assert!(emitted.contains("local wrapped = (9)"), "{emitted}");
     assert!(
-        emitted.contains("__pack(7)")
-            && emitted.contains("__pack(3)")
+        emitted.contains("__pack(__left)")
+            && emitted.contains("end)(7, 3)")
             && emitted.contains("__divmag"),
         "{emitted}"
     );
@@ -2936,12 +2936,25 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(
         compiled
             .source
-            .contains("if __over and __s >= 0 then __hi = 0"),
+            .contains("if __over and __s > 0 then __hi = 0"),
         "{}",
         compiled.source
     );
     assert!(
         compiled.source.contains("__lo = 4294967295"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_div_ceil_guards_limb_width() {
+    let handler = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 7_i64.div_ceil(2); Ok(vec![Op::log(format!(\"{}\", v))]) }";
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("__ah >= __B"),
         "{}",
         compiled.source
     );
@@ -3008,14 +3021,19 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 
     let divide = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let c = i64::MIN.div_ceil(-1);
+    let d = -1_i64;
+    let c = i64::MIN.div_ceil(d);
     Ok(vec![Op::log(format!("{}", c))])
 }
 "#;
-    let error =
+    let compiled =
         compile(&source(divide), &options("handler", EntryKind::Service))
-            .expect_err("div_ceil overflow bails");
-    assert!(error.message.contains("overflow"), "{}", error.message);
+            .expect("runtime overflow guard is emitted");
+    assert!(
+        compiled.source.contains("div_ceil overflows"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]

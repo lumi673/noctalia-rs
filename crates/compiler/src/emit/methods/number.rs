@@ -117,7 +117,7 @@ fn exact_binary(
             format!(
                 concat!(
                     "if __over and __s < 0 then __hi = 0; __lo = 0; __s = 0 end;",
-                    "if __over and __s >= 0 then __hi = {max_hi}; __lo = {max_lo}; __s = 1 end;",
+                    "if __over and __s > 0 then __hi = {max_hi}; __lo = {max_lo}; __s = 1 end;",
                     "local __result = __hi * __B + __lo;",
                 ),
                 max_hi = max_hi,
@@ -136,21 +136,19 @@ fn exact_binary(
         } else {
             format!("__hi = __hi % {mod_hi};")
         };
+        let complement = if small {
+            format!("__hi = 0; if __lo ~= 0 then __lo = {lo_mod} - __lo end;")
+        } else {
+            format!(
+                "__hi = ({mod_hi} - __hi - ((__lo == 0) and 0 or 1)) % __B; if __lo ~= 0 then __lo = {lo_mod} - __lo else __lo = 0 end;"
+            )
+        };
         let sign = if signed {
-            let complement = if small {
-                format!(
-                    "__hi = 0; if __lo ~= 0 then __lo = {lo_mod} - __lo end;"
-                )
-            } else {
-                format!(
-                    "__hi = ({mod_hi} - __hi - ((__lo == 0) and 0 or 1)) % __B; if __lo ~= 0 then __lo = {mod_lo} - __lo else __lo = 0 end;"
-                )
-            };
             format!(
                 concat!(
                     "if __cmp(__hi, __lo, {min_hi}, {min_lo}) >= 0 then",
                     "  {complement}",
-                    "  __s = -1;",
+                    "  __s = -__s;",
                     "end;",
                 ),
                 min_hi = min_hi,
@@ -158,7 +156,7 @@ fn exact_binary(
                 complement = complement,
             )
         } else {
-            "__s = 1;".to_owned()
+            format!("if __s < 0 then {complement} end; __s = 1;")
         };
         format!(
             concat!(
@@ -196,7 +194,7 @@ fn exact_binary(
         }
         None => format!("local __bs, __bhi, __blo = __pack({RIGHT_MARK});"),
     };
-    format!(
+    let body = format!(
         concat!(
             "(function()",
             "local __B = 4294967296;",
@@ -263,10 +261,9 @@ fn exact_binary(
         guard = guard,
         limb_exact = LIMB_EXACT,
         operand_guard = operand_guard,
-    )
-    .replace(';', "\n")
-    .replace(LEFT_MARK, left)
-    .replace(RIGHT_MARK, &right_source)
+    );
+    let body = body.replace(';', "\n");
+    replace_marks(&body, &[(LEFT_MARK, left), (RIGHT_MARK, &right_source)])
 }
 
 /// Decimal validation and limb conversion for `parse::<T>()`.
@@ -406,18 +403,35 @@ fn has_inexact_literal(expr: &Expr) -> bool {
 }
 /// Exact `div_ceil` using 32-bit limbs. Double division cannot distinguish a
 /// rounded operand or quotient from an exact one above 2^53.
-fn exact_div_ceil(location: &str, left: &str, right: &str) -> String {
+fn exact_div_ceil(
+    location: &str,
+    left: &str,
+    right: &str,
+    bits: usize,
+    signed: bool,
+) -> String {
     const LEFT_MARK: &str = "\u{e003}";
     const RIGHT_MARK: &str = "\u{e004}";
+    let escaped = location.replace('"', "\\\"");
     let operand_guard = format!(
-        "{}{}",
+        "{}{}if __ah >= __B or __bh >= __B then error(\"{escaped}: div_ceil operand is not exactly representable in Luau (1 construct)\") end;",
         exact_guard(location, "div_ceil operand", "__ah", "__al"),
         exact_guard(location, "div_ceil operand", "__bh", "__bl")
     );
     let result_guard = exact_guard(location, "div_ceil result", "__qh", "__ql");
-    format!(
+    let overflow_guard = if signed {
+        let minimum = 1u128 << (bits - 1);
+        format!(
+            "if __as < 0 and __bs < 0 and __ah == {} and __al == {} and __bh == 0 and __bl == 1 then error(\"{escaped}: div_ceil overflows (1 construct)\") end;",
+            minimum >> 32,
+            minimum & 0xffff_ffff
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
         concat!(
-            "(function()",
+            "(function(__left, __right)",
             "local __B = 4294967296;",
             "{limb_exact}",
             "local function __pack(__v) local __s = (__v < 0) and -1 or 1; if __v < 0 then __v = -__v end; local __m = math.floor(__v); local __h = math.floor(__m / __B); local __l = __m - __h * __B; return __s, __h, __l end;",
@@ -438,9 +452,10 @@ fn exact_div_ceil(location: &str, left: &str, right: &str) -> String {
             "  end;",
             "  return __qh, __ql, __rh, __rl;",
             "end;",
-            "local __as, __ah, __al = __pack({LEFT_MARK});",
-            "local __bs, __bh, __bl = __pack({RIGHT_MARK});",
+            "local __as, __ah, __al = __pack(__left);",
+            "local __bs, __bh, __bl = __pack(__right);",
             "{operand_guard}",
+            "{overflow_guard}",
             "if __bh == 0 and __bl == 0 then error(\"divide by zero\") end;",
             "local __qh, __ql, __rh, __rl = __divmag(__ah, __al, __bh, __bl);",
             "if (__rh ~= 0 or __rl ~= 0) and __as == __bs then",
@@ -452,17 +467,64 @@ fn exact_div_ceil(location: &str, left: &str, right: &str) -> String {
             "{result_guard}",
             "if __qh == 0 and __ql == 0 then return 0 end;",
             "return (__as * __bs) * (__qh * __B + __ql);",
-            "end)()",
+            "end)({LEFT_MARK}, {RIGHT_MARK})",
         ),
         LEFT_MARK = LEFT_MARK,
         RIGHT_MARK = RIGHT_MARK,
         limb_exact = LIMB_EXACT,
         operand_guard = operand_guard,
+        overflow_guard = overflow_guard,
         result_guard = result_guard,
-    )
-    .replace(';', "\n")
-    .replace(LEFT_MARK, left)
-    .replace(RIGHT_MARK, right)
+    );
+    let body = body.replace(';', "\n");
+    replace_marks(&body, &[(LEFT_MARK, left), (RIGHT_MARK, right)])
+}
+/// Substitutes all operand markers in one pass so an inserted operand cannot
+/// have its own text treated as a later marker.
+fn replace_marks(template: &str, marks: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while !rest.is_empty() {
+        let next = marks
+            .iter()
+            .filter_map(|(marker, value)| {
+                rest.find(marker).map(|position| (position, marker, *value))
+            })
+            .min_by_key(|(position, _, _)| *position);
+        match next {
+            Some((position, marker, value)) => {
+                out.push_str(&rest[..position]);
+                out.push_str(value);
+                rest = &rest[position + marker.len()..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn int_suffix_shape(expr: &Expr) -> Option<(usize, bool)> {
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(value),
+        ..
+    }) = strip_reference(expr)
+    else {
+        return None;
+    };
+    match value.suffix() {
+        "i8" => Some((8, true)),
+        "u8" => Some((8, false)),
+        "i16" => Some((16, true)),
+        "u16" => Some((16, false)),
+        "i32" => Some((32, true)),
+        "u32" => Some((32, false)),
+        "i64" | "isize" => Some((64, true)),
+        "u64" | "usize" => Some((64, false)),
+        _ => None,
+    }
 }
 
 fn int_bounds(bits: usize, signed: bool) -> (i128, i128) {
@@ -631,7 +693,9 @@ impl<'a> Emitter<'a> {
                             ),
                         ));
                     }
-                    let (bits, signed) = int_shape(&call.receiver);
+                    let shape = int_shape(&call.receiver);
+                    let (bits, signed) =
+                        int_suffix_shape(argument).unwrap_or(shape);
                     let other = self.expr(argument)?.0;
                     let literal =
                         int_literal(argument).map(|(value, _, _)| value);
@@ -679,7 +743,13 @@ impl<'a> Emitter<'a> {
                     span.line,
                     span.column + 1
                 );
-                Ok((exact_div_ceil(&location, receiver, &other), ty))
+                let (bits, signed) = int_literal(&call.receiver)
+                    .map(|(_, bits, signed)| (bits, signed))
+                    .unwrap_or_else(|| int_shape(&call.receiver));
+                Ok((
+                    exact_div_ceil(&location, receiver, &other, bits, signed),
+                    ty,
+                ))
             }
             "is_sign_positive"
                 if matches!(ty.base, Base::Float | Base::Value) =>
