@@ -561,7 +561,7 @@ fn compiles_remaining_std_wrappers() {
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let smaller = i64::min(3, 4);
     let bytes = std::str::from_utf8(&[104, 105]).unwrap_or("");
-    let buffer = 104u8;
+    let buffer = ByteBuf::new(vec![104u8]);
     let options = OpenOptions::new();
     let _ = options;
     Ok(vec![Op::log(format!("{smaller}{bytes}{buffer}"))])

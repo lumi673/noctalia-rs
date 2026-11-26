@@ -1213,15 +1213,7 @@ impl<'a> Emitter<'a> {
                 if let Some(start) = range.start.as_deref()
                     && let Some((text, _)) = constant(start)
                 {
-                    let operator = if matches!(
-                        range.limits,
-                        syn::RangeLimits::Closed(_)
-                    ) {
-                        ">="
-                    } else {
-                        ">"
-                    };
-                    conditions.push(format!("({value} {operator} {text})"));
+                    conditions.push(format!("({value} >= {text})"));
                 }
                 if let Some(end) = range.end.as_deref()
                     && let Some((text, _)) = constant(end)
@@ -1563,15 +1555,7 @@ impl<'a> Emitter<'a> {
                 if let Some(start) = range.start.as_deref()
                     && let Some((text, _)) = constant(start)
                 {
-                    let operator = if matches!(
-                        range.limits,
-                        syn::RangeLimits::Closed(_)
-                    ) {
-                        ">="
-                    } else {
-                        ">"
-                    };
-                    conditions.push(format!("({value} {operator} {text})"));
+                    conditions.push(format!("({value} >= {text})"));
                 }
                 if let Some(end) = range.end.as_deref()
                     && let Some((text, _)) = constant(end)

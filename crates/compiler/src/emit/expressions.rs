@@ -57,8 +57,25 @@ impl<'a> Emitter<'a> {
                         })
                     }) =>
             {
-                let (text, _) = self.expr(&call.receiver)?;
+                let (text, ty) = self.expr(&call.receiver)?;
+                if ty.base == Base::Str {
+                    return Ok((text, ty));
+                }
                 Ok((format!("table.concat({text})"), Ty::STR))
+            }
+            Expr::MethodCall(call)
+                if call.method == "as_str"
+                    && self.is_chars_receiver(&call.receiver) =>
+            {
+                let chars = self.expr(&call.receiver)?.0;
+                let value = self.temp();
+                self.line(&format!("local {value} = {chars}"));
+                Ok((
+                    format!(
+                        "table.concat({value}, \"\", ({value}.__next or 1))"
+                    ),
+                    Ty::STR,
+                ))
             }
             Expr::MethodCall(call) => self.method(call),
             Expr::Call(call) => match self.std_call(call)? {
@@ -341,7 +358,26 @@ impl<'a> Emitter<'a> {
             || name == "call"
             || name == "node"
             || name.contains("::ui::");
+        if name == "ByteBuf::new"
+            && !self.strict()
+            && args.len() == 1
+            && matches!(
+                strip_reference(arg(&args, 0, call)?),
+                Expr::Macro(_) | Expr::Array(_)
+            )
+        {
+            return Ok(Some((self.expr(arg(&args, 0, call)?)?.0, Ty::VALUE)));
+        }
         if ui_import && matches!(last, "callback" | "call") && args.len() == 1 {
+            if self.strict() {
+                let mut strict_call = call.clone();
+                strict_call.func = if last == "call" {
+                    syn::parse_quote!(ui::call)
+                } else {
+                    syn::parse_quote!(ui::callback)
+                };
+                return Ok(Some(self.call(&strict_call)?));
+            }
             let value = self.expr(arg(&args, 0, call)?)?.0;
             let marker = if last == "call" {
                 "__call"
@@ -363,12 +399,12 @@ impl<'a> Emitter<'a> {
                         || matches!(children, Expr::Macro(mac) if macro_name(mac) == "vec"
                             && parse_vec(mac).is_ok_and(|items| items.is_empty()))
                     {
-                        "{}".to_owned()
+                        empty_array()
                     } else {
                         self.expr(children)?.0
                     }
                 }
-                None => "{}".to_owned(),
+                None => empty_array(),
             };
             return Ok(Some((
                 format!(
@@ -1108,6 +1144,16 @@ impl<'a> Emitter<'a> {
         self.deferred = saved_deferred;
         result?;
         Ok((text, Ty::VALUE))
+    }
+
+    fn is_chars_receiver(&self, expr: &Expr) -> bool {
+        let Expr::Path(path) = strip_reference(expr) else {
+            return false;
+        };
+        let Some(name) = path.path.get_ident().map(ToString::to_string) else {
+            return false;
+        };
+        self.lookup(&name).is_some_and(|ty| ty.base == Base::List)
     }
 
     /// A closure body whose only statement is a call to a unit helper stays a

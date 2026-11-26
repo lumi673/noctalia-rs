@@ -297,8 +297,13 @@ impl<'a> Emitter<'a> {
         if !is_luau_keyword(name) {
             return name.to_owned();
         }
-        if let Some(existing) = self.kw_names.get(name) {
-            return existing.clone();
+        if let Some(existing) = self.kw_names.get(name).cloned()
+            && !self
+                .scopes
+                .iter()
+                .any(|scope| scope.contains_key(&existing))
+        {
+            return existing;
         }
         let mut candidate = format!("__kw_{name}");
         let mut suffix = 1;

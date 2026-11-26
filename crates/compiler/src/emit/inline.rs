@@ -378,7 +378,8 @@ impl<'a> Emitter<'a> {
                     ty,
                     container,
                 } => {
-                    self.line(&format!("local {name} = {text}"));
+                    let lua = self.bind_name(&name);
+                    self.line(&format!("local {lua} = {text}"));
                     if container != StaticKind::Value {
                         self.containers.insert(name.clone(), container);
                     }
