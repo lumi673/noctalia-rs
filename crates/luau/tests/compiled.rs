@@ -1637,6 +1637,47 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn receiver_width_survives_annotations_casts_and_shadows() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let step = 1_u8;
+    let annotated = a.wrapping_add(step);
+    let x = 255_i64;
+    let casted = (x as u8).wrapping_add(step);
+    let shadowed = 255_i64;
+    let shadowed = 255_u8;
+    let shadow = shadowed.wrapping_add(step);
+    let ok = annotated == 0 && casted == 0 && shadow == 0;
+    Ok(vec![Op::log(format!("{}", ok))])
+}
+"#;
+    let source =
+        compiled_source("receiver_shapes", handler, EntryKind::Service);
+    let ctx = context("receiver_shapes", "render", json!({}), json!({}));
+    let luau = ops("receiver_shapes", &source, &ctx);
+    let native = duplicated(vec![Op::log("true".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn unary_suffixed_receiver_keeps_signed_width() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = -128_i8;
+    let b = 1_i8;
+    let value = a.wrapping_sub(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("unary_shape", handler, EntryKind::Service);
+    let ctx = context("unary_shape", "render", json!({}), json!({}));
+    let luau = ops("unary_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("127".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
 fn u32_wrapping_add_returns_zero_at_32_bits() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
