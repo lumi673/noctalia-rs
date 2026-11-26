@@ -1,14 +1,28 @@
 use super::*;
 
-/// Rejects any limb magnitude above 2^53 before conversion to a Luau number.
-/// The error carries the Rust method span so the failure is attributable to the
-/// exact construct that produced it.
-fn exact_guard(location: &str, construct: &str) -> String {
+/// Checks that a pair of 32-bit limbs round-trips through Luau's number model.
+/// Powers of two above 2^53 are exact even though most neighbours are not.
+const LIMB_EXACT: &str = concat!(
+    "local function __bits(__v) local __n = 0 while __v >= 1 do __v = math.floor(__v / 2); __n = __n + 1 end return __n - 1 end;",
+    "local function __exact(__h, __l) local __e = (__h > 0) and (32 + __bits(__h)) or __bits(__l); if __e <= 52 then return true end; local __shift = __e - 52; if __shift <= 32 then return (__l % (2 ^ __shift)) == 0 end; return __l == 0 and (__h % (2 ^ (__shift - 32))) == 0 end;",
+);
+
+/// Rejects a limb value that would change on conversion to a Luau number.
+fn exact_guard(
+    location: &str,
+    construct: &str,
+    high: &str,
+    low: &str,
+) -> String {
     let location = location.replace('"', "\\\"");
     let construct = construct.replace('"', "\\\"");
     format!(
-        "if __hi > 2097152 or (__hi == 2097152 and __lo > 0) then error(\"{location}: {construct} result exceeds 9007199254740992 (1 construct)\") end;",
+        "if not __exact({high}, {low}) then error(\"{location}: {construct} is not exactly representable in Luau (1 construct)\") end;",
     )
+}
+
+fn exact_i128(value: i128) -> bool {
+    value as f64 as i128 == value
 }
 
 /// Luau-only 64-bit magnitude arithmetic. Values are sign plus two 32-bit
@@ -90,9 +104,9 @@ fn exact_binary(
         if signed {
             format!(
                 concat!(
+                    "if __over and __s < 0 then __hi = {min_hi}; __lo = {min_lo}; __s = -1 end;",
+                    "if __over and __s >= 0 then __hi = {max_hi}; __lo = {max_lo}; __s = 1 end;",
                     "local __result = __s * (__hi * __B + __lo);",
-                    "if __over and __s < 0 then __result = -({min_hi} * __B + {min_lo}) end;",
-                    "if __over and __s >= 0 then __result = {max_hi} * __B + {max_lo} end;",
                 ),
                 min_hi = min_hi,
                 min_lo = min_lo,
@@ -102,11 +116,10 @@ fn exact_binary(
         } else {
             format!(
                 concat!(
+                    "if __over and __s < 0 then __hi = 0; __lo = 0; __s = 0 end;",
+                    "if __over and __s >= 0 then __hi = {max_hi}; __lo = {max_lo}; __s = 1 end;",
                     "local __result = __hi * __B + __lo;",
-                    "if __over and __s < 0 then __result = {under} end;",
-                    "if __over and __s >= 0 then __result = {max_hi} * __B + {max_lo} end;",
                 ),
-                under = "0",
                 max_hi = max_hi,
                 max_lo = max_lo,
             )
@@ -151,7 +164,13 @@ fn exact_binary(
             sign = sign,
         )
     };
-    let guard = exact_guard(location, method);
+    let guard =
+        exact_guard(location, &format!("{method} result"), "__hi", "__lo");
+    let operand_guard = format!(
+        "{}{}",
+        exact_guard(location, &format!("{method} operand"), "__ahi", "__all",),
+        exact_guard(location, &format!("{method} operand"), "__bhi", "__blo",),
+    );
     const LEFT_MARK: &str = "\u{e000}";
     const RIGHT_MARK: &str = "\u{e001}";
     let right_source = if right_literal.is_some() {
@@ -175,6 +194,7 @@ fn exact_binary(
         concat!(
             "(function()",
             "local __B = 4294967296;",
+            "{limb_exact}",
             "local function __pack(__v)",
             "  local __s = (__v < 0) and -1 or 1;",
             "  if __v < 0 then __s = -1; __v = -__v end;",
@@ -220,6 +240,7 @@ fn exact_binary(
             "end;",
             "local __as, __ahi, __all = __pack({left});",
             "{right_operand}",
+            "{operand_guard}",
             "local __s = 0;",
             "{operation}",
             "{bound_check}",
@@ -234,6 +255,8 @@ fn exact_binary(
         bound_check = bound_check,
         finish = finish,
         guard = guard,
+        limb_exact = LIMB_EXACT,
+        operand_guard = operand_guard,
     )
     .replace(';', "\n")
     .replace(LEFT_MARK, left)
@@ -257,7 +280,12 @@ pub(super) fn exact_parse(
         _ => ("9223372036854775807", "9223372036854775808", true),
     };
     const RECEIVER_MARK: &str = "\u{e002}";
-    let guard = exact_guard(location, &format!("parse::<{target}>"));
+    let guard = exact_guard(
+        location,
+        &format!("parse::<{target}> result"),
+        "__hi",
+        "__lo",
+    );
     format!(
         concat!(
             "(function()",
@@ -271,6 +299,7 @@ pub(super) fn exact_parse(
             "local __limit = __neg and \"{negative}\" or \"{positive}\";",
             "if #__digits > #__limit or (#__digits == #__limit and __digits > __limit) then return nil, \"number too large or small\" end;",
             "local __B = 4294967296;",
+            "{limb_exact}",
             "local __hi, __lo = 0, 0;",
             "for __i = 1, #__digits do",
             "  local __v = __lo * 10 + (string.byte(__digits, __i) - 48);",
@@ -289,6 +318,7 @@ pub(super) fn exact_parse(
         negative = negative,
         positive = positive,
         guard = guard,
+        limb_exact = LIMB_EXACT,
     )
     .replace(';', "\n")
     .replace(RECEIVER_MARK, receiver)
@@ -347,6 +377,22 @@ fn int_literal(expr: &Expr) -> Option<(i128, usize, bool)> {
             let (bits, signed) = width.unwrap_or((64, true));
             Some((value, bits, signed))
         }
+    }
+}
+
+fn has_inexact_literal(expr: &Expr) -> bool {
+    match strip_reference(expr) {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(_), ..
+        }) => int_literal(expr).is_some_and(|(value, _, _)| !exact_i128(value)),
+        Expr::Binary(binary) => {
+            has_inexact_literal(&binary.left)
+                || has_inexact_literal(&binary.right)
+        }
+        Expr::Paren(paren) => has_inexact_literal(&paren.expr),
+        Expr::Group(group) => has_inexact_literal(&group.expr),
+        Expr::Unary(unary) => has_inexact_literal(&unary.expr),
+        _ => false,
     }
 }
 
@@ -496,16 +542,26 @@ impl<'a> Emitter<'a> {
                     } else {
                         raw.clamp(min, max)
                     };
-                    if result.abs() > 9007199254740992 {
+                    if !exact_i128(result) {
                         return Err(Error::at(
                             call.method.span(),
                             format!(
-                                "`{method}` result {result} exceeds 9007199254740992 (1 construct)"
+                                "`{method}` result {result} is not exactly representable in Luau (1 construct)"
                             ),
                         ));
                     }
                     Ok((format!("({result})"), ty))
                 } else {
+                    if has_inexact_literal(&call.receiver)
+                        || has_inexact_literal(argument)
+                    {
+                        return Err(Error::at(
+                            call.method.span(),
+                            format!(
+                                "`{method}` operand is not exactly representable in Luau (1 construct)"
+                            ),
+                        ));
+                    }
                     let (bits, signed) = int_shape(&call.receiver);
                     let other = self.expr(argument)?.0;
                     let literal =
@@ -531,14 +587,20 @@ impl<'a> Emitter<'a> {
                             "integer division overflows",
                         ));
                     }
-                    if left.abs() > 9007199254740992
-                        || right.abs() > 9007199254740992
-                    {
+                    if !exact_i128(left) || !exact_i128(right) {
                         return Err(Error::at(
                             call.method.span(),
                             "integer division needs exact operands",
                         ));
                     }
+                }
+                if has_inexact_literal(&call.receiver)
+                    || has_inexact_literal(other_expr)
+                {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "integer division needs exact operands",
+                    ));
                 }
                 let other = self.expr(other_expr)?.0;
                 let span = call.method.span().start();
@@ -550,7 +612,7 @@ impl<'a> Emitter<'a> {
                 );
                 Ok((
                     format!(
-                        "(function() local __a, __b = math.floor({receiver}), math.floor({other}); if __b == 0 then error(\"divide by zero\") end; if __a > 9007199254740992 or __a < -9007199254740992 or __b > 9007199254740992 or __b < -9007199254740992 then error(\"{location}: div_ceil operands exceed 9007199254740992 (1 construct)\") end; local __q = (__a >= 0 and math.floor(__a / __b) or math.ceil(__a / __b)); local __r = __a - __q * __b; if __r ~= 0 and ((__r > 0) == (__b > 0)) then __q = __q + 1 end; if __q > 9007199254740992 or __q < -9007199254740992 then error(\"{location}: div_ceil result exceeds 9007199254740992 (1 construct)\") end; return __q end)()"
+                        "(function() local __a, __b = math.floor({receiver}), math.floor({other}); local function __roundtrip(__v) if __v ~= math.floor(__v) then return false end return tonumber(string.format(\"%.0f\", __v)) == __v end; if __b == 0 then error(\"divide by zero\") end; if not __roundtrip(__a) or not __roundtrip(__b) then error(\"{location}: div_ceil operand is not exactly representable in Luau (1 construct)\") end; local __q = (__a >= 0 and math.floor(__a / __b) or math.ceil(__a / __b)); local __r = __a - __q * __b; if __r ~= 0 and ((__r > 0) == (__b > 0)) then __q = __q + 1 end; if not __roundtrip(__q) then error(\"{location}: div_ceil result is not exactly representable in Luau (1 construct)\") end; return __q end)()"
                     ),
                     ty,
                 ))

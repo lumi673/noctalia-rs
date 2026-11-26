@@ -2765,15 +2765,14 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(format!("{}", value))])
 }
 "#;
-    let error =
+    let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect_err("folded wrap above 2^53 bails");
+            .expect("compiles");
     assert!(
-        error.message.contains("9007199254740992"),
+        compiled.source.contains("(-9223372036854775808)"),
         "{}",
-        error.message
+        compiled.source
     );
-    assert!(error.line > 0 && error.column > 0, "{error:?}");
 }
 
 #[test]
@@ -2875,12 +2874,75 @@ fn review_exact_guard_rejects_folded_results() {
             compile(&source(handler), &options("handler", EntryKind::Service))
                 .expect_err("folded result above 2^53 bails");
         assert!(
-            error.message.contains("9007199254740992"),
+            error.message.contains("not exactly representable"),
             "{}",
             error.message
         );
         assert!(error.line > 0 && error.column > 0, "{error:?}");
     }
+}
+
+#[test]
+fn review_exact_guard_accepts_folded_boundaries() {
+    for (handler, literal) in [
+        (
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = i64::MAX.wrapping_add(1); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+            "(-9223372036854775808)",
+        ),
+        (
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9007199254740992_i64.wrapping_add(9007199254740992); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+            "(18014398509481984)",
+        ),
+    ] {
+        let compiled =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect("exact folded boundary compiles");
+        assert!(compiled.source.contains(literal), "{}", compiled.source);
+    }
+}
+
+#[test]
+fn review_exact_guard_rejects_inexact_div_ceil() {
+    let handler = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9007199254740993_i64.div_ceil(2); Ok(vec![Op::log(format!(\"{}\", v))]) }";
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("inexact div_ceil operand bails");
+    assert!(
+        error.message.contains("exact operands"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn review_exact_guard_emits_limb_order_and_operand_checks() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let b = 4294967295_u32;
+    let value = 4294967295_u32.saturating_mul(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("__exact(__ahi, __all)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("if __over and __s >= 0 then __hi = 0"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__lo = 4294967295"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]
@@ -2923,7 +2985,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             .expect_err("div_ceil overflow bails");
     assert!(
         error.message.contains("overflow")
-            || error.message.contains("9007199254740992"),
+            || error.message.contains("not exactly representable"),
         "{}",
         error.message
     );
