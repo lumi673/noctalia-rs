@@ -88,10 +88,16 @@ impl<'a> Emitter<'a> {
                 Ok((Self::reverse_split(receiver, &separator), Ty::LIST))
             }
             "match_indices" if ty.is_string() || ty.base == Base::Value => {
+                if literal_pattern(arg(args, 0, call)?) == Some(String::new()) {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "match_indices() needs a non-empty literal needle",
+                    ));
+                }
                 let needle = self.expr(arg(args, 0, call)?)?.0;
                 Ok((
                     format!(
-                        "(function() local __s, __needle = {receiver}, {needle}; local __out = {{}}; local __at = string.find(__s, __needle, 1, true); while __at do __out[#__out + 1] = {{ __at - 1, string.sub(__s, __at, __at + #__needle - 1) }}; __at = string.find(__s, __needle, __at + #__needle, true) end; return __out end)()"
+                        "(function() local __s, __needle = {receiver}, {needle}; local __out = {{}}; local __at = string.find(__s, __needle, 1, true); while __at do __out[#__out + 1] = {{ __at - 1, string.sub(__s, __at, __at + #__needle - 1) }}; __at = string.find(__s, __needle, __at + math.max(1, #__needle), true) end; return __out end)()"
                     ),
                     Ty::LIST,
                 ))
@@ -334,6 +340,12 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "truncate" if ty.is_string() && !ty.optional => {
+                if receiver.contains('(') || receiver.starts_with('{') {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "truncate() needs a writable string lvalue",
+                    ));
+                }
                 let length = self.expr(arg(args, 0, call)?)?.0;
                 let start = call.method.span().start();
                 self.line(&format!(
@@ -375,6 +387,12 @@ impl<'a> Emitter<'a> {
             }
             "splitn" => {
                 let limit = self.expr(arg(args, 0, call)?)?.0;
+                if matches!(args.get(1), Some(Expr::Closure(_))) {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "splitn() needs a string separator",
+                    ));
+                }
                 let separator = self.expr(arg(args, 1, call)?)?.0;
                 if !ty.is_string() && ty.base != Base::Value {
                     return Err(Error::at(

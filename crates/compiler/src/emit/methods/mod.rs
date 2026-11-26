@@ -247,17 +247,39 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn pair_value_ty(&self, expr: &Expr) -> Ty {
+        match strip_reference(expr) {
+            Expr::MethodCall(call) => match call.method.to_string().as_str() {
+                "enumerate" => self.pair_value_ty(&call.receiver),
+                "zip" | "map" | "filter" | "filter_map" | "take" | "skip"
+                | "flatten" | "copied" | "cloned" | "rev" | "take_while"
+                | "skip_while" | "flat_map" => {
+                    self.pair_value_ty(&call.receiver)
+                }
+                _ => Ty::VALUE,
+            },
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|name| self.lookup(&name.to_string()))
+                .and_then(|ty| ty.element.map(Ty::new))
+                .unwrap_or(Ty::VALUE),
+            _ => Ty::VALUE,
+        }
+    }
+
     fn invoke_pair_arg(
         &mut self,
         arg: &Expr,
         value: &str,
         key_ty: Ty,
+        value_ty: Ty,
     ) -> Result<(String, Ty), Error> {
         if let Expr::Closure(closure) = arg {
             return self.closure_value_typed(
                 closure,
                 std::slice::from_ref(&value.to_owned()),
-                &[Some(key_ty)],
+                &[Some(key_ty), Some(value_ty)],
             );
         }
         self.invoke_arg(arg, std::slice::from_ref(&value.to_owned()))
@@ -514,13 +536,16 @@ impl<'a> Emitter<'a> {
             self.line(&format!("local {result}"));
             self.line(&format!("local {seen} = 0"));
             let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                emitter.line(&format!("if {result} ~= nil then break end"));
                 emitter.line(&format!("if {seen} == ({wanted}) then"));
                 emitter.indent = emitter.indent.saturating_add(1);
                 emitter.line(&format!("{result} = {value}"));
                 emitter.line("break");
                 emitter.indent = emitter.indent.saturating_sub(1);
                 emitter.line("end");
-                emitter.line(&format!("{seen} = {seen} + 1"));
+                emitter.line(&format!(
+                    "if {result} == nil then {seen} = {seen} + 1 end"
+                ));
                 Ok(())
             };
             self.emit_iter(&call.receiver, false, &body)?;
@@ -548,10 +573,18 @@ impl<'a> Emitter<'a> {
                 if let Some(index) = &index {
                     emitter.line(&format!("{index} = {index} + 1"));
                 }
+                if nested {
+                    emitter.line(&format!("if {result} == nil then"));
+                    emitter.indent = emitter.indent.saturating_add(1);
+                }
                 let (text, _) = emitter.invoke_arg(
                     closure,
                     std::slice::from_ref(&value.to_owned()),
                 )?;
+                if nested {
+                    emitter.indent = emitter.indent.saturating_sub(1);
+                    emitter.line("end");
+                }
                 let condition = if nested {
                     format!("{result} == nil and ({text})")
                 } else {
@@ -672,6 +705,7 @@ impl<'a> Emitter<'a> {
                 "map" | "filter_map" => {
                     let pair = self.pair_source(&call.receiver);
                     let key_ty = self.pair_key_ty(&call.receiver);
+                    let value_ty = self.pair_value_ty(&call.receiver);
                     let skip_nil = call.method == "filter_map";
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
@@ -679,7 +713,9 @@ impl<'a> Emitter<'a> {
                                  value: &str|
                      -> Result<(), Error> {
                         let (text, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value, key_ty)?
+                            emitter.invoke_pair_arg(
+                                closure, value, key_ty, value_ty,
+                            )?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -706,13 +742,16 @@ impl<'a> Emitter<'a> {
                 "filter" => {
                     let pair = self.pair_source(&call.receiver);
                     let key_ty = self.pair_key_ty(&call.receiver);
+                    let value_ty = self.pair_value_ty(&call.receiver);
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
                         let (condition, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value, key_ty)?
+                            emitter.invoke_pair_arg(
+                                closure, value, key_ty, value_ty,
+                            )?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -989,8 +1028,31 @@ impl<'a> Emitter<'a> {
                 _ => {}
             },
             Expr::Range(range) => {
-                let list = self.range_list(range)?;
-                return self.emit_table(&list, false, false, None, body);
+                let start_expr = range.start.as_ref().ok_or_else(|| {
+                    Error::at(
+                        range.span(),
+                        "range iterators need an explicit start",
+                    )
+                })?;
+                let end_expr = range.end.as_ref().ok_or_else(|| {
+                    Error::at(
+                        range.span(),
+                        "range iterators need an explicit end",
+                    )
+                })?;
+                let start = self.expr(start_expr)?.0;
+                let end = self.expr(end_expr)?.0;
+                let stop = match range.limits {
+                    syn::RangeLimits::HalfOpen(_) => format!("(({end}) - 1)"),
+                    syn::RangeLimits::Closed(_) => format!("({end})"),
+                };
+                let index = self.temp();
+                self.line(&format!("for {index} = ({start}), {stop} do"));
+                self.indent = self.indent.saturating_add(1);
+                let result = body(self, &index);
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return result;
             }
             other => {
                 let (source, _) = self.expr(other)?;

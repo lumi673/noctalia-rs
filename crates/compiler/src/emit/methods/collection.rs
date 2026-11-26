@@ -32,26 +32,6 @@ impl<'a> Emitter<'a> {
             Ty::BOOL,
         ))
     }
-    pub(super) fn range_list(
-        &mut self,
-        range: &syn::ExprRange,
-    ) -> Result<String, Error> {
-        let start_expr = range.start.as_ref().ok_or_else(|| {
-            Error::at(range.span(), "range iterators need an explicit start")
-        })?;
-        let end_expr = range.end.as_ref().ok_or_else(|| {
-            Error::at(range.span(), "range iterators need an explicit end")
-        })?;
-        let start = self.expr(start_expr)?.0;
-        let end = self.expr(end_expr)?.0;
-        let stop = match range.limits {
-            syn::RangeLimits::HalfOpen(_) => format!("(({end}) - 1)"),
-            syn::RangeLimits::Closed(_) => format!("({end})"),
-        };
-        Ok(format!(
-            "(function() local __out = {{}}; for __i = ({start}), {stop} do __out[#__out + 1] = __i end; return __out end)()"
-        ))
-    }
     pub(super) fn collection_method(
         &mut self,
         call: &ExprMethodCall,
@@ -580,7 +560,9 @@ impl<'a> Emitter<'a> {
                 let body = match parsed_ty.base {
                     Base::Int | Base::Value => {
                         if let Some(literal) = literal_string(&call.receiver) {
-                            let digits = literal.trim_start_matches(['+', '-']);
+                            let digits = literal
+                                .trim_start_matches(['+', '-'])
+                                .trim_start_matches('0');
                             let negative = literal.starts_with('-');
                             let limit = if negative {
                                 negative_limit
@@ -606,12 +588,12 @@ impl<'a> Emitter<'a> {
                             exact
                         } else {
                             format!(
-                                "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return {exact} end; if string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") == nil and string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") == nil then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; return __n end)()"
+                                "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return {exact} end; if string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; return __n end)()"
                             )
                         }
                     }
                     Base::Float => format!(
-                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") == nil and string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") == nil then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
+                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
                     ),
                     _ => {
                         return Err(Error::at(

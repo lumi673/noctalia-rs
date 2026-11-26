@@ -1376,3 +1376,21 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let native = duplicated(vec![Op::log("3".to_owned())]);
     assert_eq!(luau, native);
 }
+
+#[test]
+fn review_round3_width_and_parse_match_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = u8::MAX.saturating_add(1);
+    let b = u32::MAX.wrapping_add(1);
+    let c = "0000000000000000042".parse::<i64>().unwrap_or(0);
+    let d = "1e2".parse::<f64>().unwrap_or(0.0);
+    Ok(vec![Op::log(format!("{} {} {} {}", a, b, c, d))])
+}
+"#;
+    let source = compiled_source("review_round3", handler, EntryKind::Service);
+    let ctx = context("review_round3", "render", json!({}), json!({}));
+    let luau = ops("review_round3", &source, &ctx);
+    let native = duplicated(vec![Op::log("255 0 42 100".to_owned())]);
+    assert_eq!(luau, native);
+}

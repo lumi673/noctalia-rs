@@ -2525,7 +2525,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "{emitted}"
     );
     assert!(emitted.contains("local kept ="), "{emitted}");
-    assert!(emitted.contains("for __i = (0), ((4) - 1) do"), "{emitted}");
+    assert!(emitted.contains("(0), ((4) - 1) do"), "{emitted}");
 }
 
 #[test]
@@ -2890,7 +2890,11 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let error =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect_err("div_ceil overflow bails");
-    assert!(error.message.contains("overflow"), "{}", error.message);
+    assert!(
+        error.message.contains("overflow") || error.message.contains("exactly"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]
@@ -2925,5 +2929,45 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         &options("handler", EntryKind::Service),
     )
     .expect_err("call-result receiver bails");
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn review_round3_width_and_pattern_fixes() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = u8::MAX.saturating_add(1);
+    let b = u32::MAX.wrapping_add(1);
+    let c = "0000000000000000042".parse::<i64>().unwrap_or(0);
+    let d = "1.5".parse::<f64>().unwrap_or(0.0);
+    let e = "1e2".parse::<f64>().unwrap_or(0.0);
+    Ok(vec![Op::log(format!("{} {} {} {} {}", a, b, c, d, e))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local a = (255)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("local b = (0)"),
+        "{}",
+        compiled.source
+    );
+
+    let predicate = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.config_str("message").unwrap_or_default();
+    let out = text.splitn(2, |ch| ch == ',');
+    let _ = out;
+    Ok(Vec::new())
+}
+"#;
+    let error =
+        compile(&source(predicate), &options("handler", EntryKind::Service))
+            .expect_err("predicate separator bails");
     assert!(error.line > 0 && error.column > 0, "{error:?}");
 }

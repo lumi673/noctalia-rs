@@ -33,8 +33,25 @@ fn int_literal(expr: &Expr) -> Option<(i128, usize, bool)> {
         other => {
             let (text, _) = constant(other)?;
             let value = text.trim_matches(['(', ')']).parse::<i128>().ok()?;
-            let signed = !matches!(other, Expr::Path(path) if path.path.segments.iter().any(|segment| segment.ident.to_string().starts_with('u')));
-            Some((value, 64, signed))
+            let width = match other {
+                Expr::Path(path) => {
+                    path.path.segments.iter().rev().find_map(|segment| {
+                        let name = segment.ident.to_string();
+                        match name.as_str() {
+                            "i8" | "u8" => Some((8, name.starts_with('i'))),
+                            "i16" | "u16" => Some((16, name.starts_with('i'))),
+                            "i32" | "u32" => Some((32, name.starts_with('i'))),
+                            "i64" | "u64" | "isize" | "usize" => {
+                                Some((64, name.starts_with('i')))
+                            }
+                            _ => None,
+                        }
+                    })
+                }
+                _ => None,
+            };
+            let (bits, signed) = width.unwrap_or((64, true));
+            Some((value, bits, signed))
         }
     }
 }
@@ -147,29 +164,59 @@ impl<'a> Emitter<'a> {
                 };
                 let (min, max) = int_bounds(bits, signed);
                 let raw = match method {
-                    "saturating_add" | "wrapping_add" => left + right,
-                    "saturating_sub" | "wrapping_sub" => left - right,
-                    _ => left * right,
+                    "saturating_add" | "wrapping_add" => left
+                        .checked_add(right)
+                        .unwrap_or(if signed { max } else { min }),
+                    "saturating_sub" | "wrapping_sub" => left
+                        .checked_sub(right)
+                        .unwrap_or(if signed { min } else { max }),
+                    _ => left.checked_mul(right).unwrap_or(
+                        if signed && (left < 0) != (right < 0) {
+                            min
+                        } else {
+                            max
+                        },
+                    ),
                 };
                 let result = if method.starts_with("wrapping_") {
                     let span = max - min + 1;
                     ((raw - min).rem_euclid(span)) + min
-                } else {
+                } else if matches!(method, "saturating_add" | "saturating_sub")
+                {
                     raw.clamp(min, max)
+                } else {
+                    raw
                 };
+                if result.abs() > 9007199254740992
+                    && result != i64::MIN as i128
+                    && result != 9223372036854775808i128
+                {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "integer result cannot be represented exactly in Luau",
+                    ));
+                }
                 Ok((format!("({result})"), ty))
             }
             "div_ceil" if matches!(ty.base, Base::Int | Base::Value) => {
                 let other_expr = arg(args, 0, call)?;
                 if let (Some((left, _, _)), Some((right, _, _))) =
                     (int_literal(&call.receiver), int_literal(other_expr))
-                    && left == i64::MIN as i128
-                    && right == -1
                 {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "integer division overflows",
-                    ));
+                    if left == i64::MIN as i128 && right == -1 {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "integer division overflows",
+                        ));
+                    }
+                    if left.abs() > 9007199254740992
+                        || right.abs() > 9007199254740992
+                    {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "integer division needs exact operands",
+                        ));
+                    }
                 }
                 let other = self.expr(other_expr)?.0;
                 Ok((
@@ -221,13 +268,25 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "total_cmp" if ty.base == Base::Float => {
-                let other = self.expr(arg(args, 0, call)?)?.0;
+                let other_expr = arg(args, 0, call)?;
+                let other = self.expr(other_expr)?.0;
                 let nan_greater = matches!(
                     strip_reference(&call.receiver),
                     Expr::MethodCall(inner) if inner.method == "abs"
                 );
+                let other_negative = matches!(
+                    strip_reference(other_expr),
+                    Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_))
+                );
                 let a_nan = if nan_greater {
                     "\"Greater\""
+                } else {
+                    "error(\"NaN total order needs a sign bit\")"
+                };
+                let both_nan = if nan_greater && other_negative {
+                    "\"Greater\""
+                } else if nan_greater {
+                    "\"Equal\""
                 } else {
                     "error(\"NaN total order needs a sign bit\")"
                 };
@@ -238,7 +297,7 @@ impl<'a> Emitter<'a> {
                 };
                 Ok((
                     format!(
-                        "(function() local __a, __b = {receiver}, {other}; if __a ~= __a then if __b ~= __b then return \"Equal\" end return {a_nan} end; if __b ~= __b then return {b_nan} end; if __a < __b then return \"Less\" end; if __a > __b then return \"Greater\" end; if __a == 0 and __b == 0 then if (1 / __a) < (1 / __b) then return \"Less\" end; if (1 / __a) > (1 / __b) then return \"Greater\" end end; return \"Equal\" end)()"
+                        "(function() local __a, __b = {receiver}, {other}; if __a ~= __a then if __b ~= __b then return {both_nan} end return {a_nan} end; if __b ~= __b then return {b_nan} end; if __a < __b then return \"Less\" end; if __a > __b then return \"Greater\" end; if __a == 0 and __b == 0 then if (1 / __a) < (1 / __b) then return \"Less\" end; if (1 / __a) > (1 / __b) then return \"Greater\" end end; return \"Equal\" end)()"
                     ),
                     Ty::VALUE,
                 ))
