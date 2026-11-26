@@ -351,6 +351,34 @@ impl<'a> Emitter<'a> {
                     Ty::TABLE,
                 ));
             }
+            if matches!(name.rsplit("::").next(), Some("from_iter"))
+                && args.len() == 1
+            {
+                let list = arg(&args, 0, call)?;
+                let Expr::Array(items) = strip_reference(list) else {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                };
+                if items
+                    .elems
+                    .iter()
+                    .any(|item| !matches!(item, Expr::Tuple(tuple) if tuple.elems.len() == 2))
+                {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                }
+                let list = self.expr(list)?.0;
+                return Ok((
+                    format!(
+                        "(function() local __map = {{}} for _, __pair in ipairs({list}) do __map[__pair[1]] = __pair[2] end return __map end)()"
+                    ),
+                    Ty::TABLE,
+                ));
+            }
             if name.ends_with("::from_str_radix") {
                 let text = self.expr(arg(&args, 0, call)?)?.0;
                 let radix = self.expr(arg(&args, 1, call)?)?.0;

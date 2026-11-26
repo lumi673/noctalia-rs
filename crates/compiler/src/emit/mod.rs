@@ -59,7 +59,7 @@ impl<'a> Emitter<'a> {
         has_action: bool,
         has_host_callback: bool,
     ) -> Self {
-        Self {
+        let emitter = Self {
             ctx: ctx.to_string(),
             out: String::new(),
             indent: 1,
@@ -133,7 +133,9 @@ impl<'a> Emitter<'a> {
             uses_callback_dispatch: false,
             has_action,
             has_host_callback,
-        }
+        };
+        methods::reset_iter_done();
+        emitter
     }
 
     /// Whether the entry is emitted as a standalone strict script.

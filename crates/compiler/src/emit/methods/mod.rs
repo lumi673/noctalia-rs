@@ -7,7 +7,17 @@
 //! `collection.rs` `Vec`/`HashMap` and `Option`/`Result` values, and `fs.rs`
 //! and `path.rs` are the `std::fs` and `std::path` receivers.
 
+use std::cell::RefCell;
+
 use super::*;
+
+pub(super) fn reset_iter_done() {
+    ITER_DONE.with(|slot| slot.borrow_mut().clear());
+}
+
+thread_local! {
+    static ITER_DONE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
 
 mod collection;
 mod fs;
@@ -50,6 +60,28 @@ impl<'a> Emitter<'a> {
         Ok(Some((def.name, def.kind)))
     }
 
+    fn alias_target(&self, lua: &str) -> Option<String> {
+        let needle = format!("local {lua} = ");
+        for line in self.out.lines().rev() {
+            if line.contains("local function ") {
+                break;
+            }
+            if let Some(position) = line.find(&needle) {
+                let value = line[position + needle.len()..].trim();
+                if value.contains('(') || value == "nil" {
+                    return None;
+                }
+                if value.starts_with("__static_")
+                    || value.contains('[')
+                    || value.contains('.')
+                {
+                    return Some(value.to_owned());
+                }
+                return None;
+            }
+        }
+        None
+    }
     fn static_method(
         &mut self,
         lua: &str,
@@ -72,19 +104,21 @@ impl<'a> Emitter<'a> {
                 Ok((String::new(), Ty::VOID))
             }
             "get_or_init" | "get_or_try_init" => {
+                let target =
+                    self.alias_target(lua).unwrap_or_else(|| lua.to_owned());
                 let closure = arg(args, 0, call)?;
-                self.line(&format!("if {lua} == nil then"));
+                self.line(&format!("if {target} == nil then"));
                 self.indent = self.indent.saturating_add(1);
                 let (text, ty) = self.invoke_arg(closure, &[])?;
                 if text.is_empty() || ty.base == Base::Void {
-                    self.line(&format!("{lua} = true"));
+                    self.line(&format!("{target} = true"));
                 } else {
-                    self.line(&format!("{lua} = {text}"));
+                    self.line(&format!("{target} = {text}"));
                 }
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 Ok((
-                    lua.to_owned(),
+                    target,
                     Ty {
                         result: false,
                         ..ty
@@ -177,6 +211,10 @@ impl<'a> Emitter<'a> {
                         .is_some_and(|ty| ty.base == Base::Table),
                     _ => false,
                 },
+                "enumerate" | "zip" => true,
+                "rev" | "take_while" | "skip_while" | "flat_map" => {
+                    self.pair_source(&call.receiver)
+                }
                 "map" | "filter" | "filter_map" | "take" | "skip"
                 | "flatten" | "copied" | "cloned" => {
                     self.pair_source(&call.receiver)
@@ -187,18 +225,143 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Invoke a closure whose argument is a `(key, value)` pair, typing the
-    /// first tuple element as a string.
+    fn has_deferred_callback(expr: &Expr) -> bool {
+        let Expr::MethodCall(call) = strip_reference(expr) else {
+            return false;
+        };
+        matches!(
+            call.method.to_string().as_str(),
+            "map"
+                | "filter"
+                | "filter_map"
+                | "flat_map"
+                | "flatten"
+                | "take_while"
+                | "skip_while"
+                | "zip"
+                | "rev"
+                | "enumerate"
+        ) || Self::has_deferred_callback(&call.receiver)
+    }
+    fn done_names(&self) -> Vec<String> {
+        ITER_DONE.with(|slot| slot.borrow().clone())
+    }
+
+    fn emit_done_break(&mut self) {
+        for name in self.done_names() {
+            self.line(&format!("if {name} then break end"));
+        }
+    }
+
+    fn with_done<T>(
+        &mut self,
+        name: Option<String>,
+        action: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        if let Some(name) = name.clone() {
+            ITER_DONE.with(|slot| slot.borrow_mut().push(name));
+        }
+        let result = action(self);
+        if name.is_some() {
+            ITER_DONE.with(|slot| {
+                slot.borrow_mut().pop();
+            });
+        }
+        result
+    }
+
+    fn materialize_iter(
+        &mut self,
+        expr: &Expr,
+        pair: bool,
+    ) -> Result<String, Error> {
+        let table = self.temp();
+        self.line(&format!("local {table} = {{}}"));
+        self.emit_iter(expr, pair, &|emitter, value| {
+            emitter.line(&format!("table.insert({table}, {value})"));
+            Ok(())
+        })?;
+        Ok(table)
+    }
+    fn expr_element_ty(&self, expr: &Expr) -> Ty {
+        let expr = strip_reference(expr);
+        match expr {
+            Expr::MethodCall(call)
+                if matches!(
+                    call.method.to_string().as_str(),
+                    "iter" | "into_iter"
+                ) =>
+            {
+                self.expr_element_ty(&call.receiver)
+            }
+            Expr::Array(array) => array
+                .elems
+                .first()
+                .map(|item| constant(item).map_or(Ty::VALUE, |(_, ty)| ty))
+                .unwrap_or(Ty::VALUE),
+            Expr::Macro(mac) if mac.mac.path.is_ident("vec") => {
+                match syn::parse2::<syn::ExprArray>(mac.mac.tokens.clone()) {
+                    Ok(array) => self.expr_element_ty(&Expr::Array(array)),
+                    Err(_) => Ty::VALUE,
+                }
+            }
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|name| self.lookup(&name.to_string()))
+                .and_then(|ty| ty.element.map(Ty::new))
+                .unwrap_or(Ty::VALUE),
+            _ => Ty::VALUE,
+        }
+    }
+
+    fn pair_types(&self, expr: &Expr) -> (Ty, Ty) {
+        match strip_reference(expr) {
+            Expr::MethodCall(call) => match call.method.to_string().as_str() {
+                "enumerate" => (Ty::INT, self.expr_element_ty(&call.receiver)),
+                "zip" => {
+                    let key = self.expr_element_ty(&call.receiver);
+                    let value = call
+                        .args
+                        .first()
+                        .map(|arg| self.expr_element_ty(arg))
+                        .unwrap_or(Ty::VALUE);
+                    (key, value)
+                }
+                "map" | "filter" | "filter_map" | "take" | "skip"
+                | "flatten" | "copied" | "cloned" | "rev" | "take_while"
+                | "skip_while" | "flat_map" => self.pair_types(&call.receiver),
+                "iter" | "into_iter" => {
+                    if let Expr::Path(path) = strip_reference(&call.receiver)
+                        && let Some(name) = path.path.get_ident()
+                        && self
+                            .lookup(&name.to_string())
+                            .is_some_and(|ty| ty.base == Base::Table)
+                    {
+                        (Ty::LIST_OF_KEYS, Ty::VALUE)
+                    } else {
+                        (Ty::VALUE, Ty::VALUE)
+                    }
+                }
+                _ => (Ty::VALUE, Ty::VALUE),
+            },
+            _ => (Ty::VALUE, Ty::VALUE),
+        }
+    }
+
     fn invoke_pair_arg(
         &mut self,
         arg: &Expr,
         value: &str,
+        key_ty: Ty,
+        value_ty: Ty,
     ) -> Result<(String, Ty), Error> {
         if let Expr::Closure(closure) = arg {
             return self.closure_value_typed(
                 closure,
                 std::slice::from_ref(&value.to_owned()),
-                &[Some(Ty::LIST_OF_KEYS)],
+                &[],
+                Some((key_ty, value_ty)),
             );
         }
         self.invoke_arg(arg, std::slice::from_ref(&value.to_owned()))
@@ -216,8 +379,47 @@ impl<'a> Emitter<'a> {
             "lock" | "read" | "write" => {
                 return Ok(Some((receiver.to_owned(), Ty::result(ty.base))));
             }
-            "map_err" if ty.result => {
+            "map_err" => {
                 return Ok(Some((receiver.to_owned(), ty)));
+            }
+            "get_or_init" | "get_or_try_init"
+                if is_identifier(receiver)
+                    || (receiver.starts_with(|c: char| {
+                        c.is_ascii_alphabetic() || c == '_'
+                    }) && (receiver.ends_with(']')
+                        || receiver.contains('.'))) =>
+            {
+                let target = self
+                    .alias_target(receiver)
+                    .unwrap_or_else(|| receiver.to_owned());
+                if target == receiver
+                    && is_identifier(receiver)
+                    && (self.lookup(receiver).is_some()
+                        || receiver.starts_with("__t"))
+                {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "get_or_init() needs an assignable static or field lvalue",
+                    ));
+                }
+                let closure = arg(args, 0, call)?;
+                self.line(&format!("if {target} == nil then"));
+                self.indent = self.indent.saturating_add(1);
+                let (text, value_ty) = self.invoke_arg(closure, &[])?;
+                if text.is_empty() || value_ty.base == Base::Void {
+                    self.line(&format!("{target} = true"));
+                } else {
+                    self.line(&format!("{target} = {text}"));
+                }
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return Ok(Some((
+                    target,
+                    Ty {
+                        result: false,
+                        ..value_ty
+                    },
+                )));
             }
             "unwrap_or_else" if ty.result => {
                 let closure = arg(args, 0, call)?;
@@ -394,13 +596,48 @@ impl<'a> Emitter<'a> {
         call: &ExprMethodCall,
     ) -> Result<OptionalValue, Error> {
         let method = call.method.to_string();
-        if !matches!(
-            method.as_str(),
-            "any" | "all" | "sum" | "count" | "for_each" | "find" | "position"
-        ) {
+        if method != "nth"
+            && !matches!(
+                method.as_str(),
+                "any"
+                    | "all"
+                    | "sum"
+                    | "count"
+                    | "for_each"
+                    | "find"
+                    | "position"
+            )
+        {
             return Ok(None);
         }
         let args = call.args.iter().collect::<Vec<_>>();
+        if method == "nth" {
+            let wanted = self.expr(arg(&args, 0, call)?)?.0;
+            let result = self.temp();
+            let seen = self.temp();
+            let done = self.temp();
+            self.line(&format!(
+                "local {result}, {seen}, {done} = nil, 0, false"
+            ));
+            let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
+                emitter.line(&format!("if {done} then break end"));
+                emitter.line(&format!("if {seen} == ({wanted}) then"));
+                emitter.indent = emitter.indent.saturating_add(1);
+                emitter.line(&format!("{result} = {value}"));
+                emitter.line(&format!("{done} = true"));
+                emitter.line("break");
+                emitter.indent = emitter.indent.saturating_sub(1);
+                emitter.line("end");
+                emitter.line(&format!(
+                    "if {result} == nil then {seen} = {seen} + 1 end"
+                ));
+                Ok(())
+            };
+            self.with_done(Some(done.clone()), |emitter| {
+                emitter.emit_iter(&call.receiver, false, &body)
+            })?;
+            return Ok(Some((result, Ty::OPT_VALUE)));
+        }
         let Some(closure) = args.first().copied() else {
             if method == "count" {
                 let (receiver, _) = self.expr(&call.receiver)?;
@@ -411,45 +648,49 @@ impl<'a> Emitter<'a> {
         if matches!(method.as_str(), "find" | "position")
             && matches!(closure, Expr::Closure(_))
         {
-            if method == "position" && is_iterator_adaptor(&call.receiver) {
-                return Err(Error::at(
-                    call.method.span(),
-                    "position after an iterator adaptor is not supported by the Luau compiler",
-                ));
-            }
-            if has_flatten_adaptor(&call.receiver) {
-                return Err(Error::at(
-                    call.method.span(),
-                    format!(
-                        "{method} after `flatten` is not supported by the Luau compiler"
-                    ),
-                ));
-            }
             let result = self.temp();
-            self.line(&format!("local {result}"));
+            let done = self.temp();
+            self.line(&format!("local {result}, {done} = nil, false"));
             let index = (method == "position").then(|| {
                 let index = self.temp();
                 self.line(&format!("local {index} = 0"));
                 index
             });
+            let nested = has_flatten_adaptor(&call.receiver);
             let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
                 if let Some(index) = &index {
                     emitter.line(&format!("{index} = {index} + 1"));
+                }
+                if nested {
+                    emitter.line(&format!("if {result} == nil then"));
+                    emitter.indent = emitter.indent.saturating_add(1);
                 }
                 let (text, _) = emitter.invoke_arg(
                     closure,
                     std::slice::from_ref(&value.to_owned()),
                 )?;
-                emitter.line(&format!("if {text} then"));
+                let condition = if nested {
+                    format!("({text})")
+                } else {
+                    text.clone()
+                };
+                emitter.line(&format!("if {condition} then"));
                 emitter.indent = emitter.indent.saturating_add(1);
                 let found = index.as_deref().unwrap_or(value);
                 emitter.line(&format!("{result} = {found}"));
+                emitter.line(&format!("{done} = true"));
                 emitter.line("break");
                 emitter.indent = emitter.indent.saturating_sub(1);
                 emitter.line("end");
+                if nested {
+                    emitter.indent = emitter.indent.saturating_sub(1);
+                    emitter.line("end");
+                }
                 Ok(())
             };
-            self.emit_iter(&call.receiver, false, &body)?;
+            self.with_done(Some(done.clone()), |emitter| {
+                emitter.emit_iter(&call.receiver, false, &body)
+            })?;
             let ty = if index.is_some() {
                 Ty::OPT_INT
             } else {
@@ -554,14 +795,18 @@ impl<'a> Emitter<'a> {
             Expr::MethodCall(call) => match call.method.to_string().as_str() {
                 "map" | "filter_map" => {
                     let pair = self.pair_source(&call.receiver);
+                    let (key_ty, value_ty) = self.pair_types(&call.receiver);
                     let skip_nil = call.method == "filter_map";
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
+                        emitter.emit_done_break();
                         let (text, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value)?
+                            emitter.invoke_pair_arg(
+                                closure, value, key_ty, value_ty,
+                            )?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -587,13 +832,17 @@ impl<'a> Emitter<'a> {
                 }
                 "filter" => {
                     let pair = self.pair_source(&call.receiver);
+                    let (key_ty, value_ty) = self.pair_types(&call.receiver);
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
+                        emitter.emit_done_break();
                         let (condition, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value)?
+                            emitter.invoke_pair_arg(
+                                closure, value, key_ty, value_ty,
+                            )?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -608,6 +857,25 @@ impl<'a> Emitter<'a> {
                         Ok(())
                     };
                     return self.emit_iter(&call.receiver, pair, &inner);
+                }
+                "splitn" | "match_indices" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let (text, ty) = self.expr(&call.receiver)?;
+                    let (list, _) = self
+                        .string_method(
+                            call,
+                            &call.method.to_string(),
+                            &args,
+                            &text,
+                            ty,
+                        )?
+                        .ok_or_else(|| {
+                            Error::at(
+                                call.method.span(),
+                                "iterator method is not supported",
+                            )
+                        })?;
+                    return self.emit_table(&list, false, false, None, body);
                 }
                 "split" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -625,6 +893,13 @@ impl<'a> Emitter<'a> {
                     let (text, _) = self.expr(&call.receiver)?;
                     let words = self.whitespace_split(&text);
                     return self.emit_table(&words, false, false, None, body);
+                }
+                "char_indices" => {
+                    let (text, _) = self.expr(&call.receiver)?;
+                    let pairs = format!(
+                        "(function() local __out = {{}}; for __offset, __code in utf8.codes({text}) do __out[#__out + 1] = {{ __offset - 1, utf8.char(__code) }} end; __out.__next = 1; return __out end)()"
+                    );
+                    return self.emit_table(&pairs, false, false, None, body);
                 }
                 "chars" | "bytes" => {
                     let (text, _) = self.expr(&call.receiver)?;
@@ -705,6 +980,131 @@ impl<'a> Emitter<'a> {
                     };
                     return self.emit_iter(&call.receiver, pair, &inner);
                 }
+                "rev" => {
+                    if Self::has_deferred_callback(&call.receiver) {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "rev() after a callback adaptor has no faithful Luau execution order",
+                        ));
+                    }
+                    let source =
+                        self.materialize_iter(&call.receiver, false)?;
+                    let table = &source;
+                    let index = self.temp();
+                    self.line(&format!("for {index} = #{table}, 1, -1 do"));
+                    self.indent = self.indent.saturating_add(1);
+                    self.emit_done_break();
+                    let result = body(self, &format!("{table}[{index}]"));
+                    self.indent = self.indent.saturating_sub(1);
+                    self.line("end");
+                    return result;
+                }
+                "enumerate" => {
+                    let index = self.temp();
+                    self.line(&format!("local {index} = 0"));
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        body(emitter, &format!("{{ {index}, {value} }}"))?;
+                        emitter.line(&format!("{index} = {index} + 1"));
+                        Ok(())
+                    };
+                    return self.emit_iter(&call.receiver, pair, &inner);
+                }
+                "zip" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let right = arg(&args, 0, call)?;
+                    if Self::has_deferred_callback(right) {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "zip() needs a plain right-hand iterator",
+                        ));
+                    }
+                    let other = self.materialize_iter(right, false)?;
+                    let index = self.temp();
+                    self.line(&format!("local {index} = 1"));
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        emitter.line(&format!("if {value} == nil or {other}[{index}] == nil then break end"));
+                        body(
+                            emitter,
+                            &format!("{{ {value}, {other}[{index}] }}"),
+                        )?;
+                        emitter.line(&format!("{index} = {index} + 1"));
+                        Ok(())
+                    };
+                    return self.emit_iter(&call.receiver, pair, &inner);
+                }
+                "take_while" | "skip_while" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let closure = arg(&args, 0, call)?;
+                    let active = self.temp();
+                    self.line(&format!("local {active} = true"));
+                    let taking = call.method == "take_while";
+                    let done = self.temp();
+                    self.line(&format!("local {done} = false"));
+                    let done_for_iter = taking.then(|| done.clone());
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        emitter.line(&format!("if {active} then"));
+                        emitter.indent = emitter.indent.saturating_add(1);
+                        let (condition, _) = emitter.invoke_arg(
+                            closure,
+                            std::slice::from_ref(&value.to_owned()),
+                        )?;
+                        if taking {
+                            emitter.line(&format!(
+                                "if not ({condition}) then {active} = false; {done} = true end"
+                            ));
+                            emitter.line(&format!("if {active} then"));
+                            emitter.indent = emitter.indent.saturating_add(1);
+                            body(emitter, value)?;
+                            emitter.indent = emitter.indent.saturating_sub(1);
+                            emitter.line("end");
+                        } else {
+                            emitter.line(&format!(
+                                "if not ({condition}) then {active} = false end"
+                            ));
+                            emitter.line(&format!("if not {active} then"));
+                            emitter.indent = emitter.indent.saturating_add(1);
+                            body(emitter, value)?;
+                            emitter.indent = emitter.indent.saturating_sub(1);
+                            emitter.line("end");
+                        }
+                        emitter.indent = emitter.indent.saturating_sub(1);
+                        emitter.line("end");
+                        Ok(())
+                    };
+                    self.with_done(done_for_iter, |emitter| {
+                        emitter.emit_iter(&call.receiver, pair, &inner)
+                    })?;
+                    return Ok(());
+                }
+                "flat_map" => {
+                    let args = call.args.iter().collect::<Vec<_>>();
+                    let closure = arg(&args, 0, call)?;
+                    let inner = |emitter: &mut Self,
+                                 value: &str|
+                     -> Result<(), Error> {
+                        let (text, _) = emitter.invoke_arg(
+                            closure,
+                            std::slice::from_ref(&value.to_owned()),
+                        )?;
+                        if text.is_empty() {
+                            return Ok(());
+                        }
+                        emitter.emit_table(
+                            &format!("({text})"),
+                            false,
+                            false,
+                            None,
+                            body,
+                        )
+                    };
+                    return self.emit_iter(&call.receiver, pair, &inner);
+                }
                 "flatten" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     if ty.optional {
@@ -716,7 +1116,7 @@ impl<'a> Emitter<'a> {
                             body,
                         );
                     }
-                    if ty.base == Base::List {
+                    if matches!(ty.base, Base::List | Base::Value | Base::Ops) {
                         let inner =
                             |emitter: &mut Self,
                              value: &str|
@@ -736,6 +1136,34 @@ impl<'a> Emitter<'a> {
                 }
                 _ => {}
             },
+            Expr::Range(range) => {
+                let start_expr = range.start.as_ref().ok_or_else(|| {
+                    Error::at(
+                        range.span(),
+                        "range iterators need an explicit start",
+                    )
+                })?;
+                let end_expr = range.end.as_ref().ok_or_else(|| {
+                    Error::at(
+                        range.span(),
+                        "range iterators need an explicit end",
+                    )
+                })?;
+                let start = self.expr(start_expr)?.0;
+                let end = self.expr(end_expr)?.0;
+                let stop = match range.limits {
+                    syn::RangeLimits::HalfOpen(_) => format!("(({end}) - 1)"),
+                    syn::RangeLimits::Closed(_) => format!("({end})"),
+                };
+                let index = self.temp();
+                self.line(&format!("for {index} = ({start}), {stop} do"));
+                self.indent = self.indent.saturating_add(1);
+                self.emit_done_break();
+                let result = body(self, &index);
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                return result;
+            }
             other => {
                 let (source, _) = self.expr(other)?;
                 return self.emit_table(&source, false, false, None, body);
@@ -803,6 +1231,7 @@ impl<'a> Emitter<'a> {
         self.line(&format!("local {table} = {source}"));
         self.line(&format!("for {index} = {table}.__next or 1, #{table} do"));
         self.indent = self.indent.saturating_add(1);
+        self.emit_done_break();
         let result = body(self, &format!("{table}[{index}]"));
         self.indent = self.indent.saturating_sub(1);
         self.line("end");
@@ -987,6 +1416,11 @@ impl<'a> Emitter<'a> {
         if let Some(value) = self.entry_method(call, &method, &args)? {
             return Ok(value);
         }
+        if method == "contains"
+            && let Expr::Range(range) = strip_reference(&call.receiver)
+        {
+            return self.range_contains(call, &args, range);
+        }
         if self.is_ctx_expr(&call.receiver) {
             return self.context_method(call, &method, &args);
         }
@@ -1163,7 +1597,7 @@ impl<'a> Emitter<'a> {
                         Ty::OPT_VALUE,
                     ));
                 }
-                let path = self.string_arg(args, 0, call)?;
+                let path = self.string_literal_arg(args, 0, call)?;
                 Ok((host_path(&unquote(&path))?.to_owned(), Ty::OPT_VALUE))
             }
             "translations" if self.strict() => {
@@ -1653,6 +2087,56 @@ impl<'a> Emitter<'a> {
         Ok(format!("{{ {} }}", parts.join(", ")))
     }
 
+    fn class_name_of(&self, expr: &Expr) -> Option<String> {
+        if let Some(class) = self.class_of_receiver(expr) {
+            return Some(class);
+        }
+        let Expr::Call(call) = strip_reference(expr) else {
+            return None;
+        };
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let segments = path_segments(&path.path)?;
+        let resolved = self.program.resolve(&self.module, &segments)?;
+        match &resolved.function.sig.output {
+            syn::ReturnType::Type(_, ty) => Some(type_text(ty)),
+            syn::ReturnType::Default => None,
+        }
+        .filter(|name| !name.is_empty())
+    }
+
+    fn known_string_ty(&self, expr: &Expr) -> Option<Ty> {
+        let expr = strip_reference(expr);
+        match expr {
+            Expr::Field(field) => {
+                let Member::Named(member) = &field.member else {
+                    return None;
+                };
+                let class = self.class_name_of(&field.base)?;
+                let def = self.program.struct_def(&self.module, &class)?;
+                let (_, ty) = def
+                    .fields
+                    .iter()
+                    .find(|(name, _)| name == &member.to_string())?;
+                (type_hint(ty).base == Base::Str).then_some(Ty::STR)
+            }
+            Expr::Call(call) => {
+                let Expr::Path(path) = &*call.func else {
+                    return None;
+                };
+                let segments = path_segments(&path.path)?;
+                let resolved = self.program.resolve(&self.module, &segments)?;
+                match &resolved.function.sig.output {
+                    syn::ReturnType::Type(_, ty) => {
+                        (type_hint(ty).base == Base::Str).then_some(Ty::STR)
+                    }
+                    syn::ReturnType::Default => None,
+                }
+            }
+            _ => None,
+        }
+    }
     fn string_arg(
         &mut self,
         args: &[&Expr],
@@ -1661,7 +2145,23 @@ impl<'a> Emitter<'a> {
     ) -> Result<String, Error> {
         let value = arg(args, index, call)?;
         let (text, ty) = self.expr(value)?;
-        if ty.base != Base::Str {
+        if ty.base != Base::Str && self.known_string_ty(value).is_none() {
+            return Err(Error::at(
+                value.span(),
+                "expected a string argument with a known type",
+            ));
+        }
+        Ok(text)
+    }
+    fn string_literal_arg(
+        &mut self,
+        args: &[&Expr],
+        index: usize,
+        call: &ExprMethodCall,
+    ) -> Result<String, Error> {
+        let value = arg(args, index, call)?;
+        let text = self.string_arg(args, index, call)?;
+        if !text.starts_with('"') {
             return Err(Error::at(
                 value.span(),
                 "expected a string literal argument",
@@ -2083,29 +2583,14 @@ fn guard_target(expr: &Expr) -> &Expr {
     guard_target(&call.receiver)
 }
 
-fn is_iterator_adaptor(expr: &Expr) -> bool {
-    let Expr::MethodCall(call) = strip_reference(expr) else {
-        return false;
-    };
-    matches!(
-        call.method.to_string().as_str(),
-        "map"
-            | "filter"
-            | "filter_map"
-            | "take"
-            | "skip"
-            | "flatten"
-            | "rsplit"
-    )
-}
-
 /// `flatten` opens an inner loop, so a `break` in the callback would only
 /// leave that inner loop.
 fn has_flatten_adaptor(expr: &Expr) -> bool {
     let Expr::MethodCall(call) = strip_reference(expr) else {
         return false;
     };
-    call.method == "flatten" || has_flatten_adaptor(&call.receiver)
+    matches!(call.method.to_string().as_str(), "flatten" | "flat_map")
+        || has_flatten_adaptor(&call.receiver)
 }
 
 /// Every character an or-pattern of literals matches.

@@ -241,7 +241,6 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn covers_additional_bail_and_expression_branches() {
     for handler in [
-        "fn widget(ctx: &Context) -> Result<Vec<Op>> { let value = ctx.config_str(\"message\").map_err(|e| e); let _ = value; Ok(vec![]) }",
         "fn widget(ctx: &Context) -> Result<Vec<Op>> { let value = ctx.config_str(\"message\").map(|a: i64, b: i64| a + b); let _ = value; Ok(vec![]) }",
         "fn widget(ctx: &Context) -> Result<Vec<Op>> { static X: std::sync::OnceLock<String> = std::sync::OnceLock::new(); X.compare_exchange(1, 2); Ok(vec![]) }",
         "fn widget(ctx: &Context) -> Result<Vec<Op>> { let f = |(a, b): (i64, i64)| a + b; let _ = f; Ok(vec![]) }",
@@ -405,16 +404,8 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 
 #[test]
 fn bails_on_array_initializers_and_comparators_with_positions() {
-    for (handler, name) in [
-        (
-            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let values = std::array::from_fn(|_| 1); Ok(vec![]) }",
-            "from_fn",
-        ),
-        (
-            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let mut values = vec![2, 1]; values.sort_by(|a, b| a.cmp(b)); Ok(vec![]) }",
-            "sort_by",
-        ),
-    ] {
+    {
+        let handler = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let values = std::array::from_fn(|_| 1); Ok(vec![]) }";
         let error =
             compile(&source(handler), &options("handler", EntryKind::Service))
                 .expect_err("bail");
@@ -426,7 +417,7 @@ fn bails_on_array_initializers_and_comparators_with_positions() {
             )),
             "{error:?}"
         );
-        assert!(error.message.contains(name), "{}", error.message);
+        assert!(error.message.contains("from_fn"), "{}", error.message);
     }
 }
 
