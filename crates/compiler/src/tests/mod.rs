@@ -2,12 +2,14 @@ use crate::{EntryKind, Module, NativeMode, Options, compile};
 mod calls;
 mod constants;
 mod expressions;
+mod files;
 mod inline;
 mod macros;
 mod methods;
 mod native;
 mod ops;
 mod statements;
+mod strict;
 mod types;
 
 fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
@@ -21,6 +23,7 @@ fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         module: "main",
         modules: &[],
         native: NativeMode::Deny,
+        strict: None,
     }
 }
 
@@ -45,6 +48,26 @@ fn module_options<'a>(
         module: "main",
         modules,
         native: NativeMode::Deny,
+        strict: None,
+    }
+}
+
+fn strict_options<'a>(
+    handler: &'a str,
+    kind: EntryKind,
+    strict: crate::StrictOptions<'a>,
+) -> Options<'a> {
+    Options {
+        handler,
+        entry: "widget",
+        state_key: "hello.state",
+        kind,
+        strings: &["message", "name"],
+        settings: &["message", "name"],
+        module: "main",
+        modules: &[],
+        native: NativeMode::Deny,
+        strict: Some(strict),
     }
 }
 
@@ -59,6 +82,7 @@ fn native_options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
         module: "main",
         modules: &[],
         native: NativeMode::Allow,
+        strict: None,
     }
 }
 
@@ -66,7 +90,7 @@ const NATIVE_HELPER: &str = r#"
 use noctalia_rs::{Context, Op, Result};
 
 fn load_rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -91,5 +115,6 @@ fn native_options_with<'a>(
         module: "main",
         modules,
         native: NativeMode::Allow,
+        strict: None,
     }
 }

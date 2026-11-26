@@ -395,6 +395,7 @@ name = "noctalia-rs-build"
 version = "0.3.0"
 dependencies = [
  "noctalia-rs-compiler",
+ "serde_json",
  "syn 3.0.10",
  "toml",
 ]

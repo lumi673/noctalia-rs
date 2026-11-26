@@ -22,6 +22,7 @@ struct Unit {
     statics: HashMap<String, ItemStatic>,
     enums: HashMap<String, Vec<String>>,
     newtypes: BTreeSet<String>,
+    tuple_structs: HashMap<String, usize>,
     structs: HashMap<String, StructDef>,
     impls: HashMap<String, HashMap<String, ItemFn>>,
     constants: HashMap<String, Expr>,
@@ -37,6 +38,7 @@ impl Unit {
             statics: HashMap::new(),
             enums: HashMap::new(),
             newtypes: BTreeSet::new(),
+            tuple_structs: HashMap::new(),
             structs: HashMap::new(),
             impls: HashMap::new(),
             constants: HashMap::new(),
@@ -354,6 +356,17 @@ impl Program {
 }
 
 impl Program {
+    /// Whether any `impl` block in the crate defines `name`. A method whose
+    /// receiver type the compiler lost is only treated as a `std` call when the
+    /// crate could not have defined it.
+    pub(crate) fn defines_method(&self, name: &str) -> bool {
+        self.units.values().any(|unit| {
+            unit.impls
+                .values()
+                .any(|methods| methods.contains_key(name))
+        })
+    }
+
     pub(crate) fn resolve_method(
         &self,
         module: &str,
@@ -524,6 +537,12 @@ fn collect(
                     && fields.unnamed.len() == 1
                 {
                     unit.newtypes.insert(item_struct.ident.to_string());
+                } else if let syn::Fields::Unnamed(fields) = &item_struct.fields
+                {
+                    unit.tuple_structs.insert(
+                        item_struct.ident.to_string(),
+                        fields.unnamed.len(),
+                    );
                 }
             }
             Item::Enum(item_enum) => {
@@ -706,6 +725,21 @@ impl Program {
             found = Some(value);
         }
         found
+    }
+
+    pub(crate) fn tuple_struct_len(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Option<usize> {
+        self.units
+            .get(module)
+            .and_then(|unit| unit.tuple_structs.get(name).copied())
+            .or_else(|| {
+                self.units
+                    .values()
+                    .find_map(|unit| unit.tuple_structs.get(name).copied())
+            })
     }
 
     pub(crate) fn is_newtype(&self, module: &str, name: &str) -> bool {

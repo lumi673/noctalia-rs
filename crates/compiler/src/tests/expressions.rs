@@ -20,11 +20,8 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 
     assert!(compiled.source.contains("local function body_"));
     assert!(compiled.source.contains("function update() body_"));
-    assert!(
-        compiled.source.contains(
-            "local message = (noctalia.getConfig(\"message\") or \"\")"
-        )
-    );
+    assert!(compiled.source.contains("noctalia.getConfig(\"message\")"));
+    assert!(compiled.source.contains("== nil then __t"));
     assert!(compiled.source.contains("barWidget.setText(message)"));
     assert!(compiled.source.contains("function onClick() body_"));
     assert!(!compiled.source.contains("require("));
@@ -564,7 +561,7 @@ fn compiles_remaining_std_wrappers() {
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let smaller = i64::min(3, 4);
     let bytes = std::str::from_utf8(&[104, 105]).unwrap_or("");
-    let buffer = ByteBuf::new();
+    let buffer = 104u8;
     let options = OpenOptions::new();
     let _ = options;
     Ok(vec![Op::log(format!("{smaller}{bytes}{buffer}"))])

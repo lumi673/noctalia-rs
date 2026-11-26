@@ -83,7 +83,8 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(compiled.source.contains("local first, second ="));
     assert!(compiled.source.contains("local value = __t"));
-    assert!(compiled.source.contains("value ~= nil"));
+    assert!(!compiled.source.contains("if __static"));
+    assert!(compiled.source.contains("if (((value ~= nil)))"));
     assert!(!compiled.source.contains("if __static"));
 }
 

@@ -166,7 +166,7 @@ fn luau_attribute_turns_a_split_into_a_fatal_error() {
     let handler = r#"
 #[luau]
 fn load_rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -192,7 +192,7 @@ struct Store {
 }
 impl Store {
     fn load_rows(&self) -> Result<Vec<String>> {
-        let text = std::fs::read_to_string("/tmp/rows")?;
+        let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
         Ok(vec![text])
     }
 }
@@ -219,7 +219,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 fn native_calls_inside_closures_are_rejected() {
     let handler = r#"
 fn load_rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -244,7 +244,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 fn a_native_function_is_emitted_once_per_script() {
     let handler = r#"
 fn load_rows() -> Result<Vec<String>> {
-    let text = std::fs::read_to_string("/tmp/rows")?;
+    let text = std::fs::read_link("/tmp/rows")?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -281,7 +281,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn native_reference_parameters_receive_owned_values() {
     let handler = r#"
 fn parse(path: &str, items: &[String]) -> Result<Vec<String>> {
-    let text = std::fs::read_to_string(path)?;
+    let text = std::fs::read_link(path)?.to_string_lossy().into_owned();
     Ok(vec![format!("{text}{}", items.len())])
 }
 
@@ -311,7 +311,7 @@ fn native_mutable_and_nested_reference_parameters_are_rejected() {
     let mutable = r#"
 fn parse(path: &mut String) -> Result<Vec<String>> {
     path.push('x');
-    let text = std::fs::read_to_string(path)?;
+    let text = std::fs::read_link(path)?.to_string_lossy().into_owned();
     Ok(vec![text])
 }
 
@@ -332,7 +332,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 fn native_reference_returns_are_serialized() {
     let handler = r#"
 fn label() -> Result<&'static str> {
-    let text = std::fs::read_to_string("/tmp/x")?;
+    let text = std::fs::read_link("/tmp/x")?.to_string_lossy().into_owned();
     let _ = text;
     Ok("ready")
 }
@@ -355,7 +355,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 fn native_functions_can_take_the_handler_context() {
     let handler = r#"
 fn describe(ctx: &Context) -> Result<String> {
-    let text = std::fs::read_to_string("/tmp/x")?;
+    let text = std::fs::read_link("/tmp/x")?.to_string_lossy().into_owned();
     Ok(format!("{}:{}", ctx.event, text))
 }
 
@@ -416,12 +416,12 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn native_optional_references_use_owned_optionals() {
     let handler = r#"
 fn truthy(value: Option<&Value>) -> bool {
-    let _ = std::fs::read_to_string("/tmp/x");
+    let _ = std::fs::read_link("/tmp/x");
     value.is_some()
 }
 
 fn text(value: Option<&str>) -> String {
-    let _ = std::fs::read_to_string("/tmp/x");
+    let _ = std::fs::read_link("/tmp/x");
     value.unwrap_or("").to_owned()
 }
 
@@ -464,7 +464,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 "#;
     let widget = r#"
 fn load() -> String {
-    let text = std::fs::read_to_string("/tmp/x").unwrap_or_default();
+    let text = std::fs::read_link("/tmp/x").map(|value| value.to_string_lossy().into_owned()).unwrap_or_default();
     text
 }
 "#;
@@ -516,7 +516,7 @@ fn a_luau_requirement_is_not_swallowed_by_an_outer_split() {
     let handler = r#"
 #[luau]
 fn inner() -> Result<String> {
-    let text = std::fs::read_to_string("/tmp/x")?;
+    let text = std::fs::read_link("/tmp/x")?.to_string_lossy().into_owned();
     Ok(text)
 }
 
@@ -542,7 +542,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 fn native_borrowed_container_and_path_parameters() {
     let handler = r#"
 fn summary(items: &Vec<String>, path: Option<&Path>, buf: Option<&PathBuf>) -> String {
-    let text = std::fs::read_to_string("/tmp/x").unwrap_or_default();
+    let text = std::fs::read_link("/tmp/x").map(|value| value.to_string_lossy().into_owned()).unwrap_or_default();
     format!("{}{}{}{}", items.len(), path.is_some(), buf.is_some(), text)
 }
 
@@ -568,7 +568,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 fn a_native_result_keeps_the_error_path_for_unwrap() {
     let handler = r#"
 fn label() -> Result<String> {
-    let text = std::fs::read_to_string("/tmp/x")?;
+    let text = std::fs::read_link("/tmp/x")?.to_string_lossy().into_owned();
     Ok(text)
 }
 

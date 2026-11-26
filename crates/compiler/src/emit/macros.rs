@@ -7,6 +7,8 @@ impl<'a> Emitter<'a> {
     ) -> Result<(String, Ty), Error> {
         match macro_name(mac).as_str() {
             "format" => self.format(mac),
+            "write" => self.write_macro(mac, false),
+            "writeln" => self.write_macro(mac, true),
             "matches" => self.matches_macro(mac),
             "json" => self.json(mac),
             "vec" => {
@@ -33,6 +35,16 @@ impl<'a> Emitter<'a> {
         mac: &ExprMacro,
     ) -> Result<(String, Ty), Error> {
         let parsed: FormatArgs = syn::parse2(mac.mac.tokens.clone())?;
+        let text = self.format_text(mac, &parsed)?;
+        Ok((text, Ty::STR))
+    }
+
+    /// The `format!` body, shared with `write!` and `writeln!`.
+    pub(crate) fn format_text(
+        &mut self,
+        mac: &ExprMacro,
+        parsed: &FormatArgs,
+    ) -> Result<String, Error> {
         let mut pieces = Vec::new();
         let mut text = String::new();
         let mut chars = parsed.literal.chars().peekable();
@@ -118,7 +130,7 @@ impl<'a> Emitter<'a> {
         if pieces.is_empty() {
             pieces.push("\"\"".to_owned());
         }
-        Ok((pieces.join(" .. "), Ty::STR))
+        Ok(pieces.join(" .. "))
     }
 
     pub(super) fn json(
@@ -135,152 +147,40 @@ impl<'a> Emitter<'a> {
     ) -> Result<(String, Ty), Error> {
         let parsed: MatchesArgs = syn::parse2(mac.mac.tokens.clone())?;
         self.record_pattern_events(&parsed.expr, &parsed.pat);
-        let (expr, _) = self.expr(&parsed.expr)?;
+        let (expr, ty) = self.expr(&parsed.expr)?;
         let Some(guard) = parsed.guard else {
-            let condition = self.pattern_condition(&expr, &parsed.pat)?;
+            let (condition, _) =
+                self.pattern_match(&expr, &parsed.pat, None)?;
             return Ok((format!("({condition})"), Ty::BOOL));
         };
         let value = self.temp();
+        let result = self.temp();
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        self.indent = 0;
         self.line(&format!("local {value} = {expr}"));
+        self.line(&format!("local {result} = false"));
         let (condition, bindings) =
             self.pattern_match(&value, &parsed.pat, None)?;
+        self.line(&format!("if {condition} then"));
+        self.indent = self.indent.saturating_add(1);
         self.scopes.push(HashMap::new());
         for (name, text) in bindings {
+            let binding = self.binding_ty(&parsed.pat, &name, ty);
             let lua = self.bind_name(&name);
             self.line(&format!("local {lua} = {text}"));
-            self.push(&name, Ty::VALUE);
+            self.push(&name, binding);
         }
-        let guard_result = self.expr(&guard);
+        let guard = self.expr(&guard);
         self.scopes.pop();
-        let (guard_text, _) = guard_result?;
-        Ok((format!("({condition} and {guard_text})"), Ty::BOOL))
-    }
-
-    fn pattern_condition(
-        &self,
-        value: &str,
-        pattern: &Pat,
-    ) -> Result<String, Error> {
-        match pattern {
-            Pat::Wild(_) => Ok("true".to_owned()),
-            Pat::Lit(lit) => {
-                let literal = Expr::Lit(lit.clone());
-                let (text, _) = constant(&literal).ok_or_else(|| {
-                    Error::at(lit.span(), "unsupported matches! literal")
-                })?;
-                Ok(format!("({value} == {text})"))
-            }
-            Pat::Or(or) => {
-                let mut parts = Vec::new();
-                for case in &or.cases {
-                    parts.push(self.pattern_condition(value, case)?);
-                }
-                Ok(format!("({})", parts.join(" or ")))
-            }
-            Pat::Paren(paren) => self.pattern_condition(value, &paren.pat),
-            Pat::Ident(pattern) => {
-                let name = pattern.ident.to_string();
-                match name.as_str() {
-                    "None" | "Null" => Ok(format!("({value} == nil)")),
-                    "Some" => Ok(format!("({value} ~= nil)")),
-                    _ => match self.pattern_constant(&name) {
-                        Some((text, _)) => Ok(format!("({value} == {text})")),
-                        None => Ok("true".to_owned()),
-                    },
-                }
-            }
-            Pat::Path(path) => {
-                let name = path
-                    .path
-                    .segments
-                    .last()
-                    .map(|segment| segment.ident.to_string())
-                    .unwrap_or_default();
-                match name.as_str() {
-                    "None" | "Null" => Ok(format!("({value} == nil)")),
-                    "Some" => Ok(format!("({value} ~= nil)")),
-                    _ => {
-                        let segments = path
-                            .path
-                            .segments
-                            .iter()
-                            .map(|segment| segment.ident.to_string())
-                            .collect::<Vec<_>>();
-                        if let Some(variant) =
-                            self.program.enum_variant(&self.module, &segments)
-                        {
-                            return Ok(format!(
-                                "({value} == {})",
-                                quote(&variant)
-                            ));
-                        }
-                        Err(Error::at(
-                            path.span(),
-                            format!(
-                                "matches! pattern `{name}` is not supported by the Luau compiler"
-                            ),
-                        ))
-                    }
-                }
-            }
-            Pat::TupleStruct(item) => {
-                let name = item
-                    .path
-                    .segments
-                    .last()
-                    .map(|segment| segment.ident.to_string())
-                    .unwrap_or_default();
-                match name.as_str() {
-                    "Some" => {
-                        let mut conditions = vec![format!("({value} ~= nil)")];
-                        let mut bindings = Vec::new();
-                        for inner in &item.elems {
-                            self.nested_pattern(
-                                value,
-                                inner,
-                                &mut conditions,
-                                &mut bindings,
-                            )?;
-                        }
-                        Ok(format!("({})", conditions.join(" and ")))
-                    }
-                    "Null" => Ok(format!("({value} == nil)")),
-                    "Bool" | "String" | "Number" | "Object" | "Array" => {
-                        let lua_type = match name.as_str() {
-                            "Bool" => "boolean",
-                            "String" => "string",
-                            "Number" => "number",
-                            _ => "table",
-                        };
-                        let mut conditions =
-                            vec![format!("(type({value}) == \"{lua_type}\")")];
-                        let mut bindings = Vec::new();
-                        for inner in &item.elems {
-                            self.nested_pattern(
-                                value,
-                                inner,
-                                &mut conditions,
-                                &mut bindings,
-                            )?;
-                        }
-                        Ok(format!("({})", conditions.join(" and ")))
-                    }
-                    _ => Err(Error::at(
-                        item.span(),
-                        format!(
-                            "matches! pattern `{name}` is not supported by the Luau compiler"
-                        ),
-                    )),
-                }
-            }
-            Pat::Struct(_) | Pat::Range(_) => self
-                .pattern_match(value, pattern, None)
-                .map(|(text, _)| text),
-            _ => Err(Error::at(
-                pattern.span(),
-                "matches! pattern is not supported by the Luau compiler",
-            )),
-        }
+        let (guard, _) = guard?;
+        self.line(&format!("{result} = ({guard})"));
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        self.line(&format!("return {result}"));
+        let body = std::mem::replace(&mut self.out, saved_out);
+        self.indent = saved_indent;
+        Ok((format!("(function()\n{body}end)()"), Ty::BOOL))
     }
 
     fn json_node(&mut self, node: &JsonNode) -> Result<(String, Ty), Error> {
@@ -297,7 +197,7 @@ impl<'a> Emitter<'a> {
                     }
                     parts.push(format!("{} = {text}", lua_key(key)));
                 }
-                Ok((format!("{{ {} }}", parts.join(", ")), Ty::TABLE))
+                Ok((format!("{{ {} }}", parts.join(", ")), Ty::VALUE))
             }
             JsonNode::Array(values) => {
                 let mut parts = Vec::new();
@@ -311,15 +211,22 @@ impl<'a> Emitter<'a> {
                     }
                     parts.push(text);
                 }
-                Ok((format!("{{ {} }}", parts.join(", ")), Ty::LIST))
+                if parts.is_empty() {
+                    return Ok((empty_array(), Ty::VALUE));
+                }
+                Ok((format!("{{ {} }}", parts.join(", ")), Ty::VALUE))
             }
             JsonNode::Expr(expr) => {
                 if let Expr::Path(path) = &**expr
                     && path.path.is_ident("null")
                 {
-                    return Ok(("nil".to_owned(), Ty::VALUE));
+                    return Ok(("nil".to_owned(), Ty::NULL));
                 }
-                self.expr(expr)
+                let (text, ty) = self.expr(expr)?;
+                if ty.is_numeric() {
+                    return Ok((text, ty));
+                }
+                Ok((text, Ty::VALUE))
             }
         }
     }
@@ -387,7 +294,7 @@ fn format_specifier(
     }
     format.push_str(rest);
     let conversion = match ty.base {
-        Base::Str => 's',
+        Base::Str | Base::Path => 's',
         Base::Int => 'd',
         Base::Float => {
             if rest.contains('.') {
@@ -397,11 +304,13 @@ fn format_specifier(
             }
         }
         Base::Bool | Base::Value | Base::List | Base::Table | Base::Node => 's',
-        Base::Ops | Base::Context | Base::Void => return Err(unsupported()),
+        Base::Info | Base::Ops | Base::Context | Base::Void => {
+            return Err(unsupported());
+        }
     };
     format.push(conversion);
     let value = match ty.base {
-        Base::Str | Base::Int | Base::Float => value,
+        Base::Str | Base::Path | Base::Int | Base::Float => value,
         _ => format!("tostring({value})"),
     };
     Ok(format!("string.format({}, {value})", quote(&format)))
@@ -410,6 +319,8 @@ fn format_specifier(
 fn format_piece(value: String, ty: Ty) -> String {
     if ty.is_string() || ty.is_numeric() {
         value
+    } else if ty.base == Base::Value {
+        format!("(json.encode({value}))")
     } else {
         format!("tostring({value})")
     }
@@ -541,4 +452,27 @@ impl JsonNode {
             Self::Expr(expr) => expr.span(),
         }
     }
+}
+
+/// The global name in a `json!` object's `onAction` field, when literal.
+pub(super) fn json_action_name(expr: &Expr) -> Option<String> {
+    let Expr::Macro(mac) = strip_reference(expr) else {
+        return None;
+    };
+    if macro_name(mac) != "json" {
+        return None;
+    }
+    let node: JsonNode = syn::parse2(mac.mac.tokens.clone()).ok()?;
+    let JsonNode::Object(entries) = node else {
+        return None;
+    };
+    entries.into_iter().find_map(|(key, value)| {
+        if key != "onAction" {
+            return None;
+        }
+        let JsonNode::Expr(expr) = value else {
+            return None;
+        };
+        literal_string(&expr)
+    })
 }

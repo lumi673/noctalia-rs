@@ -3,6 +3,11 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Base {
     Str,
+    /// A filesystem path. The value is a Luau string, and the base only selects
+    /// component-wise path semantics over string ones.
+    Path,
+    /// A `{ size, mtime, isDir }` table from `fileInfo`.
+    Info,
     Int,
     Float,
     Bool,
@@ -20,6 +25,10 @@ pub(crate) struct Ty {
     pub(crate) base: Base,
     pub(crate) optional: bool,
     pub(crate) result: bool,
+    /// The expression is a JSON null, which a Luau container cannot hold.
+    pub(crate) null: bool,
+    /// Element type of a list that is known, used by `next()`.
+    pub(crate) element: Option<Base>,
 }
 
 impl Ty {
@@ -28,6 +37,8 @@ impl Ty {
             base,
             optional: false,
             result: false,
+            null: false,
+            element: None,
         }
     }
 
@@ -36,6 +47,8 @@ impl Ty {
             base,
             optional: true,
             result: false,
+            null: false,
+            element: None,
         }
     }
 
@@ -44,10 +57,15 @@ impl Ty {
             base,
             optional: false,
             result: true,
+            null: false,
+            element: None,
         }
     }
 
     pub(crate) const STR: Self = Self::new(Base::Str);
+    pub(crate) const PATH: Self = Self::new(Base::Path);
+    pub(crate) const OPT_PATH: Self = Self::opt(Base::Path);
+    pub(crate) const INFO: Self = Self::new(Base::Info);
     pub(crate) const OPT_STR: Self = Self::opt(Base::Str);
     pub(crate) const INT: Self = Self::new(Base::Int);
     pub(crate) const OPT_INT: Self = Self::opt(Base::Int);
@@ -64,22 +82,45 @@ impl Ty {
     pub(crate) const OPS: Self = Self::new(Base::Ops);
     pub(crate) const CONTEXT: Self = Self::new(Base::Context);
     pub(crate) const VOID: Self = Self::new(Base::Void);
+    pub(crate) const NULL: Self = Self {
+        base: Base::Value,
+        optional: false,
+        result: false,
+        null: true,
+        element: None,
+    };
+    pub(crate) const LIST_OF_KEYS: Self = Self {
+        base: Base::List,
+        optional: false,
+        result: false,
+        null: false,
+        element: Some(Base::Str),
+    };
+    pub(crate) const STRING_LIST: Self = Self {
+        base: Base::List,
+        optional: false,
+        result: false,
+        null: false,
+        element: Some(Base::Str),
+    };
 
     pub(crate) const fn is_numeric(self) -> bool {
         matches!(self.base, Base::Int | Base::Float)
     }
 
+    /// Whether the value prints and behaves as text, which includes a path.
     pub(super) fn is_string(self) -> bool {
-        self.base == Base::Str
+        matches!(self.base, Base::Str | Base::Path)
     }
 
     pub(crate) const fn default_literal(self) -> Option<&'static str> {
         match self.base {
-            Base::Str => Some("\"\""),
+            Base::Str | Base::Path => Some("\"\""),
             Base::Int | Base::Float => Some("0"),
             Base::Bool => Some("false"),
             Base::List | Base::Table => Some("{}"),
-            Base::Value
+            Base::Info
+            | Base::Value
             | Base::Node
             | Base::Ops
             | Base::Context
@@ -267,12 +308,14 @@ pub(super) fn container_default(name: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn value_accessor(name: &str) -> Option<&'static str> {
+pub(super) fn value_accessor(name: &str) -> Option<(&'static str, Ty)> {
     match name {
-        "as_str" => Some("string"),
-        "as_bool" => Some("boolean"),
-        "as_i64" | "as_u64" | "as_f64" => Some("number"),
-        "as_array" | "as_object" => Some("table"),
+        "as_str" => Some(("string", Ty::OPT_STR)),
+        "as_bool" => Some(("boolean", Ty::OPT_BOOL)),
+        "as_i64" | "as_u64" => Some(("number", Ty::OPT_INT)),
+        "as_f64" => Some(("number", Ty::OPT_FLOAT)),
+        "as_array" => Some(("table", Ty::OPT_LIST)),
+        "as_object" => Some(("table", Ty::OPT_VALUE)),
         _ => None,
     }
 }
@@ -381,6 +424,9 @@ pub(super) fn type_hint(ty: &Type) -> Ty {
     }
     if text.contains("String") || text == "str" {
         Ty::STR
+    } else if matches!(text.as_str(), "Path" | "PathBuf" | "OsStr" | "OsString")
+    {
+        Ty::PATH
     } else if text == "bool" {
         Ty::BOOL
     } else if text.starts_with("Vec") || text.starts_with("Option<Vec") {

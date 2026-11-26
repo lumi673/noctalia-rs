@@ -404,6 +404,7 @@ fn compile_fixture(plan: &Plan, handler: &str) -> Result<String> {
             module: "main",
             modules: &[],
             native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
         },
     )
     .map_err(|error| format!("{}: {error}", plan.workload))?;
