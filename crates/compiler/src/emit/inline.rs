@@ -173,32 +173,29 @@ impl<'a> Emitter<'a> {
         if let Type::Reference(reference) = ty
             && reference.mutability.is_some()
         {
-            let base = type_text(ty);
-            if !matches!(
-                base.as_str(),
-                "String"
-                    | "str"
-                    | "Vec"
-                    | "HashMap"
-                    | "BTreeMap"
-                    | "Value"
-                    | "Op"
-                    | "Context"
-                    | "Path"
-                    | "PathBuf"
+            if matches!(
+                &*reference.elem,
+                Type::Reference(_)
+                    | Type::ImplTrait(_)
+                    | Type::TraitObject(_)
+                    | Type::Ptr(_)
             ) {
-                let (text, value) = self.expr(argument)?;
-                return Ok(Binding::Local {
-                    name,
-                    text,
-                    ty: value,
-                    container: StaticKind::Value,
-                });
+                return Err(Error::at(
+                    ty.span(),
+                    "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
+                ));
             }
-            return Err(Error::at(
-                ty.span(),
-                "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
-            ));
+            let (text, value) = self.expr(argument)?;
+            let target = mutable_lvalue(argument).then(|| text.clone());
+            let scalar = is_mut_scalar(&type_text(&reference.elem));
+            return Ok(Binding::Mut {
+                name,
+                text,
+                ty: value,
+                target,
+                scalar,
+                span: argument.span(),
+            });
         }
         let (text, value) = self.expr(argument)?;
         let kind = static_kind(ty);
@@ -350,6 +347,11 @@ impl<'a> Emitter<'a> {
         self.constant_scopes.push(scope);
         let saved_target = self.tail_target.clone();
         self.tail_target = if iife { None } else { temp.clone() };
+        let saved_value_helper = self.value_helper;
+        let assigned = assigned_params(&helper.function.block);
+        let body_start = self.out.len();
+        let mut write_backs = Vec::new();
+        let mut string_params = Vec::new();
         for binding in bindings {
             match binding {
                 Binding::Context(name) => self.push(&name, Ty::CONTEXT),
@@ -369,9 +371,34 @@ impl<'a> Emitter<'a> {
                     }
                     self.push(&name, ty);
                 }
+                Binding::Mut {
+                    name,
+                    text,
+                    ty,
+                    target,
+                    scalar,
+                    span,
+                } => {
+                    self.line(&format!("local {name} = {text}"));
+                    if scalar && ty.base == Base::Str {
+                        string_params.push(name.clone());
+                    }
+                    if scalar || assigned.contains(&name) {
+                        let target = target.ok_or_else(|| {
+                            Error::at(
+                                span,
+                                format!(
+                                    "cannot preserve `&mut` aliasing for the `{}` argument of `{}`",
+                                    name, helper.name
+                                ),
+                            )
+                        })?;
+                        write_backs.push((target, name.clone()));
+                    }
+                    self.push(&name, ty);
+                }
             }
         }
-        let saved_value_helper = self.value_helper;
         self.value_helper = mode == Inline::Value;
         let key = format!("{}::{}", helper.module, helper.name);
         self.inline_stack.push(key);
@@ -398,6 +425,17 @@ impl<'a> Emitter<'a> {
                 .ops_body(&helper.function.block)
                 .map(|()| (String::new(), Ty::VOID)),
         };
+        if !write_backs.is_empty() {
+            let body = self.out.split_off(body_start);
+            self.out.push_str(&copy_back_returns(
+                &body,
+                &write_backs,
+                &string_params,
+            ));
+            for (target, name) in &write_backs {
+                self.line(&format!("{target} = {name}"));
+            }
+        }
         self.inline_stack.pop();
         self.value_helper = saved_value_helper;
         self.self_class = saved_class;
@@ -496,6 +534,221 @@ pub(crate) enum Binding {
         ty: Ty,
         container: StaticKind,
     },
+    Mut {
+        name: String,
+        text: String,
+        ty: Ty,
+        target: Option<String>,
+        scalar: bool,
+        span: proc_macro2::Span,
+    },
+}
+
+fn is_mut_scalar(name: &str) -> bool {
+    matches!(
+        name,
+        "String"
+            | "str"
+            | "bool"
+            | "char"
+            | "Path"
+            | "PathBuf"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
+}
+
+fn mutable_lvalue(expr: &Expr) -> bool {
+    match strip_reference(expr) {
+        Expr::Path(_) => true,
+        Expr::Field(field) => mutable_lvalue(&field.base),
+        Expr::Index(index) => mutable_lvalue(&index.expr),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+            mutable_lvalue(&unary.expr)
+        }
+        Expr::Group(group) => mutable_lvalue(&group.expr),
+        Expr::Paren(paren) => mutable_lvalue(&paren.expr),
+        _ => false,
+    }
+}
+
+fn assigned_params(block: &syn::Block) -> std::collections::HashSet<String> {
+    fn collect(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::Assign(item) => {
+                target(&item.left, out);
+                collect(&item.right, out);
+            }
+            Expr::Closure(item) => collect(&item.body, out),
+            Expr::Block(item) => body(&item.block, out),
+            Expr::If(item) => {
+                collect(&item.cond, out);
+                body(&item.then_branch, out);
+                if let Some((_, branch)) = &item.else_branch {
+                    collect(branch, out);
+                }
+            }
+            Expr::Match(item) => {
+                collect(&item.expr, out);
+                for arm in &item.arms {
+                    collect(&arm.body, out);
+                }
+            }
+            Expr::ForLoop(item) => body(&item.body, out),
+            Expr::While(item) => body(&item.body, out),
+            Expr::Loop(item) => body(&item.body, out),
+            Expr::MethodCall(item) => {
+                collect(&item.receiver, out);
+                for argument in &item.args {
+                    collect(argument, out);
+                }
+            }
+            Expr::Call(item) => {
+                collect(&item.func, out);
+                for argument in &item.args {
+                    collect(argument, out);
+                }
+            }
+            Expr::Unary(item) => collect(&item.expr, out),
+            Expr::Binary(item) => {
+                collect(&item.left, out);
+                collect(&item.right, out);
+            }
+            Expr::Paren(item) => collect(&item.expr, out),
+            Expr::Group(item) => collect(&item.expr, out),
+            Expr::Reference(item) => collect(&item.expr, out),
+            Expr::Try(item) => collect(&item.expr, out),
+            Expr::Return(item) => {
+                if let Some(value) = &item.expr {
+                    collect(value, out);
+                }
+            }
+            Expr::Field(item) => collect(&item.base, out),
+            Expr::Index(item) => {
+                collect(&item.expr, out);
+                collect(&item.index, out);
+            }
+            Expr::Array(item) => {
+                for element in &item.elems {
+                    collect(element, out);
+                }
+            }
+            Expr::Tuple(item) => {
+                for element in &item.elems {
+                    collect(element, out);
+                }
+            }
+            Expr::Struct(item) => {
+                for field in &item.fields {
+                    collect(&field.expr, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn target(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match strip_reference(expr) {
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                target(&unary.expr, out);
+            }
+            Expr::Path(path) => {
+                if let Some(name) = path.path.get_ident() {
+                    out.insert(name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn body(block: &syn::Block, out: &mut std::collections::HashSet<String>) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Expr(expr, _) => collect(expr, out),
+                Stmt::Local(local) => {
+                    if let Some(init) = &local.init {
+                        collect(&init.expr, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = std::collections::HashSet::new();
+    body(block, &mut out);
+    out
+}
+
+fn copy_back_returns(
+    body: &str,
+    write_backs: &[(String, String)],
+    string_params: &[String],
+) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut blocks: Vec<bool> = Vec::new();
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = &line[..line.len() - trimmed.len()];
+        let newline = trimmed.ends_with('\n');
+        let content = trimmed.strip_suffix('\n').unwrap_or(trimmed);
+        if content.contains("function(") || content.contains("(function()") {
+            blocks.push(true);
+        } else if content == "do"
+            || content.ends_with(" then")
+            || content.ends_with(" do")
+        {
+            blocks.push(false);
+        }
+        let mut line = content.to_owned();
+        for name in string_params {
+            if let Some(value) = line
+                .strip_prefix(&format!("table.insert({name}, "))
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                line = format!("{name} = {name} .. ({value})");
+            } else if line == format!("table.clear({name})") {
+                line = format!("{name} = \"\"");
+            }
+        }
+        if !blocks.iter().any(|function| *function)
+            && trimmed.starts_with("return")
+            && !trimmed.strip_prefix("return").is_some_and(|rest| {
+                rest.starts_with(|c: char| {
+                    c.is_ascii_alphanumeric() || c == '_'
+                })
+            })
+        {
+            for (target, name) in write_backs {
+                out.push_str(indent);
+                out.push_str(target);
+                out.push_str(" = ");
+                out.push_str(name);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(&line);
+        if newline {
+            out.push('\n');
+        }
+        if content.starts_with("end") {
+            blocks.pop();
+        }
+    }
+    out
 }
 
 #[derive(Default)]

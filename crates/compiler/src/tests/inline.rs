@@ -276,14 +276,86 @@ fn compiles_closures_in_helpers() {
 }
 
 #[test]
-fn rejects_mut_borrows_that_cannot_be_inlined() {
+fn copies_back_mut_string_borrows() {
     let handler = r#"
 fn helper(word: &mut String) {
     word.push('x');
+    word.push_str("y");
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let mut word = String::new();
     helper(&mut word);
+    Ok(vec![Op::log(word)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("word = word .. (\"x\")"));
+    assert!(compiled.source.contains("word = word .. (\"y\")"));
+    assert!(compiled.source.contains("noctalia.log(word)"));
+}
+
+#[test]
+fn copies_back_mut_value_reassignment() {
+    let handler = r#"
+fn apply(value: &mut serde_json::Value, ok: bool) {
+    if !ok {
+        return;
+    }
+    *value = json!({ "ready": true });
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut value = json!({});
+    apply(&mut value, ctx.event == "render");
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("value = { ready = true }"));
+    assert!(compiled.source.contains("do\n"));
+}
+
+#[test]
+fn copies_back_mut_scalars_after_early_returns() {
+    let handler = r#"
+fn mark(flag: &mut bool, count: &mut i64, early: bool) {
+    if early {
+        *flag = true;
+        *count = 1;
+        return;
+    }
+    *flag = false;
+    *count = 0;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut flag = false;
+    let mut count = 0;
+    mark(&mut flag, &mut count, ctx.event == "render");
+    Ok(vec![Op::log(flag.to_string()), Op::log(count.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("flag = true\n"));
+    assert!(compiled.source.contains("count = 1\n"));
+    assert!(compiled.source.contains("flag = flag"));
+    assert!(compiled.source.contains("count = count"));
+}
+
+#[test]
+fn rejects_mut_borrows_that_cannot_be_inlined() {
+    let handler = r#"
+fn helper(word: &mut &mut String) {
+    **word = "x".to_owned();
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut word = String::new();
+    let mut reference = &mut word;
+    helper(&mut reference);
     Ok(vec![Op::log(word)])
 }
 "#;
