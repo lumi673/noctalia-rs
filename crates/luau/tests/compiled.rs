@@ -1256,6 +1256,83 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn chars_cursor_advances_once_after_next() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut iter = "é中ab".chars();
+    iter.next();
+    let skipped = iter.skip(1).as_str();
+    let mut taken_iter = "é中ab".chars();
+    taken_iter.next();
+    let taken = taken_iter.take(1).collect::<String>();
+    Ok(vec![Op::BarText { text: format!("{skipped}|{taken}") }])
+}
+"#;
+    let source = compiled_source("chars_cursor", handler, EntryKind::Widget);
+    let actual = ops(
+        "chars_cursor",
+        &source,
+        &context("chars_cursor", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "ab|中".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn local_names_shadow_ui_helpers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let callback = |value: &str| value.to_owned();
+    let call = |value: &str| value.to_owned();
+    let node = |value: &str| value.to_owned();
+    let button = |value: &str| value.to_owned();
+    Ok(vec![Op::BarText { text: format!(
+        "{}|{}|{}|{}",
+        callback("callback"), call("call"), node("node"), button("button")
+    ) }])
+}
+"#;
+    let source = compiled_source("locals", handler, EntryKind::Widget);
+    let actual = ops(
+        "locals",
+        &source,
+        &context("locals", "update", json!({}), json!({})),
+    );
+    let expected = duplicated(vec![Op::BarText {
+        text: "\"callback\"|\"call\"|\"node\"|\"button\"".to_owned(),
+    }]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn float_max_and_min_ignore_nan_like_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let larger = f64::max(f64::NAN, 2.0);
+    let smaller = f64::min(f64::NAN, 2.0);
+    let integer = i64::max(3, 4);
+    Ok(vec![Op::BarText { text: format!("{larger}|{smaller}|{integer}") }])
+}
+"#;
+    let source = compiled_source("nan", handler, EntryKind::Widget);
+    let actual = ops(
+        "nan",
+        &source,
+        &context("nan", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "2|2|4".to_owned()
+        }])
+    );
+}
+
+#[test]
 fn review_l1_stable_sort_matches_rust() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

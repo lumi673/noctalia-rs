@@ -116,7 +116,7 @@ impl<'a> Emitter<'a> {
                         "#__list".to_owned()
                     };
                     format!(
-                        "(function() local __list = {text}; local __out = {{}}; local __byte = __list.__byte_cursor or 1; for __i = 1, ({start}) - 1 do __byte = __byte + #(__list[__i] or \"\") end; for __i = {start}, {limit} do __out[#__out + 1] = __list[__i] end; __out.__noctalia_chars = true; __out.__next = 1; __out.__byte_cursor = 1; __out.__source = string.sub(__list.__source, __byte); return __out end)()"
+                        "(function() local __list = {text}; local __out = {{}}; local __byte = 1; for __i = 1, ({start}) - 1 do __byte = __byte + #(__list[__i] or \"\") end; for __i = {start}, {limit} do __out[#__out + 1] = __list[__i] end; __out.__noctalia_chars = true; __out.__next = 1; __out.__byte_cursor = 1; __out.__source = string.sub(__list.__source, __byte); return __out end)()"
                     )
                 };
                 let value = self.temp();
@@ -399,6 +399,16 @@ impl<'a> Emitter<'a> {
         let Some(name) = path_last_name(&call.func) else {
             return Ok(None);
         };
+        if !name.contains("::") {
+            let found = self.lookup(&name).is_some()
+                || self
+                    .program
+                    .resolve(&self.module, std::slice::from_ref(&name))
+                    .is_some();
+            if found {
+                return Ok(None);
+            }
+        }
         let args = call.args.iter().collect::<Vec<_>>();
         if matches!(
             name.as_str(),
@@ -495,10 +505,15 @@ impl<'a> Emitter<'a> {
             } else {
                 "min"
             };
-            return Ok(Some((
-                format!("math.{function}({left}, {right})"),
-                Ty::VALUE,
-            )));
+            let text = if name.starts_with("f64::") || name.starts_with("f32::")
+            {
+                format!(
+                    "(function() local __a, __b = {left}, {right}; if __a ~= __a then return __b end; if __b ~= __b then return __a end; return math.{function}(__a, __b) end)()"
+                )
+            } else {
+                format!("math.{function}({left}, {right})")
+            };
+            return Ok(Some((text, Ty::VALUE)));
         }
         Ok(None)
     }
