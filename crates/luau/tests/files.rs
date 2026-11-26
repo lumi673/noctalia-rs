@@ -100,6 +100,7 @@ fn run(handler: &str, dir: &Path) -> (String, Vec<Value>) {
             module: "main",
             modules: &[],
             native: NativeMode::Deny,
+            strict: None,
         },
     )
     .expect("compile")

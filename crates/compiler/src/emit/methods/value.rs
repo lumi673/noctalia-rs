@@ -10,17 +10,15 @@ impl<'a> Emitter<'a> {
         ty: Ty,
     ) -> Result<OptionalValue, Error> {
         let value: Result<(String, Ty), Error> = match method {
-            "to_string" if ty.base == Base::Value => {
-                Ok((format!("json.encode({receiver})"), Ty::STR))
+            "to_string"
+                if matches!(ty.base, Base::Value | Base::Int | Base::Float) =>
+            {
+                Ok((format!("(json.encode({receiver}))"), Ty::STR))
             }
             "as_object_mut" => {
-                self.uses_array_shape = true;
-                Ok((
-                    format!(
-                        "(type({receiver}) == \"table\" and not is_array({receiver}) and {receiver} or nil)"
-                    ),
-                    Ty::OPT_VALUE,
-                ))
+                let test =
+                    object_test(receiver, ty, &mut self.uses_array_shape);
+                Ok((test, Ty::OPT_VALUE))
             }
             "entry" => Err(Error::at(
                 call.method.span(),
@@ -37,6 +35,9 @@ impl<'a> Emitter<'a> {
                 Ok((number_check(receiver, ty), Ty::OPT_FLOAT))
             }
             "as_bool" => Ok((boolean_check(receiver, ty), Ty::OPT_BOOL)),
+            "as_array" | "as_array_mut" if ty.base == Base::List => {
+                Ok((receiver.to_owned(), Ty::OPT_LIST))
+            }
             "as_array" | "as_array_mut" => {
                 self.uses_array_shape = true;
                 Ok((
@@ -46,27 +47,31 @@ impl<'a> Emitter<'a> {
             }
             "is_null" => Ok((format!("({receiver} == nil)"), Ty::BOOL)),
             "as_object" => {
-                self.uses_array_shape = true;
-                Ok((
-                    format!(
-                        "(type({receiver}) == \"table\" and not is_array({receiver}) and {receiver} or nil)"
-                    ),
-                    Ty::OPT_VALUE,
-                ))
+                let test =
+                    object_test(receiver, ty, &mut self.uses_array_shape);
+                Ok((test, Ty::OPT_VALUE))
             }
-            "is_array" => {
-                self.uses_array_shape = true;
-                Ok((format!("is_array({receiver})"), Ty::BOOL))
-            }
-            "is_object" => {
-                self.uses_array_shape = true;
-                Ok((
-                    format!(
-                        "(type({receiver}) == \"table\" and not is_array({receiver}))"
-                    ),
-                    Ty::BOOL,
-                ))
-            }
+            "is_array" => match ty.base {
+                Base::List => Ok(("true".to_owned(), Ty::BOOL)),
+                Base::Table => Ok(("false".to_owned(), Ty::BOOL)),
+                _ => {
+                    self.uses_array_shape = true;
+                    Ok((format!("is_array({receiver})"), Ty::BOOL))
+                }
+            },
+            "is_object" => match ty.base {
+                Base::List => Ok(("false".to_owned(), Ty::BOOL)),
+                Base::Table => Ok(("true".to_owned(), Ty::BOOL)),
+                _ => {
+                    self.uses_array_shape = true;
+                    Ok((
+                        format!(
+                            "(type({receiver}) == \"table\" and not is_array({receiver}))"
+                        ),
+                        Ty::BOOL,
+                    ))
+                }
+            },
             "is_string" => {
                 Ok((format!("(type({receiver}) == \"string\")"), Ty::BOOL))
             }
@@ -114,12 +119,13 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("{target} = nil"));
                 Ok((value, Ty::new(ty.base)))
             }
-            "keys" => Ok((
-                format!(
-                    "(function() local __keys = {{}} for __key in pairs({receiver}) do __keys[#__keys + 1] = __key end return __keys end)()"
-                ),
-                Ty::LIST,
-            )),
+            "keys" => {
+                let keys = self.temp();
+                self.line(&format!(
+                    "local {keys} = (function() local __keys = {{}} for __key in pairs({receiver}) do __keys[#__keys + 1] = __key end table.sort(__keys, function(a, b) return tostring(a) < tostring(b) end) setmetatable(__keys, {{ {CURSOR_MARKER} = 0 }}) return __keys end)()"
+                ));
+                Ok((keys, Ty::STRING_LIST))
+            }
             _ => return Ok(None),
         };
         Ok(Some(value?))

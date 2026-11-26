@@ -29,7 +29,7 @@ fn update(ctx: &Context) -> Result<Vec<Op>> {
             .contains("type(row[\"value\"]) == \"number\"")
     );
     assert!(compiled.source.contains("row[\"value\"] % 1 == 0"));
-    assert!(compiled.source.contains(" or 0)"));
+    assert!(compiled.source.contains("== nil then __t"));
     assert!(compiled.source.contains("total += value"));
     assert!(compiled.source.contains("barWidget.setText(status)"));
 }
@@ -142,7 +142,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "noctalia.layer.configure(",
         "launcher.setResults(",
         "noctalia.removeFile(",
-        "host_call(\"noctalia\", { \"systemStats\" }, {})",
+        "host_call(\"noctalia\", { \"systemStats\" }, setmetatable({}, { __noctalia_array = true }))",
     ] {
         assert!(
             compiled.source.contains(needle),
@@ -439,9 +439,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled
-            .source
-            .contains("for name, value in pairs(__t1) do"),
+        compiled.source.contains("for __t3 = 1, #__t2 do"),
         "{}",
         compiled.source
     );
@@ -460,7 +458,12 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(values), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains("for _, value in pairs(__t1) do"),
+        compiled.source.contains("for __key in pairs(counts) do"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("table.sort(__keys"),
         "{}",
         compiled.source
     );

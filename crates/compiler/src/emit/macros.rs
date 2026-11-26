@@ -196,7 +196,7 @@ impl<'a> Emitter<'a> {
                     }
                     parts.push(format!("{} = {text}", lua_key(key)));
                 }
-                Ok((format!("{{ {} }}", parts.join(", ")), Ty::TABLE))
+                Ok((format!("{{ {} }}", parts.join(", ")), Ty::VALUE))
             }
             JsonNode::Array(values) => {
                 let mut parts = Vec::new();
@@ -210,15 +210,22 @@ impl<'a> Emitter<'a> {
                     }
                     parts.push(text);
                 }
-                Ok((format!("{{ {} }}", parts.join(", ")), Ty::LIST))
+                if parts.is_empty() {
+                    return Ok((empty_array(), Ty::VALUE));
+                }
+                Ok((format!("{{ {} }}", parts.join(", ")), Ty::VALUE))
             }
             JsonNode::Expr(expr) => {
                 if let Expr::Path(path) = &**expr
                     && path.path.is_ident("null")
                 {
-                    return Ok(("nil".to_owned(), Ty::VALUE));
+                    return Ok(("nil".to_owned(), Ty::NULL));
                 }
-                self.expr(expr)
+                let (text, ty) = self.expr(expr)?;
+                if ty.is_numeric() {
+                    return Ok((text, ty));
+                }
+                Ok((text, Ty::VALUE))
             }
         }
     }
@@ -311,6 +318,8 @@ fn format_specifier(
 fn format_piece(value: String, ty: Ty) -> String {
     if ty.is_string() || ty.is_numeric() {
         value
+    } else if ty.base == Base::Value {
+        format!("(json.encode({value}))")
     } else {
         format!("tostring({value})")
     }
@@ -442,4 +451,27 @@ impl JsonNode {
             Self::Expr(expr) => expr.span(),
         }
     }
+}
+
+/// The global name in a `json!` object's `onAction` field, when literal.
+pub(super) fn json_action_name(expr: &Expr) -> Option<String> {
+    let Expr::Macro(mac) = strip_reference(expr) else {
+        return None;
+    };
+    if macro_name(mac) != "json" {
+        return None;
+    }
+    let node: JsonNode = syn::parse2(mac.mac.tokens.clone()).ok()?;
+    let JsonNode::Object(entries) = node else {
+        return None;
+    };
+    entries.into_iter().find_map(|(key, value)| {
+        if key != "onAction" {
+            return None;
+        }
+        let JsonNode::Expr(expr) = value else {
+            return None;
+        };
+        literal_string(&expr)
+    })
 }

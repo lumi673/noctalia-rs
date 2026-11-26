@@ -6,19 +6,31 @@ impl<'a> Emitter<'a> {
         items: &[Expr],
     ) -> Result<(String, Ty), Error> {
         if items.is_empty() {
-            return Ok(("{}".to_owned(), Ty::LIST));
+            return Ok((empty_array(), Ty::LIST));
         }
         let mut values = Vec::new();
         for item in items {
-            let (text, _) = self.expr(item)?;
-            if !text.is_empty() {
-                values.push(text);
+            let (text, item_ty) = self.expr(item)?;
+            if text.is_empty() {
+                continue;
             }
+            reject_null(&text, item_ty, item.span(), "a list literal")?;
+            values.push(text);
         }
         Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
     }
 
     pub(super) fn expr(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
+        let result = self.expr_inner(expr);
+        if let Ok((text, ty)) = &result
+            && ty.null
+        {
+            self.null_texts.insert(text.clone());
+        }
+        result
+    }
+
+    fn expr_inner(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
         match expr {
             Expr::Lit(lit) => self.literal(lit),
             Expr::Path(path) => self.path(expr, path),
@@ -104,21 +116,35 @@ impl<'a> Emitter<'a> {
                 };
                 self.line(&format!("if {condition} then"));
                 self.indent = self.indent.saturating_add(1);
-                let (value, ty) = self.block_value(&item.then_branch)?;
-                self.line(&format!("{name} = {value}"));
+                let (value, then_ty) = self.block_value(&item.then_branch)?;
+                let mut result = then_ty;
+                if !value.is_empty() && then_ty.base != Base::Void {
+                    self.line(&format!("{name} = {value}"));
+                } else {
+                    result = Ty::VALUE;
+                }
                 self.indent = self.indent.saturating_sub(1);
                 if let Some((_, branch)) = &item.else_branch {
                     self.line("else");
                     self.indent = self.indent.saturating_add(1);
-                    let (value, _) = match &**branch {
+                    let (value, else_ty) = match &**branch {
                         Expr::Block(block) => self.block_value(&block.block)?,
                         other => self.expr(other)?,
                     };
-                    self.line(&format!("{name} = {value}"));
+                    result.null = then_ty.null || else_ty.null;
+                    if !value.is_empty() && else_ty.base != Base::Void {
+                        self.line(&format!("{name} = {value}"));
+                    } else {
+                        // A branch that produces nothing leaves nil.
+                        result = Ty::NULL;
+                    }
                     self.indent = self.indent.saturating_sub(1);
+                } else {
+                    // Without an else branch the false path leaves nil.
+                    result.null = true;
                 }
                 self.line("end");
-                Ok((name, ty))
+                Ok((name, result))
             }
             Expr::Array(array) => {
                 let mut values = Vec::new();
@@ -135,10 +161,15 @@ impl<'a> Emitter<'a> {
             }
             Expr::Tuple(tuple) => {
                 let mut values = Vec::new();
+                let mut types = Vec::new();
                 for element in &tuple.elems {
-                    values.push(self.expr(element)?.0);
+                    let (text, ty) = self.expr(element)?;
+                    types.push(TupleShape::Leaf(ty));
+                    values.push(text);
                 }
-                Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
+                let text = format!("{{ {} }}", values.join(", "));
+                self.tuple_expr_shapes.insert(text.clone(), types);
+                Ok((text, Ty::LIST))
             }
             other => Err(Error::at(
                 other.span(),
@@ -201,6 +232,7 @@ impl<'a> Emitter<'a> {
                 copied = Some(target);
             }
         }
+        let mut null_fields = BTreeSet::new();
         for field in &item.fields {
             let syn::Member::Named(name) = &field.member else {
                 return Err(Error::at(
@@ -208,7 +240,14 @@ impl<'a> Emitter<'a> {
                     "tuple structs are not supported by the Luau compiler",
                 ));
             };
-            let value = self.expr(&field.expr)?.0;
+            let (value, value_ty) = self.expr(&field.expr)?;
+            if let Some(shapes) = self.tuple_expr_shapes.get(&value).cloned() {
+                self.tuple_expr_shapes
+                    .insert(format!("{class}.{name}"), shapes);
+            }
+            if value_ty.null {
+                null_fields.insert(name.to_string());
+            }
             if let Some(target) = &copied {
                 self.line(&format!(
                     "{target}.{} = {value}",
@@ -219,6 +258,9 @@ impl<'a> Emitter<'a> {
             }
         }
         self.pending_class = Some(class);
+        if !null_fields.is_empty() {
+            self.pending_null_fields = Some(null_fields);
+        }
         if let Some(target) = copied {
             return Ok((target, Ty::VALUE));
         }
@@ -303,7 +345,7 @@ impl<'a> Emitter<'a> {
             && segments.last().is_some_and(|name| name == "Null")
             && segments.iter().any(|name| name == "Value")
         {
-            return Ok(("nil".to_owned(), Ty::VALUE));
+            return Ok(("nil".to_owned(), Ty::NULL));
         }
         if let Some(segments) = path_segments(&path.path)
             && let Some(variant) =
@@ -346,14 +388,14 @@ impl<'a> Emitter<'a> {
         }
         if let Some(segments) = path_segments(&path.path)
             && segments.iter().any(|name| name == "Value")
-            && let Some(lua_type) =
+            && let Some((lua_type, ty)) =
                 segments.last().and_then(|name| value_accessor(name))
         {
             return Ok((
                 format!(
                     "(function(__value) if type(__value) == \"{lua_type}\" then return __value end end)"
                 ),
-                Ty::VALUE,
+                ty,
             ));
         }
         if let Some(segments) = path_segments(&path.path) {
@@ -488,7 +530,7 @@ impl<'a> Emitter<'a> {
             return Ok((name, Ty::BOOL));
         }
         if name == "None" {
-            return Ok(("nil".to_owned(), Ty::VALUE));
+            return Ok(("nil".to_owned(), Ty::NULL));
         }
         if name == self.ctx {
             return Err(Error::at(
@@ -609,18 +651,41 @@ impl<'a> Emitter<'a> {
                     })
                 {
                     let args = call.args.iter().collect::<Vec<_>>();
-                    let (value, _) = self.expr(arg(&args, 0, call)?)?;
-                    return Ok((value, Ty::VALUE));
+                    let (value, value_ty) = self.expr(arg(&args, 0, call)?)?;
+                    self.newtype_types.insert(value.clone(), value_ty);
+                    return Ok((value, value_ty));
                 }
-                let (base, _) = self.expr(&field.base)?;
+                let (base, base_ty) = self.expr(&field.base)?;
                 if index.index == 0
-                    && self.class_of_receiver(&field.base).is_some_and(
+                    && (self.class_of_receiver(&field.base).is_some_and(
                         |class| self.program.is_newtype(&self.module, &class),
-                    )
+                    ) || self.newtype_types.contains_key(&base))
                 {
-                    return Ok((base, Ty::VALUE));
+                    let ty = path_ident(strip_reference(&field.base))
+                        .and_then(|name| self.newtype_types.get(&name).copied())
+                        .or_else(|| self.newtype_types.get(&base).copied())
+                        .unwrap_or(base_ty);
+                    self.newtype_types.insert(base.clone(), ty);
+                    return Ok((base, ty));
                 }
-                return Ok((format!("{base}[{}]", index.index + 1), Ty::VALUE));
+                let key = self
+                    .tuple_expr_text
+                    .get(&base)
+                    .cloned()
+                    .unwrap_or_else(|| base.clone());
+                let ty = self
+                    .tuple_expr_shapes
+                    .get(&key)
+                    .and_then(|shapes| shapes.get(index.index as usize))
+                    .map(|shape| match shape {
+                        TupleShape::Leaf(ty) => *ty,
+                        TupleShape::Tuple(parts) => Ty {
+                            null: parts.iter().any(TupleShape::any_null),
+                            ..Ty::VALUE
+                        },
+                    })
+                    .unwrap_or(Ty::VALUE);
+                return Ok((format!("{base}[{}]", index.index + 1), ty));
             }
         };
         if self.is_ctx_expr(&field.base) {
@@ -651,7 +716,13 @@ impl<'a> Emitter<'a> {
                         .to_owned(),
                     Ty::PATH,
                 )),
-                "config" => Ok(("noctalia".to_owned(), Ty::VALUE)),
+                "config" => {
+                    if self.strict() {
+                        self.uses_config_table = true;
+                        return Ok(("CONFIG".to_owned(), Ty::VALUE));
+                    }
+                    Ok(("noctalia".to_owned(), Ty::VALUE))
+                }
                 other => Err(Error::at(
                     field.member.span(),
                     format!(
@@ -669,14 +740,51 @@ impl<'a> Emitter<'a> {
                 _ => (format!("{base}[{}]", quote(&member)), Ty::OPT_VALUE),
             });
         }
-        Ok((
-            if is_identifier(&member) {
-                format!("{base}.{member}")
-            } else {
-                format!("{base}[{}]", quote(&member))
-            },
-            Ty::OPT_VALUE,
-        ))
+        let class = self.class_of_receiver(&field.base);
+        let declared = class
+            .as_deref()
+            .and_then(|class| self.program.struct_def(&self.module, class))
+            .and_then(|def| {
+                def.fields
+                    .iter()
+                    .find(|(name, _)| name == &member)
+                    .map(|(_, ty)| ty.clone())
+            });
+        let field_ty = class
+            .as_deref()
+            .and_then(|class| self.program.struct_def(&self.module, class))
+            .and_then(|def| {
+                def.fields
+                    .iter()
+                    .find(|(name, _)| name == &member)
+                    .map(|(_, ty)| type_hint(ty))
+            })
+            .unwrap_or(Ty::OPT_VALUE);
+        let text = if is_identifier(&member) {
+            format!("{base}.{member}")
+        } else {
+            format!("{base}[{}]", quote(&member))
+        };
+        let mut field_ty = field_ty;
+        if let Some(shapes) = self.tuple_expr_shapes.get(&text).cloned() {
+            self.last_tuple_shape = Some(shapes);
+        } else if let Some(Type::Tuple(items)) = declared.as_ref()
+            && items.elems.iter().any(|item| {
+                matches!(item, Type::Path(path)
+                    if path.path.segments.last().is_some_and(|s| s.ident == "Value"))
+            })
+        {
+            self.unknown_value_tuple = true;
+        }
+        if let Some(name) = path_ident(strip_reference(&field.base))
+            && self
+                .null_fields
+                .get(&name)
+                .is_some_and(|nulls| nulls.contains(&member))
+        {
+            field_ty.null = true;
+        }
+        Ok((text, field_ty))
     }
 
     pub(super) fn index(
@@ -859,6 +967,7 @@ impl<'a> Emitter<'a> {
         &mut self,
         pattern: &Pat,
         value: &str,
+        ty: Option<Ty>,
     ) -> Result<(), Error> {
         match pattern {
             Pat::Ident(pattern) => {
@@ -870,20 +979,32 @@ impl<'a> Emitter<'a> {
                     ));
                 }
                 self.line(&format!("local {name} = {value}"));
-                self.push(&name, Ty::VALUE);
+                self.push(&name, ty.unwrap_or(Ty::VALUE));
                 Ok(())
             }
             Pat::Wild(_) => Ok(()),
             Pat::Reference(reference) => {
-                self.bind_closure_pattern(&reference.pat, value)
+                self.bind_closure_pattern(&reference.pat, value, ty)
             }
-            Pat::Paren(paren) => self.bind_closure_pattern(&paren.pat, value),
-            Pat::Type(typed) => self.bind_closure_pattern(&typed.pat, value),
+            Pat::Paren(paren) => {
+                self.bind_closure_pattern(&paren.pat, value, ty)
+            }
+            Pat::Type(typed) => {
+                self.bind_closure_pattern(&typed.pat, value, ty)
+            }
             Pat::Tuple(tuple) => {
                 for (index, element) in tuple.elems.iter().enumerate() {
+                    let item = ty.map(|outer| {
+                        if outer.element == Some(Base::Str) {
+                            if index == 0 { Ty::STR } else { Ty::VALUE }
+                        } else {
+                            outer
+                        }
+                    });
                     self.bind_closure_pattern(
                         element,
                         &format!("{value}[{}]", index + 1),
+                        item,
                     )?;
                 }
                 Ok(())
@@ -900,6 +1021,15 @@ impl<'a> Emitter<'a> {
         closure: &syn::ExprClosure,
         args: &[String],
     ) -> Result<(String, Ty), Error> {
+        self.closure_value_typed(closure, args, &[])
+    }
+
+    pub(super) fn closure_value_typed(
+        &mut self,
+        closure: &syn::ExprClosure,
+        args: &[String],
+        types: &[Option<Ty>],
+    ) -> Result<(String, Ty), Error> {
         if closure.inputs.len() != args.len() {
             return Err(Error::at(
                 closure.span(),
@@ -912,12 +1042,17 @@ impl<'a> Emitter<'a> {
         }
         self.scopes.push(HashMap::new());
         self.local_statics.push(HashMap::new());
-        for (input, value) in closure.inputs.iter().zip(args) {
+        for ((input, value), ty) in closure
+            .inputs
+            .iter()
+            .zip(args)
+            .zip(types.iter().copied().chain(std::iter::repeat(None)))
+        {
             let input = match input {
                 Pat::Type(typed) => &*typed.pat,
                 other => other,
             };
-            if let Err(error) = self.bind_closure_pattern(input, value) {
+            if let Err(error) = self.bind_closure_pattern(input, value, ty) {
                 self.local_statics.pop();
                 self.scopes.pop();
                 return Err(error);
@@ -934,7 +1069,7 @@ impl<'a> Emitter<'a> {
                         _ => Ok(("nil".to_owned(), Ty::VALUE)),
                     }
                 }
-                None => Ok(("nil".to_owned(), Ty::VALUE)),
+                None => Ok(("nil".to_owned(), Ty::NULL)),
             },
             body => self.value_or_statement(body),
         };
@@ -1062,13 +1197,16 @@ fn numeric(left: &Ty, right: &Ty) -> Ty {
 }
 
 pub(super) fn wider(left: Ty, right: Ty) -> Ty {
-    if left.base == right.base {
+    let null = left.null || right.null;
+    let mut ty = if left.base == right.base {
         left
     } else if left.is_numeric() && right.is_numeric() {
         Ty::FLOAT
     } else {
         Ty::VALUE
-    }
+    };
+    ty.null = null;
+    ty
 }
 
 pub(super) fn path_last_name(expr: &Expr) -> Option<String> {
@@ -1126,7 +1264,13 @@ pub(super) fn is_vec_new(call: &ExprCall) -> bool {
 
 pub(super) fn multi_return(expr: &Expr) -> bool {
     match expr {
-        Expr::MethodCall(call) => call.method.to_string().ends_with("_result"),
+        Expr::MethodCall(call) => {
+            call.method.to_string().ends_with("_result")
+                || matches!(
+                    call.method.to_string().as_str(),
+                    "query_pair" | "query_response"
+                )
+        }
         Expr::Call(call) => path_last_name(&call.func)
             .is_some_and(|name| name.ends_with("_result")),
         _ => false,

@@ -48,6 +48,7 @@ fn compile_kind(entry: &str, kind: EntryKind, handler: &str) -> String {
             module: "main",
             modules: &[],
             native: NativeMode::Allow,
+            strict: None,
         },
     )
     .expect("compile")

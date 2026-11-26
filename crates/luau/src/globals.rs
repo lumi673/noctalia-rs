@@ -112,8 +112,38 @@ struct Runtime<'a> {
 impl Runtime<'_> {
     fn json_args(&self, args: Vec<LuaValue>) -> LuaResult<Vec<JsonValue>> {
         args.into_iter()
-            .map(|value| host_converter(self.lua, self.host).to_json(value))
+            .map(|value| {
+                self.reject_markers(&value, 0)?;
+                host_converter(self.lua, self.host).to_json(value)
+            })
             .collect()
+    }
+
+    /// Fails a strict call that carries a bridge marker table.
+    ///
+    /// Plugin API 57 takes a function for a callback, so a strict entry must
+    /// pass a closure. A table with `__host_callback` or `__call` is the
+    /// compiler's bridge form, which strict emit does not produce.
+    fn reject_markers(&self, value: &LuaValue, depth: usize) -> LuaResult<()> {
+        const MAX_DEPTH: usize = 32;
+        if !self.host.strict() || depth > MAX_DEPTH {
+            return Ok(());
+        }
+        let LuaValue::Table(table) = value else {
+            return Ok(());
+        };
+        for key in ["__host_callback", "__call"] {
+            if let LuaValue::String(_) = table.raw_get::<LuaValue>(key)? {
+                return Err(mlua::Error::runtime(format!(
+                    "plugin API 57 takes a function here; strict emit passed the `{key}` marker table"
+                )));
+            }
+        }
+        for pair in table.clone().pairs::<LuaValue, LuaValue>() {
+            let (_, item) = pair?;
+            self.reject_markers(&item, depth + 1)?;
+        }
+        Ok(())
     }
 
     #[expect(
@@ -126,6 +156,12 @@ impl Runtime<'_> {
         path: &[&str],
         args: Vec<JsonValue>,
     ) -> LuaResult<MultiValue> {
+        if self.host.strict()
+            && self.host.query_dir().is_none()
+            && let Some(result) = self.strict_response(root, path, &args)?
+        {
+            return Ok(result);
+        }
         if self.host.query_dir().is_none() {
             return Ok(MultiValue::from_vec(vec![LuaValue::Nil]));
         }
@@ -156,6 +192,94 @@ impl Runtime<'_> {
         Ok(MultiValue::from_vec(result))
     }
 
+    /// Serves `readFile` and `removeFile` from the strict response registry.
+    ///
+    /// A strict entry has no helper and no response files. A query result is
+    /// stored by path when the entry writes it, so the read that follows finds
+    /// the same text the bridge would have written. A path that is not in the
+    /// registry falls through to the host.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one call carries the full query envelope"
+    )]
+    fn strict_response(
+        &self,
+        root: &str,
+        path: &[&str],
+        args: &[JsonValue],
+    ) -> LuaResult<Option<MultiValue>> {
+        if root != "noctalia" || path.len() != 1 {
+            return Ok(None);
+        }
+        let name = path.first().copied().unwrap_or_default();
+        let string_at = |index: usize| {
+            args.get(index)
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        };
+        let pair = |ok: bool| {
+            Some(MultiValue::from_vec(vec![
+                LuaValue::Boolean(ok),
+                LuaValue::Nil,
+            ]))
+        };
+        match name {
+            "writeFile" => {
+                let (Some(target), Some(body)) = (string_at(0), string_at(1))
+                else {
+                    return Ok(None);
+                };
+                self.host.store_response(&target, body);
+                Ok(pair(true))
+            }
+            "readFile" => {
+                let Some(target) = string_at(0) else {
+                    return Ok(None);
+                };
+                let Some(body) = self.host.response(&target) else {
+                    return Ok(None);
+                };
+                Ok(Some(MultiValue::from_vec(vec![
+                    LuaValue::String(self.lua.create_string(body)?),
+                    LuaValue::Nil,
+                ])))
+            }
+            "removeFile" => {
+                let Some(target) = string_at(0) else {
+                    return Ok(None);
+                };
+                if !self.host.has_response(&target) {
+                    return Ok(None);
+                }
+                let _ = self.host.take_response(&target);
+                Ok(pair(true))
+            }
+            "renameFile" => {
+                let (Some(from), Some(to)) = (string_at(0), string_at(1))
+                else {
+                    return Ok(None);
+                };
+                let Some(body) = self.host.take_response(&from) else {
+                    return Ok(None);
+                };
+                self.host.store_response(&to, body);
+                Ok(pair(true))
+            }
+            "fileExists" => {
+                let Some(target) = string_at(0) else {
+                    return Ok(None);
+                };
+                if self.host.has_response(&target) {
+                    return Ok(Some(MultiValue::from_vec(vec![
+                        LuaValue::Boolean(true),
+                    ])));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "one call carries the full query envelope"
@@ -179,6 +303,7 @@ impl Runtime<'_> {
 
     fn json(&self, args: &[LuaValue], index: usize) -> LuaResult<JsonValue> {
         let value = args.get(index).cloned().unwrap_or(LuaValue::Nil);
+        self.reject_markers(&value, 0)?;
         host_converter(self.lua, self.host).to_json(value)
     }
 
@@ -191,6 +316,11 @@ impl Runtime<'_> {
             Some(value) if !matches!(value, LuaValue::Nil) => value.clone(),
             _ => return Ok(None),
         };
+        if self.host.strict() && !matches!(value, LuaValue::Function(_)) {
+            return Err(mlua::Error::runtime(
+                "plugin API 57 takes a function here; strict emit passed a table or a name",
+            ));
+        }
         let json = host_converter(self.lua, self.host).to_json(value)?;
         Ok(json
             .get("__host_callback")
@@ -250,6 +380,24 @@ fn bool_arg(args: &[LuaValue], index: usize, default: bool) -> bool {
     }
 }
 
+/// Whether a command can be handed to the host.
+///
+/// `runAsync` takes a string or an argv table, and `runStream` takes a
+/// command string. Anything else is not accepted, so the call reports false
+/// instead of starting a process it cannot describe.
+fn command_accepted(command: &JsonValue) -> bool {
+    match command {
+        JsonValue::String(value) => !value.is_empty(),
+        JsonValue::Array(values) => {
+            !values.is_empty()
+                && values.iter().all(|value| {
+                    value.as_str().is_some_and(|text| !text.is_empty())
+                })
+        }
+        _ => false,
+    }
+}
+
 fn json_arg(
     lua: &Lua,
     args: &[LuaValue],
@@ -288,6 +436,9 @@ fn to_json(
 
 fn ui_node(lua: &Lua, value: LuaValue) -> LuaResult<noctalia_rs::ui::UiNode> {
     let host = host(lua)?;
+    if host.strict() {
+        return host_converter(lua, &host).ui_node(value);
+    }
     call_converter(lua, &host).ui_node(value)
 }
 
@@ -609,6 +760,15 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let values = args.to_vec();
         let request = json_arg(lua, &values, 0)?;
         let callback = callback_marker(lua, &values, 1)?;
+        if host.strict()
+            && host
+                .snapshot
+                .setting("shell.offline_mode")
+                .as_bool()
+                .unwrap_or_default()
+        {
+            return Ok(LuaValue::Boolean(false));
+        }
         host.collector.emit(Op::http(request, callback.as_deref()));
         Ok(LuaValue::Boolean(true))
     })?;
@@ -655,6 +815,9 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         } else {
             lua.coerce_number(timeout).ok().flatten()
         };
+        if host.strict() && !command_accepted(&command) {
+            return Ok(LuaValue::Boolean(false));
+        }
         host.collector.emit(Op::run_with_timeout(
             command,
             callback.as_deref(),
@@ -667,6 +830,9 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
         let values = args.to_vec();
         let command = json_arg(lua, &values, 0)?;
         let id = callback_id(lua, &values, 1)?;
+        if host.strict() && !command_accepted(&command) {
+            return Ok(LuaValue::Boolean(false));
+        }
         host.collector.emit(Op::run_stream(command, &id));
         Ok(LuaValue::Boolean(true))
     })?;
