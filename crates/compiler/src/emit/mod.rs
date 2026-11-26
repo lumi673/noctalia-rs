@@ -421,7 +421,7 @@ pub(crate) fn empty_array() -> String {
 
 /// The shape of a tuple value, kept so nested destructuring can carry the
 /// nullness of an inner element through each step.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum TupleShape {
     Leaf(Ty),
     Tuple(Vec<TupleShape>),

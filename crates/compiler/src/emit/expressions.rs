@@ -171,8 +171,15 @@ impl<'a> Emitter<'a> {
                 self.push_scope();
                 self.local_statics.push(HashMap::new());
                 let result = self.block_expr(&block.block);
+                let chars = match &result {
+                    Ok((text, _)) => self.is_chars(text),
+                    Err(_) => false,
+                };
                 self.local_statics.pop();
                 self.pop_scope();
+                if chars && let Ok((text, _)) = &result {
+                    self.mark_chars(text);
+                }
                 result
             }
             Expr::Repeat(repeat) => {
@@ -244,6 +251,9 @@ impl<'a> Emitter<'a> {
                 self.indent = self.indent.saturating_add(1);
                 let (value, then_ty) = self.block_value(&item.then_branch)?;
                 let mut then_chars = self.is_chars(&value);
+                let mut then_shapes =
+                    self.tuple_expr_shapes.get(&value).cloned();
+                let mut then_types = self.tuple_types.get(&value).cloned();
                 let mut result = then_ty;
                 if !value.is_empty() && then_ty.base != Base::Void {
                     self.line(&format!("{name} = {value}"));
@@ -259,6 +269,13 @@ impl<'a> Emitter<'a> {
                         other => self.expr(other)?,
                     };
                     then_chars = then_chars && self.is_chars(&value);
+                    let else_shapes =
+                        self.tuple_expr_shapes.get(&value).cloned();
+                    let else_types = self.tuple_types.get(&value).cloned();
+                    if then_shapes != else_shapes || then_types != else_types {
+                        then_shapes = None;
+                        then_types = None;
+                    }
                     result.null = then_ty.null || else_ty.null;
                     if !value.is_empty() && else_ty.base != Base::Void {
                         self.line(&format!("{name} = {value}"));
@@ -270,6 +287,10 @@ impl<'a> Emitter<'a> {
                 } else {
                     then_chars = false;
                     result.null = true;
+                }
+                if let (Some(shapes), Some(types)) = (then_shapes, then_types) {
+                    self.tuple_expr_shapes.insert(name.clone(), shapes);
+                    self.tuple_types.insert(name.clone(), types);
                 }
                 if then_chars {
                     self.mark_chars(&name);

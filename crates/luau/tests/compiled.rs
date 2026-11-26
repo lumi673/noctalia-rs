@@ -1572,6 +1572,39 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn review_rr_runtime_if_shapes_and_block_iterators() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = ctx.event == "never";
+    let (a, b) = if flag {
+        (5, 2)
+    } else {
+        (9, 3)
+    };
+    let ratio = a / b;
+    let rest = {
+        let mut iter = "ab".chars();
+        iter.next();
+        iter
+    }.collect::<String>();
+    Ok(vec![Op::BarText { text: format!("{ratio}|{rest}") }])
+}
+"#;
+    let source = compiled_source("rr", handler, EntryKind::Widget);
+    let actual = ops(
+        "rr",
+        &source,
+        &context("rr", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "3|b".to_owned()
+        }])
+    );
+}
+
+#[test]
 fn review_l1_stable_sort_matches_rust() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

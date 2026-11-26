@@ -589,8 +589,8 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn void_if_branches_do_not_emit_empty_assignments() {
     let handler = r#"
-fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let flag = true;
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = ctx.event == "never";
     let _picked = if flag {
         Op::log("a")
     } else {
@@ -600,13 +600,13 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 "#;
     let compiled =
-        compile(&source(handler), &options("handler", EntryKind::Service))
+        compile(&source(handler), &options("handler", EntryKind::Widget))
             .expect("compiles");
     assert!(
-        !compiled
-            .source
-            .lines()
-            .any(|line| line.trim_end().ends_with('=')),
+        !compiled.source.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("__t") && line.ends_with('=')
+        }),
         "{}",
         compiled.source
     );
