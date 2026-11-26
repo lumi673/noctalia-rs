@@ -320,7 +320,8 @@ impl<'a> Emitter<'a> {
                     values.push(text);
                 }
                 let text = format!("{{ {} }}", values.join(", "));
-                self.tuple_expr_shapes.insert(text.clone(), types);
+                self.tuple_expr_shapes.insert(text.clone(), types.clone());
+                self.tuple_types.insert(text.clone(), types);
                 Ok((text, Ty::LIST))
             }
             other => Err(Error::at(

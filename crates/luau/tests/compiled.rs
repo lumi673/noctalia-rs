@@ -1579,7 +1579,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let (a, b) = if flag {
         (5, 2)
     } else {
-        (9, 3)
+        (7, 3)
     };
     let ratio = a / b;
     let rest = {
@@ -1599,7 +1599,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert_eq!(
         actual,
         duplicated(vec![Op::BarText {
-            text: "3|b".to_owned()
+            text: "2|b".to_owned()
         }])
     );
 }
