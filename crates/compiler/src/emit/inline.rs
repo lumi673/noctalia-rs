@@ -138,6 +138,7 @@ impl<'a> Emitter<'a> {
             ));
         };
         let name = pattern.ident.to_string();
+        super::methods::record_param_width(&name, ty);
         if is_context(ty) {
             if !self.is_ctx_expr(strip_reference(argument)) {
                 return Err(Error::at(

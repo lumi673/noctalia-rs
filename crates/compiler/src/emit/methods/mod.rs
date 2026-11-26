@@ -26,6 +26,8 @@ mod path;
 mod string;
 mod value;
 
+pub(crate) use number::record_param_width;
+
 impl<'a> Emitter<'a> {
     fn static_receiver(
         &mut self,

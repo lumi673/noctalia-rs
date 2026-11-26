@@ -421,6 +421,27 @@ fn has_large_literal(expr: &Expr) -> bool {
     }
 }
 
+type Width = (usize, bool);
+type Pos = (usize, usize);
+type ShapeCandidate = (Pos, Pos, Width);
+
+thread_local! {
+    static PARAM_WIDTHS: std::cell::RefCell<std::collections::HashMap<String, Width>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub(crate) fn record_param_width(name: &str, ty: &syn::Type) {
+    if let Some(shape) = shape_from_type(ty) {
+        PARAM_WIDTHS.with(|slot| {
+            slot.borrow_mut().insert(name.to_owned(), shape);
+        });
+    }
+}
+
+fn param_width(name: &str) -> Option<(usize, bool)> {
+    PARAM_WIDTHS.with(|slot| slot.borrow().get(name).copied())
+}
+
 fn shape_from_type(ty: &syn::Type) -> Option<(usize, bool)> {
     match type_text(ty).as_str() {
         "i8" => Some((8, true)),
@@ -452,32 +473,6 @@ fn shape_in_expr(expr: &Expr) -> Option<(usize, bool)> {
     int_literal(expr).map(|(_, bits, signed)| (bits, signed))
 }
 
-fn shape_in_block(block: &syn::Block, name: &str) -> Option<(usize, bool)> {
-    for statement in block.stmts.iter().rev() {
-        let syn::Stmt::Local(local) = statement else {
-            continue;
-        };
-        let (pattern, annotation) = match &local.pat {
-            syn::Pat::Type(typed) => (&*typed.pat, shape_from_type(&typed.ty)),
-            other => (other, None),
-        };
-        let syn::Pat::Ident(ident) = pattern else {
-            continue;
-        };
-        if ident.ident != name {
-            continue;
-        }
-        if let Some(shape) = annotation {
-            return Some(shape);
-        }
-        if let Some(init) = &local.init
-            && let Some(shape) = shape_in_expr(&init.expr)
-        {
-            return Some(shape);
-        }
-    }
-    None
-}
 fn shape_from_param(
     program: &Program,
     module: &str,
@@ -520,7 +515,105 @@ fn shape_from_binding(
     program: &Program,
     module: &str,
     name: &str,
+    call: (usize, usize),
 ) -> Option<(usize, bool)> {
+    fn inside(
+        start: (usize, usize),
+        end: (usize, usize),
+        at: (usize, usize),
+    ) -> bool {
+        start <= at && at <= end
+    }
+
+    fn collect(
+        block: &syn::Block,
+        name: &str,
+        call: (usize, usize),
+        found: &mut Vec<ShapeCandidate>,
+    ) {
+        let start = block.span().start();
+        let end = block.span().end();
+        let start = (start.line, start.column);
+        let end = (end.line, end.column);
+        if !inside(start, end, call) {
+            return;
+        }
+        for statement in &block.stmts {
+            if let syn::Stmt::Local(local) = statement {
+                let (pattern, annotation) = match &local.pat {
+                    syn::Pat::Type(typed) => {
+                        (&*typed.pat, shape_from_type(&typed.ty))
+                    }
+                    other => (other, None),
+                };
+                if let syn::Pat::Ident(ident) = pattern
+                    && ident.ident == name
+                {
+                    let at = local.span().start();
+                    let at = (at.line, at.column);
+                    let shape = annotation.or_else(|| {
+                        local
+                            .init
+                            .as_ref()
+                            .and_then(|init| shape_in_expr(&init.expr))
+                    });
+                    if at <= call
+                        && let Some(shape) = shape
+                    {
+                        found.push((start, at, shape));
+                    }
+                }
+            }
+            collect_from_statement(statement, name, call, found);
+        }
+    }
+
+    fn collect_from_statement(
+        statement: &syn::Stmt,
+        name: &str,
+        call: (usize, usize),
+        found: &mut Vec<ShapeCandidate>,
+    ) {
+        match statement {
+            syn::Stmt::Expr(expr, _) => {
+                collect_from_expr(expr, name, call, found)
+            }
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    collect_from_expr(&init.expr, name, call, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_from_expr(
+        expr: &Expr,
+        name: &str,
+        call: (usize, usize),
+        found: &mut Vec<ShapeCandidate>,
+    ) {
+        match expr {
+            Expr::Block(block) => collect(&block.block, name, call, found),
+            Expr::If(item) => {
+                collect(&item.then_branch, name, call, found);
+                if let Some((_, branch)) = &item.else_branch {
+                    collect_from_expr(branch, name, call, found);
+                }
+            }
+            Expr::Loop(item) => collect(&item.body, name, call, found),
+            Expr::While(item) => collect(&item.body, name, call, found),
+            Expr::ForLoop(item) => collect(&item.body, name, call, found),
+            Expr::Match(item) => {
+                for arm in &item.arms {
+                    collect_from_expr(&arm.body, name, call, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
     for candidate in [
         "handler",
         "widget",
@@ -533,13 +626,14 @@ fn shape_from_binding(
         "render",
         "update",
     ] {
-        if let Ok(resolved) = program.handler(module, candidate)
-            && let Some(shape) = shape_in_block(&resolved.function.block, name)
-        {
-            return Some(shape);
+        if let Ok(resolved) = program.handler(module, candidate) {
+            collect(&resolved.function.block, name, call, &mut found);
         }
     }
-    None
+    found
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+        .map(|(_, _, shape)| shape)
 }
 /// Exact `div_ceil` using 32-bit limbs. Double division cannot distinguish a
 /// rounded operand or quotient from an exact one above 2^53.
@@ -833,19 +927,23 @@ impl<'a> Emitter<'a> {
                             ),
                         ));
                     }
-                    let shape =
-                        match int_literal(&call.receiver)
-                            .map(|(_, bits, signed)| (bits, signed))
-                            .or_else(|| shape_in_expr(&call.receiver))
-                        {
-                            Some(shape) => shape,
-                            None => path_last_name(&call.receiver)
-                                .and_then(|name| {
-                                    shape_from_binding(
-                                        self.program,
-                                        &self.module,
-                                        &name,
-                                    )
+                    let shape = match int_literal(&call.receiver)
+                        .map(|(_, bits, signed)| (bits, signed))
+                        .or_else(|| shape_in_expr(&call.receiver))
+                    {
+                        Some(shape) => shape,
+                        None => path_last_name(&call.receiver)
+                            .and_then(|name| {
+                                param_width(&name)
+                                    .or_else(|| {
+                                        let at = call.method.span().start();
+                                        shape_from_binding(
+                                            self.program,
+                                            &self.module,
+                                            &name,
+                                            (at.line, at.column),
+                                        )
+                                    })
                                     .or_else(|| {
                                         shape_from_param(
                                             self.program,
@@ -854,9 +952,9 @@ impl<'a> Emitter<'a> {
                                             &name,
                                         )
                                     })
-                                })
-                                .unwrap_or_else(|| int_shape(&call.receiver)),
-                        };
+                            })
+                            .unwrap_or_else(|| int_shape(&call.receiver)),
+                    };
                     let (bits, signed) =
                         int_suffix_shape(argument).unwrap_or(shape);
                     let lhs = self.temp();

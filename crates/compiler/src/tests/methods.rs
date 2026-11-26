@@ -2948,6 +2948,50 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn review_nested_binding_shape_and_scope_restore() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let inner = { let a = 255_i64; a.saturating_add(1) };
+    let outer = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", inner, outer))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("2147483647"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__lo = 255"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_inlined_usize_parameter_shape() {
+    let handler = r#"
+fn clean(max: usize) -> usize { max.saturating_sub(1) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = clean(0);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local max = 0"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
 fn review_div_ceil_guards_limb_width() {
     let handler = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 7_i64.div_ceil(2); Ok(vec![Op::log(format!(\"{}\", v))]) }";
     let compiled =
