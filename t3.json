@@ -7,6 +7,13 @@
       "icon": "play",
       "runOnWorktreeCreate": false,
       "runOnSettle": true
+    },
+    {
+      "name": "Setup Worktree",
+      "command": "nix develop --command true",
+      "icon": "configure",
+      "runOnWorktreeCreate": true,
+      "async": false
     }
   ]
 }
