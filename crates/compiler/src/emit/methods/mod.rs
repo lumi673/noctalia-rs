@@ -50,6 +50,22 @@ impl<'a> Emitter<'a> {
         Ok(Some((def.name, def.kind)))
     }
 
+    fn alias_target(&self, lua: &str) -> Option<String> {
+        let needle = format!("local {lua} = ");
+        for line in self.out.lines().rev() {
+            if let Some(position) = line.find(&needle) {
+                let value = line[position + needle.len()..].trim();
+                if value.starts_with("__static_")
+                    || value.contains('[')
+                    || value.contains('.')
+                {
+                    return Some(value.to_owned());
+                }
+                return None;
+            }
+        }
+        None
+    }
     fn static_method(
         &mut self,
         lua: &str,
@@ -72,19 +88,21 @@ impl<'a> Emitter<'a> {
                 Ok((String::new(), Ty::VOID))
             }
             "get_or_init" | "get_or_try_init" => {
+                let target =
+                    self.alias_target(lua).unwrap_or_else(|| lua.to_owned());
                 let closure = arg(args, 0, call)?;
-                self.line(&format!("if {lua} == nil then"));
+                self.line(&format!("if {target} == nil then"));
                 self.indent = self.indent.saturating_add(1);
                 let (text, ty) = self.invoke_arg(closure, &[])?;
                 if text.is_empty() || ty.base == Base::Void {
-                    self.line(&format!("{lua} = true"));
+                    self.line(&format!("{target} = true"));
                 } else {
-                    self.line(&format!("{lua} = {text}"));
+                    self.line(&format!("{target} = {text}"));
                 }
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 Ok((
-                    lua.to_owned(),
+                    target,
                     Ty {
                         result: false,
                         ..ty
@@ -230,19 +248,22 @@ impl<'a> Emitter<'a> {
                     }) && (receiver.ends_with(']')
                         || receiver.contains('.'))) =>
             {
+                let target = self
+                    .alias_target(receiver)
+                    .unwrap_or_else(|| receiver.to_owned());
                 let closure = arg(args, 0, call)?;
-                self.line(&format!("if {receiver} == nil then"));
+                self.line(&format!("if {target} == nil then"));
                 self.indent = self.indent.saturating_add(1);
                 let (text, value_ty) = self.invoke_arg(closure, &[])?;
                 if text.is_empty() || value_ty.base == Base::Void {
-                    self.line(&format!("{receiver} = true"));
+                    self.line(&format!("{target} = true"));
                 } else {
-                    self.line(&format!("{receiver} = {text}"));
+                    self.line(&format!("{target} = {text}"));
                 }
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 return Ok(Some((
-                    receiver.to_owned(),
+                    target,
                     Ty {
                         result: false,
                         ..value_ty

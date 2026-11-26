@@ -57,7 +57,16 @@ impl<'a> Emitter<'a> {
             }
             "max" | "min" => {
                 let other = self.expr(arg(args, 0, call)?)?.0;
-                Ok((format!("math.{method}({receiver}, {other})"), Ty::FLOAT))
+                if ty.base == Base::Int {
+                    Ok((format!("math.{method}({receiver}, {other})"), ty))
+                } else {
+                    Ok((
+                        format!(
+                            "(function() local __a, __b = {receiver}, {other}; if __a ~= __a then return __b end; if __b ~= __b then return __a end; return math.{method}(__a, __b) end)()"
+                        ),
+                        ty,
+                    ))
+                }
             }
             "rem_euclid" => {
                 let other = self.expr(arg(args, 0, call)?)?.0;
@@ -96,7 +105,7 @@ impl<'a> Emitter<'a> {
                 let operator = if method == "wrapping_add" { "+" } else { "-" };
                 Ok((
                     format!(
-                        "(math.floor({receiver}) {operator} math.floor({other}))"
+                        "(function() local __a, __b = {receiver}, {other}; local __r = __a {operator} __b; if __r >= 9223372036854775808 then return tonumber(string.format(\"%.0f\", __r - 18446744073709551616)) end; if __r < -9223372036854775808 then return tonumber(string.format(\"%.0f\", __r + 18446744073709551616)) end; return tonumber(string.format(\"%.0f\", __r)) end)()"
                     ),
                     ty,
                 ))

@@ -207,7 +207,24 @@ impl<'a> Emitter<'a> {
             "lines" => Ok((self.split_lines(receiver), Ty::LIST)),
             "trim" => Ok((format!("string.trim({receiver})"), Ty::STR)),
             "to_lowercase" => {
-                Ok((format!("string.lower({receiver})"), Ty::STR))
+                if let Some(literal) = literal_string(&call.receiver)
+                    && !literal.is_ascii()
+                {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "to_lowercase() has no Luau equivalent for non-ASCII text",
+                    ));
+                }
+                let start = call.method.span().start();
+                Ok((
+                    format!(
+                        "(function() local __s = {receiver}; for __i = 1, #__s do if string.byte(__s, __i) >= 128 then error(\"{}:{}:{}: to_lowercase() has no Luau equivalent for non-ASCII text\") end end; return string.lower(__s) end)()",
+                        self.module,
+                        start.line,
+                        start.column + 1,
+                    ),
+                    Ty::STR,
+                ))
             }
             "to_uppercase" => {
                 Ok((format!("string.upper({receiver})"), Ty::STR))
@@ -252,7 +269,23 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "replacen" => {
-                let from = self.expr(arg(args, 0, call)?)?.0;
+                let from_expr = arg(args, 0, call)?;
+                match literal_string(from_expr).as_deref() {
+                    Some("") => {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "replacen() with an empty pattern has no faithful Luau lowering",
+                        ));
+                    }
+                    None => {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "replacen() needs a literal non-empty pattern",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                let from = self.expr(from_expr)?.0;
                 let to = self.expr(arg(args, 1, call)?)?.0;
                 let count = self.expr(arg(args, 2, call)?)?.0;
                 if !ty.is_string() && ty.base != Base::Value {
@@ -279,8 +312,15 @@ impl<'a> Emitter<'a> {
             }
             "truncate" if ty.is_string() && !ty.optional => {
                 let length = self.expr(arg(args, 0, call)?)?.0;
+                let start = call.method.span().start();
                 self.line(&format!(
-                    "{receiver} = string.sub({receiver}, 1, math.max(0, math.floor({length})))"
+                    "(function() local __s, __n = {receiver}, math.floor({length}); if __n < 0 or __n > #__s then error(\"{}:{}:{}: byte index out of bounds\") end; local __next = string.byte(__s, __n + 1); if __n ~= #__s and __next >= 128 and __next <= 191 then error(\"{}:{}:{}: not a char boundary\") end; {receiver} = string.sub(__s, 1, __n) end)()",
+                    self.module,
+                    start.line,
+                    start.column + 1,
+                    self.module,
+                    start.line,
+                    start.column + 1,
                 ));
                 Ok((String::new(), Ty::VOID))
             }

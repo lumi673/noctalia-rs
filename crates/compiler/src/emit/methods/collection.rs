@@ -36,14 +36,14 @@ impl<'a> Emitter<'a> {
         &mut self,
         range: &syn::ExprRange,
     ) -> Result<String, Error> {
-        let start = match &range.start {
-            Some(expr) => self.expr(expr)?.0,
-            None => "1".to_owned(),
-        };
-        let end = match &range.end {
-            Some(expr) => self.expr(expr)?.0,
-            None => "0".to_owned(),
-        };
+        let start_expr = range.start.as_ref().ok_or_else(|| {
+            Error::at(range.span(), "range iterators need an explicit start")
+        })?;
+        let end_expr = range.end.as_ref().ok_or_else(|| {
+            Error::at(range.span(), "range iterators need an explicit end")
+        })?;
+        let start = self.expr(start_expr)?.0;
+        let end = self.expr(end_expr)?.0;
         let stop = match range.limits {
             syn::RangeLimits::HalfOpen(_) => format!("(({end}) - 1)"),
             syn::RangeLimits::Closed(_) => format!("({end})"),
@@ -186,17 +186,23 @@ impl<'a> Emitter<'a> {
                         ));
                     }
                     let index = self.temp();
-                    self.line(&format!("for {index} = #{receiver}, 1, -1 do"));
+                    let rejected = self.temp();
+                    let position = self.temp();
+                    self.line(&format!("local {rejected} = {{}}"));
+                    self.line(&format!("for {index} = 1, #{receiver} do"));
                     self.indent = self.indent.saturating_add(1);
                     let item = self.temp();
                     self.line(&format!("local {item} = {receiver}[{index}]"));
                     let (text, _) =
                         self.invoke_arg(closure, std::slice::from_ref(&item))?;
                     self.line(&format!(
-                        "if not ({text}) then table.remove({receiver}, {index}) end"
+                        "if not ({text}) then {rejected}[#{rejected} + 1] = {index} end"
                     ));
                     self.indent = self.indent.saturating_sub(1);
                     self.line("end");
+                    self.line(&format!(
+                        "for {position} = #{rejected}, 1, -1 do table.remove({receiver}, {rejected}[{position}]) end"
+                    ));
                 } else {
                     return Err(Error::at(
                         call.method.span(),
@@ -209,60 +215,139 @@ impl<'a> Emitter<'a> {
                 if matches!(ty.base, Base::List | Base::Ops | Base::Value)
                     && args.is_empty() =>
             {
-                self.line(&format!("table.sort({receiver})"));
+                let indices = self.temp();
+                let left = self.temp();
+                let right = self.temp();
+                let sorted = self.temp();
+                let position = self.temp();
+                self.line(&format!("local {indices} = {{}}"));
+                self.line(&format!(
+                    "for {position} = 1, #{receiver} do {indices}[{position}] = {position} end"
+                ));
+                self.line(&format!(
+                    "table.sort({indices}, function({left}, {right})"
+                ));
+                self.indent = self.indent.saturating_add(1);
+                self.line(&format!(
+                    "if ({receiver}[{left}]) < ({receiver}[{right}]) then return true end"
+                ));
+                self.line(&format!(
+                    "if ({receiver}[{right}]) < ({receiver}[{left}]) then return false end"
+                ));
+                self.line(&format!("return {left} < {right}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end)");
+                self.line(&format!("local {sorted} = {{}}"));
+                self.line(&format!(
+                    "for {position} = 1, #{indices} do {sorted}[{position}] = {receiver}[{indices}[{position}]] end"
+                ));
+                self.line(&format!(
+                    "for {position} = 1, #{sorted} do {receiver}[{position}] = {sorted}[{position}] end"
+                ));
                 Ok((String::new(), Ty::VOID))
             }
-            "sort_by" | "sort_unstable_by"
+            "sort_by"
                 if matches!(ty.base, Base::List | Base::Ops | Base::Value) =>
             {
                 let closure = arg(args, 0, call)?;
+                let indices = self.temp();
                 let left = self.temp();
                 let right = self.temp();
+                let sorted = self.temp();
+                let position = self.temp();
+                self.line(&format!("local {indices} = {{}}"));
                 self.line(&format!(
-                    "table.sort({receiver}, function({left}, {right})"
+                    "for {position} = 1, #{receiver} do {indices}[{position}] = {position} end"
+                ));
+                self.line(&format!(
+                    "table.sort({indices}, function({left}, {right})"
                 ));
                 self.indent = self.indent.saturating_add(1);
-                let (order, _) =
-                    self.invoke_arg(closure, &[left.clone(), right.clone()])?;
+                self.line("do");
+                self.indent = self.indent.saturating_add(1);
+                let (order, _) = self.invoke_arg(
+                    closure,
+                    &[
+                        format!("{receiver}[{left}]"),
+                        format!("{receiver}[{right}]"),
+                    ],
+                )?;
                 self.line(&format!(
                     "if ({order}) == \"Less\" then return true end"
                 ));
-                self.line("return false");
+                self.line(&format!(
+                    "if ({order}) == \"Greater\" then return false end"
+                ));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                self.line(&format!("return {left} < {right}"));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end)");
+                self.line(&format!("local {sorted} = {{}}"));
+                self.line(&format!(
+                    "for {position} = 1, #{indices} do {sorted}[{position}] = {receiver}[{indices}[{position}]] end"
+                ));
+                self.line(&format!(
+                    "for {position} = 1, #{sorted} do {receiver}[{position}] = {sorted}[{position}] end"
+                ));
                 Ok((String::new(), Ty::VOID))
             }
-            "sort_by_key" | "sort_unstable_by_key"
+            "sort_by_key"
                 if matches!(ty.base, Base::List | Base::Ops | Base::Value) =>
             {
                 let closure = arg(args, 0, call)?;
+                let indices = self.temp();
+                let keys = self.temp();
                 let left = self.temp();
                 let right = self.temp();
-                let left_key = self.temp();
-                let right_key = self.temp();
-                self.line(&format!("local {left_key}, {right_key}"));
+                let sorted = self.temp();
+                let position = self.temp();
+                self.line(&format!("local {indices}, {keys} = {{}}, {{}}"));
+                self.line(&format!("for {position} = 1, #{receiver} do"));
+                self.indent = self.indent.saturating_add(1);
+                self.line("do");
+                self.indent = self.indent.saturating_add(1);
+                let (key, _) = self.invoke_arg(
+                    closure,
+                    std::slice::from_ref(&format!("{receiver}[{position}]")),
+                )?;
+                self.line(&format!("{keys}[{position}] = {key}"));
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
                 self.line(&format!(
-                    "table.sort({receiver}, function({left}, {right})"
+                    "for {position} = 1, #{receiver} do {indices}[{position}] = {position} end"
+                ));
+                self.line(&format!(
+                    "table.sort({indices}, function({left}, {right})"
                 ));
                 self.indent = self.indent.saturating_add(1);
-                self.line("do");
-                self.indent = self.indent.saturating_add(1);
-                let (text, _) =
-                    self.invoke_arg(closure, std::slice::from_ref(&left))?;
-                self.line(&format!("{left_key} = {text}"));
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-                self.line("do");
-                self.indent = self.indent.saturating_add(1);
-                let (text, _) =
-                    self.invoke_arg(closure, std::slice::from_ref(&right))?;
-                self.line(&format!("{right_key} = {text}"));
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-                self.line(&format!("return ({left_key}) < ({right_key})"));
+                self.line(&format!(
+                    "if ({keys}[{left}]) < ({keys}[{right}]) then return true end"
+                ));
+                self.line(&format!(
+                    "if ({keys}[{right}]) < ({keys}[{left}]) then return false end"
+                ));
+                self.line(&format!("return {left} < {right}"));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end)");
+                self.line(&format!("local {sorted} = {{}}"));
+                self.line(&format!(
+                    "for {position} = 1, #{indices} do {sorted}[{position}] = {receiver}[{indices}[{position}]] end"
+                ));
+                self.line(&format!(
+                    "for {position} = 1, #{sorted} do {receiver}[{position}] = {sorted}[{position}] end"
+                ));
                 Ok((String::new(), Ty::VOID))
+            }
+            "sort_unstable_by" | "sort_unstable_by_key" => {
+                return Err(Error::at(
+                    call.method.span(),
+                    format!(
+                        "`{method}` has no Luau equivalent: it reorders equal elements"
+                    ),
+                ));
             }
             "then" if matches!(args.first(), Some(Expr::Closure(_))) => {
                 let closure = arg(args, 0, call)?;
@@ -467,8 +552,25 @@ impl<'a> Emitter<'a> {
                 Ok((value, Ty::new(ty.base)))
             }
             "parse" => {
-                let ty = turbofish_type(call.turbofish.as_ref());
-                Ok((receiver.to_owned(), ty))
+                let parsed_ty = turbofish_type(call.turbofish.as_ref());
+                let body = match parsed_ty.base {
+                    Base::Int => format!(
+                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") == nil then return nil, \"invalid digit found in string\" end; local __n = tonumber(__s); if __n == nil or __n > 9223372036854775807 or __n < -9223372036854775808 then return nil, \"number too large or small\" end; return math.floor(__n) end)()"
+                    ),
+                    Base::Float => format!(
+                        "(function() local __s = {receiver}; local __decimal = string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") ~= nil or string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") ~= nil; if not __decimal then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
+                    ),
+                    Base::Value => format!(
+                        "(function() local __s = {receiver}; local __decimal = string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") ~= nil or string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") ~= nil; if not __decimal then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return math.floor(__n) end; return __n end)()"
+                    ),
+                    _ => {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "parse::<T>() has no faithful Luau lowering for this type",
+                        ));
+                    }
+                };
+                Ok((body, Ty::result(parsed_ty.base)))
             }
             "ok" if ty.result => {
                 let value = self.temp();
