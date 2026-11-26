@@ -315,7 +315,10 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     let source = &compiled.source;
     assert!(source.contains("local value = __t"), "{source}");
-    assert!(source.contains("if (not (#value == 0)) then"), "{source}");
+    assert!(
+        source.contains("if (function(value) return (not (#value == 0)) end)("),
+        "{source}"
+    );
 }
 
 #[test]

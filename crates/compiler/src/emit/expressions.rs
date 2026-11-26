@@ -78,6 +78,12 @@ impl<'a> Emitter<'a> {
                 Ok((format!("table.concat({text})"), Ty::STR))
             }
             Expr::MethodCall(call) if call.method == "chars" => {
+                if matches!(strip_reference(&call.receiver), Expr::Block(_)) {
+                    return Err(Error::at(
+                        call.span(),
+                        "block receivers for `chars()` are not supported by the Luau compiler",
+                    ));
+                }
                 let (source, ty) = self.expr(&call.receiver)?;
                 if ty.base != Base::Str {
                     return self.method(call);
@@ -202,7 +208,12 @@ impl<'a> Emitter<'a> {
                 self.indent = saved_indent;
                 self.tail_target = saved_target;
                 result?;
-                Ok((format!("(function()\n{body}end)()"), Ty::VALUE))
+                let ty = if match_returns_string(item) {
+                    Ty::STR
+                } else {
+                    Ty::VALUE
+                };
+                Ok((format!("(function()\n{body}end)()"), ty))
             }
             Expr::Struct(item) => self.struct_expr(item),
             Expr::If(item) => {
@@ -560,9 +571,10 @@ impl<'a> Emitter<'a> {
                 Ok((quote(&value.value().to_string()), Ty::STR))
             }
             Lit::Byte(value) => Ok((value.value().to_string(), Ty::INT)),
-            Lit::ByteStr(value) => {
-                Ok((quote(&String::from_utf8_lossy(&value.value())), Ty::STR))
-            }
+            Lit::ByteStr(value) => Err(Error::at(
+                value.span(),
+                "byte strings are not supported by the Luau compiler",
+            )),
             other => Err(Error::at(other.span(), "unsupported literal")),
         }
     }
@@ -811,9 +823,10 @@ impl<'a> Emitter<'a> {
                 if let Some((text, ty)) = constant(value) {
                     return Ok((text, ty));
                 }
-                let value = (*value).clone();
-                let text = self.static_value(&value)?;
-                return Ok((text, Ty::VALUE));
+                return Err(Error::at(
+                    expr.span(),
+                    "imported constant expression cannot be lowered in the handler scope",
+                ));
             }
             if segments.len() >= 2
                 && let Some(name) = segments.last()
@@ -1264,6 +1277,36 @@ impl<'a> Emitter<'a> {
         }
         self.expr(expr)
     }
+    fn emit_chain_parts(
+        &mut self,
+        parts: &[&Expr],
+        assignments: &mut Vec<(String, String)>,
+    ) -> Result<(), Error> {
+        let Some((part, rest)) = parts.split_first() else {
+            for (lua, text) in assignments.drain(..) {
+                self.line(&format!("{lua} = {text}"));
+            }
+            self.line("return true");
+            return Ok(());
+        };
+        let condition = match part {
+            Expr::Let(item) => {
+                let (condition, bindings, _) = self.let_condition_pair(item)?;
+                for (name, text) in bindings {
+                    assignments.push((self.bind_name(&name), text));
+                }
+                condition
+            }
+            other => self.expr(other)?.0,
+        };
+        self.line(&format!("if {condition} then"));
+        self.indent = self.indent.saturating_add(1);
+        self.emit_chain_parts(rest, assignments)?;
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        Ok(())
+    }
+
     fn chain_condition(
         &mut self,
         binary: &ExprBinary,
@@ -1276,39 +1319,23 @@ impl<'a> Emitter<'a> {
                 let mut names = Vec::new();
                 pattern_binding_names(&item.pat, &mut names);
                 for name in names {
-                    let lua = self.bind_name(&name);
-                    self.line(&format!("local {lua} = nil"));
-                    self.push(&name, Ty::VALUE);
+                    if self.lookup(&name).is_none() {
+                        let lua = self.bind_name(&name);
+                        self.line(&format!("local {lua} = nil"));
+                        self.push(&name, Ty::VALUE);
+                    }
                 }
             }
         }
         let saved_out = std::mem::take(&mut self.out);
         let saved_indent = self.indent;
         self.indent = 0;
-        let mut conditions = Vec::new();
-        for part in parts {
-            match part {
-                Expr::Let(item) => {
-                    let (condition, bindings, _) =
-                        self.let_condition_pair(item)?;
-                    conditions.push(condition);
-                    for (name, text) in bindings {
-                        let lua = self.bind_name(&name);
-                        self.line(&format!("{lua} = {text}"));
-                    }
-                }
-                other => conditions.push(self.expr(other)?.0),
-            }
-        }
+        let mut assignments = Vec::new();
+        self.emit_chain_parts(&parts, &mut assignments)?;
+        self.line("return false");
         let body = std::mem::replace(&mut self.out, saved_out);
         self.indent = saved_indent;
-        Ok((
-            format!(
-                "(function()\n{body} return {} end)()",
-                conditions.join(" and ")
-            ),
-            Ty::BOOL,
-        ))
+        Ok((format!("(function()\n{body}end)()"), Ty::BOOL))
     }
 
     fn receiver_is_chars(&self, expr: &Expr) -> bool {
@@ -1455,6 +1482,7 @@ impl<'a> Emitter<'a> {
                                 && !rest.is_empty()
                                 && let Expr::Call(call) = expr
                                 && let Some(helper) = self.helper(call)
+                                && !helper.name.ends_with("retain")
                                 && matches!(
                                     return_kind(&helper.function)?,
                                     Returns::Value(_)
@@ -1725,6 +1753,37 @@ pub(super) fn strip_reference(expr: &Expr) -> &Expr {
     }
 }
 
+fn match_returns_string(item: &syn::ExprMatch) -> bool {
+    !item.arms.is_empty()
+        && item.arms.iter().all(|arm| {
+            let expr = match &*arm.body {
+                Expr::Block(block) => {
+                    block.block.stmts.last().and_then(|stmt| {
+                        if let Stmt::Expr(expr, _) = stmt {
+                            Some(expr)
+                        } else {
+                            None
+                        }
+                    })
+                }
+                other => Some(other),
+            };
+            expr.is_some_and(|expr| match strip_reference(expr) {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(_), ..
+                }) => true,
+                Expr::MethodCall(call) => {
+                    matches!(
+                        call.method.to_string().as_str(),
+                        "to_owned" | "to_string"
+                    )
+                }
+                Expr::Macro(mac) => macro_name(mac) == "format",
+                _ => false,
+            })
+        })
+}
+
 fn collect_and<'a>(expr: &'a Expr, parts: &mut Vec<&'a Expr>) {
     if let Expr::Binary(binary) = expr
         && matches!(binary.op, BinOp::And(_))
@@ -1766,6 +1825,11 @@ fn pattern_binding_names(pattern: &Pat, names: &mut Vec<String>) {
         Pat::Or(or) => {
             if let Some(first) = or.cases.first() {
                 pattern_binding_names(first, names);
+            }
+        }
+        Pat::Struct(item) => {
+            for field in &item.fields {
+                pattern_binding_names(&field.pat, names);
             }
         }
         _ => {}

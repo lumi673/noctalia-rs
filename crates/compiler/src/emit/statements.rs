@@ -785,11 +785,18 @@ impl<'a> Emitter<'a> {
         for (name, text) in bindings {
             let binding = self.binding_ty(&item.pat, &name, ty);
             let lua = self.bind_name(&name);
-            self.line(&format!("local {lua} = {text}"));
-            self.push(&name, binding);
-            if let Some(class) = &class {
-                self.classes.insert(lua.clone(), class.clone());
+            if is_identifier(&text) {
+                self.line(&format!("local {lua} = {text}"));
+                if let Some(class) = &class {
+                    self.classes.insert(lua.clone(), class.clone());
+                }
+            } else {
+                if self.lookup(&name).is_none() {
+                    self.line(&format!("local {lua} = nil"));
+                }
+                self.line(&format!("if {condition} then {lua} = {text} end"));
             }
+            self.push(&name, binding);
         }
         Ok(condition)
     }
@@ -937,19 +944,45 @@ impl<'a> Emitter<'a> {
         self.line(&format!("if {condition} then"));
         self.indent = self.indent.saturating_add(1);
         self.push_scope();
+        self.push_scope();
+        let mut prepared = Vec::new();
         for (name, text) in bindings {
             let binding = self.binding_ty(pattern, &name, scrutinee_ty);
             let lua = self.bind_name(&name);
-            self.line(&format!("local {lua} = {text}"));
             self.push(&name, binding);
+            prepared.push((lua, name, text, binding));
         }
         if let Some(guard) = guard {
-            let (text, _) = self.expr(guard)?;
-            self.line(&format!("if {text} then"));
+            let (guard_text, _) = self.expr(guard)?;
+            let params = prepared
+                .iter()
+                .map(|(lua, _, _, _)| lua.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let values = prepared
+                .iter()
+                .map(|(_, _, text, _)| text.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.line(&format!(
+                "if (function({params}) return {guard_text} end)({values}) then"
+            ));
             self.indent = self.indent.saturating_add(1);
+            for (lua, _, text, _) in &prepared {
+                self.line(&format!("local {lua} = {text}"));
+            }
             let body = self.arm_body(&arm.body, tail);
             self.indent = self.indent.saturating_sub(1);
             self.pop_scope();
+            self.line("else");
+            self.indent = self.indent.saturating_add(1);
+            let guard_rest = if !rest.is_empty() {
+                self.match_arms(rest, scrutinee, scrutinee_ty, error, tail)
+            } else {
+                Ok(())
+            };
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
             if !rest.is_empty() {
                 self.line("else");
                 self.indent = self.indent.saturating_add(1);
@@ -957,15 +990,17 @@ impl<'a> Emitter<'a> {
                     self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
-                self.line("end");
                 body?;
+                guard_rest?;
                 rest_result?
             } else {
-                self.line("end");
-                self.line("end");
-                body?
+                body?;
+                guard_rest?
             }
         } else {
+            for (lua, _, text, _) in &prepared {
+                self.line(&format!("local {lua} = {text}"));
+            }
             let body = self.arm_body(&arm.body, tail);
             self.pop_scope();
             self.indent = self.indent.saturating_sub(1);
@@ -2047,11 +2082,15 @@ impl<'a> Emitter<'a> {
         {
             let (text, _) = self.expr(right)?;
             let source = self.temp();
+            self.uses_deep_clone = true;
             self.line(&format!("local {source} = {text}"));
             let mut values = Vec::new();
             for index in 0..tuple.elems.len() {
                 let value = self.temp();
-                self.line(&format!("local {value} = {source}[{}]", index + 1));
+                self.line(&format!(
+                    "local {value} = deep_clone({source}[{}])",
+                    index + 1
+                ));
                 values.push(value);
             }
             for (index, element) in tuple.elems.iter().enumerate() {

@@ -453,11 +453,10 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(format!("{marker}{label}"))])
 }
 "#;
-    let compiled =
+    let error =
         compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect("compiles");
-    assert!(compiled.source.contains("35"), "{}", compiled.source);
-    assert!(compiled.source.contains("\"ready\""), "{}", compiled.source);
+            .expect_err("byte string");
+    assert!(error.message.contains("byte strings"), "{}", error.message);
 }
 #[test]
 fn compiles_std_wrappers() {

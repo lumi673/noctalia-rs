@@ -1405,7 +1405,67 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert_eq!(
         actual,
         duplicated(vec![Op::BarText {
-            text: "\"13\"|\"two\"|\"none\"".to_owned()
+            text: "\"13\"|two|none".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_gg_short_circuit_scopes_and_match_fallbacks() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let n = 7;
+    let mut total = 0;
+    let hit = if let Some(a) = Some(1) && let Some(b) = Some(2) {
+        total = total + 100;
+        format!("{a}{b}")
+    } else {
+        "miss".to_owned()
+    };
+    let miss = if let Some(_) = None && let Some(b) = { total = total + 1; Some(b2()) } {
+        format!("{b}")
+    } else {
+        format!("{n}|{total}")
+    };
+    let iter = "éx".chars();
+    {
+        let iter = "block";
+        let _ = iter;
+    }
+    let first = iter.next();
+    let rest = iter.as_str();
+    let empty: Option<(i64,)> = None;
+    let indexed = if let Some((value,)) = empty {
+        format!("{value}")
+    } else {
+        "indexed-else".to_owned()
+    };
+    let outer = 9;
+    let guard = match 2 {
+        value if false => format!("{value}"),
+        _ => format!("{outer}"),
+    };
+    let fallback = match 2 {
+        1 if false => "one".to_owned(),
+        _ => "fallback".to_owned(),
+    };
+    Ok(vec![Op::BarText { text: format!("{hit}|{miss}|{first}{rest}|{indexed}|{guard}|{fallback}") }])
+}
+
+fn b2() -> i64 {
+    2
+}
+"#;
+    let source = compiled_source("gg", handler, EntryKind::Widget);
+    let actual = ops(
+        "gg",
+        &source,
+        &context("gg", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "12|7|0|éx|indexed-else|9|fallback".to_owned()
         }])
     );
 }

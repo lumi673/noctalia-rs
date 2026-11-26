@@ -116,7 +116,7 @@ impl<'a> Emitter<'a> {
             emitted: false,
             temp: 0,
             kw_scopes: vec![HashMap::new()],
-            chars: BTreeSet::new(),
+            char_scopes: vec![BTreeSet::new()],
             native_mode,
             known_native,
             native_found: BTreeMap::new(),
@@ -367,24 +367,33 @@ impl<'a> Emitter<'a> {
         self.scopes.push(HashMap::new());
         self.kw_scopes.push(HashMap::new());
         self.constant_scopes.push(HashMap::new());
+        self.char_scopes.push(BTreeSet::new());
     }
 
     pub(super) fn pop_scope(&mut self) {
         self.scopes.pop();
         self.kw_scopes.pop();
         self.constant_scopes.pop();
+        self.char_scopes.pop();
     }
 
     pub(super) fn unmark_chars(&mut self, name: &str) {
-        self.chars.remove(name);
+        if let Some(scope) = self.char_scopes.last_mut() {
+            scope.remove(name);
+        }
     }
 
     pub(super) fn mark_chars(&mut self, name: &str) {
-        self.chars.insert(name.to_owned());
+        if let Some(scope) = self.char_scopes.last_mut() {
+            scope.insert(name.to_owned());
+        }
     }
 
     pub(super) fn is_chars(&self, name: &str) -> bool {
-        self.chars.contains(name)
+        self.char_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name))
     }
 
     pub(super) fn temp(&mut self) -> String {
@@ -554,7 +563,7 @@ pub(crate) struct Emitter<'a> {
     emitted: bool,
     temp: usize,
     kw_scopes: Vec<HashMap<String, String>>,
-    chars: BTreeSet<String>,
+    char_scopes: Vec<BTreeSet<String>>,
     native_mode: NativeMode,
     known_native: &'a BTreeMap<String, NativeFn>,
     native_found: BTreeMap<String, NativeFn>,
@@ -575,4 +584,4 @@ pub(crate) struct Emitter<'a> {
     has_host_callback: bool,
 }
 
-pub(crate) const MAX_INLINE_CALLS: usize = 200;
+pub(crate) const MAX_INLINE_CALLS: usize = 300;
