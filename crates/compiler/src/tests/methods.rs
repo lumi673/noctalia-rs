@@ -3026,7 +3026,9 @@ fn review_round6_state_cleanup_and_failure_recovery() {
     let bad = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let value = 1_i64.unsupported_integer_method();
-    Ok(vec![Op::log(format!("{}", value))])
+    let found = (0..2).find(|x| *x == 9);
+    let value = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    Ok(vec![Op::log(format!("{} {}", found.unwrap_or(0), value))])
 }
 "#;
     let error = compile(&source(bad), &options("handler", EntryKind::Service))
@@ -3040,6 +3042,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(Vec::new())
 }
 "#;
-    compile(&source(good), &options("handler", EntryKind::Service))
+    let clean = compile(&source(good), &options("handler", EntryKind::Service))
         .expect("clean compile follows failed compile");
+    assert!(!clean.source.contains("then break end"), "{}", clean.source);
 }
