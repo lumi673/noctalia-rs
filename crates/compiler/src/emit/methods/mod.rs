@@ -7,7 +7,13 @@
 //! `collection.rs` `Vec`/`HashMap` and `Option`/`Result` values, and `fs.rs`
 //! and `path.rs` are the `std::fs` and `std::path` receivers.
 
+use std::cell::RefCell;
+
 use super::*;
+
+thread_local! {
+    static ITER_DONE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 mod collection;
 mod fs;
@@ -213,6 +219,38 @@ impl<'a> Emitter<'a> {
             },
             _ => false,
         }
+    }
+
+    fn has_deferred_callback(expr: &Expr) -> bool {
+        let Expr::MethodCall(call) = strip_reference(expr) else {
+            return false;
+        };
+        matches!(
+            call.method.to_string().as_str(),
+            "map"
+                | "filter"
+                | "filter_map"
+                | "flat_map"
+                | "flatten"
+                | "take_while"
+                | "skip_while"
+                | "zip"
+                | "rev"
+                | "enumerate"
+        ) || Self::has_deferred_callback(&call.receiver)
+    }
+    fn done_name(&self) -> Option<String> {
+        ITER_DONE.with(|slot| slot.borrow().clone())
+    }
+
+    fn emit_done_break(&mut self) {
+        if let Some(name) = self.done_name() {
+            self.line(&format!("if {name} then break end"));
+        }
+    }
+
+    fn set_done(&mut self, name: Option<String>) {
+        ITER_DONE.with(|slot| *slot.borrow_mut() = name);
     }
 
     fn materialize_iter(
@@ -524,13 +562,15 @@ impl<'a> Emitter<'a> {
             let wanted = self.expr(arg(&args, 0, call)?)?.0;
             let result = self.temp();
             let seen = self.temp();
-            self.line(&format!("local {result}"));
-            self.line(&format!("local {seen} = 0"));
+            let done = self.temp();
+            self.line(&format!("local {seen}, {done} = 0, false"));
+            self.set_done(Some(done.clone()));
             let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
-                emitter.line(&format!("if {result} ~= nil then break end"));
+                emitter.line(&format!("if {done} then break end"));
                 emitter.line(&format!("if {seen} == ({wanted}) then"));
                 emitter.indent = emitter.indent.saturating_add(1);
                 emitter.line(&format!("{result} = {value}"));
+                emitter.line(&format!("{done} = true"));
                 emitter.line("break");
                 emitter.indent = emitter.indent.saturating_sub(1);
                 emitter.line("end");
@@ -540,6 +580,7 @@ impl<'a> Emitter<'a> {
                 Ok(())
             };
             self.emit_iter(&call.receiver, false, &body)?;
+            self.set_done(None);
             return Ok(Some((result, Ty::OPT_VALUE)));
         }
         let Some(closure) = args.first().copied() else {
@@ -553,7 +594,9 @@ impl<'a> Emitter<'a> {
             && matches!(closure, Expr::Closure(_))
         {
             let result = self.temp();
-            self.line(&format!("local {result}"));
+            let done = self.temp();
+            self.line(&format!("local {result}, {done} = nil, false"));
+            self.set_done(Some(done.clone()));
             let index = (method == "position").then(|| {
                 let index = self.temp();
                 self.line(&format!("local {index} = 0"));
@@ -581,6 +624,7 @@ impl<'a> Emitter<'a> {
                 emitter.indent = emitter.indent.saturating_add(1);
                 let found = index.as_deref().unwrap_or(value);
                 emitter.line(&format!("{result} = {found}"));
+                emitter.line(&format!("{done} = true"));
                 emitter.line("break");
                 emitter.indent = emitter.indent.saturating_sub(1);
                 emitter.line("end");
@@ -591,6 +635,7 @@ impl<'a> Emitter<'a> {
                 Ok(())
             };
             self.emit_iter(&call.receiver, false, &body)?;
+            self.set_done(None);
             let ty = if index.is_some() {
                 Ty::OPT_INT
             } else {
@@ -701,7 +746,7 @@ impl<'a> Emitter<'a> {
                         element: Some(key_ty.base),
                         null: false,
                         optional: false,
-                        result: false,
+                        result: key_ty.base == Base::Int,
                     };
                     let skip_nil = call.method == "filter_map";
                     let closure =
@@ -709,6 +754,7 @@ impl<'a> Emitter<'a> {
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
+                        emitter.emit_done_break();
                         let (text, _) = if pair {
                             emitter.invoke_pair_arg(closure, value, pair_ty)?
                         } else {
@@ -742,13 +788,14 @@ impl<'a> Emitter<'a> {
                         element: Some(key_ty.base),
                         null: false,
                         optional: false,
-                        result: false,
+                        result: key_ty.base == Base::Int,
                     };
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
+                        emitter.emit_done_break();
                         let (condition, _) = if pair {
                             emitter.invoke_pair_arg(closure, value, pair_ty)?
                         } else {
@@ -889,12 +936,19 @@ impl<'a> Emitter<'a> {
                     return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "rev" => {
+                    if Self::has_deferred_callback(&call.receiver) {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "rev() after a callback adaptor has no faithful Luau execution order",
+                        ));
+                    }
                     let source =
                         self.materialize_iter(&call.receiver, false)?;
                     let table = &source;
                     let index = self.temp();
                     self.line(&format!("for {index} = #{table}, 1, -1 do"));
                     self.indent = self.indent.saturating_add(1);
+                    self.emit_done_break();
                     let result = body(self, &format!("{table}[{index}]"));
                     self.indent = self.indent.saturating_sub(1);
                     self.line("end");
@@ -914,8 +968,14 @@ impl<'a> Emitter<'a> {
                 }
                 "zip" => {
                     let args = call.args.iter().collect::<Vec<_>>();
-                    let other =
-                        self.materialize_iter(arg(&args, 0, call)?, false)?;
+                    let right = arg(&args, 0, call)?;
+                    if Self::has_deferred_callback(right) {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "zip() needs a plain right-hand iterator",
+                        ));
+                    }
+                    let other = self.materialize_iter(right, false)?;
                     let index = self.temp();
                     self.line(&format!("local {index} = 1"));
                     let inner = |emitter: &mut Self,
@@ -937,6 +997,13 @@ impl<'a> Emitter<'a> {
                     let active = self.temp();
                     self.line(&format!("local {active} = true"));
                     let taking = call.method == "take_while";
+                    let done = self.temp();
+                    self.line(&format!("local {done} = false"));
+                    let previous_done =
+                        taking.then(|| self.done_name()).flatten();
+                    if taking {
+                        self.set_done(Some(done.clone()));
+                    }
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
@@ -948,7 +1015,7 @@ impl<'a> Emitter<'a> {
                         )?;
                         if taking {
                             emitter.line(&format!(
-                                "if not ({condition}) then {active} = false end"
+                                "if not ({condition}) then {active} = false; {done} = true end"
                             ));
                             emitter.line(&format!("if {active} then"));
                             emitter.indent = emitter.indent.saturating_add(1);
@@ -969,7 +1036,11 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, pair, &inner);
+                    self.emit_iter(&call.receiver, pair, &inner)?;
+                    if taking {
+                        self.set_done(previous_done);
+                    }
+                    return Ok(());
                 }
                 "flat_map" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -1047,6 +1118,7 @@ impl<'a> Emitter<'a> {
                 let index = self.temp();
                 self.line(&format!("for {index} = ({start}), {stop} do"));
                 self.indent = self.indent.saturating_add(1);
+                self.emit_done_break();
                 let result = body(self, &index);
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
@@ -1119,6 +1191,7 @@ impl<'a> Emitter<'a> {
         self.line(&format!("local {table} = {source}"));
         self.line(&format!("for {index} = {table}.__next or 1, #{table} do"));
         self.indent = self.indent.saturating_add(1);
+        self.emit_done_break();
         let result = body(self, &format!("{table}[{index}]"));
         self.indent = self.indent.saturating_sub(1);
         self.line("end");

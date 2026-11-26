@@ -2496,7 +2496,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(emitted.contains("table.remove(numbers"), "{emitted}");
     assert!(emitted.contains(", 1, -1 do"), "{emitted}");
     assert!(emitted.contains("__t16 = __t16 + 1"), "{emitted}");
-    assert!(emitted.contains(" = false end"), "{emitted}");
+    assert!(emitted.contains(" = true end"), "{emitted}");
     assert!(emitted.contains("local zipped ="), "{emitted}");
 }
 

@@ -1405,7 +1405,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let found = vec![vec![10_i64], vec![20]].into_iter().flatten().find(|x| **x == 10);
     let nth = vec![vec![10_i64], vec![20]].into_iter().flatten().nth(0);
     let taken = vec![1_i64, 2, 3].into_iter().take_while(|x| **x < 3).collect::<Vec<_>>();
-    let reversed = vec![1_i64, 2, 3].into_iter().map(|x| x + 1).rev().collect::<Vec<_>>();
+    let reversed = vec![2_i64, 3, 4].into_iter().rev().collect::<Vec<_>>();
     Ok(vec![Op::log(format!("{} {} {} {} {} {} {}", a, b, c, found.unwrap_or(0), nth.unwrap_or(0), taken.len(), reversed[0]))])
 }
 "#;

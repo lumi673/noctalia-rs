@@ -996,6 +996,7 @@ impl<'a> Emitter<'a> {
                 for (index, element) in tuple.elems.iter().enumerate() {
                     let item = ty.map(|outer| match outer.element {
                         Some(base) if index == 0 => Ty::new(base),
+                        Some(base) if outer.result => Ty::new(base),
                         Some(_) => Ty::VALUE,
                         None => outer,
                     });
