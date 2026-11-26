@@ -552,16 +552,29 @@ impl<'a> Emitter<'a> {
         &mut self,
         block: &syn::Block,
     ) -> Result<(String, Ty), Error> {
-        let Some((last, rest)) = block.stmts.split_last() else {
-            return Ok(("nil".to_owned(), Ty::VALUE));
+        let value = self.temp();
+        self.line(&format!("local {value} = nil"));
+        self.line("do");
+        self.indent = self.indent.saturating_add(1);
+        self.push_scope();
+        let result = match block.stmts.split_last() {
+            Some((last, rest)) => {
+                for stmt in rest {
+                    self.stmt(stmt)?;
+                }
+                match last {
+                    Stmt::Expr(expr, _) => self.expr(expr),
+                    _ => Ok(("nil".to_owned(), Ty::VALUE)),
+                }
+            }
+            None => Ok(("nil".to_owned(), Ty::VALUE)),
         };
-        for stmt in rest {
-            self.stmt(stmt)?;
-        }
-        match last {
-            Stmt::Expr(value, _) => self.expr(value),
-            _ => Ok(("nil".to_owned(), Ty::VALUE)),
-        }
+        let (text, ty) = result?;
+        self.line(&format!("{value} = {text}"));
+        self.pop_scope();
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        Ok((value, ty))
     }
 
     pub(super) fn literal(
@@ -1295,7 +1308,12 @@ impl<'a> Emitter<'a> {
         };
         let (condition, bindings) = match part {
             Expr::Let(item) => {
-                let (condition, bindings, _) = self.let_condition_pair(item)?;
+                let (condition, bindings, ty) =
+                    self.let_condition_pair(item)?;
+                for (name, _) in &bindings {
+                    let binding = self.binding_ty(&item.pat, name, ty);
+                    self.push(name, binding);
+                }
                 (condition, bindings)
             }
             other => (self.expr(other)?.0, Vec::new()),
@@ -1332,7 +1350,6 @@ impl<'a> Emitter<'a> {
                     }
                     let lua = self.bind_name(&name);
                     self.line(&format!("local {lua} = nil"));
-                    self.push(&name, Ty::VALUE);
                 }
             }
         }

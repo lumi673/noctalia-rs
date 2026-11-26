@@ -984,11 +984,11 @@ impl<'a> Emitter<'a> {
         let guard_lines = std::mem::replace(&mut self.out, saved_out);
         self.indent = saved_indent;
         let (guard_text, _) = guard_result?;
-        self.line(&format!("if {guard_text} then"));
-        self.indent = self.indent.saturating_add(1);
         if !guard_lines.trim().is_empty() {
             self.out.push_str(&guard_lines);
         }
+        self.line(&format!("if {guard_text} then"));
+        self.indent = self.indent.saturating_add(1);
         self.line(&format!("{matched} = true"));
         let body = self.arm_body(&arm.body, tail);
         self.indent = self.indent.saturating_sub(1);

@@ -1476,6 +1476,43 @@ fn b2() -> i64 {
 }
 
 #[test]
+fn review_nn_branch_scopes_types_and_guard_setup() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let n = 7;
+    let picked = if true {
+        let n = 9;
+        n
+    } else {
+        0
+    };
+    let ratio = if let Some(x) = Some(5) && let Some(y) = Some(2) {
+        x / y
+    } else {
+        0
+    };
+    let guard_pick = match 2 {
+        n if { let accepted = n == 2; accepted } => 1,
+        _ => 0,
+    };
+    Ok(vec![Op::BarText { text: format!("{picked}|{n}|{ratio}|{guard_pick}") }])
+}
+"#;
+    let source = compiled_source("nn", handler, EntryKind::Widget);
+    let actual = ops(
+        "nn",
+        &source,
+        &context("nn", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "9|7|2|1".to_owned()
+        }])
+    );
+}
+
+#[test]
 fn review_l1_stable_sort_matches_rust() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
