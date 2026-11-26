@@ -36,6 +36,7 @@ fn compiled_source(entry: &str, handler: &str, kind: EntryKind) -> String {
             module: "main",
             modules: &[],
             native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
         },
     )
     .expect("compile")
@@ -342,6 +343,7 @@ pub fn handle(ctx: &Context) -> Result<Vec<Op>> {
             module: "main",
             modules: &modules,
             native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
         },
     )
     .expect("compile")
@@ -805,4 +807,365 @@ fn native_json_literals(_ctx: &Context) -> Vec<Op> {
     ops.push(Op::log(dotted));
     ops.push(Op::log(shaped.to_string()));
     ops
+}
+
+#[test]
+fn json_iterators_and_scalars_match_the_native_handler() {
+    let handler = r#"
+use serde_json::Map;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut numbers: Vec<Value> = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    map.insert("flag".to_owned(), json!(false));
+    labels.push(json!("one").to_string());
+    labels.push(format!("{}", json!(2)));
+    numbers.push(json!(1));
+    numbers.push(json!(2));
+    let mut keys = map.keys();
+    let first = keys.next().unwrap_or_default();
+    let second = keys.next().unwrap_or_default();
+    let third = keys.next().unwrap_or_default();
+    let exhausted = keys.next().unwrap_or_default();
+    let flag = map.get("flag").and_then(Value::as_bool).unwrap_or(true);
+    let fallback = map.get("missing").cloned().unwrap_or(json!(true));
+    let ordered: Vec<Value> = map.values().take(2).cloned().collect();
+    let mut rendered = Vec::new();
+    for (name, value) in map.iter() {
+        rendered.push(format!("{name}={value}"));
+    }
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{flag}|{fallback}|{}|{}",
+        labels.join(","),
+        numbers.len(),
+        first,
+        second,
+        third,
+        exhausted,
+        ordered.len(),
+        rendered.join(",")
+    )));
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("json_iterators", handler, EntryKind::Service);
+    let state = json!({});
+    let ctx = context("json_iterators", "load", json!({}), state);
+    assert_eq!(
+        ops("json_iterators", &source, &ctx),
+        rust_ops(native_json_iterators(&ctx))
+    );
+}
+
+fn native_json_iterators(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    let mut ops = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    let mut numbers: Vec<Value> = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    map.insert("flag".to_owned(), json!(false));
+    labels.push(json!("one").to_string());
+    labels.push(format!("{}", json!(2)));
+    numbers.push(json!(1));
+    numbers.push(json!(2));
+    let mut keys = map.keys();
+    let first = keys.next().cloned().unwrap_or_default();
+    let second = keys.next().cloned().unwrap_or_default();
+    let third = keys.next().cloned().unwrap_or_default();
+    let exhausted = keys.next().cloned().unwrap_or_default();
+    let flag = map.get("flag").and_then(Value::as_bool).unwrap_or(true);
+    let fallback = map.get("missing").cloned().unwrap_or(json!(true));
+    let ordered: Vec<Value> = map.values().take(2).cloned().collect();
+    let mut rendered = Vec::new();
+    for (name, value) in map.iter() {
+        rendered.push(format!("{name}={value}"));
+    }
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{flag}|{fallback}|{}|{}",
+        labels.join(","),
+        numbers.len(),
+        first,
+        second,
+        third,
+        exhausted,
+        ordered.len(),
+        rendered.join(",")
+    )));
+    ops
+}
+
+#[test]
+fn json_null_flags_and_map_chains_match_the_native_handler() {
+    let handler = r#"
+use serde_json::Map;
+
+fn put(map: &mut Map, value: Value) {
+    map.insert("v".to_owned(), value);
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut ops = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    let keys: Vec<String> = map.keys().cloned().collect();
+    let pair_keys: Vec<String> = map.iter().map(|(key, _)| key.clone()).collect();
+    let vals: Vec<Value> = map.values().take(1).cloned().collect();
+    let filtered: Vec<String> = map
+        .iter()
+        .filter(|(_, value)| value.as_i64().unwrap_or(0) > 1)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let skipped: Vec<String> = map.keys().skip(1).cloned().collect();
+    let mut plain = Vec::new();
+    for (key, value) in &map {
+        plain.push(format!("{key}={value}"));
+    }
+    let one: Vec<String> = map.keys().cloned().collect();
+    let flag = json!(false).as_bool().unwrap_or(true);
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{}|{flag}",
+        keys.join(","),
+        pair_keys.join(","),
+        vals.len(),
+        filtered.join(","),
+        skipped.join(","),
+        plain.join(","),
+        one.join(",")
+    )));
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("json_chains", handler, EntryKind::Service);
+    assert!(source.contains(noctalia_rs_luau::ARRAY_MARKER));
+    let state = json!({});
+    let ctx = context("json_chains", "load", json!({}), state);
+    assert_eq!(
+        ops("json_chains", &source, &ctx),
+        rust_ops(native_json_chains(&ctx))
+    );
+}
+
+fn native_json_chains(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    let mut ops = Vec::new();
+    let mut map = Map::new();
+    map.insert("b".to_owned(), json!(2));
+    map.insert("a".to_owned(), json!(1));
+    let keys: Vec<String> = map.keys().cloned().collect();
+    let pair_keys: Vec<String> =
+        map.iter().map(|(key, _)| key.clone()).collect();
+    let vals: Vec<Value> = map.values().take(1).cloned().collect();
+    let filtered: Vec<String> = map
+        .iter()
+        .filter(|(_, value)| value.as_i64().unwrap_or(0) > 1)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let skipped: Vec<String> = map.keys().skip(1).cloned().collect();
+    let mut plain = Vec::new();
+    for (key, value) in &map {
+        plain.push(format!("{key}={value}"));
+    }
+    let one: Vec<String> = map.keys().cloned().collect();
+    let flag = json!(false).as_bool().unwrap_or(true);
+    ops.push(Op::log(format!(
+        "{}|{}|{}|{}|{}|{}|{}|{flag}",
+        keys.join(","),
+        pair_keys.join(","),
+        vals.len(),
+        filtered.join(","),
+        skipped.join(","),
+        plain.join(","),
+        one.join(",")
+    )));
+    ops
+}
+
+#[test]
+fn newtype_and_nested_values_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder(Value);
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let nested = ((json!("a"), json!(2)), json!(3));
+    let (inner, _) = nested;
+    let (_, name) = inner;
+    let holder = Holder(name);
+    let mut map = serde_json::Map::new();
+    map.insert("k".to_owned(), holder.0);
+    let value = ctx.setting("flag").unwrap_or(Value::Null);
+    ops_push(value.is_null());
+    Ok(vec![Op::state("seen", json!(map))])
+}
+
+fn ops_push(_flag: bool) {}
+"#;
+    let source = compiled_source("newtype_chain", handler, EntryKind::Service);
+    let state = json!({});
+    let ctx = context("newtype_chain", "load", json!({}), state);
+    assert_eq!(
+        ops("newtype_chain", &source, &ctx),
+        rust_ops(native_newtype_chain(&ctx))
+    );
+}
+
+fn native_newtype_chain(_ctx: &Context) -> Vec<Op> {
+    use serde_json::Map;
+
+    let nested = ((json!("a"), json!(2)), json!(3));
+    let (inner, _) = nested;
+    let (_, name) = inner;
+    let mut map = Map::new();
+    map.insert("k".to_owned(), name);
+    vec![Op::state("seen", json!(map))]
+}
+
+#[test]
+fn tuple_fields_helpers_and_newtypes_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder { pair: (Value, Value) }
+struct Inner(Value);
+struct Outer(Inner);
+
+fn make() -> (Value, Value) { (json!("a"), json!(2)) }
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let holder = Holder { pair: (json!("field"), json!(1)) };
+    let (_, from_field) = holder.pair;
+    let (_, from_helper) = make();
+    let outer = Outer(Inner(json!("newtype")));
+    let value = ctx.setting("flag").unwrap_or(Value::Null);
+    let _ = value;
+    Ok(vec![Op::state("field", json!(from_field)),
+            Op::state("helper", json!(from_helper)),
+            Op::state("newtype", json!(outer.0.0))])
+}
+"#;
+    let source = compiled_source("tuple_paths", handler, EntryKind::Service);
+    let state = json!({});
+    let ctx = context("tuple_paths", "load", json!({}), state);
+    assert_eq!(
+        ops("tuple_paths", &source, &ctx),
+        rust_ops(native_tuple_paths(&ctx))
+    );
+}
+
+fn native_tuple_paths(_ctx: &Context) -> Vec<Op> {
+    vec![
+        Op::state("field", json!(1)),
+        Op::state("helper", json!(2)),
+        Op::state("newtype", json!("newtype")),
+    ]
+}
+
+#[test]
+fn round_eight_tuple_paths_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder { pair: (Value, Value) }
+struct Pair(Value, Value);
+fn make() -> (Value, Value) { let pair = (json!(1), json!("a")); pair }
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (_, from_helper) = make();
+    let holder = Holder { pair: (json!(5), json!(6)) };
+    let (_, from_field) = holder.pair;
+    let pair = Pair(json!(2), json!("b"));
+    Ok(vec![Op::state("helper", json!(from_helper)),
+            Op::state("field", json!(from_field)),
+            Op::state("pair", json!(pair.1))])
+}
+"#;
+    let source = compiled_source("tuple_round8", handler, EntryKind::Service);
+    let ctx = context("tuple_round8", "load", json!({}), json!({}));
+    assert_eq!(
+        ops("tuple_round8", &source, &ctx),
+        rust_ops(native_tuple_round8(&ctx))
+    );
+}
+
+fn native_tuple_round8(_ctx: &Context) -> Vec<Op> {
+    vec![
+        Op::state("helper", json!("a")),
+        Op::state("field", json!(6)),
+        Op::state("pair", json!("b")),
+    ]
+}
+
+#[test]
+fn round_nine_chains_reach_the_host_when_non_null() {
+    let handler = r#"
+struct Holder { pair: (Value, Value) }
+fn make() -> (Value, Value) { (json!(1), json!("a")) }
+fn passthrough(t: (Value, Value)) -> (Value, Value) { t }
+static PAIR: (Value, Value) = (json!(2), json!("s"));
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let t = make();
+    let (_, from_local) = t;
+    let (_, from_helper) = passthrough(make());
+    let mut holder = Holder { pair: make() };
+    holder = Holder { pair: (json!(3), json!(4)) };
+    let (_, from_field) = holder.pair;
+    let (_, from_static) = PAIR;
+    Ok(vec![Op::state("local", json!(from_local)),
+            Op::state("helper", json!(from_helper)),
+            Op::state("field", json!(from_field)),
+            Op::state("static", json!(from_static))])
+}
+"#;
+    let source = compiled_source("chain9", handler, EntryKind::Service);
+    let ctx = context("chain9", "load", json!({}), json!({}));
+    assert_eq!(ops("chain9", &source, &ctx), rust_ops(native_chain9(&ctx)));
+}
+
+fn native_chain9(_ctx: &Context) -> Vec<Op> {
+    vec![
+        Op::state("local", json!("a")),
+        Op::state("helper", json!("a")),
+        Op::state("field", json!(4)),
+        Op::state("static", json!("s")),
+    ]
+}
+
+#[test]
+fn round_ten_chains_reach_the_host_when_non_null() {
+    let handler = r#"
+fn passthrough(t: (Value, Value)) -> (Value, Value) { t }
+fn make_pair() -> (Value, Value) { (json!(1), json!(2)) }
+fn make_value() -> Value { json!(3) }
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (_, from_arg) = passthrough((json!(1), json!(2)));
+    let mut t = (json!(1), json!(2));
+    t = make_pair();
+    let (_, from_call) = t;
+    static PAIR: (Value, Value) = (json!(4), make_value());
+    let (_, from_static) = PAIR;
+    Ok(vec![Op::state("arg", json!(from_arg)),
+            Op::state("call", json!(from_call)),
+            Op::state("static", json!(from_static))])
+}
+"#;
+    let source = compiled_source("chain10", handler, EntryKind::Service);
+    let ctx = context("chain10", "load", json!({}), json!({}));
+    assert_eq!(
+        ops("chain10", &source, &ctx),
+        rust_ops(native_chain10(&ctx))
+    );
+}
+
+fn native_chain10(_ctx: &Context) -> Vec<Op> {
+    vec![
+        Op::state("arg", json!(2)),
+        Op::state("call", json!(2)),
+        Op::state("static", json!(3)),
+    ]
 }

@@ -84,6 +84,8 @@ end
 M.last_query = nil
 
 local boot = nil
+local fixed_host = nil
+local fixed_sent = false
 local sequence = 0
 local pending = {}
 local stream_started = false
@@ -187,18 +189,9 @@ local function invoke(root, path, ...)
   return nil
 end
 local function snapshot()
-  local host = {
-    now_ms = invoke(noctalia, "nowMs") or 0,
-    dark = invoke(noctalia, "isDarkMode"),
-    outputs = invoke(noctalia, "outputs"),
-    focused_output_name = invoke(noctalia, "focusedOutputName"),
+  local fixed = {
     pluginDir = invoke(noctalia, "pluginDir"),
     pluginDataDir = invoke(noctalia, "pluginDataDir"),
-    clipboard = invoke(noctalia, "clipboardText"),
-    calendar = invoke(noctalia, "calendarEvents"),
-    media = invoke(noctalia, "mediaPlayer"),
-    stats = invoke(noctalia, "systemStats"),
-    nightlight = invoke(noctalia, "nightlight.state"),
     compositor = { name = invoke(noctalia, "compositor.name") },
     setting = {},
     bar = {
@@ -208,11 +201,40 @@ local function snapshot()
     colors = {},
   }
   for _, path in ipairs(SETTING_PATHS) do
-    host.setting[path] = invoke(noctalia, "getSetting", path)
+    fixed.setting[path] = invoke(noctalia, "getSetting", path)
   end
   for _, role in ipairs(COLOR_ROLES) do
-    host.colors[role] = invoke(noctalia, "getColor", role)
+    fixed.colors[role] = invoke(noctalia, "getColor", role)
   end
+  return {
+    now_ms = invoke(noctalia, "nowMs") or 0,
+    dark = invoke(noctalia, "isDarkMode"),
+    outputs = invoke(noctalia, "outputs"),
+    focused_output_name = invoke(noctalia, "focusedOutputName"),
+    clipboard = invoke(noctalia, "clipboardText"),
+    calendar = invoke(noctalia, "calendarEvents"),
+    media = invoke(noctalia, "mediaPlayer"),
+    stats = invoke(noctalia, "systemStats"),
+    nightlight = invoke(noctalia, "nightlight.state"),
+  }, fixed
+end
+
+local function sameValue(left, right)
+  if left == right then return true end
+  if type(left) ~= "table" or type(right) ~= "table" then return false end
+  for key, value in pairs(left) do
+    if not sameValue(value, right[key]) then return false end
+  end
+  for key in pairs(right) do
+    if left[key] == nil then return false end
+  end
+  return true
+end
+
+local function mergeHost(fixed, live)
+  local host = {}
+  for key, value in pairs(fixed) do host[key] = value end
+  for key, value in pairs(live) do host[key] = value end
   return host
 end
 
@@ -315,17 +337,28 @@ end
 
 local function writeRequest(request)
   sequence += 1
-  local name = string.format("%012d", sequence)
-  local temporary = REQUEST_DIR .. "/" .. name .. ".pending"
-  local target = REQUEST_DIR .. "/" .. name .. ".json"
-  M.host = snapshot()
-  request.host = M.host
-  local ok, err = noctalia.writeFile(temporary, noctalia.json.encode(encodeBytes(request)))
-  if ok then
-    ok, err = noctalia.renameFile(temporary, target)
+  local target = REQUEST_DIR .. "/" .. string.format("%012d", sequence) .. ".json"
+  local host, fixed = snapshot()
+  M.host = mergeHost(fixed, host)
+  request.host = host
+  local sends_fixed = not fixed_sent or not sameValue(fixed, fixed_host)
+  if sends_fixed then
+    request.host_fixed = fixed
+  end
+  -- Written in place. The helper wakes on the create and retries a truncated
+  -- payload, so the round trip overlaps the write instead of waiting for a
+  -- rename to publish the file.
+  local ok, err = noctalia.writeFile(target, noctalia.json.encode(encodeBytes(request)))
+  if sends_fixed then
+    -- A write that failed never reached the helper, so the fixed part has to
+    -- travel again even though it was built once.
+    fixed_sent = ok == true
+    if fixed_sent then
+      fixed_host = fixed
+    end
   end
   if not ok then
-    noctalia.removeFile(temporary)
+    noctalia.removeFile(target)
     noctalia.log("noctalia bridge: spool write failed: " .. tostring(err))
   end
 end
@@ -348,12 +381,17 @@ local function onLine(line)
     return
   end
   if message.control == "ready" then
+    -- A fresh helper has no cached fixed snapshot.
+    fixed_sent = false
     boot = message.boot
     REQUEST_DIR = message.spool or SPOOL_DIR
     flushPending()
     return
   end
   if message.control == "error" then
+    -- The helper may have rejected the request that carried the fixed part,
+    -- so it has to travel again with the next one.
+    fixed_sent = false
     noctalia.log("noctalia bridge: " .. tostring(message.message))
     return
   end
@@ -412,7 +450,8 @@ function M.setup(entry, configKeys)
     M.config[key] = noctalia.getConfig(key)
   end
   M.state = noctalia.state.get(STATE_KEY) or {}
-  M.host = snapshot()
+  local host, fixed = snapshot()
+  M.host = mergeHost(fixed, host)
   startStream()
 end
 

@@ -31,6 +31,12 @@ impl<'a> Emitter<'a> {
         let kind = static_kind(&item.ty);
         let init = self.static_init(&item.expr, kind)?;
         let lua_name = format!("__static_{}", sanitize(&key));
+        if let Expr::Tuple(items) = item.expr.as_ref() {
+            let shapes = self.tuple_shapes(
+                &items.elems.iter().cloned().collect::<Vec<_>>(),
+            )?;
+            self.tuple_expr_shapes.insert(lua_name.clone(), shapes);
+        }
         let def = StaticDef {
             name: lua_name,
             kind,
@@ -45,6 +51,41 @@ impl<'a> Emitter<'a> {
         expr: &Expr,
         kind: StaticKind,
     ) -> Result<String, Error> {
+        if let Expr::Tuple(items) = expr {
+            let saved_out = std::mem::take(&mut self.out);
+            let saved_indent = self.indent;
+            self.indent = 0;
+            let result = items
+                .elems
+                .iter()
+                .map(|item| self.expr(item))
+                .collect::<Result<Vec<_>, Error>>();
+            let emitted = std::mem::replace(&mut self.out, saved_out);
+            self.indent = saved_indent;
+            let values = result?;
+            let shapes = values
+                .iter()
+                .zip(items.elems.iter())
+                .map(|((text, ty), _)| {
+                    let mut ty = *ty;
+                    if self.null_texts.contains(text) {
+                        ty.null = true;
+                    }
+                    TupleShape::Leaf(ty)
+                })
+                .collect::<Vec<_>>();
+            let text = format!(
+                "{{ {} }}",
+                values
+                    .iter()
+                    .map(|(text, _)| text.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            self.tuple_expr_shapes.insert(text.clone(), shapes);
+            self.out.push_str(&emitted);
+            return Ok(text);
+        }
         if let Some((text, _)) = constant(expr) {
             return Ok(text);
         }
@@ -144,6 +185,9 @@ impl<'a> Emitter<'a> {
         let init = self.static_init(&item.expr, kind)?;
         let name = format!("__local_{}", self.temp().trim_start_matches("__t"));
         self.line(&format!("local {name} = {init}"));
+        if let Some(shapes) = self.tuple_expr_shapes.get(&init).cloned() {
+            self.tuple_expr_shapes.insert(name.clone(), shapes);
+        }
         if let Some(scope) = self.local_statics.last_mut() {
             scope.insert(item.ident.to_string(), (name, kind));
         }

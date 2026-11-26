@@ -165,6 +165,49 @@ impl<'a> Emitter<'a> {
         Ok((format!("({text})({})", values.join(", ")), ty))
     }
 
+    /// Whether an iterator chain yields `(key, value)` pairs.
+    fn pair_source(&self, expr: &Expr) -> bool {
+        match strip_reference(expr) {
+            Expr::MethodCall(call) => match call.method.to_string().as_str() {
+                "iter" | "into_iter" => match strip_reference(&call.receiver) {
+                    Expr::Path(path) => path
+                        .path
+                        .get_ident()
+                        .and_then(|name| self.lookup(&name.to_string()))
+                        .is_some_and(|ty| ty.base == Base::Table),
+                    _ => false,
+                },
+                "enumerate" | "zip" => true,
+                "rev" | "take_while" | "skip_while" | "flat_map" => {
+                    self.pair_source(&call.receiver)
+                }
+                "map" | "filter" | "filter_map" | "take" | "skip"
+                | "flatten" | "copied" | "cloned" => {
+                    self.pair_source(&call.receiver)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Invoke a closure whose argument is a `(key, value)` pair, typing the
+    /// first tuple element as a string.
+    fn invoke_pair_arg(
+        &mut self,
+        arg: &Expr,
+        value: &str,
+    ) -> Result<(String, Ty), Error> {
+        if let Expr::Closure(closure) = arg {
+            return self.closure_value_typed(
+                closure,
+                std::slice::from_ref(&value.to_owned()),
+                &[Some(Ty::LIST_OF_KEYS)],
+            );
+        }
+        self.invoke_arg(arg, std::slice::from_ref(&value.to_owned()))
+    }
+
     fn combinator(
         &mut self,
         call: &ExprMethodCall,
@@ -322,11 +365,17 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("local {result} = {value}"));
                 self.line(&format!("if {value} == nil then"));
                 self.indent = self.indent.saturating_add(1);
-                let (text, fallback_ty) = self.fallback(closure, ty)?;
+                let (text, mut fallback_ty) = self.fallback(closure, ty)?;
                 self.line(&format!("{result} = {text}"));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
-                return Ok(Some((result, wider(ty, fallback_ty))));
+                // Only a real fallback value clears the receiver's nullness;
+                // a fallback that is itself null must reach the insertion
+                // check like any other null.
+                if text != "nil" && !fallback_ty.null {
+                    fallback_ty.null = false;
+                }
+                return Ok(Some((result, fallback_ty)));
             }
             "ok_or" => {
                 let message = arg(args, 0, call)?;
@@ -406,7 +455,7 @@ impl<'a> Emitter<'a> {
                 emitter.line("end");
                 Ok(())
             };
-            self.emit_iter(&call.receiver, &body)?;
+            self.emit_iter(&call.receiver, false, &body)?;
             return Ok(Some((result, Ty::OPT_VALUE)));
         }
         let Some(closure) = args.first().copied() else {
@@ -449,7 +498,7 @@ impl<'a> Emitter<'a> {
                 emitter.line("end");
                 Ok(())
             };
-            self.emit_iter(&call.receiver, &body)?;
+            self.emit_iter(&call.receiver, false, &body)?;
             let ty = if index.is_some() {
                 Ty::OPT_INT
             } else {
@@ -478,7 +527,7 @@ impl<'a> Emitter<'a> {
                 }
                 Ok(())
             };
-            self.emit_iter(&call.receiver, &body)?;
+            self.emit_iter(&call.receiver, false, &body)?;
             return Ok(Some((String::new(), Ty::VOID)));
         }
         self.line(&format!("local {result} = {initial}"));
@@ -511,7 +560,7 @@ impl<'a> Emitter<'a> {
             }
             Ok(())
         };
-        self.emit_iter(&call.receiver, &body)?;
+        self.emit_iter(&call.receiver, false, &body)?;
         let ty = match method.as_str() {
             "any" | "all" => Ty::BOOL,
             "count" => Ty::INT,
@@ -530,7 +579,7 @@ impl<'a> Emitter<'a> {
             emitter.line(&format!("{result}[#{result} + 1] = {value}"));
             Ok(())
         };
-        self.emit_iter(&method.receiver, &insert)?;
+        self.emit_iter(&method.receiver, false, &insert)?;
         Ok(Some((result, Ty::LIST)))
     }
 
@@ -541,23 +590,33 @@ impl<'a> Emitter<'a> {
     fn emit_iter(
         &mut self,
         expr: &Expr,
+        pair: bool,
         body: &dyn Fn(&mut Self, &str) -> Result<(), Error>,
     ) -> Result<(), Error> {
         match strip_reference(expr) {
-            Expr::Paren(paren) => return self.emit_iter(&paren.expr, body),
-            Expr::Group(group) => return self.emit_iter(&group.expr, body),
+            Expr::Paren(paren) => {
+                return self.emit_iter(&paren.expr, pair, body);
+            }
+            Expr::Group(group) => {
+                return self.emit_iter(&group.expr, pair, body);
+            }
             Expr::MethodCall(call) => match call.method.to_string().as_str() {
                 "map" | "filter_map" => {
+                    let pair = self.pair_source(&call.receiver);
                     let skip_nil = call.method == "filter_map";
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
-                        let (text, _) = emitter.invoke_arg(
-                            closure,
-                            std::slice::from_ref(&value.to_owned()),
-                        )?;
+                        let (text, _) = if pair {
+                            emitter.invoke_pair_arg(closure, value)?
+                        } else {
+                            emitter.invoke_arg(
+                                closure,
+                                std::slice::from_ref(&value.to_owned()),
+                            )?
+                        };
                         if text.is_empty() {
                             return Ok(());
                         }
@@ -573,18 +632,23 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "filter" => {
+                    let pair = self.pair_source(&call.receiver);
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
-                        let (condition, _) = emitter.invoke_arg(
-                            closure,
-                            std::slice::from_ref(&value.to_owned()),
-                        )?;
+                        let (condition, _) = if pair {
+                            emitter.invoke_pair_arg(closure, value)?
+                        } else {
+                            emitter.invoke_arg(
+                                closure,
+                                std::slice::from_ref(&value.to_owned()),
+                            )?
+                        };
                         emitter.line(&format!("if {condition} then"));
                         emitter.indent = emitter.indent.saturating_add(1);
                         body(emitter, value)?;
@@ -592,7 +656,7 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "splitn" | "match_indices" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -611,7 +675,7 @@ impl<'a> Emitter<'a> {
                                 "iterator method is not supported",
                             )
                         })?;
-                    return self.emit_table(&list, false, false, body);
+                    return self.emit_table(&list, false, false, None, body);
                 }
                 "split" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -621,20 +685,21 @@ impl<'a> Emitter<'a> {
                         &format!("string.split({text}, {separator})"),
                         false,
                         false,
+                        None,
                         body,
                     );
                 }
                 "split_whitespace" => {
                     let (text, _) = self.expr(&call.receiver)?;
                     let words = self.whitespace_split(&text);
-                    return self.emit_table(&words, false, false, body);
+                    return self.emit_table(&words, false, false, None, body);
                 }
                 "char_indices" => {
                     let (text, _) = self.expr(&call.receiver)?;
                     let pairs = format!(
                         "(function() local __out = {{}}; for __offset, __code in utf8.codes({text}) do __out[#__out + 1] = {{ __offset - 1, utf8.char(__code) }} end; __out.__next = 1; return __out end)()"
                     );
-                    return self.emit_table(&pairs, false, false, body);
+                    return self.emit_table(&pairs, false, false, None, body);
                 }
                 "chars" | "bytes" => {
                     let (text, _) = self.expr(&call.receiver)?;
@@ -642,26 +707,43 @@ impl<'a> Emitter<'a> {
                         &format!("string.split({text}, \"\")"),
                         false,
                         false,
+                        None,
                         body,
                     );
                 }
                 "lines" => {
                     let (text, _) = self.expr(&call.receiver)?;
                     let lines = self.split_lines(&text);
-                    return self.emit_table(&lines, false, false, body);
+                    return self.emit_table(&lines, false, false, None, body);
                 }
                 "iter" | "into_iter" | "values" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     let map = ty.base == Base::Table;
-                    return self.emit_table(&source, false, map, body);
+                    let _ = pair;
+                    return self.emit_table(
+                        &source,
+                        false,
+                        map,
+                        Some(
+                            call.method.to_string().as_str() == "iter"
+                                || call.method == "into_iter",
+                        ),
+                        body,
+                    );
                 }
                 "copied" | "cloned" => {
-                    return self.emit_iter(&call.receiver, body);
+                    return self.emit_iter(&call.receiver, pair, body);
                 }
                 "keys" => {
                     let (source, ty) = self.expr(&call.receiver)?;
                     let map = ty.base == Base::Table;
-                    return self.emit_table(&source, true, map, body);
+                    return self.emit_table(
+                        &source,
+                        true,
+                        map,
+                        Some(false),
+                        body,
+                    );
                 }
                 "skip" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -682,7 +764,7 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "take" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -696,7 +778,7 @@ impl<'a> Emitter<'a> {
                         emitter.line(&format!("{left} = {left} - 1"));
                         body(emitter, value)
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "rev" => {
                     let (source, _) = self.expr(&call.receiver)?;
@@ -719,7 +801,7 @@ impl<'a> Emitter<'a> {
                         emitter.line(&format!("{index} = {index} + 1"));
                         body(emitter, &format!("{{ {index}, {value} }}"))
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "zip" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -737,7 +819,7 @@ impl<'a> Emitter<'a> {
                             &format!("{{ {value}, {other_table}[{index}] }}"),
                         )
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "take_while" | "skip_while" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -777,7 +859,7 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "flat_map" => {
                     let args = call.args.iter().collect::<Vec<_>>();
@@ -796,10 +878,11 @@ impl<'a> Emitter<'a> {
                             &format!("({text})"),
                             false,
                             false,
+                            None,
                             body,
                         )
                     };
-                    return self.emit_iter(&call.receiver, &inner);
+                    return self.emit_iter(&call.receiver, pair, &inner);
                 }
                 "flatten" => {
                     let (source, ty) = self.expr(&call.receiver)?;
@@ -808,6 +891,7 @@ impl<'a> Emitter<'a> {
                             &format!("({source} or {{}})"),
                             false,
                             false,
+                            None,
                             body,
                         );
                     }
@@ -816,9 +900,10 @@ impl<'a> Emitter<'a> {
                             |emitter: &mut Self,
                              value: &str|
                              -> Result<(), Error> {
-                                emitter.emit_table(value, false, false, body)
+                                emitter
+                                    .emit_table(value, false, false, None, body)
                             };
-                        return self.emit_iter(&call.receiver, &inner);
+                        return self.emit_iter(&call.receiver, pair, &inner);
                     }
                 }
                 "rsplit" => {
@@ -826,17 +911,17 @@ impl<'a> Emitter<'a> {
                     let (text, _) = self.expr(&call.receiver)?;
                     let separator = self.expr(arg(&args, 0, call)?)?.0;
                     let parts = Self::reverse_split(&text, &separator);
-                    return self.emit_table(&parts, false, false, body);
+                    return self.emit_table(&parts, false, false, None, body);
                 }
                 _ => {}
             },
             Expr::Range(range) => {
                 let list = self.range_list(range)?;
-                return self.emit_table(&list, false, false, body);
+                return self.emit_table(&list, false, false, None, body);
             }
             other => {
                 let (source, _) = self.expr(other)?;
-                return self.emit_table(&source, false, false, body);
+                return self.emit_table(&source, false, false, None, body);
             }
         }
         Err(Error::at(
@@ -854,17 +939,44 @@ impl<'a> Emitter<'a> {
         source: &str,
         keys: bool,
         map: bool,
+        pairs: Option<bool>,
         body: &dyn Fn(&mut Self, &str) -> Result<(), Error>,
     ) -> Result<(), Error> {
-        let item = self.temp();
         if map {
-            if keys {
-                self.line(&format!("for {item} in pairs({source}) do"));
-            } else {
-                self.line(&format!("for _, {item} in pairs({source}) do"));
-            }
+            let order = self.temp();
+            let index = self.temp();
+            self.line(&format!("local {order} = {{}}"));
+            self.line(&format!(
+                "for __key in pairs({source}) do {order}[#({order}) + 1] = __key end"
+            ));
+            self.line(&format!(
+                "table.sort({order}, function(a, b) return tostring(a) < tostring(b) end)"
+            ));
+            self.line(&format!("for {index} = 1, #{order} do"));
             self.indent = self.indent.saturating_add(1);
-            let result = body(self, &item);
+            let result = if keys {
+                body(self, &format!("{order}[{index}]"))
+            } else if pairs == Some(true) {
+                // `iter`/`into_iter` yield a (key, value) pair, so a closure
+                // tuple binding reads `[1]` and `[2]` as Rust expects.
+                let key = self.temp();
+                self.line(&format!("local {key} = {order}[{index}]"));
+                let pair = self.temp();
+                self.line(&format!(
+                    "local {pair} = {{ {key}, {source}[{key}] }}"
+                ));
+                let saved_pair = self.lookup(&key);
+                self.push(&key, Ty::STR);
+                let result = body(self, &pair);
+                if let Some(ty) = saved_pair {
+                    self.push(&key, ty);
+                }
+                result
+            } else {
+                let key = self.temp();
+                self.line(&format!("local {key} = {order}[{index}]"));
+                body(self, &format!("{source}[{key}]"))
+            };
             self.indent = self.indent.saturating_sub(1);
             self.line("end");
             return result;
@@ -1050,6 +1162,11 @@ impl<'a> Emitter<'a> {
         }
         let method = call.method.to_string();
         let args = call.args.iter().collect::<Vec<_>>();
+        if method == "open"
+            && let Some(value) = self.open_append(call, &args)?
+        {
+            return Ok(value);
+        }
         if let Some(value) = self.entry_method(call, &method, &args)? {
             return Ok(value);
         }
@@ -1076,6 +1193,12 @@ impl<'a> Emitter<'a> {
             if let Some(value) = self.method_call(call, &receiver, &class)? {
                 return Ok(value);
             }
+            if class == fs::APPEND_HANDLE
+                && let Some(value) =
+                    self.append_method(call, &method, &args, &receiver)?
+            {
+                return Ok(value);
+            }
         }
         let (receiver, ty) = self.expr(&call.receiver)?;
         let receiver = if receiver.starts_with('{') {
@@ -1087,6 +1210,17 @@ impl<'a> Emitter<'a> {
             self.combinator(call, &method, &args, &receiver, ty)?
         {
             return Ok(value);
+        }
+        if ty.base == Base::Path
+            && let Some((text, ty)) =
+                self.path_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
+        }
+        if let Some((text, ty)) =
+            self.fs_method(call, &method, &args, &receiver, ty)?
+        {
+            return Ok((text, ty));
         }
         if let Some((text, ty)) =
             self.value_method(call, &method, &args, &receiver, ty)?
@@ -1204,8 +1338,25 @@ impl<'a> Emitter<'a> {
                 Ok((format!("noctalia.getColor({role})"), Ty::OPT_VALUE))
             }
             "host" => {
+                if self.strict() {
+                    let argument = arg(args, 0, call)?;
+                    let Some(path) = literal_string(argument) else {
+                        return Err(Error::at(
+                            argument.span(),
+                            "strict host resolution needs a literal path",
+                        ));
+                    };
+                    return Ok((
+                        host_path(&path)?.to_owned(),
+                        Ty::OPT_VALUE,
+                    ));
+                }
                 let path = self.string_literal_arg(args, 0, call)?;
                 Ok((host_path(&unquote(&path))?.to_owned(), Ty::OPT_VALUE))
+            }
+            "translations" if self.strict() => {
+                self.uses_translations_table = true;
+                Ok(("TRANSLATIONS".to_owned(), Ty::VALUE))
             }
             "clipboard" => Ok((
                 "noctalia.clipboardText()".to_owned(),
@@ -1245,11 +1396,11 @@ impl<'a> Emitter<'a> {
                 Ok(("noctalia.isDarkMode()".to_owned(), Ty::BOOL))
             }
             "plugin_dir" => {
-                Ok(("noctalia.pluginDir()".to_owned(), Ty::STR))
+                Ok(("noctalia.pluginDir()".to_owned(), Ty::PATH))
             }
             "plugin_data_dir" => Ok((
                 "noctalia.pluginDataDir()".to_owned(),
-                Ty::OPT_STR,
+                Ty::OPT_PATH,
             )),
             "time_format" => Ok((
                 "noctalia.getSetting(\"shell.time_format\")".to_owned(),
@@ -1295,7 +1446,7 @@ impl<'a> Emitter<'a> {
             }
             "expand_path" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("noctalia.expandPath({path})"), Ty::STR))
+                Ok((format!("noctalia.expandPath({path})"), Ty::PATH))
             }
             "list_dir" => {
                 let path = self.path_arg(args, 0, call)?;
@@ -1337,11 +1488,11 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "plugin_data_dir_result" => Ok((
-                "(noctalia.pluginDataDir())".to_owned(),
-                Ty::OPT_STR,
+                "noctalia.pluginDataDir()".to_owned(),
+                Ty::OPT_PATH,
             )),
             "plugin_dir_result" => {
-                Ok(("(noctalia.pluginDir())".to_owned(), Ty::OPT_STR))
+                Ok(("noctalia.pluginDir()".to_owned(), Ty::OPT_PATH))
             }
             "os_clock" => Ok(("os.clock()".to_owned(), Ty::FLOAT)),
             "os_time" => Ok(("os.time()".to_owned(), Ty::INT)),
@@ -1373,27 +1524,55 @@ impl<'a> Emitter<'a> {
             }
             "read_file_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.readFile({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.readFile({path})"), Ty::VALUE))
             }
             "list_dir_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.listDir({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.listDir({path})"), Ty::VALUE))
             }
             "load_font_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.loadFont({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.loadFont({path})"), Ty::VALUE))
             }
             "file_info_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.fileInfo({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.fileInfo({path})"), Ty::VALUE))
             }
             "mkdir_all_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.mkdirAll({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.mkdirAll({path})"), Ty::VALUE))
             }
             "remove_file_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.removeFile({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.removeFile({path})"), Ty::VALUE))
+            }
+            "write_file_result" if !self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                let contents = self.path_arg(args, 1, call)?;
+                Ok((
+                    format!("noctalia.writeFile({path}, {contents})"),
+                    Ty::VALUE,
+                ))
+            }
+            "write_file_bytes_result" => {
+                let path = self.path_arg(args, 0, call)?;
+                let contents = self.path_arg(args, 1, call)?;
+                Ok((
+                    format!("noctalia.writeFile({path}, {contents})"),
+                    Ty::VALUE,
+                ))
+            }
+            "rename_file_result" if !self.strict() => {
+                let from = self.path_arg(args, 0, call)?;
+                let to = self.path_arg(args, 1, call)?;
+                Ok((
+                    format!("noctalia.renameFile({from}, {to})"),
+                    Ty::VALUE,
+                ))
+            }
+            "read_file_bytes_result" if !self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                Ok((format!("noctalia.readFile({path})"), Ty::VALUE))
             }
             "math_randomseed" => {
                 let seed = self.expr(arg(args, 0, call)?)?.0;
@@ -1413,6 +1592,14 @@ impl<'a> Emitter<'a> {
                     format!("noctalia.trp({key}, {count}, {table})"),
                     Ty::STR,
                 ))
+            }
+            "query_value" | "query_bool"
+                if self.strict() =>
+            {
+                self.strict_query(method, args, call)
+            }
+            "query_pair" | "query_response" if self.strict() => {
+                self.strict_query(method, args, call)
             }
             "query_value" | "query_bool" => {
                 let root = self.string_arg(args, 0, call)?;
@@ -1435,7 +1622,33 @@ impl<'a> Emitter<'a> {
             }
             "file_info" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("noctalia.fileInfo({path})"), Ty::VALUE))
+                Ok((format!("noctalia.fileInfo({path})"), Ty::INFO))
+            }
+            "run_async_start" | "run_stream_start" | "http_start"
+                if self.strict() =>
+            {
+                let (request, _) = self.expr(arg(args, 0, call)?)?;
+                let callback = arg(args, 1, call)?;
+                let callback =
+                    self.strict_callback(callback, callback.span())?;
+                let head = match method {
+                    "run_async_start" => "noctalia.runAsync",
+                    "run_stream_start" => "noctalia.runStream",
+                    _ => "noctalia.http",
+                };
+                let line = if method == "run_async_start" {
+                    let timeout = match args.get(2) {
+                        Some(timeout) => self.option_value(timeout)?,
+                        None => "nil".to_owned(),
+                    };
+                    format!("{head}({request}, {callback}, {timeout})")
+                } else {
+                    format!("{head}({request}, {callback})")
+                };
+                let value = self.temp();
+                self.line(&format!("local {value} = {line}"));
+                self.emitted = true;
+                Ok((format!("({value})"), Ty::BOOL))
             }
             "run_async_start" | "run_stream_start" | "http_start" => {
                 if !self.in_statement {
@@ -1464,8 +1677,59 @@ impl<'a> Emitter<'a> {
                 } else {
                     format!("{head}({request}, {callback})")
                 };
+                if self.value_needed {
+                    return Ok((line, Ty::BOOL));
+                }
                 self.line(&line);
                 Ok((String::new(), Ty::VOID))
+            }
+            "write_file_result" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                let contents = self.expr(arg(args, 1, call)?)?.0;
+                Ok((
+                    format!("noctalia.writeFile({path}, {contents})"),
+                    Ty::VOID,
+                ))
+            }
+            "rename_file_result" if self.strict() => {
+                let from = self.path_arg(args, 0, call)?;
+                let to = self.path_arg(args, 1, call)?;
+                Ok((
+                    format!("noctalia.renameFile({from}, {to})"),
+                    Ty::VOID,
+                ))
+            }
+            "copy_bytes" if self.strict() => {
+                let bytes = self.expr(arg(args, 0, call)?)?.0;
+                let mime = self.expr(arg(args, 1, call)?)?.0;
+                Ok((
+                    format!("noctalia.copyToClipboard({bytes}, {mime})"),
+                    Ty::BOOL,
+                ))
+            }
+            "write_file_bytes" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                let bytes = self.expr(arg(args, 1, call)?)?.0;
+                Ok((
+                    format!("noctalia.writeFile({path}, {bytes})"),
+                    Ty::VOID,
+                ))
+            }
+            "read_file_bytes" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                Ok((
+                    format!("noctalia.readFile({path})"),
+                    Ty::result(Base::Str),
+                ))
+            }
+            "read_file_bytes_result" if self.strict() => {
+                let path = self.path_arg(args, 0, call)?;
+                Ok((format!("noctalia.readFile({path})"), Ty::VALUE))
+            }
+            "payload_bytes" if self.strict() => {
+                self.uses_payload = true;
+                let key = self.string_arg(args, 0, call)?;
+                Ok((format!("payload[{key}]"), Ty::VALUE))
             }
             other => Err(Error::at(
                 call.method.span(),
@@ -1473,6 +1737,60 @@ impl<'a> Emitter<'a> {
                     "context method `{other}` is not supported by the Luau compiler"
                 ),
             )),
+        }
+    }
+
+    /// A strict host query: the direct member call, resolved at build time.
+    fn strict_query(
+        &mut self,
+        method: &str,
+        args: &[&Expr],
+        call: &ExprMethodCall,
+    ) -> Result<(String, Ty), Error> {
+        let root_expr = arg(args, 0, call)?;
+        let Some(root) = literal_string(root_expr) else {
+            return Err(Error::at(
+                root_expr.span(),
+                "strict host resolution needs a literal root",
+            ));
+        };
+        let path_expr = arg(args, 1, call)?;
+        let path = literal_path(path_expr)?;
+        let values = self.expr(arg(args, 2, call)?)?.0;
+        let full = strict::member_path(&root, &path);
+        let Some(kind) = strict::member(&root, &path) else {
+            return Err(Error::at(
+                path_expr.span(),
+                format!("unknown host member `{full}`"),
+            ));
+        };
+        if matches!(
+            kind,
+            strict::MemberKind::Namespace
+                | strict::MemberKind::Node
+                | strict::MemberKind::Void
+        ) {
+            return Err(Error::at(
+                path_expr.span(),
+                format!("`{full}` cannot answer a query"),
+            ));
+        }
+        self.uses_unpack = true;
+        let text = format!("{full}(__unpack({values}))");
+        match method {
+            "query_bool" => Ok((format!("({text} == true)"), Ty::BOOL)),
+            "query_value" => Ok((text, Ty::VALUE)),
+            "query_pair" => Ok((text, Ty::VALUE)),
+            _ => {
+                let value = self.temp();
+                let error = self.temp();
+                Ok((
+                    format!(
+                        "(function() local {value}, {error} = {text}; return {{ ok = true, value = {value}, error = {error} }} end)()"
+                    ),
+                    Ty::VALUE,
+                ))
+            }
         }
     }
 
@@ -1754,7 +2072,7 @@ impl<'a> Emitter<'a> {
     ) -> Result<String, Error> {
         let value = arg(args, index, call)?;
         let (text, ty) = self.expr(value)?;
-        if ty.base == Base::Str {
+        if ty.is_string() {
             return Ok(text);
         }
         Ok(format!("tostring({text})"))
@@ -1917,7 +2235,10 @@ fn boolean_check(receiver: &str, ty: Ty) -> String {
     if ty.base == Base::Bool {
         receiver.to_owned()
     } else {
-        format!("(type({receiver}) == \"boolean\" and {receiver} or nil)")
+        // `false or nil` is nil, so a false payload needs the branch form.
+        format!(
+            "(function(__value) if type(__value) == \"boolean\" then return __value end end)({receiver})"
+        )
     }
 }
 
@@ -1960,10 +2281,11 @@ fn integer_check(receiver: &str, ty: Ty, range: (&str, &str)) -> String {
 /// removes the slot, so a computed `Value::Null` would silently disappear.
 pub(super) fn reject_null(
     text: &str,
+    ty: Ty,
     span: proc_macro2::Span,
     construct: &str,
 ) -> Result<(), Error> {
-    if text != "nil" {
+    if text != "nil" && !ty.null {
         return Ok(());
     }
     Err(Error::at(

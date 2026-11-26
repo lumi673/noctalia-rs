@@ -7,6 +7,8 @@ impl<'a> Emitter<'a> {
     ) -> Result<(String, Ty), Error> {
         match macro_name(mac).as_str() {
             "format" => self.format(mac),
+            "write" => self.write_macro(mac, false),
+            "writeln" => self.write_macro(mac, true),
             "matches" => self.matches_macro(mac),
             "json" => self.json(mac),
             "vec" => {
@@ -33,6 +35,16 @@ impl<'a> Emitter<'a> {
         mac: &ExprMacro,
     ) -> Result<(String, Ty), Error> {
         let parsed: FormatArgs = syn::parse2(mac.mac.tokens.clone())?;
+        let text = self.format_text(mac, &parsed)?;
+        Ok((text, Ty::STR))
+    }
+
+    /// The `format!` body, shared with `write!` and `writeln!`.
+    pub(crate) fn format_text(
+        &mut self,
+        mac: &ExprMacro,
+        parsed: &FormatArgs,
+    ) -> Result<String, Error> {
         let mut pieces = Vec::new();
         let mut text = String::new();
         let mut chars = parsed.literal.chars().peekable();
@@ -118,7 +130,7 @@ impl<'a> Emitter<'a> {
         if pieces.is_empty() {
             pieces.push("\"\"".to_owned());
         }
-        Ok((pieces.join(" .. "), Ty::STR))
+        Ok(pieces.join(" .. "))
     }
 
     pub(super) fn json(
@@ -207,7 +219,7 @@ impl<'a> Emitter<'a> {
                 if let Expr::Path(path) = &**expr
                     && path.path.is_ident("null")
                 {
-                    return Ok(("nil".to_owned(), Ty::VALUE));
+                    return Ok(("nil".to_owned(), Ty::NULL));
                 }
                 let (text, ty) = self.expr(expr)?;
                 if ty.is_numeric() {
@@ -281,7 +293,7 @@ fn format_specifier(
     }
     format.push_str(rest);
     let conversion = match ty.base {
-        Base::Str => 's',
+        Base::Str | Base::Path => 's',
         Base::Int => 'd',
         Base::Float => {
             if rest.contains('.') {
@@ -291,11 +303,13 @@ fn format_specifier(
             }
         }
         Base::Bool | Base::Value | Base::List | Base::Table | Base::Node => 's',
-        Base::Ops | Base::Context | Base::Void => return Err(unsupported()),
+        Base::Info | Base::Ops | Base::Context | Base::Void => {
+            return Err(unsupported());
+        }
     };
     format.push(conversion);
     let value = match ty.base {
-        Base::Str | Base::Int | Base::Float => value,
+        Base::Str | Base::Path | Base::Int | Base::Float => value,
         _ => format!("tostring({value})"),
     };
     Ok(format!("string.format({}, {value})", quote(&format)))
@@ -305,7 +319,7 @@ fn format_piece(value: String, ty: Ty) -> String {
     if ty.is_string() || ty.is_numeric() {
         value
     } else if ty.base == Base::Value {
-        format!("json.encode({value})")
+        format!("(json.encode({value}))")
     } else {
         format!("tostring({value})")
     }
@@ -437,4 +451,27 @@ impl JsonNode {
             Self::Expr(expr) => expr.span(),
         }
     }
+}
+
+/// The global name in a `json!` object's `onAction` field, when literal.
+pub(super) fn json_action_name(expr: &Expr) -> Option<String> {
+    let Expr::Macro(mac) = strip_reference(expr) else {
+        return None;
+    };
+    if macro_name(mac) != "json" {
+        return None;
+    }
+    let node: JsonNode = syn::parse2(mac.mac.tokens.clone()).ok()?;
+    let JsonNode::Object(entries) = node else {
+        return None;
+    };
+    entries.into_iter().find_map(|(key, value)| {
+        if key != "onAction" {
+            return None;
+        }
+        let JsonNode::Expr(expr) = value else {
+            return None;
+        };
+        literal_string(&expr)
+    })
 }

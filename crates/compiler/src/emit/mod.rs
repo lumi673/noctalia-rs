@@ -8,6 +8,8 @@
 //! and statics, and `types.rs` the type model.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::strict;
 use std::fmt::Write as _;
 
 use syn::parse::{Parse, ParseStream};
@@ -21,7 +23,7 @@ use syn::{
 use crate::program::{Program, typed_args};
 use crate::{
     Error, NativeFn, NativeMode, NativeParam, NativeParamKind, NativePass,
-    is_context, is_identifier, is_luau_keyword, quote, sanitize,
+    StrictOptions, is_context, is_identifier, is_luau_keyword, quote, sanitize,
 };
 
 mod calls;
@@ -53,6 +55,9 @@ impl<'a> Emitter<'a> {
         module: &str,
         native_mode: NativeMode,
         known_native: &'a BTreeMap<String, NativeFn>,
+        strict: Option<StrictOptions<'a>>,
+        has_action: bool,
+        has_host_callback: bool,
     ) -> Self {
         Self {
             ctx: ctx.to_string(),
@@ -78,8 +83,19 @@ impl<'a> Emitter<'a> {
             classes: HashMap::new(),
             self_class: None,
             pending_class: None,
+            pending_null_fields: None,
+            null_fields: HashMap::new(),
+            tuple_types: HashMap::new(),
+            tuple_expr_shapes: HashMap::new(),
+            tuple_expr_text: HashMap::new(),
+            last_tuple_shape: None,
+            unknown_value_tuple: false,
+            null_texts: std::collections::BTreeSet::new(),
+            last_value_ty: None,
+            newtype_types: HashMap::new(),
             value_helper: false,
             in_statement: false,
+            value_needed: false,
             containers: HashMap::new(),
             tail_target: None,
             uses_state: false,
@@ -105,7 +121,24 @@ impl<'a> Emitter<'a> {
             uses_native: false,
             uses_native_context: false,
             deferred: 0,
+            strict,
+            values: HashMap::new(),
+            actions: BTreeSet::new(),
+            notify_actions: BTreeSet::new(),
+            uses_config_table: false,
+            uses_translations_table: false,
+            uses_unpack: false,
+            uses_pcall: false,
+            uses_action_dispatch: false,
+            uses_callback_dispatch: false,
+            has_action,
+            has_host_callback,
         }
+    }
+
+    /// Whether the entry is emitted as a standalone strict script.
+    pub(super) fn strict(&self) -> bool {
+        self.strict.is_some()
     }
 
     pub(super) fn statement_block(
@@ -229,6 +262,13 @@ impl<'a> Emitter<'a> {
                 .values()
                 .map(|def| (def.name.clone(), def.init.clone()))
                 .collect(),
+            actions: self.actions,
+            notify_actions: self.notify_actions,
+            uses_action_dispatch: self.uses_action_dispatch,
+            uses_config_table: self.uses_config_table,
+            uses_translations_table: self.uses_translations_table,
+            uses_unpack: self.uses_unpack,
+            uses_pcall: self.uses_pcall,
         }
     }
 
@@ -267,8 +307,29 @@ impl<'a> Emitter<'a> {
 /// the pair in `tests`.
 pub(crate) const ARRAY_MARKER: &str = "__noctalia_array";
 
+/// Where a list iterator keeps its position, in the table's metatable so the
+/// elements stay a clean sequence.
+pub(crate) const CURSOR_MARKER: &str = "__noctalia_cursor";
+
 pub(crate) fn empty_array() -> String {
     format!("setmetatable({{}}, {{ {ARRAY_MARKER} = true }})")
+}
+
+/// The shape of a tuple value, kept so nested destructuring can carry the
+/// nullness of an inner element through each step.
+#[derive(Clone)]
+pub(crate) enum TupleShape {
+    Leaf(Ty),
+    Tuple(Vec<TupleShape>),
+}
+
+impl TupleShape {
+    pub(crate) fn any_null(&self) -> bool {
+        match self {
+            Self::Leaf(ty) => ty.null,
+            Self::Tuple(shapes) => shapes.iter().any(Self::any_null),
+        }
+    }
 }
 
 pub(crate) type PayloadParam = (&'static str, &'static str, &'static str);
@@ -332,6 +393,13 @@ pub(crate) struct Body {
     pub uses_native_context: bool,
     pub native: Vec<NativeFn>,
     pub statics: Vec<(String, String)>,
+    pub actions: BTreeSet<String>,
+    pub notify_actions: BTreeSet<String>,
+    pub uses_action_dispatch: bool,
+    pub uses_config_table: bool,
+    pub uses_translations_table: bool,
+    pub uses_unpack: bool,
+    pub uses_pcall: bool,
 }
 
 #[derive(Clone)]
@@ -359,8 +427,19 @@ pub(crate) struct Emitter<'a> {
     classes: HashMap<String, String>,
     self_class: Option<String>,
     pending_class: Option<String>,
+    pending_null_fields: Option<BTreeSet<String>>,
+    null_fields: HashMap<String, BTreeSet<String>>,
+    tuple_types: HashMap<String, Vec<TupleShape>>,
+    tuple_expr_shapes: HashMap<String, Vec<TupleShape>>,
+    tuple_expr_text: HashMap<String, String>,
+    last_tuple_shape: Option<Vec<TupleShape>>,
+    unknown_value_tuple: bool,
+    null_texts: std::collections::BTreeSet<String>,
+    last_value_ty: Option<Ty>,
+    newtype_types: HashMap<String, Ty>,
     value_helper: bool,
     in_statement: bool,
+    value_needed: bool,
     containers: HashMap<String, StaticKind>,
     tail_target: Option<String>,
     uses_state: bool,
@@ -386,6 +465,18 @@ pub(crate) struct Emitter<'a> {
     uses_native: bool,
     uses_native_context: bool,
     deferred: usize,
+    strict: Option<StrictOptions<'a>>,
+    values: HashMap<String, String>,
+    actions: BTreeSet<String>,
+    notify_actions: BTreeSet<String>,
+    uses_config_table: bool,
+    uses_translations_table: bool,
+    uses_unpack: bool,
+    uses_pcall: bool,
+    uses_action_dispatch: bool,
+    uses_callback_dispatch: bool,
+    has_action: bool,
+    has_host_callback: bool,
 }
 
 pub(crate) const MAX_INLINE_CALLS: usize = 200;

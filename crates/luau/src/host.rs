@@ -225,19 +225,60 @@ pub struct Host {
     pub snapshot: Snapshot,
     pub collector: Collector,
     translations: Translations,
+    strict: bool,
+    responses: Mutex<HashMap<String, String>>,
     query_dir: OnceLock<PathBuf>,
     miss_checked_ms: AtomicU64,
 }
 
 impl Host {
     pub fn new(ctx: &Context, sources: &[(&str, &str)]) -> Self {
+        Self::with_contract(ctx, sources, false)
+    }
+
+    pub fn new_strict(ctx: &Context, sources: &[(&str, &str)]) -> Self {
+        Self::with_contract(ctx, sources, true)
+    }
+
+    fn with_contract(
+        ctx: &Context,
+        sources: &[(&str, &str)],
+        strict: bool,
+    ) -> Self {
         Self {
             snapshot: Snapshot::new(ctx),
             collector: Collector::default(),
             translations: Translations::new(ctx, sources),
+            strict,
+            responses: Mutex::new(HashMap::new()),
             query_dir: OnceLock::new(),
             miss_checked_ms: AtomicU64::new(f64::NEG_INFINITY.to_bits()),
         }
+    }
+
+    /// Whether this runtime enforces the strict Luau contract.
+    ///
+    /// A strict runtime has no bridge and no native helper, so a marker table
+    /// where plugin API 57 takes a function is an error, and a query response
+    /// stays in memory instead of being written to a response file.
+    pub fn strict(&self) -> bool {
+        self.strict
+    }
+
+    pub fn response(&self, path: &str) -> Option<String> {
+        crate::locked(&self.responses).get(path).cloned()
+    }
+
+    pub fn has_response(&self, path: &str) -> bool {
+        crate::locked(&self.responses).contains_key(path)
+    }
+
+    pub fn store_response(&self, path: &str, text: String) {
+        crate::locked(&self.responses).insert(path.to_owned(), text);
+    }
+
+    pub fn take_response(&self, path: &str) -> Option<String> {
+        crate::locked(&self.responses).remove(path)
     }
 
     pub fn update(&self, ctx: &Context) {

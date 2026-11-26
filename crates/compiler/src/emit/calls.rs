@@ -147,6 +147,20 @@ impl<'a> Emitter<'a> {
                     Ty::VALUE,
                 ));
             }
+            if self.program.tuple_struct_len(&self.module, &name)
+                == Some(args.len())
+            {
+                let mut values = Vec::new();
+                let mut shapes = Vec::new();
+                for argument in &args {
+                    let (text, ty) = self.expr(argument)?;
+                    shapes.push(TupleShape::Leaf(ty));
+                    values.push(text);
+                }
+                let text = format!("{{ {} }}", values.join(", "));
+                self.tuple_expr_shapes.insert(text.clone(), shapes);
+                return Ok((text, Ty::VALUE));
+            }
             match name.as_str() {
                 "Some" => return self.expr(arg(&args, 0, call)?),
                 "drop" => {
@@ -185,6 +199,11 @@ impl<'a> Emitter<'a> {
                 "SystemTime::now" => {
                     return Ok(("noctalia.nowMs()".to_owned(), Ty::INT));
                 }
+                "ByteBuf::new" | "ByteBuf::from"
+                    if self.strict() && args.len() == 1 =>
+                {
+                    return self.byte_string(arg(&args, 0, call)?);
+                }
                 _ => {}
             }
             if args.len() == 1
@@ -194,6 +213,9 @@ impl<'a> Emitter<'a> {
                 let value = self.expr(arg(&args, 0, call)?)?.0;
                 self.pending_class = Some(name.to_owned());
                 return Ok((value, Ty::VALUE));
+            }
+            if let Some(value) = self.fs_call(call, &name, &args)? {
+                return Ok(value);
             }
             let identity = name.ends_with("::try_from")
                 || name.ends_with("::from_utf8_lossy")
@@ -271,7 +293,63 @@ impl<'a> Emitter<'a> {
             }
             if name == "serde_json::to_string" {
                 let text = self.expr(arg(&args, 0, call)?)?.0;
-                return Ok((format!("json.encode({text})"), Ty::STR));
+                return Ok((format!("(json.encode({text}))"), Ty::STR));
+            }
+            if matches!(name.rsplit("::").next(), Some("from_iter"))
+                && args.len() == 1
+            {
+                let list = arg(&args, 0, call)?;
+                let Expr::Array(items) = strip_reference(list) else {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                };
+                if items
+                    .elems
+                    .iter()
+                    .any(|item| !matches!(item, Expr::Tuple(tuple) if tuple.elems.len() == 2))
+                {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                }
+                let list = self.expr(list)?.0;
+                return Ok((
+                    format!(
+                        "(function() local __map = {{}} for _, __pair in ipairs({list}) do __map[__pair[1]] = __pair[2] end return __map end)()"
+                    ),
+                    Ty::TABLE,
+                ));
+            }
+            if matches!(name.rsplit("::").next(), Some("from_iter"))
+                && args.len() == 1
+            {
+                let list = arg(&args, 0, call)?;
+                let Expr::Array(items) = strip_reference(list) else {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                };
+                if items
+                    .elems
+                    .iter()
+                    .any(|item| !matches!(item, Expr::Tuple(tuple) if tuple.elems.len() == 2))
+                {
+                    return Err(Error::at(
+                        call.span(),
+                        "from_iter() needs an array literal of pairs",
+                    ));
+                }
+                let list = self.expr(list)?.0;
+                return Ok((
+                    format!(
+                        "(function() local __map = {{}} for _, __pair in ipairs({list}) do __map[__pair[1]] = __pair[2] end return __map end)()"
+                    ),
+                    Ty::TABLE,
+                ));
             }
             if matches!(name.rsplit("::").next(), Some("from_iter"))
                 && args.len() == 1
@@ -312,7 +390,15 @@ impl<'a> Emitter<'a> {
             if let Some(variant) = qualified_variant(&name, "ui")
                 && let Some(builder) = ui_marker(variant)
             {
-                let value = self.expr(arg(&args, 0, call)?)?.0;
+                let argument = arg(&args, 0, call)?;
+                if self.strict() {
+                    return self.strict_ui_marker(
+                        variant,
+                        argument,
+                        call.span(),
+                    );
+                }
+                let value = self.expr(argument)?.0;
                 return Ok((format!("{{ {builder} = {value} }}"), Ty::VALUE));
             }
             if let Some(value) = self.std_constructor(call, &args)? {
@@ -328,6 +414,12 @@ impl<'a> Emitter<'a> {
                 self.op_call(call, &op)?;
                 return Ok((String::new(), Ty::VOID));
             }
+            if name == "Op::query" && self.strict() {
+                return Err(Error::at(
+                    call.span(),
+                    "strict op `query` can only be pushed or returned as an Op",
+                ));
+            }
             if let Some(op) = unsupported_op(&name) {
                 return Err(Error::at(call.span(), op));
             }
@@ -342,6 +434,200 @@ impl<'a> Emitter<'a> {
                 "call to `{label}` is not supported by the Luau compiler: no function in the crate matches, and only ops, ui constructors and a small set of std calls are supported"
             ),
         ))
+    }
+
+    /// `std::fs`, `std::path` and the path calls of `std::env`. Every host
+    /// mapping goes through the API 57 members the fixture declares.
+    fn fs_call(
+        &mut self,
+        call: &ExprCall,
+        name: &str,
+        args: &[&Expr],
+    ) -> Result<OptionalValue, Error> {
+        let mut parts = name.rsplit("::");
+        let last = parts.next().unwrap_or_default();
+        let scope = parts.next().unwrap_or_default();
+        match (scope, last) {
+            ("Path", "new")
+            | ("Path", "from")
+            | ("PathBuf", "from")
+            | ("OsStr", "new")
+            | ("OsString", "from") => {
+                if args.is_empty() {
+                    return Ok(Some(("\"\"".to_owned(), Ty::PATH)));
+                }
+                let text = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((text, Ty::PATH)));
+            }
+            ("PathBuf", "new")
+            | ("OsString", "new")
+            | ("PathBuf", "default")
+            | ("OsString", "default") => {
+                return Ok(Some(("\"\"".to_owned(), Ty::PATH)));
+            }
+            ("fs", "read_to_string") | ("fs", "read") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.readFile({path})"),
+                    Ty::result(Base::Str),
+                )));
+            }
+            ("fs", "write") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                let contents = self.expr(arg(args, 1, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.writeFile({path}, {contents})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "create_dir_all") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.mkdirAll({path})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "remove_file") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.removeFile({path})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "rename") => {
+                let from = self.expr(arg(args, 0, call)?)?.0;
+                let to = self.expr(arg(args, 1, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.renameFile({from}, {to})"),
+                    Ty::result(Base::Void),
+                )));
+            }
+            ("fs", "read_dir") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.listDir({path})"),
+                    Ty::result(Base::List),
+                )));
+            }
+            ("fs", "metadata") => {
+                let path = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.fileInfo({path})"),
+                    Ty::result(Base::Info),
+                )));
+            }
+            ("env", "var_os") => {
+                let key = self.expr(arg(args, 0, call)?)?.0;
+                return Ok(Some((
+                    format!("noctalia.getenv({key})"),
+                    Ty::OPT_PATH,
+                )));
+            }
+            ("env", "temp_dir") => {
+                return Err(Error::at(
+                    call.span(),
+                    "`std::env::temp_dir` has no API 57 member; scratch space belongs in `pluginDataDir`",
+                ));
+            }
+            ("env", "split_paths") => {
+                return Err(Error::at(
+                    call.span(),
+                    "`std::env::split_paths` has no API 57 member; `noctalia.commandExists` answers the same question",
+                ));
+            }
+            ("fs", other) => {
+                return Err(Error::at(
+                    call.span(),
+                    format!(
+                        "`std::fs::{other}` has no API 57 mapping: the host exposes readFile, writeFile, mkdirAll, removeFile, renameFile, fileExists, fileInfo and listDir"
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// A byte string for a strict `ByteBuf`.
+    ///
+    /// A byte array becomes `string.char(...)` so it stays a Lua string. Any
+    /// other expression (a `String`, `&str`, or a value already carrying
+    /// bytes) is used as is.
+    fn byte_string(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
+        let inner = strip_reference(expr);
+        let items = match inner {
+            Expr::Macro(mac) if macro_name(mac) == "vec" => parse_vec(mac)?,
+            Expr::Array(array) => {
+                array.elems.iter().cloned().collect::<Vec<_>>()
+            }
+            _ => return self.expr(expr),
+        };
+        let mut values = Vec::new();
+        let mut all_literals = true;
+        for item in &items {
+            let Expr::Lit(ExprLit {
+                lit: Lit::Int(value),
+                ..
+            }) = strip_reference(item)
+            else {
+                all_literals = false;
+                break;
+            };
+            values.push(value.base10_parse::<u32>()?.to_string());
+        }
+        if all_literals {
+            return Ok((
+                format!("string.char({})", values.join(", ")),
+                Ty::STR,
+            ));
+        }
+        let list = self.list(&items)?.0;
+        self.uses_unpack = true;
+        Ok((format!("string.char(__unpack({list}))"), Ty::STR))
+    }
+
+    /// A real callback value for strict emit.
+    ///
+    /// `ui::callback(id)` becomes a closure that forwards its arguments to the
+    /// host-callback body, and `ui::call(name)` becomes the name of the plugin
+    /// global emitted for that action. A dynamic action name becomes a
+    /// closure that forwards to the shared action dispatcher.
+    fn strict_ui_marker(
+        &mut self,
+        variant: &str,
+        argument: &Expr,
+        span: proc_macro2::Span,
+    ) -> Result<(String, Ty), Error> {
+        match variant {
+            "callback" => {
+                if !self.has_host_callback {
+                    return Err(Error::at(
+                        span,
+                        "ui::callback needs a host_callback branch in strict mode",
+                    ));
+                }
+                let id = self.expr(argument)?.0;
+                self.uses_callback_dispatch = true;
+                Ok((strict::closure(strict::CALLBACK_DISPATCH, &id), Ty::VALUE))
+            }
+            "call" => {
+                if !self.has_action {
+                    return Err(Error::at(
+                        span,
+                        "ui::call needs an action branch in strict mode",
+                    ));
+                }
+                if let Some(name) = literal_string(argument) {
+                    self.actions.insert(name.clone());
+                    let global = strict::action_global(&name);
+                    return Ok((format!("\"{global}\""), Ty::VALUE));
+                }
+                let name = self.expr(argument)?.0;
+                self.uses_action_dispatch = true;
+                Ok((strict::closure(strict::ACTION_DISPATCH, &name), Ty::VALUE))
+            }
+            _ => Err(Error::at(span, "unknown ui marker")),
+        }
     }
 
     fn ui_node(
@@ -403,4 +689,17 @@ fn ui_marker(variant: &str) -> Option<&'static str> {
         "callback" => Some("__host_callback"),
         _ => None,
     }
+}
+
+/// A string literal, optionally behind a reference.
+pub(super) fn literal_string(expr: &Expr) -> Option<String> {
+    let expr = strip_reference(expr);
+    let Expr::Lit(ExprLit {
+        lit: Lit::Str(value),
+        ..
+    }) = expr
+    else {
+        return None;
+    };
+    Some(value.value())
 }
