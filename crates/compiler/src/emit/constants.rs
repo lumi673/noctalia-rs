@@ -58,32 +58,14 @@ impl<'a> Emitter<'a> {
             let result = items
                 .elems
                 .iter()
-                .map(|item| self.expr(item))
+                .map(|item| self.expr(item).map(|value| value.0))
                 .collect::<Result<Vec<_>, Error>>();
-            let emitted = std::mem::replace(&mut self.out, saved_out);
+            let shapes = self
+                .tuple_shapes(&items.elems.iter().cloned().collect::<Vec<_>>());
+            self.out = saved_out;
             self.indent = saved_indent;
-            let values = result?;
-            let shapes = values
-                .iter()
-                .zip(items.elems.iter())
-                .map(|((text, ty), _)| {
-                    let mut ty = *ty;
-                    if self.null_texts.contains(text) {
-                        ty.null = true;
-                    }
-                    TupleShape::Leaf(ty)
-                })
-                .collect::<Vec<_>>();
-            let text = format!(
-                "{{ {} }}",
-                values
-                    .iter()
-                    .map(|(text, _)| text.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            self.tuple_expr_shapes.insert(text.clone(), shapes);
-            self.out.push_str(&emitted);
+            let text = format!("{{ {} }}", result?.join(", "));
+            self.tuple_expr_shapes.insert(text.clone(), shapes?);
             return Ok(text);
         }
         if let Some((text, _)) = constant(expr) {
