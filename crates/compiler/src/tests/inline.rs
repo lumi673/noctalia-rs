@@ -70,9 +70,9 @@ pub fn handle(ctx: &Context) -> Result<Vec<Op>> {
         &module_options("widget", EntryKind::Widget, &modules),
     )
     .expect("compiles");
-    assert!(compiled.source.contains(
-        "barWidget.setText((noctalia.getConfig(\"message\") or \"\"))"
-    ));
+    assert!(compiled.source.contains("barWidget.setText("));
+    assert!(compiled.source.contains("noctalia.getConfig(\"message\")"));
+    assert!(compiled.source.contains("== nil then"));
     assert!(!compiled.source.contains("widget::handle"));
     assert!(compiled.source.contains("do\n"));
 }

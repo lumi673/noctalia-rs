@@ -17,11 +17,9 @@ fn service(ctx: &Context) -> Result<Vec<Op>> {
 
     assert!(compiled.source.contains("noctalia.setUpdateInterval(1000)"));
     assert!(compiled.source.contains("noctalia.log(name .. \" ready\")"));
-    assert!(
-        compiled.source.contains(
-            "local name = (noctalia.getConfig(\"name\") or \"bench\")"
-        )
-    );
+    assert!(compiled.source.contains("noctalia.getConfig(\"name\")"));
+    assert!(compiled.source.contains("== nil then __t"));
+    assert!(compiled.source.contains("= \"bench\" end"));
     assert!(!compiled.source.contains("body_load"));
     assert!(!compiled.source.contains("noctalia.state.watch(STATE_KEY"));
 }
@@ -48,7 +46,9 @@ fn launcher(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
 
     assert!(compiled.source.contains("local function body_"));
-    assert!(compiled.source.contains("launcher.setResults(text, {})"));
+    assert!(compiled.source.contains(
+        "launcher.setResults(text, setmetatable({}, { __noctalia_array = true }))"
+    ));
     assert!(compiled.source.contains("noctalia.log(id)"));
     assert!(compiled.source.contains("function update() end"));
     assert!(
@@ -62,7 +62,9 @@ fn launcher(ctx: &Context) -> Result<Vec<Op>> {
             .source
             .contains("function onActivate(id) body_activate(")
     );
-    assert!(compiled.source.contains("launcher.setResults(text, {})"));
+    assert!(compiled.source.contains(
+        "launcher.setResults(text, setmetatable({}, { __noctalia_array = true }))"
+    ));
     assert!(compiled.source.contains("last_query"));
     assert_eq!(compiled.events, vec!["activate", "query", "search"]);
 }
@@ -362,4 +364,23 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let finite = "(function() local __value = 1.5; if __value == __value and __value ~= math.huge and __value ~= -math.huge then return __value end end)()";
     assert!(generated.contains(finite), "{generated}");
     assert!(generated.contains("~= nil then"), "{generated}");
+}
+
+#[test]
+fn compiles_matches_with_a_guard() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = ctx.setting("flag");
+    let flag = matches!(value, Some(Value::String(text)) if text == "true");
+    let plain = matches!(value, Some(Value::Bool(true)));
+    Ok(vec![Op::log(format!("{}{}", flag, plain))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    let generated = &compiled.source;
+    assert!(generated.contains("(function()"), "{generated}");
+    assert!(generated.contains("text == \"true\""), "{generated}");
+    assert!(generated.contains("local __t"), "{generated}");
 }

@@ -24,11 +24,8 @@ fn panel(ctx: &Context) -> Result<Vec<Op>> {
             .source
             .contains("local plugin_state = state.get(STATE_KEY) or {}")
     );
-    assert!(
-        compiled
-            .source
-            .contains("local label = (plugin_state[\"label\"] or \"\")")
-    );
+    assert!(compiled.source.contains("plugin_state[\"label\"]"));
+    assert!(compiled.source.contains("== nil then __t"));
     assert!(compiled.source.contains(
         "{ kind = \"column\", props = { id = \"root\", gap = 4 }, children = {"
     ));
