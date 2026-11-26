@@ -66,7 +66,7 @@ fn exact_binary(
         format!(
             concat!(
                 "local __bs2 = {right_sign};",
-                "if __ahi == 0 and __all == 0 and __bhi == 0 and __blo == 0 then __s = 0 elseif __ahi == 0 and __all == 0 then __s = __bs2 elseif __bhi == 0 and __blo == 0 then __s = __as elseif __as == __bs2 then __s = __as else __s = __cmp(__ahi, __all, __bhi, __blo) end;",
+                "if __ahi == 0 and __all == 0 and __bhi == 0 and __blo == 0 then __s = 0 elseif __ahi == 0 and __all == 0 then __s = __bs2 elseif __bhi == 0 and __blo == 0 then __s = __as elseif __as == __bs2 then __s = __as elseif __cmp(__ahi, __all, __bhi, __blo) > 0 then __s = __as else __s = __bs2 end;",
                 "local __hi, __lo;",
                 "if __as ~= 0 and __as == __bs2 then",
                 "  __hi, __lo = __addmag(__ahi, __all, __bhi, __blo);",
@@ -391,6 +391,8 @@ fn has_inexact_literal(expr: &Expr) -> bool {
         Expr::Binary(binary) => {
             has_inexact_literal(&binary.left)
                 || has_inexact_literal(&binary.right)
+                || has_large_literal(&binary.left)
+                || has_large_literal(&binary.right)
         }
         Expr::Paren(paren) => has_inexact_literal(&paren.expr),
         Expr::Group(group) => has_inexact_literal(&group.expr),
@@ -400,6 +402,82 @@ fn has_inexact_literal(expr: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn has_large_literal(expr: &Expr) -> bool {
+    match strip_reference(expr) {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(_), ..
+        })
+        | Expr::Path(_) => int_literal(expr)
+            .is_some_and(|(value, _, _)| value.abs() >= 9007199254740992),
+        Expr::Binary(binary) => {
+            has_large_literal(&binary.left) || has_large_literal(&binary.right)
+        }
+        Expr::Paren(paren) => has_large_literal(&paren.expr),
+        Expr::Group(group) => has_large_literal(&group.expr),
+        Expr::Unary(unary) => has_large_literal(&unary.expr),
+        _ => false,
+    }
+}
+
+fn shape_in_expr(expr: &Expr) -> Option<(usize, bool)> {
+    if let Some((_, bits, signed)) = int_literal(expr) {
+        return Some((bits, signed));
+    }
+    match strip_reference(expr) {
+        Expr::Unary(unary) => shape_in_expr(&unary.expr),
+        Expr::Binary(binary) => {
+            shape_in_expr(&binary.left).or_else(|| shape_in_expr(&binary.right))
+        }
+        _ => None,
+    }
+}
+
+fn shape_in_block(block: &syn::Block, name: &str) -> Option<(usize, bool)> {
+    for statement in &block.stmts {
+        let syn::Stmt::Local(local) = statement else {
+            continue;
+        };
+        let syn::Pat::Ident(ident) = &local.pat else {
+            continue;
+        };
+        if ident.ident != name {
+            continue;
+        }
+        if let Some(init) = &local.init
+            && let Some(shape) = shape_in_expr(&init.expr)
+        {
+            return Some(shape);
+        }
+    }
+    None
+}
+
+fn shape_from_binding(
+    program: &Program,
+    module: &str,
+    name: &str,
+) -> Option<(usize, bool)> {
+    for candidate in [
+        "handler",
+        "widget",
+        "service",
+        "panel",
+        "shortcut",
+        "launcher",
+        "desktop_widget",
+        "layer",
+        "render",
+        "update",
+    ] {
+        if let Ok(resolved) = program.handler(module, candidate)
+            && let Some(shape) = shape_in_block(&resolved.function.block, name)
+        {
+            return Some(shape);
+        }
+    }
+    None
 }
 /// Exact `div_ceil` using 32-bit limbs. Double division cannot distinguish a
 /// rounded operand or quotient from an exact one above 2^53.
@@ -693,15 +771,28 @@ impl<'a> Emitter<'a> {
                             ),
                         ));
                     }
-                    let shape = int_shape(&call.receiver);
+                    let shape = match int_literal(&call.receiver) {
+                        Some((_, bits, signed)) => (bits, signed),
+                        None => path_last_name(&call.receiver)
+                            .and_then(|name| {
+                                shape_from_binding(
+                                    self.program,
+                                    &self.module,
+                                    &name,
+                                )
+                            })
+                            .unwrap_or_else(|| int_shape(&call.receiver)),
+                    };
                     let (bits, signed) =
                         int_suffix_shape(argument).unwrap_or(shape);
+                    let lhs = self.temp();
+                    self.line(&format!("local {lhs} = {receiver}"));
                     let other = self.expr(argument)?.0;
                     let literal =
                         int_literal(argument).map(|(value, _, _)| value);
                     Ok((
                         exact_binary(
-                            method, receiver, &other, literal, bits, signed,
+                            method, &lhs, &other, literal, bits, signed,
                             &location,
                         ),
                         ty,

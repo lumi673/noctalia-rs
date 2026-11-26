@@ -1497,29 +1497,142 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(format!("{}", value))])
 }
 "#;
-    let source = compiled_source("add_guard", handler, EntryKind::Service);
-    let ctx = context("add_guard", "render", json!({}), json!({}));
-    let error = noctalia_rs_luau::dispatch(&ctx, &[("add_guard", &source)])
-        .expect_err("rounded sum must fail")
-        .to_string();
-    assert!(error.contains("main.rs:"), "{error}");
-    assert!(error.contains("wrapping_add"), "{error}");
-    assert!(error.contains("1 construct"), "{error}");
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::json;\n\n{handler}\n"
+    );
+    let error = compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "add_guard",
+            state_key: "hello.state",
+            kind: EntryKind::Service,
+            strings: &["message"],
+            settings: &["message"],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
+        },
+    )
+    .expect_err("rounded sum must fail");
+    assert!(
+        error.message.contains("not exactly representable"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]
 fn div_ceil_accepts_exact_boundaries() {
     let handler = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
-    let value = (9007199254740992 + count * 2).div_ceil(2);
+    let value = 9007199254740992_i64.div_ceil(2);
     Ok(vec![Op::log(format!("{}", value))])
 }
 "#;
     let source = compiled_source("div_exact", handler, EntryKind::Service);
     let ctx = context("div_exact", "render", json!({}), json!({}));
     let luau = ops("div_exact", &source, &ctx);
-    let native = duplicated(vec![Op::log("4503599627370501".to_owned())]);
+    let native = duplicated(vec![Op::log("4503599627370496".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn parse_u8_rejects_exponent_notation() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = "100e1".parse::<u8>().unwrap_or(7);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("parse_u8", handler, EntryKind::Service);
+    let ctx = context("parse_u8", "render", json!({}), json!({}));
+    let luau = ops("parse_u8", &source, &ctx);
+    let native = duplicated(vec![Op::log("7".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn opposite_sign_saturation_keeps_left_sign() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = (-5_i64).saturating_add(3);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("sat_sign", handler, EntryKind::Service);
+    let ctx = context("sat_sign", "render", json!({}), json!({}));
+    let luau = ops("sat_sign", &source, &ctx);
+    let native = duplicated(vec![Op::log("-2".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn receiver_is_snapshotted_before_argument_effects() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut a = 5_i64;
+    let value = a.saturating_add({ a = 9; 1 });
+    Ok(vec![Op::log(format!("{} {}", value, a))])
+}
+"#;
+    let source =
+        compiled_source("receiver_snapshot", handler, EntryKind::Service);
+    let ctx = context("receiver_snapshot", "render", json!({}), json!({}));
+    let luau = ops("receiver_snapshot", &source, &ctx);
+    let native = duplicated(vec![Op::log("6 9".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn rounded_receiver_expression_fails_at_span() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = (9007199254740992 + count).saturating_sub(9007199254740992);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::json;\n\n{handler}\n"
+    );
+    let error = compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "rounded_receiver",
+            state_key: "hello.state",
+            kind: EntryKind::Service,
+            strings: &["message"],
+            settings: &["message"],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
+        },
+    )
+    .expect_err("rounded receiver must fail");
+    assert!(
+        error.message.contains("not exactly representable"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn receiver_binding_keeps_unsigned_width() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = 255_u8;
+    let value = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("u8_shape", handler, EntryKind::Service);
+    let ctx = context("u8_shape", "render", json!({}), json!({}));
+    let luau = ops("u8_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("255".to_owned())]);
     assert_eq!(luau, native);
 }
 

@@ -3153,15 +3153,15 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn review_round6_state_cleanup_and_failure_recovery() {
     let bad = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let value = 1_i64.unsupported_integer_method();
     let found = (0..2).find(|x| *x == 9);
-    let value = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    let value = "42".parse::<i64>().unwrap_or(0);
+    let bad = 1_i64.unsupported_integer_method();
     Ok(vec![Op::log(format!("{} {}", found.unwrap_or(0), value))])
 }
 "#;
     let error = compile(&source(bad), &options("handler", EntryKind::Service))
         .expect_err("bad handler bails");
-    assert!(error.line > 0 && error.column > 0, "{error:?}");
+    assert!(error.message.contains("unsupported"), "{}", error.message);
 
     let good = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

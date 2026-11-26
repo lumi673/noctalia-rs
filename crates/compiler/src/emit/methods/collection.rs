@@ -545,34 +545,43 @@ impl<'a> Emitter<'a> {
                         _ => None,
                     })
                     .unwrap_or_default();
-                let body = match parsed_ty.base {
-                    Base::Int | Base::Value => {
-                        let span = call.method.span().start();
-                        let location = format!(
-                            "{}.rs:{}:{}",
-                            self.module,
-                            span.line,
-                            span.column + 1
-                        );
-                        let exact = super::number::exact_parse(
-                            receiver, &target, &location,
-                        );
-                        if parsed_ty.base == Base::Int {
-                            exact
-                        } else {
-                            format!(
-                                "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return {exact} end; if string.find(__s, \"^[+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; return __n end)()"
-                            )
+                let integer_target = matches!(
+                    target.as_str(),
+                    "i8" | "i16"
+                        | "i32"
+                        | "i64"
+                        | "isize"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "usize"
+                );
+                let span = call.method.span().start();
+                let location = format!(
+                    "{}.rs:{}:{}",
+                    self.module,
+                    span.line,
+                    span.column + 1
+                );
+                let exact =
+                    super::number::exact_parse(receiver, &target, &location);
+                let body = if integer_target {
+                    exact
+                } else {
+                    match parsed_ty.base {
+                        Base::Float => format!(
+                            "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
+                        ),
+                        Base::Value => format!(
+                            "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return {exact} end; if string.find(__s, \"^[+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; return __n end)()"
+                        ),
+                        _ => {
+                            return Err(Error::at(
+                                call.method.span(),
+                                "parse::<T>() has no faithful Luau lowering for this type",
+                            ));
                         }
-                    }
-                    Base::Float => format!(
-                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
-                    ),
-                    _ => {
-                        return Err(Error::at(
-                            call.method.span(),
-                            "parse::<T>() has no faithful Luau lowering for this type",
-                        ));
                     }
                 };
                 Ok((body, Ty::result(parsed_ty.base)))
