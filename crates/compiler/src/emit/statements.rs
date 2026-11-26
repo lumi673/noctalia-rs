@@ -410,9 +410,7 @@ impl<'a> Emitter<'a> {
             ty.base = json_base_for_type(hint)?;
         }
         self.line(&format!("local {lua} = {text}"));
-        if let Expr::MethodCall(call) = strip_reference(&init.expr)
-            && call.method == "chars"
-        {
+        if self.is_chars(&text) {
             self.mark_chars(&lua);
         }
         if ty.base == Base::Str {
@@ -530,11 +528,11 @@ impl<'a> Emitter<'a> {
             Expr::Block(block) => {
                 self.line("do");
                 self.indent = self.indent.saturating_add(1);
-                self.scopes.push(HashMap::new());
+                self.push_scope();
                 self.local_statics.push(HashMap::new());
                 let result = self.block_inner(&block.block, false);
                 self.local_statics.pop();
-                self.scopes.pop();
+                self.pop_scope();
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 result
@@ -966,7 +964,7 @@ impl<'a> Emitter<'a> {
             let keyword = if opened { "elseif" } else { "if" };
             self.line(&format!("{keyword} {condition} then"));
             self.indent = self.indent.saturating_add(1);
-            self.scopes.push(HashMap::new());
+            self.push_scope();
             for (name, text) in bindings {
                 let binding = self.binding_ty(pattern, &name, scrutinee_ty);
                 let lua = self.bind_name(&name);
@@ -983,7 +981,7 @@ impl<'a> Emitter<'a> {
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
             }
-            self.scopes.pop();
+            self.pop_scope();
             result?;
             self.indent = self.indent.saturating_sub(1);
             opened = true;

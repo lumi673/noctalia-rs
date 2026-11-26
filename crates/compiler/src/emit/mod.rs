@@ -59,7 +59,7 @@ impl<'a> Emitter<'a> {
         has_action: bool,
         has_host_callback: bool,
     ) -> Self {
-        Self {
+        let emitter = Self {
             ctx: ctx.to_string(),
             out: String::new(),
             indent: 1,
@@ -115,7 +115,7 @@ impl<'a> Emitter<'a> {
             uses_count_keys: false,
             emitted: false,
             temp: 0,
-            kw_names: HashMap::new(),
+            kw_scopes: vec![HashMap::new()],
             chars: BTreeSet::new(),
             native_mode,
             known_native,
@@ -135,7 +135,9 @@ impl<'a> Emitter<'a> {
             uses_callback_dispatch: false,
             has_action,
             has_host_callback,
-        }
+        };
+        methods::reset_iter_done();
+        emitter
     }
 
     /// Whether the entry is emitted as a standalone strict script.
@@ -147,20 +149,20 @@ impl<'a> Emitter<'a> {
         &mut self,
         block: &syn::Block,
     ) -> Result<(), Error> {
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         self.local_statics.push(HashMap::new());
         let result = self.block_inner(block, false);
         self.local_statics.pop();
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 
     pub(crate) fn block(&mut self, block: &syn::Block) -> Result<(), Error> {
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         self.local_statics.push(HashMap::new());
         let result = self.block_inner(block, true);
         self.local_statics.pop();
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 
@@ -295,9 +297,14 @@ impl<'a> Emitter<'a> {
             .find_map(|scope| scope.get(name).copied())
     }
     pub(super) fn bind_name(&mut self, name: &str) -> String {
+        let reserved = self
+            .kw_scopes
+            .iter()
+            .flat_map(|scope| scope.values().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
         let mut suffix = 1;
         if !is_luau_keyword(name) {
-            if !self.kw_names.values().any(|value| value == name) {
+            if !reserved.contains(name) {
                 return name.to_owned();
             }
             let mut candidate = format!("{name}_{suffix}");
@@ -305,19 +312,22 @@ impl<'a> Emitter<'a> {
                 .scopes
                 .iter()
                 .any(|scope| scope.contains_key(&candidate))
-                || self.kw_names.values().any(|value| value == &candidate)
+                || reserved.contains(&candidate)
             {
                 suffix += 1;
                 candidate = format!("{name}_{suffix}");
             }
-            self.kw_names.insert(name.to_owned(), candidate.clone());
+            self.kw_scopes
+                .last_mut()
+                .expect("a scope always exists")
+                .insert(name.to_owned(), candidate.clone());
             return candidate;
         }
-        if let Some(existing) = self.kw_names.get(name).cloned()
-            && !self
-                .scopes
-                .iter()
-                .any(|scope| scope.contains_key(&existing))
+        if let Some(existing) = self
+            .kw_scopes
+            .last()
+            .and_then(|scope| scope.get(name))
+            .cloned()
         {
             return existing;
         }
@@ -326,17 +336,25 @@ impl<'a> Emitter<'a> {
             .scopes
             .iter()
             .any(|scope| scope.contains_key(&candidate))
-            || self.kw_names.values().any(|value| value == &candidate)
+            || reserved.contains(&candidate)
         {
             candidate = format!("__kw_{name}_{suffix}");
             suffix += 1;
         }
-        self.kw_names.insert(name.to_owned(), candidate.clone());
+        self.kw_scopes
+            .last_mut()
+            .expect("a scope always exists")
+            .insert(name.to_owned(), candidate.clone());
         candidate
     }
 
     pub(super) fn local_name(&self, name: &str) -> String {
-        if let Some(existing) = self.kw_names.get(name) {
+        if let Some(existing) = self
+            .kw_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+        {
             return existing.clone();
         }
         if is_luau_keyword(name) {
@@ -345,6 +363,16 @@ impl<'a> Emitter<'a> {
             name.to_owned()
         }
     }
+    pub(super) fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.kw_scopes.push(HashMap::new());
+    }
+
+    pub(super) fn pop_scope(&mut self) {
+        self.scopes.pop();
+        self.kw_scopes.pop();
+    }
+
     pub(super) fn mark_chars(&mut self, name: &str) {
         self.chars.insert(name.to_owned());
     }
@@ -519,7 +547,7 @@ pub(crate) struct Emitter<'a> {
     uses_count_keys: bool,
     emitted: bool,
     temp: usize,
-    kw_names: HashMap<String, String>,
+    kw_scopes: Vec<HashMap<String, String>>,
     chars: BTreeSet<String>,
     native_mode: NativeMode,
     known_native: &'a BTreeMap<String, NativeFn>,

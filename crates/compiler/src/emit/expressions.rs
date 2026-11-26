@@ -156,11 +156,11 @@ impl<'a> Emitter<'a> {
             Expr::Cast(cast) => self.cast(cast),
             Expr::Try(item) => self.try_expr(&item.expr),
             Expr::Block(block) => {
-                self.scopes.push(HashMap::new());
+                self.push_scope();
                 self.local_statics.push(HashMap::new());
                 let result = self.block_expr(&block.block);
                 self.local_statics.pop();
-                self.scopes.pop();
+                self.pop_scope();
                 result
             }
             Expr::Repeat(repeat) => {
@@ -1166,7 +1166,7 @@ impl<'a> Emitter<'a> {
         self.deferred = self.deferred.saturating_add(1);
         self.indent = 0;
         self.tail_target = None;
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         self.local_statics.push(HashMap::new());
         let mut params = Vec::new();
         for input in &closure.inputs {
@@ -1183,7 +1183,7 @@ impl<'a> Emitter<'a> {
                 syn::Pat::Wild(_) => params.push("_".to_owned()),
                 other => {
                     self.local_statics.pop();
-                    self.scopes.pop();
+                    self.pop_scope();
                     self.out = saved_out;
                     self.indent = saved_indent;
                     self.tail_target = saved_target;
@@ -1206,7 +1206,7 @@ impl<'a> Emitter<'a> {
         self.line("end");
         let text = std::mem::replace(&mut self.out, saved_out);
         self.local_statics.pop();
-        self.scopes.pop();
+        self.pop_scope();
         self.indent = saved_indent;
         self.tail_target = saved_target;
         self.deferred = saved_deferred;
@@ -1264,16 +1264,19 @@ impl<'a> Emitter<'a> {
             }
             Pat::Tuple(tuple) => {
                 for (index, element) in tuple.elems.iter().enumerate() {
-                    let item = ty.map(|outer| {
-                        if outer.element == Some(Base::Str) {
-                            if index == 0 { Ty::STR } else { Ty::VALUE }
-                        } else {
-                            outer
-                        }
+                    let item = ty.map(|outer| match outer.element {
+                        Some(base) if index == 0 => Ty::new(base),
+                        Some(_) => Ty::VALUE,
+                        None => outer,
                     });
+                    let source = if value.starts_with('{') {
+                        format!("({value})")
+                    } else {
+                        value.to_owned()
+                    };
                     self.bind_closure_pattern(
                         element,
-                        &format!("{value}[{}]", index + 1),
+                        &format!("{source}[{}]", index + 1),
                         item,
                     )?;
                 }
@@ -1291,7 +1294,7 @@ impl<'a> Emitter<'a> {
         closure: &syn::ExprClosure,
         args: &[String],
     ) -> Result<(String, Ty), Error> {
-        self.closure_value_typed(closure, args, &[])
+        self.closure_value_typed(closure, args, &[], None)
     }
 
     pub(super) fn closure_value_typed(
@@ -1299,6 +1302,7 @@ impl<'a> Emitter<'a> {
         closure: &syn::ExprClosure,
         args: &[String],
         types: &[Option<Ty>],
+        pair_types: Option<(Ty, Ty)>,
     ) -> Result<(String, Ty), Error> {
         if closure.inputs.len() != args.len() {
             return Err(Error::at(
@@ -1310,7 +1314,7 @@ impl<'a> Emitter<'a> {
                 ),
             ));
         }
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         self.local_statics.push(HashMap::new());
         for ((input, value), ty) in closure
             .inputs
@@ -1322,9 +1326,33 @@ impl<'a> Emitter<'a> {
                 Pat::Type(typed) => &*typed.pat,
                 other => other,
             };
-            if let Err(error) = self.bind_closure_pattern(input, value, ty) {
+            let bound = if let Some((key_ty, value_ty)) = pair_types
+                && closure.inputs.len() == 1
+                && let Pat::Tuple(tuple) = input
+                && tuple.elems.len() == 2
+            {
+                let source = if value.starts_with('{') {
+                    format!("({value})")
+                } else {
+                    value.to_owned()
+                };
+                let first = self.bind_closure_pattern(
+                    &tuple.elems[0],
+                    &format!("{source}[1]"),
+                    Some(key_ty),
+                );
+                let second = self.bind_closure_pattern(
+                    &tuple.elems[1],
+                    &format!("{source}[2]"),
+                    Some(value_ty),
+                );
+                first.and(second)
+            } else {
+                self.bind_closure_pattern(input, value, ty)
+            };
+            if let Err(error) = bound {
                 self.local_statics.pop();
-                self.scopes.pop();
+                self.pop_scope();
                 return Err(error);
             }
         }
@@ -1365,7 +1393,7 @@ impl<'a> Emitter<'a> {
             body => self.value_or_statement(body),
         };
         self.local_statics.pop();
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 }

@@ -1170,6 +1170,11 @@ fn native_chain10(_ctx: &Context) -> Vec<Op> {
     ]
 }
 
+fn duplicated(ops: Vec<Op>) -> Vec<Value> {
+    let values = rust_ops(ops);
+    [values.clone(), values].concat()
+}
+
 #[test]
 fn chars_iterator_keeps_utf8_boundaries() {
     let handler = r#"
@@ -1195,13 +1200,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         &source,
         &context("chars", "update", json!({}), json!({})),
     );
-    let expected = rust_ops(vec![
-        Op::BarText {
-            text: "éab|ab|éa|éab|".to_owned(),
-        },
-        Op::BarText {
-            text: "bc".to_owned(),
-        },
+    let expected = duplicated(vec![
         Op::BarText {
             text: "éab|ab|éa|éab|".to_owned(),
         },
@@ -1209,7 +1208,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             text: "bc".to_owned(),
         },
     ]);
-    assert_eq!(actual, expected, "source:\n{source}");
+    assert_eq!(actual, expected);
 }
 
 #[test]
@@ -1242,16 +1241,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         &source,
         &context("names", "update", json!({}), json!({})),
     );
-    let expected = rust_ops(vec![
-        Op::BarText {
-            text: "1|2".to_owned(),
-        },
-        Op::BarText {
-            text: "3|4".to_owned(),
-        },
-        Op::BarText {
-            text: "6|5".to_owned(),
-        },
+    let expected = duplicated(vec![
         Op::BarText {
             text: "1|2".to_owned(),
         },
@@ -1263,4 +1253,289 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         },
     ]);
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn review_l1_stable_sort_matches_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut items = vec![
+        (0_i64, 11_i64), (0, 10), (0, 9), (0, 8), (0, 7), (0, 6),
+        (0, 5), (0, 4), (0, 3), (0, 2), (0, 1), (0, 0),
+    ];
+    items.sort_by_key(|item| item.0);
+    let mut ops = Vec::new();
+    for (_, id) in items {
+        ops.push(Op::log(id.to_string()));
+    }
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("review_l1", handler, EntryKind::Service);
+    let ctx = context("review_l1", "render", json!({}), json!({}));
+    let luau = ops("review_l1", &source, &ctx);
+    let native =
+        duplicated((0..12).rev().map(|id| Op::log(id.to_string())).collect());
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l2_retain_matches_rust() {
+    let handler = r#"
+static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut numbers = vec![1_i64, 2, 3, 4];
+    numbers.retain(|number| {
+        LAST.store(*number, std::sync::atomic::Ordering::Relaxed);
+        *number % 2 == 0
+    });
+    let mut ops = Vec::new();
+    for number in numbers {
+        ops.push(Op::log(number.to_string()));
+    }
+    ops.push(Op::log(LAST.load(std::sync::atomic::Ordering::Relaxed).to_string()));
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("review_l2", handler, EntryKind::Service);
+    let ctx = context("review_l2", "render", json!({}), json!({}));
+    let luau = ops("review_l2", &source, &ctx);
+    let native = duplicated(vec![
+        Op::log("2".to_owned()),
+        Op::log("4".to_owned()),
+        Op::log("4".to_owned()),
+    ]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l3_bounded_range_matches_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let values: Vec<i64> = (1..4).collect();
+    let mut ops = Vec::new();
+    for value in values {
+        ops.push(Op::log(value.to_string()));
+    }
+    Ok(ops)
+}
+"#;
+    let source = compiled_source("review_l3", handler, EntryKind::Service);
+    let ctx = context("review_l3", "render", json!({}), json!({}));
+    let luau = ops("review_l3", &source, &ctx);
+    let native = duplicated(vec![
+        Op::log("1".to_owned()),
+        Op::log("2".to_owned()),
+        Op::log("3".to_owned()),
+    ]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l4_replacen_matches_rust() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = ctx.config_str("message").unwrap_or_default();
+    Ok(vec![Op::log(text.replacen("e", "E", 1))])
+}
+"#;
+    let source = compiled_source("review_l4", handler, EntryKind::Service);
+    let ctx = context("review_l4", "render", json!({}), json!({}));
+    let luau = ops("review_l4", &source, &ctx);
+    let native = duplicated(vec![Op::log("HEllo".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l5_boundary_safe_truncate_matches_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = "abcd".to_owned();
+    text.truncate(2);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let source = compiled_source("review_l5", handler, EntryKind::Service);
+    let ctx = context("review_l5", "render", json!({}), json!({}));
+    let luau = ops("review_l5", &source, &ctx);
+    let native = duplicated(vec![Op::log("ab".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l6_wrapping_add_matches_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = i64::MAX.wrapping_add(1);
+    Ok(vec![Op::log(if value == i64::MIN { "wrapped" } else { "wrong" })])
+}
+"#;
+    let source = compiled_source("review_l6", handler, EntryKind::Service);
+    let ctx = context("review_l6", "render", json!({}), json!({}));
+    let luau = ops("review_l6", &source, &ctx);
+    let native = duplicated(vec![Op::log("wrapped".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l7_direct_static_cell_matches_rust() {
+    let handler = r#"
+static CELL: OnceLock<i64> = OnceLock::new();
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = *CELL.get_or_init(|| 3);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let source = compiled_source("review_l7", handler, EntryKind::Service);
+    let ctx = context("review_l7", "render", json!({}), json!({}));
+    let luau = ops("review_l7", &source, &ctx);
+    let native = duplicated(vec![Op::log("3".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l8_ascii_lowercase_matches_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = "ABCD".to_lowercase();
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let source = compiled_source("review_l8", handler, EntryKind::Service);
+    let ctx = context("review_l8", "render", json!({}), json!({}));
+    let luau = ops("review_l8", &source, &ctx);
+    let native = duplicated(vec![Op::log("abcd".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l9_max_ignores_nan_like_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = f64::NAN.max(2.0);
+    Ok(vec![Op::log(if value == 2.0 { "ok" } else { "bad" })])
+}
+"#;
+    let source = compiled_source("review_l9", handler, EntryKind::Service);
+    let ctx = context("review_l9", "render", json!({}), json!({}));
+    let luau = ops("review_l9", &source, &ctx);
+    let native = duplicated(vec![Op::log("ok".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l10_parse_and_fallback_match_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let good = "42".parse::<i64>().unwrap_or(0);
+    let bad = "abc".parse::<i64>().unwrap_or(7);
+    Ok(vec![Op::log(format!("{}:{}", good, bad))])
+}
+"#;
+    let source = compiled_source("review_l10", handler, EntryKind::Service);
+    let ctx = context("review_l10", "render", json!({}), json!({}));
+    let luau = ops("review_l10", &source, &ctx);
+    let native = duplicated(vec![Op::log("42:7".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_l7_alias_cell_matches_rust() {
+    let handler = r#"
+static CELL: OnceLock<i64> = OnceLock::new();
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let slot = &CELL;
+    let value = slot.get_or_init(|| 3);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let source =
+        compiled_source("review_l7_alias", handler, EntryKind::Service);
+    let ctx = context("review_l7_alias", "render", json!({}), json!({}));
+    let luau = ops("review_l7_alias", &source, &ctx);
+    let native = duplicated(vec![Op::log("3".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_round3_width_and_parse_match_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = u8::MAX.saturating_add(1);
+    let b = u32::MAX.wrapping_add(1);
+    let c = "0000000000000000042".parse::<i64>().unwrap_or(0);
+    let d = "1e2".parse::<f64>().unwrap_or(0.0);
+    Ok(vec![Op::log(format!("{} {} {} {}", a, b, c, d))])
+}
+"#;
+    let source = compiled_source("review_round3", handler, EntryKind::Service);
+    let ctx = context("review_round3", "render", json!({}), json!({}));
+    let luau = ops("review_round3", &source, &ctx);
+    let native = duplicated(vec![Op::log("255 0 42 100".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_round4_dispatch_checks() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = "42".parse::<f64>().unwrap_or(7.0);
+    let b = "1.5e2".parse::<f64>().unwrap_or(0.0);
+    let c = 20_u8.saturating_mul(20);
+    let found = vec![vec![10_i64], vec![20]].into_iter().flatten().find(|x| **x == 10);
+    let nth = vec![vec![10_i64], vec![20]].into_iter().flatten().nth(0);
+    let taken = vec![1_i64, 2, 3].into_iter().take_while(|x| **x < 3).collect::<Vec<_>>();
+    let reversed = vec![2_i64, 3, 4].into_iter().rev().collect::<Vec<_>>();
+    Ok(vec![Op::log(format!("{} {} {} {} {} {} {}", a, b, c, found.unwrap_or(0), nth.unwrap_or(0), taken.len(), reversed[0]))])
+}
+"#;
+    let source = compiled_source("review_round4", handler, EntryKind::Service);
+    let ctx = context("review_round4", "render", json!({}), json!({}));
+    let luau = ops("review_round4", &source, &ctx);
+    let native = duplicated(vec![Op::log("42 150 255 10 10 2 4".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_round6_enumerate_and_nested_take_while() {
+    let handler = r#"
+static SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+    let ratio = [1.5_f64].into_iter().enumerate().map(|(_, x)| x / (x + x)).collect::<Vec<_>>();
+    let values = vec![1_i64, 2, 3, 4].into_iter().filter(|x| {
+        SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *x < 4
+    }).take_while(|x| **x < 4).collect::<Vec<_>>();
+    Ok(vec![Op::log(format!("{} {} {}", ratio[0], values.len(), SEEN.load(std::sync::atomic::Ordering::Relaxed)))])
+}
+"#;
+    let source = compiled_source("review_round6", handler, EntryKind::Service);
+    let ctx = context("review_round6", "render", json!({}), json!({}));
+    eprintln!("SOURCE6:\n{source}");
+    let luau = ops("review_round6", &source, &ctx);
+    let native = duplicated(vec![Op::log("0.5 3 4".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn review_round7_zip_types_and_nested_take_while() {
+    let handler = r#"
+static SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+    let ratio = [9_i64].into_iter().zip([4_i64].into_iter())
+        .map(|(a, b)| a / b).collect::<Vec<_>>();
+    let values = vec![1_i64, 2, 3, 4].into_iter().filter(|x| {
+        SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *x < 4
+    }).take_while(|_| true).take_while(|x| **x < 3).collect::<Vec<_>>();
+    Ok(vec![Op::log(format!("{} {} {}", ratio[0], values.len(), SEEN.load(std::sync::atomic::Ordering::Relaxed)))])
+}
+"#;
+    let source = compiled_source("review_round7", handler, EntryKind::Service);
+    let ctx = context("review_round7", "render", json!({}), json!({}));
+    let luau = ops("review_round7", &source, &ctx);
+    let native = duplicated(vec![Op::log("2 2 3".to_owned())]);
+    assert_eq!(luau, native);
 }

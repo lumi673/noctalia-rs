@@ -164,7 +164,7 @@ impl<'a> Emitter<'a> {
             self.pattern_match(&value, &parsed.pat, None)?;
         self.line(&format!("if {condition} then"));
         self.indent = self.indent.saturating_add(1);
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         for (name, text) in bindings {
             let binding = self.binding_ty(&parsed.pat, &name, ty);
             let lua = self.bind_name(&name);
@@ -172,7 +172,7 @@ impl<'a> Emitter<'a> {
             self.push(&name, binding);
         }
         let guard = self.expr(&guard);
-        self.scopes.pop();
+        self.pop_scope();
         let (guard, _) = guard?;
         self.line(&format!("{result} = ({guard})"));
         self.indent = self.indent.saturating_sub(1);
