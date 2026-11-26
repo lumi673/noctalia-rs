@@ -1415,3 +1415,25 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let native = duplicated(vec![Op::log("42 150 255 10 10 2 4".to_owned())]);
     assert_eq!(luau, native);
 }
+
+#[test]
+fn review_round6_enumerate_and_nested_take_while() {
+    let handler = r#"
+static SEEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+    let ratio = [1.5_f64].into_iter().enumerate().map(|(_, x)| x / (x + x)).collect::<Vec<_>>();
+    let values = vec![1_i64, 2, 3, 4].into_iter().filter(|x| {
+        SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *x < 4
+    }).take_while(|x| **x < 4).collect::<Vec<_>>();
+    Ok(vec![Op::log(format!("{} {} {}", ratio[0], values.len(), SEEN.load(std::sync::atomic::Ordering::Relaxed)))])
+}
+"#;
+    let source = compiled_source("review_round6", handler, EntryKind::Service);
+    let ctx = context("review_round6", "render", json!({}), json!({}));
+    eprintln!("SOURCE6:\n{source}");
+    let luau = ops("review_round6", &source, &ctx);
+    let native = duplicated(vec![Op::log("0.5 3 4".to_owned())]);
+    assert_eq!(luau, native);
+}

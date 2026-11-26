@@ -996,13 +996,17 @@ impl<'a> Emitter<'a> {
                 for (index, element) in tuple.elems.iter().enumerate() {
                     let item = ty.map(|outer| match outer.element {
                         Some(base) if index == 0 => Ty::new(base),
-                        Some(base) if outer.result => Ty::new(base),
                         Some(_) => Ty::VALUE,
                         None => outer,
                     });
+                    let source = if value.starts_with('{') {
+                        format!("({value})")
+                    } else {
+                        value.to_owned()
+                    };
                     self.bind_closure_pattern(
                         element,
-                        &format!("{value}[{}]", index + 1),
+                        &format!("{source}[{}]", index + 1),
                         item,
                     )?;
                 }
@@ -1020,7 +1024,7 @@ impl<'a> Emitter<'a> {
         closure: &syn::ExprClosure,
         args: &[String],
     ) -> Result<(String, Ty), Error> {
-        self.closure_value_typed(closure, args, &[])
+        self.closure_value_typed(closure, args, &[], None)
     }
 
     pub(super) fn closure_value_typed(
@@ -1028,6 +1032,7 @@ impl<'a> Emitter<'a> {
         closure: &syn::ExprClosure,
         args: &[String],
         types: &[Option<Ty>],
+        pair_types: Option<(Ty, Ty)>,
     ) -> Result<(String, Ty), Error> {
         if closure.inputs.len() != args.len() {
             return Err(Error::at(
@@ -1051,7 +1056,31 @@ impl<'a> Emitter<'a> {
                 Pat::Type(typed) => &*typed.pat,
                 other => other,
             };
-            if let Err(error) = self.bind_closure_pattern(input, value, ty) {
+            let bound = if let Some((key_ty, value_ty)) = pair_types
+                && closure.inputs.len() == 1
+                && let Pat::Tuple(tuple) = input
+                && tuple.elems.len() == 2
+            {
+                let source = if value.starts_with('{') {
+                    format!("({value})")
+                } else {
+                    value.to_owned()
+                };
+                let first = self.bind_closure_pattern(
+                    &tuple.elems[0],
+                    &format!("{source}[1]"),
+                    Some(key_ty),
+                );
+                let second = self.bind_closure_pattern(
+                    &tuple.elems[1],
+                    &format!("{source}[2]"),
+                    Some(value_ty),
+                );
+                first.and(second)
+            } else {
+                self.bind_closure_pattern(input, value, ty)
+            };
+            if let Err(error) = bound {
                 self.local_statics.pop();
                 self.scopes.pop();
                 return Err(error);

@@ -3009,3 +3009,26 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         assert!(error.line > 0 && error.column > 0, "{error:?}");
     }
 }
+
+#[test]
+fn review_round6_state_cleanup_and_failure_recovery() {
+    let bad = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let error = compile(&source(bad), &options("handler", EntryKind::Service))
+        .expect_err("bad handler bails");
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+
+    let good = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = [1.5_f64].into_iter().enumerate().map(|(_, x)| x / (x + x)).collect::<Vec<_>>();
+    let _ = value;
+    Ok(Vec::new())
+}
+"#;
+    compile(&source(good), &options("handler", EntryKind::Service))
+        .expect("clean compile follows failed compile");
+}

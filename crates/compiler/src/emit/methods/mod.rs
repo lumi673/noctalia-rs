@@ -11,6 +11,10 @@ use std::cell::RefCell;
 
 use super::*;
 
+pub(super) fn reset_iter_done() {
+    ITER_DONE.with(|slot| *slot.borrow_mut() = None);
+}
+
 thread_local! {
     static ITER_DONE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
@@ -252,6 +256,17 @@ impl<'a> Emitter<'a> {
     fn set_done(&mut self, name: Option<String>) {
         ITER_DONE.with(|slot| *slot.borrow_mut() = name);
     }
+    fn with_done<T>(
+        &mut self,
+        name: Option<String>,
+        action: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let previous = self.done_name();
+        self.set_done(name);
+        let result = action(self);
+        self.set_done(previous);
+        result
+    }
 
     fn materialize_iter(
         &mut self,
@@ -298,17 +313,64 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn expr_element_ty(&self, expr: &Expr) -> Ty {
+        let expr = strip_reference(expr);
+        match expr {
+            Expr::MethodCall(call)
+                if matches!(
+                    call.method.to_string().as_str(),
+                    "iter" | "into_iter"
+                ) =>
+            {
+                self.expr_element_ty(&call.receiver)
+            }
+            Expr::Array(array) => array
+                .elems
+                .first()
+                .map(|item| constant(item).map_or(Ty::VALUE, |(_, ty)| ty))
+                .unwrap_or(Ty::VALUE),
+            Expr::Macro(mac) if mac.mac.path.is_ident("vec") => {
+                match syn::parse2::<syn::ExprArray>(mac.mac.tokens.clone()) {
+                    Ok(array) => self.expr_element_ty(&Expr::Array(array)),
+                    Err(_) => Ty::VALUE,
+                }
+            }
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|name| self.lookup(&name.to_string()))
+                .and_then(|ty| ty.element.map(Ty::new))
+                .unwrap_or(Ty::VALUE),
+            _ => Ty::VALUE,
+        }
+    }
+
+    fn pair_value_ty(&self, expr: &Expr) -> Ty {
+        match strip_reference(expr) {
+            Expr::MethodCall(call)
+                if matches!(
+                    call.method.to_string().as_str(),
+                    "enumerate" | "zip"
+                ) =>
+            {
+                self.expr_element_ty(&call.receiver)
+            }
+            _ => Ty::VALUE,
+        }
+    }
     fn invoke_pair_arg(
         &mut self,
         arg: &Expr,
         value: &str,
-        pair_ty: Ty,
+        key_ty: Ty,
+        value_ty: Ty,
     ) -> Result<(String, Ty), Error> {
         if let Expr::Closure(closure) = arg {
             return self.closure_value_typed(
                 closure,
                 std::slice::from_ref(&value.to_owned()),
-                &[Some(pair_ty)],
+                &[],
+                Some((key_ty, value_ty)),
             );
         }
         self.invoke_arg(arg, std::slice::from_ref(&value.to_owned()))
@@ -563,8 +625,9 @@ impl<'a> Emitter<'a> {
             let result = self.temp();
             let seen = self.temp();
             let done = self.temp();
-            self.line(&format!("local {seen}, {done} = 0, false"));
-            self.set_done(Some(done.clone()));
+            self.line(&format!(
+                "local {result}, {seen}, {done} = nil, 0, false"
+            ));
             let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
                 emitter.line(&format!("if {done} then break end"));
                 emitter.line(&format!("if {seen} == ({wanted}) then"));
@@ -579,8 +642,9 @@ impl<'a> Emitter<'a> {
                 ));
                 Ok(())
             };
-            self.emit_iter(&call.receiver, false, &body)?;
-            self.set_done(None);
+            self.with_done(Some(done.clone()), |emitter| {
+                emitter.emit_iter(&call.receiver, false, &body)
+            })?;
             return Ok(Some((result, Ty::OPT_VALUE)));
         }
         let Some(closure) = args.first().copied() else {
@@ -596,7 +660,6 @@ impl<'a> Emitter<'a> {
             let result = self.temp();
             let done = self.temp();
             self.line(&format!("local {result}, {done} = nil, false"));
-            self.set_done(Some(done.clone()));
             let index = (method == "position").then(|| {
                 let index = self.temp();
                 self.line(&format!("local {index} = 0"));
@@ -634,8 +697,9 @@ impl<'a> Emitter<'a> {
                 }
                 Ok(())
             };
-            self.emit_iter(&call.receiver, false, &body)?;
-            self.set_done(None);
+            self.with_done(Some(done.clone()), |emitter| {
+                emitter.emit_iter(&call.receiver, false, &body)
+            })?;
             let ty = if index.is_some() {
                 Ty::OPT_INT
             } else {
@@ -741,13 +805,7 @@ impl<'a> Emitter<'a> {
                 "map" | "filter_map" => {
                     let pair = self.pair_source(&call.receiver);
                     let key_ty = self.pair_key_ty(&call.receiver);
-                    let pair_ty = Ty {
-                        base: Base::List,
-                        element: Some(key_ty.base),
-                        null: false,
-                        optional: false,
-                        result: key_ty.base == Base::Int,
-                    };
+                    let value_ty = self.pair_value_ty(&call.receiver);
                     let skip_nil = call.method == "filter_map";
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
@@ -756,7 +814,9 @@ impl<'a> Emitter<'a> {
                      -> Result<(), Error> {
                         emitter.emit_done_break();
                         let (text, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value, pair_ty)?
+                            emitter.invoke_pair_arg(
+                                closure, value, key_ty, value_ty,
+                            )?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -783,13 +843,7 @@ impl<'a> Emitter<'a> {
                 "filter" => {
                     let pair = self.pair_source(&call.receiver);
                     let key_ty = self.pair_key_ty(&call.receiver);
-                    let pair_ty = Ty {
-                        base: Base::List,
-                        element: Some(key_ty.base),
-                        null: false,
-                        optional: false,
-                        result: key_ty.base == Base::Int,
-                    };
+                    let value_ty = self.pair_value_ty(&call.receiver);
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
@@ -797,7 +851,9 @@ impl<'a> Emitter<'a> {
                      -> Result<(), Error> {
                         emitter.emit_done_break();
                         let (condition, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value, pair_ty)?
+                            emitter.invoke_pair_arg(
+                                closure, value, key_ty, value_ty,
+                            )?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -999,14 +1055,14 @@ impl<'a> Emitter<'a> {
                     let taking = call.method == "take_while";
                     let done = self.temp();
                     self.line(&format!("local {done} = false"));
-                    let previous_done =
-                        taking.then(|| self.done_name()).flatten();
-                    if taking {
-                        self.set_done(Some(done.clone()));
-                    }
+                    let outer_done = taking.then(|| self.done_name()).flatten();
+                    let done_for_iter = taking.then(|| done.clone());
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
+                        if let Some(name) = &outer_done {
+                            emitter.line(&format!("if {name} then break end"));
+                        }
                         emitter.line(&format!("if {active} then"));
                         emitter.indent = emitter.indent.saturating_add(1);
                         let (condition, _) = emitter.invoke_arg(
@@ -1036,10 +1092,9 @@ impl<'a> Emitter<'a> {
                         emitter.line("end");
                         Ok(())
                     };
-                    self.emit_iter(&call.receiver, pair, &inner)?;
-                    if taking {
-                        self.set_done(previous_done);
-                    }
+                    self.with_done(done_for_iter, |emitter| {
+                        emitter.emit_iter(&call.receiver, pair, &inner)
+                    })?;
                     return Ok(());
                 }
                 "flat_map" => {
