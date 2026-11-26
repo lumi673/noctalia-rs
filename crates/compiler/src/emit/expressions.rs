@@ -42,6 +42,12 @@ impl<'a> Emitter<'a> {
             Expr::Group(group) => self.expr(&group.expr),
             Expr::Reference(reference) => self.expr(&reference.expr),
             Expr::Unary(unary) => self.unary(unary),
+            Expr::Binary(binary)
+                if matches!(binary.op, BinOp::And(_))
+                    && and_let_count(&Expr::Binary(binary.clone())) > 1 =>
+            {
+                self.chain_condition(binary)
+            }
             Expr::Binary(binary) => self.binary(binary),
             Expr::MethodCall(call)
                 if call.method == "collect"
@@ -91,10 +97,10 @@ impl<'a> Emitter<'a> {
                     "next" | "skip" | "take"
                 ) =>
             {
-                let (text, _) = self.expr(&call.receiver)?;
-                if !self.is_chars(&text) {
+                if !self.receiver_is_chars(&call.receiver) {
                     return self.method(call);
                 }
+                let text = self.expr(&call.receiver)?.0;
                 let args = call.args.iter().collect::<Vec<_>>();
                 let method = call.method.to_string();
                 let body = if method == "next" {
@@ -103,15 +109,15 @@ impl<'a> Emitter<'a> {
                     )
                 } else {
                     let count = self.expr(arg(&args, 0, call)?)?.0;
+                    let bounded =
+                        format!("math.min(#__list, math.max(0, {count}))");
                     let start = if method == "skip" {
-                        format!("(__list.__next or 1) + math.max(0, {count})")
+                        format!("(__list.__next or 1) + {bounded}")
                     } else {
                         "(__list.__next or 1)".to_owned()
                     };
                     let limit = if method == "take" {
-                        format!(
-                            "math.min(#__list, ({start}) + math.max(0, {count}) - 1)"
-                        )
+                        format!("math.min(#__list, ({start}) + {bounded} - 1)")
                     } else {
                         "#__list".to_owned()
                     };
@@ -409,15 +415,23 @@ impl<'a> Emitter<'a> {
                 return Ok(None);
             }
         }
+        if let Expr::Path(path) = strip_reference(&call.func)
+            && let Some(segments) = path_segments(&path.path)
+            && self.program.resolve(&self.module, &segments).is_some()
+        {
+            return Ok(None);
+        }
+        if name == "std::str::from_utf8" || name == "std::str::from_utf8_lossy"
+        {
+            return Err(Error::at(
+                call.span(),
+                "UTF-8 conversion from bytes is not supported by the Luau compiler",
+            ));
+        }
         let args = call.args.iter().collect::<Vec<_>>();
         if matches!(
             name.as_str(),
-            "Box::new"
-                | "Arc::new"
-                | "std::sync::Arc::new"
-                | "Arc::clone"
-                | "std::str::from_utf8"
-                | "std::str::from_utf8_lossy"
+            "Box::new" | "Arc::new" | "std::sync::Arc::new" | "Arc::clone"
         ) && args.len() == 1
         {
             return Ok(Some((self.expr(arg(&args, 0, call)?)?.0, Ty::VALUE)));
@@ -545,9 +559,7 @@ impl<'a> Emitter<'a> {
             Lit::Char(value) => {
                 Ok((quote(&value.value().to_string()), Ty::STR))
             }
-            Lit::Byte(value) => {
-                Ok((quote(&(value.value() as char).to_string()), Ty::STR))
-            }
+            Lit::Byte(value) => Ok((value.value().to_string(), Ty::INT)),
             Lit::ByteStr(value) => {
                 Ok((quote(&String::from_utf8_lossy(&value.value())), Ty::STR))
             }
@@ -1252,6 +1264,66 @@ impl<'a> Emitter<'a> {
         }
         self.expr(expr)
     }
+    fn chain_condition(
+        &mut self,
+        binary: &ExprBinary,
+    ) -> Result<(String, Ty), Error> {
+        let mut parts = Vec::new();
+        let owned = Expr::Binary(binary.clone());
+        collect_and(&owned, &mut parts);
+        for part in &parts {
+            if let Expr::Let(item) = part {
+                let mut names = Vec::new();
+                pattern_binding_names(&item.pat, &mut names);
+                for name in names {
+                    let lua = self.bind_name(&name);
+                    self.line(&format!("local {lua} = nil"));
+                    self.push(&name, Ty::VALUE);
+                }
+            }
+        }
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        self.indent = 0;
+        let mut conditions = Vec::new();
+        for part in parts {
+            match part {
+                Expr::Let(item) => {
+                    let (condition, bindings, _) =
+                        self.let_condition_pair(item)?;
+                    conditions.push(condition);
+                    for (name, text) in bindings {
+                        let lua = self.bind_name(&name);
+                        self.line(&format!("{lua} = {text}"));
+                    }
+                }
+                other => conditions.push(self.expr(other)?.0),
+            }
+        }
+        let body = std::mem::replace(&mut self.out, saved_out);
+        self.indent = saved_indent;
+        Ok((
+            format!(
+                "(function()\n{body} return {} end)()",
+                conditions.join(" and ")
+            ),
+            Ty::BOOL,
+        ))
+    }
+
+    fn receiver_is_chars(&self, expr: &Expr) -> bool {
+        match strip_reference(expr) {
+            Expr::Path(path) => path.path.get_ident().is_some_and(|ident| {
+                self.is_chars(&self.local_name(&ident.to_string()))
+            }),
+            Expr::MethodCall(call) if call.method == "chars" => true,
+            Expr::MethodCall(call) => {
+                matches!(call.method.to_string().as_str(), "skip" | "take")
+                    && self.receiver_is_chars(&call.receiver)
+            }
+            _ => false,
+        }
+    }
 
     fn bind_closure_pattern(
         &mut self,
@@ -1650,5 +1722,52 @@ pub(super) fn strip_reference(expr: &Expr) -> &Expr {
         Expr::Paren(paren) => strip_reference(&paren.expr),
         Expr::Group(group) => strip_reference(&group.expr),
         other => other,
+    }
+}
+
+fn collect_and<'a>(expr: &'a Expr, parts: &mut Vec<&'a Expr>) {
+    if let Expr::Binary(binary) = expr
+        && matches!(binary.op, BinOp::And(_))
+    {
+        collect_and(&binary.left, parts);
+        collect_and(&binary.right, parts);
+    } else {
+        parts.push(expr);
+    }
+}
+
+fn and_let_count(expr: &Expr) -> usize {
+    let mut parts = Vec::new();
+    collect_and(expr, &mut parts);
+    parts
+        .iter()
+        .filter(|part| matches!(part, Expr::Let(_)))
+        .count()
+}
+
+fn pattern_binding_names(pattern: &Pat, names: &mut Vec<String>) {
+    match pattern {
+        Pat::Ident(ident) => names.push(ident.ident.to_string()),
+        Pat::Tuple(tuple) => {
+            for element in &tuple.elems {
+                pattern_binding_names(element, names);
+            }
+        }
+        Pat::TupleStruct(item) => {
+            for element in &item.elems {
+                pattern_binding_names(element, names);
+            }
+        }
+        Pat::Paren(paren) => pattern_binding_names(&paren.pat, names),
+        Pat::Type(typed) => pattern_binding_names(&typed.pat, names),
+        Pat::Reference(reference) => {
+            pattern_binding_names(&reference.pat, names)
+        }
+        Pat::Or(or) => {
+            if let Some(first) = or.cases.first() {
+                pattern_binding_names(first, names);
+            }
+        }
+        _ => {}
     }
 }

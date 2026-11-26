@@ -9,7 +9,11 @@ impl<'a> Emitter<'a> {
                 let value = constant(&item.expr).ok_or_else(|| {
                     Error::at(item.span(), "unsupported local constant")
                 })?;
-                self.constants.insert(item.ident.to_string(), value);
+                if let Some(scope) = self.constant_scopes.last_mut() {
+                    scope.insert(item.ident.to_string(), value);
+                } else {
+                    self.constants.insert(item.ident.to_string(), value);
+                }
                 Ok(())
             }
             Stmt::Item(syn::Item::Use(_)) => Ok(()),
@@ -268,7 +272,6 @@ impl<'a> Emitter<'a> {
                 ));
             }
         };
-        let lua = self.bind_name(&name);
         let Some(init) = &local.init else {
             let ty = hint.map_or(Ty::VALUE, type_hint);
             if let Some(kind) = hint.map(static_kind)
@@ -277,12 +280,14 @@ impl<'a> Emitter<'a> {
                 self.containers.insert(name.clone(), kind);
             }
             self.push(&name, ty);
+            let lua = self.bind_name(&name);
             self.line(&format!("local {lua} = nil"));
             return Ok(());
         };
         if let Expr::Call(call) = &*init.expr
             && is_vec_new(call)
         {
+            let lua = self.bind_name(&name);
             self.line(&format!("local {lua} = {}", empty_array()));
             self.push(&name, Ty::OPS);
             return Ok(());
@@ -295,11 +300,13 @@ impl<'a> Emitter<'a> {
                 for item in &items {
                     self.op_expr(item)?;
                 }
+                let lua = self.bind_name(&name);
                 self.line(&format!("local {lua} = nil"));
                 self.push(&name, Ty::OPS);
                 return Ok(());
             }
             let (text, ty) = self.list(&items)?;
+            let lua = self.bind_name(&name);
             self.line(&format!("local {lua} = {text}"));
             self.push(&name, ty);
             return Ok(());
@@ -308,6 +315,7 @@ impl<'a> Emitter<'a> {
             let hint =
                 hint.ok_or_else(|| bare_default_error(init.expr.span()))?;
             let text = default_value(self, hint, init.expr.span())?;
+            let lua = self.bind_name(&name);
             self.line(&format!("local {lua} = {text}"));
             self.push(&name, type_hint(hint));
             return Ok(());
@@ -318,6 +326,7 @@ impl<'a> Emitter<'a> {
         }
         let result = self.expr(&init.expr);
         self.value_needed = saved_value;
+        let lua = self.bind_name(&name);
         let (text, mut ty) = result?;
         if let Expr::Tuple(items) = strip_reference(&init.expr) {
             let element_types = self.tuple_shapes(
@@ -412,6 +421,8 @@ impl<'a> Emitter<'a> {
         self.line(&format!("local {lua} = {text}"));
         if self.is_chars(&text) {
             self.mark_chars(&lua);
+        } else if ty.base != Base::List {
+            self.unmark_chars(&lua);
         }
         if ty.base == Base::Str {
             self.values.insert(name.clone(), text.clone());
@@ -455,17 +466,17 @@ impl<'a> Emitter<'a> {
         };
         let (condition, bindings) =
             self.pattern_match(&value, pattern, error.as_deref())?;
+        self.line(&format!("if not ({condition}) then"));
+        self.indent = self.indent.saturating_add(1);
+        self.expr_stmt(diverge)?;
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
         for (name, text) in bindings {
             let binding = self.binding_ty(pattern, &name, ty);
             let lua = self.bind_name(&name);
             self.line(&format!("local {lua} = {text}"));
             self.push(&name, binding);
         }
-        self.line(&format!("if not ({condition}) then"));
-        self.indent = self.indent.saturating_add(1);
-        self.expr_stmt(diverge)?;
-        self.indent = self.indent.saturating_sub(1);
-        self.line("end");
         Ok(())
     }
 
@@ -746,10 +757,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    pub(super) fn let_condition(
+    pub(super) fn let_condition_pair(
         &mut self,
         item: &syn::ExprLet,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, PatternBindings, Ty), Error> {
         let (text, ty) = self.expr(&item.expr)?;
         let value = self.temp();
         let error = if ty.result {
@@ -762,6 +773,14 @@ impl<'a> Emitter<'a> {
         };
         let (condition, bindings) =
             self.pattern_match(&value, &item.pat, error.as_deref())?;
+        Ok((condition, bindings, ty))
+    }
+
+    pub(super) fn let_condition(
+        &mut self,
+        item: &syn::ExprLet,
+    ) -> Result<String, Error> {
+        let (condition, bindings, ty) = self.let_condition_pair(item)?;
         let class = self.pending_class.take();
         for (name, text) in bindings {
             let binding = self.binding_ty(&item.pat, &name, ty);
@@ -787,7 +806,7 @@ impl<'a> Emitter<'a> {
         };
         let (condition, _) = match condition {
             Expr::Let(item) => (self.let_condition(item)?, Ty::BOOL),
-            _ => self.expr(condition)?,
+            other => self.expr(other)?,
         };
         let keyword = if elseif { "elseif" } else { "if" };
         self.line(&format!("{keyword} {condition} then"));
@@ -901,6 +920,72 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn match_arms(
+        &mut self,
+        arms: &[&syn::Arm],
+        scrutinee: &str,
+        scrutinee_ty: Ty,
+        error: Option<&str>,
+        tail: bool,
+    ) -> Result<(), Error> {
+        let Some((arm, rest)) = arms.split_first() else {
+            return Ok(());
+        };
+        let (pattern, guard) = split_guard(&arm.pat);
+        let (condition, bindings) =
+            self.pattern_match(scrutinee, pattern, error)?;
+        self.line(&format!("if {condition} then"));
+        self.indent = self.indent.saturating_add(1);
+        self.push_scope();
+        for (name, text) in bindings {
+            let binding = self.binding_ty(pattern, &name, scrutinee_ty);
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {text}"));
+            self.push(&name, binding);
+        }
+        if let Some(guard) = guard {
+            let (text, _) = self.expr(guard)?;
+            self.line(&format!("if {text} then"));
+            self.indent = self.indent.saturating_add(1);
+            let body = self.arm_body(&arm.body, tail);
+            self.indent = self.indent.saturating_sub(1);
+            self.pop_scope();
+            if !rest.is_empty() {
+                self.line("else");
+                self.indent = self.indent.saturating_add(1);
+                let rest_result =
+                    self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                self.line("end");
+                body?;
+                rest_result?
+            } else {
+                self.line("end");
+                self.line("end");
+                body?
+            }
+        } else {
+            let body = self.arm_body(&arm.body, tail);
+            self.pop_scope();
+            self.indent = self.indent.saturating_sub(1);
+            if !rest.is_empty() {
+                self.line("else");
+                self.indent = self.indent.saturating_add(1);
+                let rest_result =
+                    self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                body?;
+                rest_result?
+            } else {
+                self.line("end");
+                body?
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn match_stmt(
         &mut self,
         item: &syn::ExprMatch,
@@ -944,7 +1029,6 @@ impl<'a> Emitter<'a> {
             None
         };
         let event_match = self.is_event_expr(&item.expr);
-        let mut opened = false;
         if event_match {
             for arm in &item.arms {
                 if let Some(patterns) = pattern_strings(&arm.pat)? {
@@ -954,47 +1038,32 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        for arm in &item.arms {
-            let (pattern, guard) = split_guard(&arm.pat);
-            let (condition, bindings) = self.pattern_match(
-                &scrutinee,
-                pattern,
-                result_error.as_deref(),
-            )?;
-            let keyword = if opened { "elseif" } else { "if" };
-            self.line(&format!("{keyword} {condition} then"));
-            self.indent = self.indent.saturating_add(1);
-            self.push_scope();
-            for (name, text) in bindings {
-                let binding = self.binding_ty(pattern, &name, scrutinee_ty);
-                let lua = self.bind_name(&name);
-                self.line(&format!("local {lua} = {text}"));
-                self.push(&name, binding);
-            }
-            if let Some(guard) = guard {
-                let (text, _) = self.expr(guard)?;
-                self.line(&format!("if {text} then"));
-                self.indent = self.indent.saturating_add(1);
-            }
-            let result = self.arm_body(&arm.body, tail);
-            if guard.is_some() {
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-            }
-            self.pop_scope();
-            result?;
-            self.indent = self.indent.saturating_sub(1);
-            opened = true;
-        }
-        if opened {
-            self.line("end");
-        }
+        let arms = item.arms.iter().collect::<Vec<_>>();
+        self.match_arms(
+            &arms,
+            &scrutinee,
+            scrutinee_ty,
+            result_error.as_deref(),
+            tail,
+        )?;
         Ok(())
     }
 
     fn binding_name(&self, pattern: &syn::PatIdent) -> Result<String, Error> {
         let name = pattern.ident.to_string();
         Ok(name)
+    }
+
+    fn pattern_bound(&self, expr: &Expr) -> Option<(String, Ty)> {
+        constant(expr).or_else(|| {
+            if let Expr::Path(path) = expr {
+                path.path
+                    .get_ident()
+                    .and_then(|ident| self.pattern_constant(&ident.to_string()))
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn pattern_match(
@@ -1098,7 +1167,7 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::TupleStruct(item)
                 if error.is_some()
@@ -1120,7 +1189,7 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::TupleStruct(item) => {
                 let name = item
@@ -1180,14 +1249,34 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::Slice(slice) => {
                 let mut conditions = Vec::new();
                 let mut bindings = Vec::new();
+                let rest = slice
+                    .elems
+                    .iter()
+                    .position(|element| matches!(element, Pat::Rest(_)));
+                let fixed = slice.elems.len() - usize::from(rest.is_some());
+                conditions.push(format!("(#({value}) >= {fixed})"));
                 for (index, element) in slice.elems.iter().enumerate() {
-                    let item = format!("({value})[{}]", index + 1);
-                    conditions.push(format!("({item} ~= nil)"));
+                    if matches!(element, Pat::Rest(_)) {
+                        continue;
+                    }
+                    let item = match rest {
+                        Some(rest) if index > rest => {
+                            let after = slice.elems.len() - rest - 1;
+                            let offset = index - rest - 1;
+                            format!(
+                                "({value})[#({value}) - {after} + 1 + {offset}]"
+                            )
+                        }
+                        _ => format!("({value})[{}]", index + 1),
+                    };
+                    if !pattern_is_none(element) {
+                        conditions.push(format!("({item} ~= nil)"));
+                    }
                     self.nested_pattern(
                         &item,
                         element,
@@ -1195,7 +1284,7 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::Tuple(tuple) => {
                 let mut conditions = Vec::new();
@@ -1209,17 +1298,17 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::Range(range) => {
                 let mut conditions = Vec::new();
                 if let Some(start) = range.start.as_deref()
-                    && let Some((text, _)) = constant(start)
+                    && let Some((text, _)) = self.pattern_bound(start)
                 {
                     conditions.push(format!("({value} >= {text})"));
                 }
                 if let Some(end) = range.end.as_deref()
-                    && let Some((text, _)) = constant(end)
+                    && let Some((text, _)) = self.pattern_bound(end)
                 {
                     let operator = if matches!(
                         range.limits,
@@ -1231,7 +1320,7 @@ impl<'a> Emitter<'a> {
                     };
                     conditions.push(format!("({value} {operator} {text})"));
                 }
-                Ok((format!("({})", conditions.join(" and ")), Vec::new()))
+                Ok((condition_text(&conditions), Vec::new()))
             }
             Pat::Struct(item) => {
                 let mut conditions =
@@ -1241,8 +1330,7 @@ impl<'a> Emitter<'a> {
                     let Member::Named(name) = &field.member else {
                         continue;
                     };
-                    let member =
-                        format!("{value}.{}", lua_key(&name.to_string()));
+                    let member = pattern_field(value, &name.to_string());
                     self.nested_pattern(
                         &member,
                         &field.pat,
@@ -1250,7 +1338,7 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             _ => Err(Error::at(
                 pattern.span(),
@@ -1530,14 +1618,36 @@ impl<'a> Emitter<'a> {
             Pat::Tuple(tuple) => {
                 for (index, element) in tuple.elems.iter().enumerate() {
                     let item = format!("({value})[{}]", index + 1);
-                    conditions.push(format!("({item} ~= nil)"));
+                    if !pattern_is_none(element) {
+                        conditions.push(format!("({item} ~= nil)"));
+                    }
                     self.nested_pattern(&item, element, conditions, bindings)?;
                 }
             }
             Pat::Slice(slice) => {
+                let rest = slice
+                    .elems
+                    .iter()
+                    .position(|element| matches!(element, Pat::Rest(_)));
+                let fixed = slice.elems.len() - usize::from(rest.is_some());
+                conditions.push(format!("(#({value}) >= {fixed})"));
                 for (index, element) in slice.elems.iter().enumerate() {
-                    let item = format!("({value})[{}]", index + 1);
-                    conditions.push(format!("({item} ~= nil)"));
+                    if matches!(element, Pat::Rest(_)) {
+                        continue;
+                    }
+                    let item = match rest {
+                        Some(rest) if index > rest => {
+                            let after = slice.elems.len() - rest - 1;
+                            let offset = index - rest - 1;
+                            format!(
+                                "({value})[#({value}) - {after} + 1 + {offset}]"
+                            )
+                        }
+                        _ => format!("({value})[{}]", index + 1),
+                    };
+                    if !pattern_is_none(element) {
+                        conditions.push(format!("({item} ~= nil)"));
+                    }
                     self.nested_pattern(&item, element, conditions, bindings)?;
                 }
             }
@@ -1547,8 +1657,7 @@ impl<'a> Emitter<'a> {
                     let Member::Named(name) = &field.member else {
                         continue;
                     };
-                    let member =
-                        format!("{value}.{}", lua_key(&name.to_string()));
+                    let member = pattern_field(value, &name.to_string());
                     self.nested_pattern(
                         &member, &field.pat, conditions, bindings,
                     )?;
@@ -1556,12 +1665,12 @@ impl<'a> Emitter<'a> {
             }
             Pat::Range(range) => {
                 if let Some(start) = range.start.as_deref()
-                    && let Some((text, _)) = constant(start)
+                    && let Some((text, _)) = self.pattern_bound(start)
                 {
                     conditions.push(format!("({value} >= {text})"));
                 }
                 if let Some(end) = range.end.as_deref()
-                    && let Some((text, _)) = constant(end)
+                    && let Some((text, _)) = self.pattern_bound(end)
                 {
                     let operator = if matches!(
                         range.limits,
@@ -1617,13 +1726,6 @@ impl<'a> Emitter<'a> {
                 ));
             }
         }
-        let lua_bindings = bindings
-            .iter()
-            .map(|binding| match binding.as_deref() {
-                Some(name) => self.bind_name(name),
-                None => "_".to_owned(),
-            })
-            .collect::<Vec<_>>();
         let mut iterable = strip_reference(&item.expr);
         let enumerate = if let Expr::MethodCall(call) = iterable
             && call.method == "enumerate"
@@ -1655,7 +1757,8 @@ impl<'a> Emitter<'a> {
                 format!("({end}) - 1")
             };
             self.push(name, Ty::INT);
-            self.line(&format!("for {} = {start}, {end} do", lua_bindings[0]));
+            let lua_name = self.bind_name(name);
+            self.line(&format!("for {lua_name} = {start}, {end} do"));
             self.indent = self.indent.saturating_add(1);
             self.statement_block(&item.body)?;
             self.indent = self.indent.saturating_sub(1);
@@ -1670,6 +1773,13 @@ impl<'a> Emitter<'a> {
         }
         let is_iterator = false;
         let (text, ty) = self.expr(iterable)?;
+        let lua_bindings = bindings
+            .iter()
+            .map(|binding| match binding.as_deref() {
+                Some(name) => self.bind_name(name),
+                None => "_".to_owned(),
+            })
+            .collect::<Vec<_>>();
         if is_iterator {
             let values = self.temp();
             self.line(&format!(
@@ -1938,11 +2048,17 @@ impl<'a> Emitter<'a> {
             let (text, _) = self.expr(right)?;
             let source = self.temp();
             self.line(&format!("local {source} = {text}"));
+            let mut values = Vec::new();
+            for index in 0..tuple.elems.len() {
+                let value = self.temp();
+                self.line(&format!("local {value} = {source}[{}]", index + 1));
+                values.push(value);
+            }
             for (index, element) in tuple.elems.iter().enumerate() {
                 let mut local = false;
                 let target =
                     self.assign_target(strip_reference(element), &mut local)?;
-                self.line(&format!("{target} = {source}[{}]", index + 1));
+                self.line(&format!("{target} = {}", values[index]));
                 if local
                     && let Some(name) = path_ident(strip_reference(element))
                 {
@@ -2143,6 +2259,47 @@ fn simple_condition(expr: &Expr) -> bool {
         }
         Expr::Field(field) => simple_condition(&field.base),
         _ => false,
+    }
+}
+fn pattern_is_none(pattern: &Pat) -> bool {
+    match strip_reference_pattern(pattern) {
+        Pat::Ident(ident) => ident.ident == "None" || ident.ident == "Null",
+        Pat::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            segment.ident == "None" || segment.ident == "Null"
+        }),
+        Pat::TupleStruct(item) => {
+            item.path.segments.last().is_some_and(|segment| {
+                segment.ident == "None" || segment.ident == "Null"
+            })
+        }
+        Pat::Struct(item) => item.path.segments.last().is_some_and(|segment| {
+            segment.ident == "None" || segment.ident == "Null"
+        }),
+        Pat::Paren(paren) => pattern_is_none(&paren.pat),
+        _ => false,
+    }
+}
+
+fn strip_reference_pattern(pattern: &Pat) -> &Pat {
+    match pattern {
+        Pat::Reference(reference) => strip_reference_pattern(&reference.pat),
+        other => other,
+    }
+}
+
+fn pattern_field(value: &str, name: &str) -> String {
+    if is_luau_keyword(name) {
+        format!("{value}[{}]", quote(name))
+    } else {
+        format!("{value}.{name}")
+    }
+}
+
+fn condition_text(conditions: &[String]) -> String {
+    if conditions.is_empty() {
+        "true".to_owned()
+    } else {
+        format!("({})", conditions.join(" and "))
     }
 }
 

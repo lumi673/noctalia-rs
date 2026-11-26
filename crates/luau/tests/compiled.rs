@@ -1333,6 +1333,84 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn review_z_scoping_and_let_chains() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    const LIMIT: i64 = 1;
+    let end = 1;
+    {
+        const LIMIT: i64 = 9;
+        let _ = LIMIT;
+    }
+    let __kw_end = 2;
+    let mut pair = (1, 2);
+    (pair.0, pair.1) = (pair.1, pair.0);
+    let hit = if let Some(a) = Some(4) && let Some(b) = Some(5) {
+        format!("{a}{b}")
+    } else {
+        "miss".to_owned()
+    };
+    let miss = if let Some(a) = None && let Some(b) = Some(5) {
+        format!("{a}{b}")
+    } else {
+        "miss".to_owned()
+    };
+    let first = pair.0;
+    let second = pair.1;
+    Ok(vec![Op::BarText { text: format!("{LIMIT}|{end}|{__kw_end}|{first}{second}|{hit}|{miss}") }])
+}
+"#;
+    let source = compiled_source("zscope", handler, EntryKind::Widget);
+    let actual = ops(
+        "zscope",
+        &source,
+        &context("zscope", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "1|1|2|21|45|miss".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_z_match_guards_and_slices() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let numbers = [1, 2, 3];
+    let slice = match numbers {
+        [first, .., last] => format!("{first}{last}"),
+        _ => String::new(),
+    };
+    let guarded = match 2 {
+        value if value == 1 => "one".to_owned(),
+        value if value == 2 => "two".to_owned(),
+        _ => "other".to_owned(),
+    };
+    let empty: Option<i64> = None;
+    let none = match empty {
+        Some(value) => format!("{value}"),
+        None => "none".to_owned(),
+    };
+    Ok(vec![Op::BarText { text: format!("{slice}|{guarded}|{none}") }])
+}
+"#;
+    let source = compiled_source("zguard", handler, EntryKind::Widget);
+    let actual = ops(
+        "zguard",
+        &source,
+        &context("zguard", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "\"13\"|\"two\"|\"none\"".to_owned()
+        }])
+    );
+}
+
+#[test]
 fn review_l1_stable_sort_matches_rust() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

@@ -156,13 +156,13 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn constant(&self, name: &str) -> Option<Constant> {
-        if let Some(value) = self.constants.get(name) {
-            return Some(value.clone());
-        }
         for scope in self.constant_scopes.iter().rev() {
             if let Some(value) = scope.get(name) {
                 return Some(value.clone());
             }
+        }
+        if let Some(value) = self.constants.get(name) {
+            return Some(value.clone());
         }
         None
     }

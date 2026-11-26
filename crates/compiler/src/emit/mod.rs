@@ -366,11 +366,17 @@ impl<'a> Emitter<'a> {
     pub(super) fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
         self.kw_scopes.push(HashMap::new());
+        self.constant_scopes.push(HashMap::new());
     }
 
     pub(super) fn pop_scope(&mut self) {
         self.scopes.pop();
         self.kw_scopes.pop();
+        self.constant_scopes.pop();
+    }
+
+    pub(super) fn unmark_chars(&mut self, name: &str) {
+        self.chars.remove(name);
     }
 
     pub(super) fn mark_chars(&mut self, name: &str) {

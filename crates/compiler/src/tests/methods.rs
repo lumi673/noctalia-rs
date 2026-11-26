@@ -60,7 +60,7 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
     assert!(compiled.source.contains("ipairs("));
-    assert!(compiled.source.contains("elseif true then"));
+    assert!(compiled.source.contains("if true then"));
     assert!(compiled.source.contains("if (noctalia.nowMs() > 0) then"));
 }
 

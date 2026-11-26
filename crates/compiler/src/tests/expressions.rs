@@ -456,7 +456,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
-    assert!(compiled.source.contains("\"#\""), "{}", compiled.source);
+    assert!(compiled.source.contains("35"), "{}", compiled.source);
     assert!(compiled.source.contains("\"ready\""), "{}", compiled.source);
 }
 #[test]
@@ -558,8 +558,12 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(format!("{smaller}{bytes}{buffer}"))])
 }
 "#;
-    let compiled =
+    let error =
         compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect("compiles");
-    assert!(compiled.source.contains("math.min"), "{}", compiled.source);
+            .expect_err("unsupported UTF-8 conversion");
+    assert!(
+        error.message.contains("UTF-8 conversion"),
+        "{}",
+        error.message
+    );
 }
