@@ -2765,14 +2765,15 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(format!("{}", value))])
 }
 "#;
-    let compiled =
+    let error =
         compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect("compiles");
+            .expect_err("folded wrap above 2^53 bails");
     assert!(
-        compiled.source.contains("(-9223372036854775808)"),
+        error.message.contains("9007199254740992"),
         "{}",
-        compiled.source
+        error.message
     );
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
 }
 
 #[test]
@@ -2864,6 +2865,25 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn review_exact_guard_rejects_folded_results() {
+    for handler in [
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9007199254740992_i64.wrapping_add(1); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = (9007199254740992_i64 - 1).saturating_mul(3); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = i64::MIN.wrapping_sub(1); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("folded result above 2^53 bails");
+        assert!(
+            error.message.contains("9007199254740992"),
+            "{}",
+            error.message
+        );
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
 fn review_round2_integer_boundaries() {
     for literal in [
         "9223372036854775807",
@@ -2902,7 +2922,8 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect_err("div_ceil overflow bails");
     assert!(
-        error.message.contains("overflow") || error.message.contains("exactly"),
+        error.message.contains("overflow")
+            || error.message.contains("9007199254740992"),
         "{}",
         error.message
     );

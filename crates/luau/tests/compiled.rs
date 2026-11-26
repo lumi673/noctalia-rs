@@ -1290,11 +1290,30 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     Ok(vec![Op::log(if value == i64::MIN { "wrapped" } else { "wrong" })])
 }
 "#;
-    let source = compiled_source("review_l6", handler, EntryKind::Service);
-    let ctx = context("review_l6", "render", json!({}), json!({}));
-    let luau = ops("review_l6", &source, &ctx);
-    let native = duplicated(vec![Op::log("wrapped".to_owned())]);
-    assert_eq!(luau, native);
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::json;\n\n{handler}\n"
+    );
+    let error = compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "review_l6",
+            state_key: "hello.state",
+            kind: EntryKind::Service,
+            strings: &["message"],
+            settings: &["message"],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
+        },
+    )
+    .expect_err("folded wrap above 2^53 bails");
+    assert!(
+        error.message.contains("9007199254740992"),
+        "{}",
+        error.message
+    );
 }
 
 #[test]
@@ -1437,15 +1456,16 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let narrow = "256".parse::<u8>().unwrap_or(7);
     let leading = "0000000000000000042".parse::<i64>().unwrap_or(0);
     let exponent = "1e2".parse::<i64>().unwrap_or(7);
+    let zero = "-0".parse::<i64>().unwrap_or(1);
     let ok = exact == 9007199254740992 && uexact == 9007199254740992;
     let bad = over == 7 && under == 7 && uover == 7 && narrow == 7 && exponent == 7;
-    Ok(vec![Op::log(format!("{} {} {}", ok, bad, leading))])
+    Ok(vec![Op::log(format!("{} {} {} {}", ok, bad, leading, zero))])
 }
 "#;
     let source = compiled_source("parse_bounds", handler, EntryKind::Service);
     let ctx = context("parse_bounds", "render", json!({}), json!({}));
     let luau = ops("parse_bounds", &source, &ctx);
-    let native = duplicated(vec![Op::log("true true 42".to_owned())]);
+    let native = duplicated(vec![Op::log("true true 42 0".to_owned())]);
     assert_eq!(luau, native);
 }
 
@@ -1485,6 +1505,61 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(error.contains("main.rs:"), "{error}");
     assert!(error.contains("saturating_mul"), "{error}");
     assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn nonexact_runtime_add_fails_instead_of_rounding() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = (9007199254740992 + count).wrapping_add(1);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("add_guard", handler, EntryKind::Service);
+    let ctx = context("add_guard", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("add_guard", &source)])
+        .expect_err("rounded sum must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("wrapping_add"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn runtime_div_ceil_above_2_53_fails_with_span() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = (9007199254740992 + count).div_ceil(3);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_guard", handler, EntryKind::Service);
+    let ctx = context("div_guard", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("div_guard", &source)])
+        .expect_err("inexact division must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("div_ceil"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn operand_source_with_semicolons_stays_intact() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let added = (";".len() as i64).wrapping_add(1);
+    let parsed = ";".parse::<i64>().unwrap_or(7);
+    Ok(vec![Op::log(format!("{} {}", added, parsed))])
+}
+"#;
+    let source =
+        compiled_source("semicolon_operand", handler, EntryKind::Service);
+    let ctx = context("semicolon_operand", "render", json!({}), json!({}));
+    let luau = ops("semicolon_operand", &source, &ctx);
+    let native = duplicated(vec![Op::log("2 7".to_owned())]);
+    assert_eq!(luau, native);
 }
 
 #[test]

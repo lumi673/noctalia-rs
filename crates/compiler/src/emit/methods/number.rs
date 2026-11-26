@@ -1,19 +1,13 @@
 use super::*;
 
-/// Rejects a limb value that Luau would round on conversion to its number
-/// model. The error carries the Rust method span so the failure is attributable
-/// to the exact construct that produced it.
+/// Rejects any limb magnitude above 2^53 before conversion to a Luau number.
+/// The error carries the Rust method span so the failure is attributable to the
+/// exact construct that produced it.
 fn exact_guard(location: &str, construct: &str) -> String {
     let location = location.replace('"', "\\\"");
     let construct = construct.replace('"', "\\\"");
     format!(
-        concat!(
-            "local function __bits(__v) local __n = 0 while __v >= 1 do __v = math.floor(__v / 2); __n = __n + 1 end return __n - 1 end;",
-            "local function __exact(__h, __l) local __e = (__h > 0) and (32 + __bits(__h)) or __bits(__l); if __e <= 52 then return true end; local __shift = __e - 52; if __shift <= 32 then return (__l % (2 ^ __shift)) == 0 end; return __l == 0 and (__h % (2 ^ (__shift - 32))) == 0 end;",
-            "if not __exact(__hi, __lo) then error(\"{location}: {construct} result is not exactly representable in Luau (1 construct)\") end;",
-        ),
-        location = location,
-        construct = construct,
+        "if __hi > 2097152 or (__hi == 2097152 and __lo > 0) then error(\"{location}: {construct} result exceeds 9007199254740992 (1 construct)\") end;",
     )
 }
 
@@ -158,6 +152,13 @@ fn exact_binary(
         )
     };
     let guard = exact_guard(location, method);
+    const LEFT_MARK: &str = "\u{e000}";
+    const RIGHT_MARK: &str = "\u{e001}";
+    let right_source = if right_literal.is_some() {
+        String::new()
+    } else {
+        right.to_owned()
+    };
     let right_operand = match right_literal {
         Some(value) => {
             let sign = if value < 0 { -1 } else { 1 };
@@ -168,7 +169,7 @@ fn exact_binary(
                 magnitude & 0xffff_ffff
             )
         }
-        None => format!("local __bs, __bhi, __blo = __pack({right});"),
+        None => format!("local __bs, __bhi, __blo = __pack({RIGHT_MARK});"),
     };
     format!(
         concat!(
@@ -227,7 +228,7 @@ fn exact_binary(
             "return __result;",
             "end)()",
         ),
-        left = left,
+        left = LEFT_MARK,
         right_operand = right_operand,
         operation = operation,
         bound_check = bound_check,
@@ -235,6 +236,8 @@ fn exact_binary(
         guard = guard,
     )
     .replace(';', "\n")
+    .replace(LEFT_MARK, left)
+    .replace(RIGHT_MARK, &right_source)
 }
 
 /// Decimal validation and limb conversion for `parse::<T>()`.
@@ -253,11 +256,12 @@ pub(super) fn exact_parse(
         "u64" | "usize" => ("18446744073709551615", "0", false),
         _ => ("9223372036854775807", "9223372036854775808", true),
     };
+    const RECEIVER_MARK: &str = "\u{e002}";
     let guard = exact_guard(location, &format!("parse::<{target}>"));
     format!(
         concat!(
             "(function()",
-            "local __s = {receiver};",
+            "local __s = {RECEIVER_MARK};",
             "local __start, __finish, __sign, __digits = string.find(__s, \"^([+-]?)(%d+)$\");",
             "if __start == nil then return nil, \"invalid digit found in string\" end;",
             "__digits = string.gsub(__digits, \"^0+\", \"\");",
@@ -274,18 +278,20 @@ pub(super) fn exact_parse(
             "  __lo = __v - __c * __B;",
             "  __hi = (__hi * 10 + __c) % __B;",
             "end;",
+            "if __hi == 0 and __lo == 0 then return 0 end;",
             "{guard}",
             "if __neg then return -(__hi * __B + __lo) end;",
             "return __hi * __B + __lo;",
             "end)()",
         ),
-        receiver = receiver,
+        RECEIVER_MARK = RECEIVER_MARK,
         signed = signed,
         negative = negative,
         positive = positive,
         guard = guard,
     )
     .replace(';', "\n")
+    .replace(RECEIVER_MARK, receiver)
 }
 
 fn int_literal(expr: &Expr) -> Option<(i128, usize, bool)> {
@@ -490,11 +496,11 @@ impl<'a> Emitter<'a> {
                     } else {
                         raw.clamp(min, max)
                     };
-                    if result as f64 as i128 != result {
+                    if result.abs() > 9007199254740992 {
                         return Err(Error::at(
                             call.method.span(),
                             format!(
-                                "`{method}` result {result} is not exactly representable in Luau (1 construct)"
+                                "`{method}` result {result} exceeds 9007199254740992 (1 construct)"
                             ),
                         ));
                     }
@@ -535,9 +541,16 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 let other = self.expr(other_expr)?.0;
+                let span = call.method.span().start();
+                let location = format!(
+                    "{}.rs:{}:{}",
+                    self.module,
+                    span.line,
+                    span.column + 1
+                );
                 Ok((
                     format!(
-                        "(function() local __a, __b = math.floor({receiver}), math.floor({other}); if __b == 0 then error(\"divide by zero\") end; local __q = (__a >= 0 and math.floor(__a / __b) or math.ceil(__a / __b)); local __r = __a - __q * __b; if __r ~= 0 and ((__r > 0) == (__b > 0)) then return __q + 1 end; return __q end)()"
+                        "(function() local __a, __b = math.floor({receiver}), math.floor({other}); if __b == 0 then error(\"divide by zero\") end; if __a > 9007199254740992 or __a < -9007199254740992 or __b > 9007199254740992 or __b < -9007199254740992 then error(\"{location}: div_ceil operands exceed 9007199254740992 (1 construct)\") end; local __q = (__a >= 0 and math.floor(__a / __b) or math.ceil(__a / __b)); local __r = __a - __q * __b; if __r ~= 0 and ((__r > 0) == (__b > 0)) then __q = __q + 1 end; if __q > 9007199254740992 or __q < -9007199254740992 then error(\"{location}: div_ceil result exceeds 9007199254740992 (1 construct)\") end; return __q end)()"
                     ),
                     ty,
                 ))
