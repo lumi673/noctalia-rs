@@ -307,3 +307,41 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         .expect("writeFile query");
     assert_eq!(query["args"], json!(["/a.txt", "x"]));
 }
+
+#[test]
+fn result_pairs_keep_host_errors_in_every_context() {
+    let dir = QueryDir::new();
+    for pass in 0..2 {
+        let base = 2 + pass * 3;
+        dir.respond(base, Value::Null, Some("host denied the list"));
+        dir.respond(base + 1, Value::Null, Some("host denied the info"));
+        dir.respond(base + 2, json!(true), None);
+    }
+    let (text, values) = run(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let (entries, list_error) = ctx.list_dir_result("/dir");
+    let (info, info_error) = ctx.file_info_result("/a.txt");
+    std::fs::write("/stmt.txt", "x")?;
+    let report = format!("{}:{}:{}:{}",
+        entries.is_some(),
+        list_error.unwrap_or_else(|| "fallback".to_owned()),
+        info.is_some(),
+        info_error.unwrap_or_else(|| "fallback".to_owned()));
+    Ok(vec![Op::BarText { text: report }])
+}
+"#,
+        dir.path(),
+    );
+    assert_eq!(
+        text, "false:host denied the list:false:host denied the info",
+        "{text}"
+    );
+    let write = values
+        .iter()
+        .find(|value| {
+            value["op"] == "query" && value["path"] == json!(["writeFile"])
+        })
+        .expect("the statement-position write");
+    assert_eq!(write["args"], json!(["/stmt.txt", "x"]));
+}

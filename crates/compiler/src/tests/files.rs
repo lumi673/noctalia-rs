@@ -375,7 +375,22 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let (renamed, rename_error) = ctx.rename_file_result("/a.txt", "/b.txt");
     let (bytes, bytes_error) = ctx.read_file_bytes_result("/b.txt");
     let (entries, list_error) = ctx.list_dir_result("/dir");
-    Ok(vec![Op::log(format!("{}{}{}{}{}{}{}{}", written, write_error.is_none(), renamed, rename_error.is_none(), bytes.is_some(), bytes_error.is_none(), entries.is_some(), list_error.is_none()))])
+    let (font, font_error) = ctx.load_font_result("f.ttf");
+    let (info, info_error) = ctx.file_info_result("/a.txt");
+    let (made, made_error) = ctx.mkdir_all_result("/made");
+    let (removed, removed_error) = ctx.remove_file_result("/gone");
+    let (data, data_error) = ctx.plugin_data_dir_result();
+    std::fs::write("/stmt.txt", "x")?;
+    let text = std::fs::read_to_string("/a.txt")?;
+    Ok(vec![Op::log(format!(
+        "{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+        written, write_error.is_none(), renamed, rename_error.is_none(),
+        bytes.is_some(), bytes_error.is_none(), entries.is_some(),
+        list_error.is_none(), font.is_some(), font_error.is_none(),
+        info.is_some(), info_error.is_none(), made, made_error.is_none(),
+        removed, removed_error.is_none(), data.is_some(),
+        data_error.is_none(), text, ctx.file_exists("/a.txt")
+    ))])
 }
 "#,
     );
@@ -383,6 +398,12 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "local written, write_error = noctalia.writeFile(\"/a.txt\", \"x\")",
         "local renamed, rename_error = noctalia.renameFile(\"/a.txt\", \"/b.txt\")",
         "local bytes, bytes_error = noctalia.readFile(\"/b.txt\")",
+        "local entries, list_error = noctalia.listDir(\"/dir\")",
+        "local font, font_error = noctalia.loadFont(\"f.ttf\")",
+        "local info, info_error = noctalia.fileInfo(\"/a.txt\")",
+        "local made, made_error = noctalia.mkdirAll(\"/made\")",
+        "local removed, removed_error = noctalia.removeFile(\"/gone\")",
+        "local data, data_error = noctalia.pluginDataDir()",
     ] {
         assert!(source.contains(binding), "missing `{binding}`: {source}");
         assert!(
@@ -390,7 +411,30 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
             "a parenthesized call truncates the pair: {binding}"
         );
     }
-    assert!(source.contains("(noctalia.listDir(\"/dir\"))"), "{source}");
+    assert!(
+        source.contains("noctalia.writeFile(\"/stmt.txt\", \"x\")"),
+        "{source}"
+    );
+    let pair_error = source
+        .lines()
+        .any(|line| line.contains(" = noctalia.") && line.contains("_error"));
+    assert!(pair_error, "{source}");
+    let try_calls = source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("local __t"))
+        .collect::<Vec<_>>();
+    assert!(
+        try_calls
+            .iter()
+            .any(|line| line.contains("noctalia.writeFile(")),
+        "{try_calls:?}"
+    );
+    assert!(
+        try_calls
+            .iter()
+            .any(|line| line.contains("noctalia.readFile(")),
+        "{try_calls:?}"
+    );
 }
 
 #[test]

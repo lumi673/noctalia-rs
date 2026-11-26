@@ -1300,11 +1300,11 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "plugin_data_dir_result" => Ok((
-                "(noctalia.pluginDataDir())".to_owned(),
+                "noctalia.pluginDataDir()".to_owned(),
                 Ty::OPT_PATH,
             )),
             "plugin_dir_result" => {
-                Ok(("(noctalia.pluginDir())".to_owned(), Ty::OPT_PATH))
+                Ok(("noctalia.pluginDir()".to_owned(), Ty::OPT_PATH))
             }
             "os_clock" => Ok(("os.clock()".to_owned(), Ty::FLOAT)),
             "os_time" => Ok(("os.time()".to_owned(), Ty::INT)),
@@ -1340,23 +1340,23 @@ impl<'a> Emitter<'a> {
             }
             "list_dir_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.listDir({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.listDir({path})"), Ty::VALUE))
             }
             "load_font_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.loadFont({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.loadFont({path})"), Ty::VALUE))
             }
             "file_info_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.fileInfo({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.fileInfo({path})"), Ty::VALUE))
             }
             "mkdir_all_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.mkdirAll({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.mkdirAll({path})"), Ty::VALUE))
             }
             "remove_file_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.removeFile({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.removeFile({path})"), Ty::VALUE))
             }
             "write_file_result" if !self.strict() => {
                 let path = self.path_arg(args, 0, call)?;
