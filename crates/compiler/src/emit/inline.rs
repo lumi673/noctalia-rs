@@ -429,7 +429,7 @@ impl<'a> Emitter<'a> {
                     let local_name = if target.as_deref() == Some(name.as_str())
                     {
                         let fresh = self.temp();
-                        renames.push((name.clone(), fresh.clone()));
+                        renames.push((name.clone(), fresh.clone(), span));
                         fresh
                     } else {
                         name.clone()
@@ -472,6 +472,17 @@ impl<'a> Emitter<'a> {
             }
         }
         for (_, original, span) in &string_params {
+            if let Some(reborrow) =
+                mut_reborrow(&helper.function.block, original)
+            {
+                return Err(Error::at(
+                    reborrow,
+                    format!(
+                        "cannot preserve `&mut` aliasing for the `{original}` argument of `{}`: mutable reborrows of a String cannot be inlined",
+                        helper.name
+                    ),
+                ));
+            }
             if let Some(method) =
                 unsupported_string_mutator(&helper.function.block, original)
             {
@@ -485,7 +496,16 @@ impl<'a> Emitter<'a> {
             }
         }
         let mut block = helper.function.block.clone();
-        for (from, to) in &renames {
+        for (from, to, _) in &renames {
+            if let Some(shadow) = shadowed_local(&helper.function.block, from) {
+                return Err(Error::at(
+                    shadow,
+                    format!(
+                        "cannot preserve `&mut` aliasing for the `{from}` argument of `{}`: the parameter is shadowed",
+                        helper.name
+                    ),
+                ));
+            }
             rename_paths(&mut block, from, to);
         }
         self.value_helper = mode == Inline::Value;
@@ -802,6 +822,145 @@ fn lvalue_operands(expr: &Expr) -> Vec<String> {
     let mut out = Vec::new();
     walk(expr, &mut out);
     out
+}
+
+fn pattern_ident(pattern: &Pat) -> Option<&syn::Ident> {
+    match pattern {
+        Pat::Ident(item) => Some(&item.ident),
+        Pat::Type(item) => pattern_ident(&item.pat),
+        Pat::Paren(item) => pattern_ident(&item.pat),
+        _ => None,
+    }
+}
+
+fn shadowed_local(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+    fn statements(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+        for stmt in &block.stmts {
+            if let Stmt::Local(local) = stmt
+                && pattern_ident(&local.pat).is_some_and(|id| id == name)
+            {
+                return Some(local.pat.span());
+            }
+            if let Some(span) = expressions(stmt, name) {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    fn expressions(stmt: &Stmt, name: &str) -> Option<proc_macro2::Span> {
+        match stmt {
+            Stmt::Expr(expr, _) => exprs(expr, name),
+            Stmt::Local(local) => {
+                local.init.as_ref().and_then(|init| exprs(&init.expr, name))
+            }
+            _ => None,
+        }
+    }
+
+    fn exprs(expr: &Expr, name: &str) -> Option<proc_macro2::Span> {
+        match expr {
+            Expr::Block(item) => statements(&item.block, name),
+            Expr::If(item) => {
+                statements(&item.then_branch, name).or_else(|| {
+                    item.else_branch.as_ref().and_then(|(_, branch)| {
+                        match &**branch {
+                            Expr::Block(block) => {
+                                statements(&block.block, name)
+                            }
+                            other => exprs(other, name),
+                        }
+                    })
+                })
+            }
+            Expr::Match(item) => {
+                item.arms.iter().find_map(|arm| match &*arm.body {
+                    Expr::Block(block) => statements(&block.block, name),
+                    other => exprs(other, name),
+                })
+            }
+            Expr::ForLoop(item) => statements(&item.body, name),
+            Expr::While(item) => statements(&item.body, name),
+            Expr::Loop(item) => statements(&item.body, name),
+            _ => None,
+        }
+    }
+
+    statements(block, name)
+}
+
+fn mut_reborrow(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+    fn statements(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+        for stmt in &block.stmts {
+            if let Stmt::Local(local) = stmt
+                && let Some(init) = &local.init
+                && reborrow(&init.expr, name)
+            {
+                return Some(init.expr.span());
+            }
+            if let Some(span) = match stmt {
+                Stmt::Expr(expr, _) => exprs(expr, name),
+                Stmt::Local(local) => {
+                    local.init.as_ref().and_then(|init| exprs(&init.expr, name))
+                }
+                _ => None,
+            } {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    fn reborrow(expr: &Expr, name: &str) -> bool {
+        let Expr::Reference(reference) = expr else {
+            return false;
+        };
+        if reference.mutability.is_none() {
+            return false;
+        }
+        match strip_reference(&reference.expr) {
+            Expr::Path(path) => {
+                path.path.get_ident().is_some_and(|id| id == name)
+            }
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                let Expr::Path(path) = strip_reference(&unary.expr) else {
+                    return false;
+                };
+                path.path.get_ident().is_some_and(|id| id == name)
+            }
+            _ => false,
+        }
+    }
+
+    fn exprs(expr: &Expr, name: &str) -> Option<proc_macro2::Span> {
+        match expr {
+            Expr::Block(item) => statements(&item.block, name),
+            Expr::If(item) => {
+                statements(&item.then_branch, name).or_else(|| {
+                    item.else_branch.as_ref().and_then(|(_, branch)| {
+                        match &**branch {
+                            Expr::Block(block) => {
+                                statements(&block.block, name)
+                            }
+                            other => exprs(other, name),
+                        }
+                    })
+                })
+            }
+            Expr::Match(item) => {
+                item.arms.iter().find_map(|arm| match &*arm.body {
+                    Expr::Block(block) => statements(&block.block, name),
+                    other => exprs(other, name),
+                })
+            }
+            Expr::ForLoop(item) => statements(&item.body, name),
+            Expr::While(item) => statements(&item.body, name),
+            Expr::Loop(item) => statements(&item.body, name),
+            _ => None,
+        }
+    }
+
+    statements(block, name)
 }
 
 fn unsupported_string_mutator(

@@ -927,3 +927,66 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     assert!(compiled.source.contains("(function()"));
     assert_eq!(compiled.source.matches("total = n").count(), 2);
 }
+
+#[test]
+fn rejects_shadowed_mut_parameters() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+}
+
+#[test]
+fn rejects_aliased_mut_string_reborrows() {
+    let handler = r#"
+fn helper(text: &mut String) {
+    let alias = &mut *text;
+    alias.push_str("x");
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("mutable reborrows"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_non_shadowing_mut_parameters() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let extra = 2;
+    *n + extra + 2
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = 0;
+    let value = helper(&mut total);
+    Ok(vec![Op::log(value.to_string()), Op::log(total.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("((n + extra) + 2)"));
+}

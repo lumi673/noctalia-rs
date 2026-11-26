@@ -181,3 +181,89 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         assert_eq!(chunk, expected);
     }
 }
+
+fn compile_result(handler: &str) -> Result<String, String> {
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::json;\n\n{handler}\n"
+    );
+    compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "mut_copyback",
+            state_key: "test.state",
+            kind: EntryKind::Widget,
+            strings: &[],
+            settings: &[],
+            module: "main",
+            modules: &[],
+            native: NativeMode::Deny,
+            strict: None,
+        },
+    )
+    .map(|result| result.source)
+    .map_err(|error| error.message)
+}
+
+#[test]
+fn shadowed_mut_parameter_is_rejected() {
+    let error = compile_result(
+        r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#,
+    )
+    .expect_err("shadowing must fail");
+    assert!(error.contains("shadowed"), "{error}");
+}
+
+#[test]
+fn non_shadowing_mut_parameter_matches_native_handler() {
+    let source = compiled(
+        r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let extra = 2;
+    *n + extra + 2
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#,
+    );
+    let expected = ["5", "1"];
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    for chunk in actual.chunks(expected.len()) {
+        assert_eq!(chunk, expected);
+    }
+}
+
+#[test]
+fn mut_string_reborrow_is_rejected() {
+    let error = compile_result(
+        r#"
+fn helper(text: &mut String) {
+    let alias = &mut *text;
+    alias.push_str("x");
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#,
+    )
+    .expect_err("aliased reborrow must fail");
+    assert!(error.contains("mutable reborrows"), "{error}");
+}
