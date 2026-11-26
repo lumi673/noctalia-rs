@@ -243,6 +243,7 @@ impl<'a> Emitter<'a> {
                 self.line(&format!("if {condition} then"));
                 self.indent = self.indent.saturating_add(1);
                 let (value, then_ty) = self.block_value(&item.then_branch)?;
+                let mut then_chars = self.is_chars(&value);
                 let mut result = then_ty;
                 if !value.is_empty() && then_ty.base != Base::Void {
                     self.line(&format!("{name} = {value}"));
@@ -257,6 +258,7 @@ impl<'a> Emitter<'a> {
                         Expr::Block(block) => self.block_value(&block.block)?,
                         other => self.expr(other)?,
                     };
+                    then_chars = then_chars && self.is_chars(&value);
                     result.null = then_ty.null || else_ty.null;
                     if !value.is_empty() && else_ty.base != Base::Void {
                         self.line(&format!("{name} = {value}"));
@@ -266,8 +268,11 @@ impl<'a> Emitter<'a> {
                     }
                     self.indent = self.indent.saturating_sub(1);
                 } else {
-                    // Without an else branch the false path leaves nil.
+                    then_chars = false;
                     result.null = true;
+                }
+                if then_chars {
+                    self.mark_chars(&name);
                 }
                 self.line("end");
                 Ok((name, result))
@@ -570,10 +575,24 @@ impl<'a> Emitter<'a> {
             None => Ok(("nil".to_owned(), Ty::VALUE)),
         };
         let (text, ty) = result?;
-        self.line(&format!("{value} = {text}"));
+        let chars = self.is_chars(&text);
+        let shapes = self.tuple_expr_shapes.get(&text).cloned();
+        let tuple_types = self.tuple_types.get(&text).cloned();
+        if !text.is_empty() {
+            self.line(&format!("{value} = {text}"));
+        }
+        if let Some(shapes) = shapes {
+            self.tuple_expr_shapes.insert(value.clone(), shapes);
+        }
+        if let Some(types) = tuple_types {
+            self.tuple_types.insert(value.clone(), types);
+        }
         self.pop_scope();
         self.indent = self.indent.saturating_sub(1);
         self.line("end");
+        if chars {
+            self.mark_chars(&value);
+        }
         Ok((value, ty))
     }
 

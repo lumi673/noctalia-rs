@@ -585,3 +585,29 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             .expect_err("shadowing");
     assert!(error.message.contains("cannot shadow"), "{}", error.message);
 }
+
+#[test]
+fn void_if_branches_do_not_emit_empty_assignments() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let flag = true;
+    let _picked = if flag {
+        Op::log("a")
+    } else {
+        Op::log("b")
+    };
+    Ok(vec![])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        !compiled
+            .source
+            .lines()
+            .any(|line| line.trim_end().ends_with('=')),
+        "{}",
+        compiled.source
+    );
+}

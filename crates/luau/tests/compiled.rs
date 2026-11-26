@@ -1513,6 +1513,65 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn review_pp_branch_result_shapes_and_iterators() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (a, b) = if true {
+        (5, 2)
+    } else {
+        (0, 1)
+    };
+    let ratio = a / b;
+    let chars = (if true {
+        let mut iter = "ab".chars();
+        iter.next();
+        iter
+    } else {
+        "xy".chars()
+    }).collect::<String>();
+    Ok(vec![Op::BarText { text: format!("{ratio}|{chars}") }])
+}
+"#;
+    let source = compiled_source("pp", handler, EntryKind::Widget);
+    let actual = ops(
+        "pp",
+        &source,
+        &context("pp", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "2|b".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_qq_void_if_branches_stay_parseable() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = ctx.event == "never";
+    let _picked = if flag {
+        Op::log("a")
+    } else {
+        Op::log("b")
+    };
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let source = compiled_source("qq", handler, EntryKind::Widget);
+    let actual = ops(
+        "qq",
+        &source,
+        &context("qq", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::log("b".to_owned()), Op::log("done".to_owned())])
+    );
+}
+
+#[test]
 fn review_l1_stable_sort_matches_rust() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
