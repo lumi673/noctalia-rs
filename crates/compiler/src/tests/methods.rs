@@ -2421,7 +2421,9 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(emitted.contains("local clamped = (-2)"), "{emitted}");
     assert!(emitted.contains("local wrapped = (9)"), "{emitted}");
     assert!(
-        emitted.contains("math.floor(7), math.floor(3)"),
+        emitted.contains("__pack(7)")
+            && emitted.contains("__pack(3)")
+            && emitted.contains("__divmag"),
         "{emitted}"
     );
     assert!(emitted.contains("math.pow(2.0, 3)"), "{emitted}");
@@ -2946,6 +2948,24 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn review_inexact_path_constants_bail() {
+    for handler in [
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let n = ctx.config_str(\"message\").unwrap_or_default().len() as i64; let v = i64::MAX.wrapping_add(n); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let n = ctx.config_str(\"message\").unwrap_or_default().len() as u64; let v = u64::MAX.saturating_add(n); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("inexact path constant bails");
+        assert!(
+            error.message.contains("not exactly representable"),
+            "{}",
+            error.message
+        );
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
 fn review_round2_integer_boundaries() {
     for literal in [
         "9223372036854775807",
@@ -2972,23 +2992,30 @@ fn review_round2_integer_boundaries() {
         );
     }
 
-    let handler = r#"
+    let wrap = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let a = (i64::MAX - 1).wrapping_add(2);
     let b = i64::MIN.wrapping_sub(2);
-    let c = i64::MIN.div_ceil(-1);
-    Ok(vec![Op::log(format!("{} {} {}", a, b, c))])
+    Ok(vec![Op::log(format!("{}", b))])
 }
 "#;
-    let error =
-        compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect_err("div_ceil overflow bails");
+    let error = compile(&source(wrap), &options("handler", EntryKind::Service))
+        .expect_err("wrapped value bails");
     assert!(
-        error.message.contains("overflow")
-            || error.message.contains("not exactly representable"),
+        error.message.contains("not exactly representable"),
         "{}",
         error.message
     );
+
+    let divide = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let c = i64::MIN.div_ceil(-1);
+    Ok(vec![Op::log(format!("{}", c))])
+}
+"#;
+    let error =
+        compile(&source(divide), &options("handler", EntryKind::Service))
+            .expect_err("div_ceil overflow bails");
+    assert!(error.message.contains("overflow"), "{}", error.message);
 }
 
 #[test]

@@ -125,15 +125,21 @@ fn exact_binary(
             )
         }
     } else {
-        let mask = if mod_hi == 0 {
-            format!("__hi = 0; __lo = __lo % {mod_lo};")
+        let small = mod_hi <= 1;
+        let lo_mod = if mod_lo == 0 {
+            "__B".to_owned()
         } else {
-            "__hi = __hi % __B;".to_owned()
+            mod_lo.to_string()
+        };
+        let mask = if small {
+            format!("__hi = 0; __lo = __lo % {lo_mod};")
+        } else {
+            format!("__hi = __hi % {mod_hi};")
         };
         let sign = if signed {
-            let complement = if mod_hi == 0 {
+            let complement = if small {
                 format!(
-                    "__hi = 0; if __lo ~= 0 then __lo = {mod_lo} - __lo end;"
+                    "__hi = 0; if __lo ~= 0 then __lo = {lo_mod} - __lo end;"
                 )
             } else {
                 format!(
@@ -152,7 +158,7 @@ fn exact_binary(
                 complement = complement,
             )
         } else {
-            "__s = 0;".to_owned()
+            "__s = 1;".to_owned()
         };
         format!(
             concat!(
@@ -392,8 +398,71 @@ fn has_inexact_literal(expr: &Expr) -> bool {
         Expr::Paren(paren) => has_inexact_literal(&paren.expr),
         Expr::Group(group) => has_inexact_literal(&group.expr),
         Expr::Unary(unary) => has_inexact_literal(&unary.expr),
+        Expr::Path(_) => {
+            int_literal(expr).is_some_and(|(value, _, _)| !exact_i128(value))
+        }
         _ => false,
     }
+}
+/// Exact `div_ceil` using 32-bit limbs. Double division cannot distinguish a
+/// rounded operand or quotient from an exact one above 2^53.
+fn exact_div_ceil(location: &str, left: &str, right: &str) -> String {
+    const LEFT_MARK: &str = "\u{e003}";
+    const RIGHT_MARK: &str = "\u{e004}";
+    let operand_guard = format!(
+        "{}{}",
+        exact_guard(location, "div_ceil operand", "__ah", "__al"),
+        exact_guard(location, "div_ceil operand", "__bh", "__bl")
+    );
+    let result_guard = exact_guard(location, "div_ceil result", "__qh", "__ql");
+    format!(
+        concat!(
+            "(function()",
+            "local __B = 4294967296;",
+            "{limb_exact}",
+            "local function __pack(__v) local __s = (__v < 0) and -1 or 1; if __v < 0 then __v = -__v end; local __m = math.floor(__v); local __h = math.floor(__m / __B); local __l = __m - __h * __B; return __s, __h, __l end;",
+            "local function __submag(__ah, __al, __bh, __bl) local __borrow = (__al < __bl) and 1 or 0; return __ah - __bh - __borrow, __al - __bl + __borrow * __B end;",
+            "local function __divmag(__ah, __al, __bh, __bl)",
+            "  local __qh, __ql, __rh, __rl = 0, 0, 0, 0;",
+            "  for __i = 63, 0, -1 do",
+            "    local __carry = (__rl >= 2147483648) and 1 or 0;",
+            "    __rh = (__rh * 2 + __carry) % __B;",
+            "    __rl = (__rl * 2) % __B;",
+            "    if __i >= 32 then __rl = __rl + (math.floor(__ah / 2 ^ (__i - 32)) % 2) end;",
+            "    if __i < 32 then __rl = __rl + (math.floor(__al / 2 ^ __i) % 2) end;",
+            "    if __rh > __bh or (__rh == __bh and __rl >= __bl) then",
+            "      __rh, __rl = __submag(__rh, __rl, __bh, __bl);",
+            "      if __i >= 32 then __qh = __qh + 2 ^ (__i - 32) end;",
+            "      if __i < 32 then __ql = __ql + 2 ^ __i end;",
+            "    end;",
+            "  end;",
+            "  return __qh, __ql, __rh, __rl;",
+            "end;",
+            "local __as, __ah, __al = __pack({LEFT_MARK});",
+            "local __bs, __bh, __bl = __pack({RIGHT_MARK});",
+            "{operand_guard}",
+            "if __bh == 0 and __bl == 0 then error(\"divide by zero\") end;",
+            "local __qh, __ql, __rh, __rl = __divmag(__ah, __al, __bh, __bl);",
+            "if (__rh ~= 0 or __rl ~= 0) and __as == __bs then",
+            "  local __l = __ql + 1;",
+            "  local __c = math.floor(__l / __B);",
+            "  __ql = __l - __c * __B;",
+            "  __qh = __qh + __c;",
+            "end;",
+            "{result_guard}",
+            "if __qh == 0 and __ql == 0 then return 0 end;",
+            "return (__as * __bs) * (__qh * __B + __ql);",
+            "end)()",
+        ),
+        LEFT_MARK = LEFT_MARK,
+        RIGHT_MARK = RIGHT_MARK,
+        limb_exact = LIMB_EXACT,
+        operand_guard = operand_guard,
+        result_guard = result_guard,
+    )
+    .replace(';', "\n")
+    .replace(LEFT_MARK, left)
+    .replace(RIGHT_MARK, right)
 }
 
 fn int_bounds(bits: usize, signed: bool) -> (i128, i128) {
@@ -610,12 +679,7 @@ impl<'a> Emitter<'a> {
                     span.line,
                     span.column + 1
                 );
-                Ok((
-                    format!(
-                        "(function() local __a, __b = math.floor({receiver}), math.floor({other}); local function __roundtrip(__v) if __v ~= math.floor(__v) then return false end return tonumber(string.format(\"%.0f\", __v)) == __v end; if __b == 0 then error(\"divide by zero\") end; if not __roundtrip(__a) or not __roundtrip(__b) then error(\"{location}: div_ceil operand is not exactly representable in Luau (1 construct)\") end; local __q = (__a >= 0 and math.floor(__a / __b) or math.ceil(__a / __b)); local __r = __a - __q * __b; if __r ~= 0 and ((__r > 0) == (__b > 0)) then __q = __q + 1 end; if not __roundtrip(__q) then error(\"{location}: div_ceil result is not exactly representable in Luau (1 construct)\") end; return __q end)()"
-                    ),
-                    ty,
-                ))
+                Ok((exact_div_ceil(&location, receiver, &other), ty))
             }
             "is_sign_positive"
                 if matches!(ty.base, Base::Float | Base::Value) =>

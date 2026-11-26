@@ -1524,6 +1524,95 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn u32_wrapping_add_returns_zero_at_32_bits() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let b = 1_u32;
+    let value = 4294967295_u32.wrapping_add(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("u32_wrap", handler, EntryKind::Service);
+    let ctx = context("u32_wrap", "render", json!({}), json!({}));
+    let luau = ops("u32_wrap", &source, &ctx);
+    let native = duplicated(vec![Op::log("0".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn div_ceil_rejects_rounded_quotient() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = 1152921504606846976_i64.div_ceil(3);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_inexact", handler, EntryKind::Service);
+    let ctx = context("div_inexact", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("div_inexact", &source)])
+        .expect_err("rounded quotient must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("div_ceil result"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn u64_wrapping_add_keeps_its_limb_result() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let n = ctx.config_str("message").unwrap_or_default().len() as u64 - 5;
+    let value = 9223372036854775808_u64.wrapping_add(n);
+    let ok = value == 9223372036854775808;
+    Ok(vec![Op::log(format!("{}", ok))])
+}
+"#;
+    let source = compiled_source("u64_wrap", handler, EntryKind::Service);
+    let ctx = context("u64_wrap", "render", json!({}), json!({}));
+    let luau = ops("u64_wrap", &source, &ctx);
+    let native = duplicated(vec![Op::log("true".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn div_ceil_uses_exact_limb_quotient() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = 18014398509481984_i64.div_ceil(3);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_limb", handler, EntryKind::Service);
+    let ctx = context("div_limb", "render", json!({}), json!({}));
+    let luau = ops("div_limb", &source, &ctx);
+    let native = duplicated(vec![Op::log("6004799503160662".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn div_ceil_rejects_rounded_large_quotients() {
+    for (entry, handler) in [
+        (
+            "div_i64_min",
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = (-9223372036854775808_i64).div_ceil(3); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        ),
+        (
+            "div_two_63",
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9223372036854775808_u64.div_ceil(3); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        ),
+    ] {
+        let source = compiled_source(entry, handler, EntryKind::Service);
+        let ctx = context(entry, "render", json!({}), json!({}));
+        let error = noctalia_rs_luau::dispatch(&ctx, &[(entry, &source)])
+            .expect_err("rounded quotient must fail")
+            .to_string();
+        assert!(error.contains("main.rs:"), "{error}");
+        assert!(error.contains("div_ceil result"), "{error}");
+        assert!(error.contains("1 construct"), "{error}");
+    }
+}
+
+#[test]
 fn saturation_clamps_limbs_before_guard() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
