@@ -10,6 +10,10 @@ const FAIL_MARGIN = 0.1
 // Identical code swings by a couple of microseconds on the smallest workloads,
 // so a difference below this never fails the gate on its own.
 const MIN_MARGIN_MS = 0.002
+// p99 is the slowest of 60 samples. One delayed sample on a shared runner can
+// add tens of microseconds without a change in the workload, so a tail-only
+// failure needs this much absolute excess as well as the relative margin.
+const P99_NOISE_MS = 0.1
 const NAME = /^[a-z0-9][a-z0-9/_-]*$/u
 const SHA = /^[0-9a-f]{40}$/u
 
@@ -149,7 +153,7 @@ function escapeText(value) {
   return String(value).replace(/\|/gu, '\\|').replace(/[\r\n]+/gu, ' ')
 }
 
-function regression(label, after, reference) {
+function regression(label, after, reference, minimumMarginMs = MIN_MARGIN_MS) {
   if (!reference) return null
   const bound = reference.worst
   const ownBound = after.worst
@@ -157,7 +161,7 @@ function regression(label, after, reference) {
     bound * FAIL_MARGIN,
     bound - reference.best,
     ownBound - after.best,
-    MIN_MARGIN_MS
+    minimumMarginMs
   )
   if (after.best > bound + margin)
     return {
@@ -238,7 +242,7 @@ function assess(name, after, reference, budgets) {
       regression('p99', { best: after.p99Ms, worst: after.worstP99Ms }, {
         best: reference.p99,
         worst: reference.worstP99,
-      }),
+      }, P99_NOISE_MS),
     ])
       if (finding) findings.push(finding)
   }
@@ -323,7 +327,7 @@ ${table.join('\n')}
 
 ${ceilingLine}
 
-All workloads run three times on a release build in the same CI session, and the best round is used. The reference is a ceiling commit re-measured in this session when one exists, otherwise main from this session. A workload fails when its median, p95, or p99 is more than 10% slower than the reference worst round, or by more than either side's spread between rounds, whichever is larger, with a floor of 2 µs. It warns at half that margin. It also fails when its median is more than 10% over budget while the reference is within budget. Budgets can only be tightened. Benchmarks use generated fixtures and never read a Noctalia config.`
+All workloads run three times on a release build in the same CI session, and the best round is used. The reference is a ceiling commit re-measured in this session when one exists, otherwise main from this session. A workload fails when its median or p95 is more than 10% slower than the reference worst round, or by more than either side's spread between rounds, whichever is larger, with a floor of 2 µs. A p99 failure also needs 100 µs of absolute excess, since p99 is the slowest of 60 samples and one delayed sample can move it. It warns at half the margin. It also fails when its median is more than 10% over budget while the reference is within budget. Budgets can only be tightened. Benchmarks use generated fixtures and never read a Noctalia config.`
 }
 
 function parseArgs(argv) {
