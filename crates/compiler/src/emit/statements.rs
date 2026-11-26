@@ -1641,9 +1641,9 @@ impl<'a> Emitter<'a> {
             let Some(name) = name else {
                 continue;
             };
-            // A tuple binding unpacks one element of a list of tuples, also
-            // under `enumerate`; a single binding receives the element itself.
-            let unpack = matches!(&*item.pat, Pat::Tuple(_));
+            // A tuple binding unpacks one element of a list of tuples. Under
+            // `enumerate` the second binding is the element itself.
+            let unpack = !enumerate && matches!(&*item.pat, Pat::Tuple(_));
             let value = if enumerate && position == 0 {
                 format!("({index} - 1)")
             } else if unpack {

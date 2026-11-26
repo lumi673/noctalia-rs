@@ -379,17 +379,59 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 "#,
     );
-    assert!(
-        source.contains("(noctalia.writeFile(\"/a.txt\", \"x\"))"),
-        "{source}"
-    );
-    assert!(
-        source.contains("(noctalia.renameFile(\"/a.txt\", \"/b.txt\"))"),
-        "{source}"
-    );
-    assert!(
-        source.contains("(noctalia.readFile(\"/b.txt\"))"),
-        "{source}"
-    );
+    for binding in [
+        "local written, write_error = noctalia.writeFile(\"/a.txt\", \"x\")",
+        "local renamed, rename_error = noctalia.renameFile(\"/a.txt\", \"/b.txt\")",
+        "local bytes, bytes_error = noctalia.readFile(\"/b.txt\")",
+    ] {
+        assert!(source.contains(binding), "missing `{binding}`: {source}");
+        assert!(
+            !source.contains(&binding.replace(" = ", " = (")),
+            "a parenthesized call truncates the pair: {binding}"
+        );
+    }
     assert!(source.contains("(noctalia.listDir(\"/dir\"))"), "{source}");
+}
+
+#[test]
+fn loop_bindings_keep_the_element_and_the_pair() {
+    let source = compiled(
+        r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = vec!["a".to_owned(), "b".to_owned()];
+    let mut text = String::new();
+    for (index, value) in rows.iter().enumerate() {
+        text.push_str(&format!("{}:{}", index, value));
+    }
+    let mut counts = std::collections::HashMap::new();
+    counts.insert("x", 1_i64);
+    for (key, count) in &counts {
+        text.push_str(&format!("{}={}", key, count));
+    }
+    for value in &rows {
+        text.push_str(value);
+    }
+    Ok(vec![Op::log(text)])
+}
+"#,
+    );
+    let body = source
+        .split("local function body_events")
+        .next()
+        .expect("render body");
+    let value_lines = body
+        .lines()
+        .filter(|line| line.trim_start().starts_with("local value = "))
+        .collect::<Vec<_>>();
+    assert_eq!(value_lines.len(), 2, "{source}");
+    assert!(
+        value_lines.iter().all(|line| !line.contains("][2]")),
+        "{value_lines:?}"
+    );
+    assert!(
+        value_lines.iter().all(|line| line.contains("__t")),
+        "{value_lines:?}"
+    );
+    assert!(source.contains("local key = __t"), "{source}");
+    assert!(source.contains("local count = __t"), "{source}");
 }

@@ -33,6 +33,20 @@ impl QueryDir {
         &self.0
     }
 
+    /// Answers one query with an explicit value and error string.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one response carries the id, value and error"
+    )]
+    fn respond(&self, id: usize, value: Value, error: Option<&str>) {
+        let body = json!({ "ok": true, "value": value, "error": error });
+        let path = self
+            .0
+            .join(".noctalia-rs/query")
+            .join(format!("noctalia_rs_luau_{id}.json"));
+        fs::write(path, body.to_string()).expect("response");
+    }
+
     /// Answers one query with an error, which the script sees in the second
     /// return value.
     fn fail(&self, id: usize, message: &str) {
@@ -236,4 +250,60 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         dir.path(),
     );
     assert_eq!(text, "[]", "{text}");
+}
+
+#[test]
+fn enumerate_tuple_loops_bind_the_element() {
+    let dir = QueryDir::new();
+    let (text, _) = run(
+        r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let rows = vec!["a".to_owned(), "b".to_owned()];
+    let mut text = String::new();
+    for (index, value) in rows.iter().enumerate() {
+        text.push_str(&format!("{}={};", index, value));
+    }
+    let mut counts = std::collections::HashMap::new();
+    counts.insert("x", 1_i64);
+    for (key, count) in &counts {
+        text.push_str(&format!("{}={};", key, count));
+    }
+    for value in &rows {
+        text.push_str(value);
+    }
+    Ok(vec![Op::BarText { text }])
+}
+"#,
+        dir.path(),
+    );
+    assert!(
+        !text.contains("nil") && text.contains("a") && text.contains("b"),
+        "{text}"
+    );
+    assert!(text.ends_with("ab"), "{text}");
+}
+
+#[test]
+fn write_file_result_reports_the_host_error_string() {
+    let dir = QueryDir::new();
+    dir.respond(2, json!(false), Some("host denied the write"));
+    dir.respond(4, json!(false), Some("host denied the write"));
+    let (text, values) = run(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let (written, error) = ctx.write_file_result("/a.txt", "x");
+    let report = error.unwrap_or_else(|| "fallback".to_owned());
+    Ok(vec![Op::BarText { text: format!("{}:{}", written, report) }])
+}
+"#,
+        dir.path(),
+    );
+    assert_eq!(text, "false:host denied the write", "{text}");
+    let query = values
+        .iter()
+        .find(|value| {
+            value["op"] == "query" && value["path"] == json!(["writeFile"])
+        })
+        .expect("writeFile query");
+    assert_eq!(query["args"], json!(["/a.txt", "x"]));
 }

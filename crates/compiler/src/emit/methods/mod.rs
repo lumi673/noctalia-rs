@@ -1336,7 +1336,7 @@ impl<'a> Emitter<'a> {
             }
             "read_file_result" => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.readFile({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.readFile({path})"), Ty::VALUE))
             }
             "list_dir_result" => {
                 let path = self.path_arg(args, 0, call)?;
@@ -1362,7 +1362,7 @@ impl<'a> Emitter<'a> {
                 let path = self.path_arg(args, 0, call)?;
                 let contents = self.path_arg(args, 1, call)?;
                 Ok((
-                    format!("(noctalia.writeFile({path}, {contents}))"),
+                    format!("noctalia.writeFile({path}, {contents})"),
                     Ty::VALUE,
                 ))
             }
@@ -1370,7 +1370,7 @@ impl<'a> Emitter<'a> {
                 let path = self.path_arg(args, 0, call)?;
                 let contents = self.path_arg(args, 1, call)?;
                 Ok((
-                    format!("(noctalia.writeFile({path}, {contents}))"),
+                    format!("noctalia.writeFile({path}, {contents})"),
                     Ty::VALUE,
                 ))
             }
@@ -1378,13 +1378,13 @@ impl<'a> Emitter<'a> {
                 let from = self.path_arg(args, 0, call)?;
                 let to = self.path_arg(args, 1, call)?;
                 Ok((
-                    format!("(noctalia.renameFile({from}, {to}))"),
+                    format!("noctalia.renameFile({from}, {to})"),
                     Ty::VALUE,
                 ))
             }
             "read_file_bytes_result" if !self.strict() => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.readFile({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.readFile({path})"), Ty::VALUE))
             }
             "math_randomseed" => {
                 let seed = self.expr(arg(args, 0, call)?)?.0;
@@ -1536,7 +1536,7 @@ impl<'a> Emitter<'a> {
             }
             "read_file_bytes_result" if self.strict() => {
                 let path = self.path_arg(args, 0, call)?;
-                Ok((format!("(noctalia.readFile({path}))"), Ty::VALUE))
+                Ok((format!("noctalia.readFile({path})"), Ty::VALUE))
             }
             "payload_bytes" if self.strict() => {
                 self.uses_payload = true;
