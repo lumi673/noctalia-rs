@@ -74,6 +74,10 @@ test('a slowdown beyond the reference spread fails at the median, p95, and p99',
   const compared = perf.compare({ meta: meta(), floor: perf.emptyFloor(), head, base })
   assert.equal(compared.failed, true)
   for (const row of compared.rows) assert.equal(row.status, 'fail')
+  const slowP99 = compared.rows.find((row) => row.name === 'slow-p99')
+  assert.ok(
+    slowP99.findings.some((finding) => finding.status === 'fail' && finding.note.startsWith('p99 '))
+  )
   const body = perf.markdown(compared)
   assert.match(body, /median 2/)
   assert.match(body, /p95 2/)
@@ -123,6 +127,97 @@ test('a few microseconds of swing on a sub-millisecond workload passes', () => {
   const regressed = perf.compare({ meta: meta(), floor: perf.emptyFloor(), head: worse, base })
   assert.equal(regressed.failed, true)
   assert.equal(regressed.rows[0].status, 'fail')
+})
+
+test('a microsecond p99 spike passes when the median and p95 do not move', () => {
+  // From the PR #24 audit flake: 27.1 µs against a 10.8 µs reference worst,
+  // while the median was 6.4 µs against 6.1 µs.
+  const base = artifact([
+    metric('json_roundtrip_luau', {
+      medianMs: 0.0061,
+      worstMedianMs: 0.0063,
+      p95Ms: 0.008,
+      worstP95Ms: 0.0086,
+      p99Ms: 0.0082,
+      worstP99Ms: 0.0108,
+      budgetMs: 2,
+    }),
+  ])
+  const head = artifact([
+    metric('json_roundtrip_luau', {
+      medianMs: 0.0064,
+      worstMedianMs: 0.0065,
+      p95Ms: 0.0081,
+      worstP95Ms: 0.0087,
+      p99Ms: 0.0271,
+      worstP99Ms: 0.028,
+      budgetMs: 2,
+    }),
+  ])
+  const compared = perf.compare({ meta: meta(), floor: perf.emptyFloor(), head, base })
+  assert.equal(compared.failed, false)
+  assert.equal(compared.rows[0].status, 'ok')
+  assert.deepEqual(compared.rows[0].findings, [])
+
+  const regressed = perf.compare({
+    meta: meta(),
+    floor: perf.emptyFloor(),
+    head: artifact([
+      metric('json_roundtrip_luau', {
+        medianMs: 0.0064,
+        worstMedianMs: 0.0065,
+        p95Ms: 0.0081,
+        worstP95Ms: 0.0087,
+        p99Ms: 0.3,
+        worstP99Ms: 0.31,
+        budgetMs: 2,
+      }),
+    ]),
+    base,
+  })
+  assert.equal(regressed.failed, true)
+  assert.ok(
+    regressed.rows[0].findings.some(
+      (finding) => finding.status === 'fail' && finding.note.startsWith('p99 ')
+    )
+  )
+})
+
+test('p99 noise does not hide a p95 regression in the same workload', () => {
+  const base = artifact([
+    metric('json_roundtrip_luau', {
+      medianMs: 0.0061,
+      worstMedianMs: 0.0063,
+      p95Ms: 0.008,
+      worstP95Ms: 0.0086,
+      p99Ms: 0.0082,
+      worstP99Ms: 0.0108,
+      budgetMs: 2,
+    }),
+  ])
+  const head = artifact([
+    metric('json_roundtrip_luau', {
+      medianMs: 0.0061,
+      worstMedianMs: 0.0063,
+      p95Ms: 0.02,
+      worstP95Ms: 0.021,
+      p99Ms: 0.0271,
+      worstP99Ms: 0.028,
+      budgetMs: 2,
+    }),
+  ])
+  const compared = perf.compare({ meta: meta(), floor: perf.emptyFloor(), head, base })
+  assert.equal(compared.failed, true)
+  assert.ok(
+    compared.rows[0].findings.some(
+      (finding) => finding.status === 'fail' && finding.note.startsWith('p95 ')
+    )
+  )
+  assert.ok(
+    !compared.rows[0].findings.some(
+      (finding) => finding.status === 'fail' && finding.note.startsWith('p99 ')
+    )
+  )
 })
 
 test('a recorded workload missing from the PR fails', () => {
