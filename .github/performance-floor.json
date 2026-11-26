@@ -303,16 +303,16 @@
       "updatedAt": "2026-11-24T03:34:48.410Z"
     },
     "plugin_color_picker_rust": {
-      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
+      "sha": "332add94aeecbc5c2332b44ca1e226b94f92e3b0",
       "method": 1,
-      "medianMs": 0.20592000000000002,
-      "worstMedianMs": 0.2076085,
-      "p95Ms": 0.21666,
-      "worstP95Ms": 0.222837,
-      "p99Ms": 0.22331900000000002,
-      "worstP99Ms": 0.257167,
+      "medianMs": 0.25100900000000004,
+      "worstMedianMs": 0.2594495,
+      "p95Ms": 0.261188,
+      "worstP95Ms": 0.27960199999999996,
+      "p99Ms": 0.264033,
+      "worstP99Ms": 0.34022499999999994,
       "budgetMs": 2,
-      "updatedAt": "2026-11-25T15:08:54.487Z"
+      "updatedAt": "2026-11-26T22:35:24.495Z"
     },
     "plugin_vietnamese_lunar_calendar_luau": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -339,16 +339,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_als_brightness_luau": {
-      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
+      "sha": "332add94aeecbc5c2332b44ca1e226b94f92e3b0",
       "method": 1,
-      "medianMs": 0.18428750000000002,
-      "worstMedianMs": 0.1861105,
-      "p95Ms": 0.19526600000000002,
-      "worstP95Ms": 0.20162,
-      "p99Ms": 0.20510299999999998,
-      "worstP99Ms": 0.21252500000000002,
+      "medianMs": 0.237042,
+      "worstMedianMs": 0.23892649999999999,
+      "p95Ms": 0.248593,
+      "worstP95Ms": 0.255327,
+      "p99Ms": 0.277548,
+      "worstP99Ms": 0.28996099999999997,
       "budgetMs": 2,
-      "updatedAt": "2026-11-25T15:08:54.487Z"
+      "updatedAt": "2026-11-26T22:35:24.495Z"
     },
     "plugin_als_brightness_rust": {
       "sha": "57796e4a9a4fc70cd9af758b296f9f4d30f987eb",
