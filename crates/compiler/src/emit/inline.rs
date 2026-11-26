@@ -138,7 +138,7 @@ impl<'a> Emitter<'a> {
             ));
         };
         let name = pattern.ident.to_string();
-        super::methods::record_param_width(&name, ty);
+        let width = super::methods::shape_from_type(ty);
         if is_context(ty) {
             if !self.is_ctx_expr(strip_reference(argument)) {
                 return Err(Error::at(
@@ -190,6 +190,7 @@ impl<'a> Emitter<'a> {
             ) {
                 let (text, value) = self.expr(argument)?;
                 return Ok(Binding::Local {
+                    width,
                     name,
                     text,
                     ty: value,
@@ -224,6 +225,7 @@ impl<'a> Emitter<'a> {
             self.containers.insert(name.to_string(), kind);
         }
         Ok(Binding::Local {
+            width,
             name,
             text,
             ty: value,
@@ -363,6 +365,7 @@ impl<'a> Emitter<'a> {
         self.indent = self.indent.saturating_add(1);
         self.scopes.push(HashMap::new());
         self.local_statics.push(HashMap::new());
+        super::methods::push_param_width_scope();
         let saved_module =
             std::mem::replace(&mut self.module, helper.module.clone());
         let scope = self.module_constants(&helper.module);
@@ -374,6 +377,7 @@ impl<'a> Emitter<'a> {
                 Binding::Context(name) => self.push(&name, Ty::CONTEXT),
                 Binding::Ops(name) => self.push(&name, Ty::OPS),
                 Binding::Local {
+                    width,
                     name,
                     text,
                     ty,
@@ -396,6 +400,9 @@ impl<'a> Emitter<'a> {
                         self.tuple_expr_shapes.insert(name.clone(), shapes);
                     }
                     self.push(&name, ty);
+                    if let Some(width) = width {
+                        super::methods::add_param_width(&name, width);
+                    }
                 }
             }
         }
@@ -427,6 +434,7 @@ impl<'a> Emitter<'a> {
                 .map(|()| (String::new(), Ty::VOID)),
         };
         self.inline_stack.pop();
+        super::methods::pop_param_width_scope();
         self.value_helper = saved_value_helper;
         self.self_class = saved_class;
         self.tail_target = saved_target;
@@ -519,6 +527,7 @@ pub(crate) enum Binding {
     Context(String),
     Ops(String),
     Local {
+        width: Option<(usize, bool)>,
         name: String,
         text: String,
         ty: Ty,

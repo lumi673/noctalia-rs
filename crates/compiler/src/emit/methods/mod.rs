@@ -26,7 +26,10 @@ mod path;
 mod string;
 mod value;
 
-pub(crate) use number::record_param_width;
+pub(crate) use number::{
+    add_param_width, pop_param_width_scope, push_param_width_scope,
+    shape_from_type,
+};
 
 impl<'a> Emitter<'a> {
     fn static_receiver(
@@ -1298,6 +1301,7 @@ impl<'a> Emitter<'a> {
             }
         };
         let mut bindings = vec![Binding::Local {
+            width: None,
             name: "self".to_owned(),
             text: receiver.to_owned(),
             ty: Ty::VALUE,

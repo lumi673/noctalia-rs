@@ -2948,6 +2948,59 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn review_closure_shadowing_shape() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let f = || { let a = 255_i64; a.saturating_add(1) };
+    let inner = f();
+    let outer = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", inner, outer))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("2147483647"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__lo = 255"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_param_width_does_not_leak() {
+    let first = source(
+        "fn clean(max: usize) -> usize { max.saturating_sub(1) }\n\
+         fn handler(_ctx: &Context) -> Result<Vec<Op>> {\
+             let v = clean(0);\
+             Ok(vec![Op::log(format!(\"{}\", v))])\
+         }",
+    );
+    compile(&first, &options("handler", EntryKind::Service))
+        .expect("first compiles");
+    let second = source(
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> {\
+             let max: u8 = 255;\
+             let v = max.saturating_add(1);\
+             Ok(vec![Op::log(format!(\"{}\", v))])\
+         }",
+    );
+    let compiled = compile(&second, &options("handler", EntryKind::Service))
+        .expect("second compiles");
+    assert!(
+        compiled.source.contains("__lo = 255"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
 fn review_nested_binding_shape_and_scope_restore() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

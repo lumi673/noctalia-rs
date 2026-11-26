@@ -1670,6 +1670,42 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn closure_shadow_width_matches_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let f = || { let a = 255_i64; a.saturating_add(1) };
+    let inner = f();
+    let outer = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", inner, outer))])
+}
+"#;
+    let source = compiled_source("closure_shape", handler, EntryKind::Service);
+    let ctx = context("closure_shape", "render", json!({}), json!({}));
+    let luau = ops("closure_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("256 255".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn post_inline_local_rebinding_matches_rust() {
+    let handler = r#"
+fn clean(max: usize) -> usize { max.saturating_sub(1) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let done = clean(0);
+    let max: u8 = 255;
+    let value = max.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", done, value))])
+}
+"#;
+    let source = compiled_source("no_width_leak", handler, EntryKind::Service);
+    let ctx = context("no_width_leak", "render", json!({}), json!({}));
+    let luau = ops("no_width_leak", &source, &ctx);
+    let native = duplicated(vec![Op::log("0 255".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
 fn receiver_width_survives_annotations_casts_and_shadows() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

@@ -422,27 +422,46 @@ fn has_large_literal(expr: &Expr) -> bool {
 }
 
 type Width = (usize, bool);
+type WidthScope = Vec<(String, Width)>;
 type Pos = (usize, usize);
 type ShapeCandidate = (Pos, Pos, Width);
 
 thread_local! {
-    static PARAM_WIDTHS: std::cell::RefCell<std::collections::HashMap<String, Width>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static PARAM_WIDTHS: std::cell::RefCell<Vec<WidthScope>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-pub(crate) fn record_param_width(name: &str, ty: &syn::Type) {
-    if let Some(shape) = shape_from_type(ty) {
-        PARAM_WIDTHS.with(|slot| {
-            slot.borrow_mut().insert(name.to_owned(), shape);
-        });
-    }
+pub(crate) fn push_param_width_scope() {
+    PARAM_WIDTHS.with(|slot| slot.borrow_mut().push(Vec::new()));
 }
 
-fn param_width(name: &str) -> Option<(usize, bool)> {
-    PARAM_WIDTHS.with(|slot| slot.borrow().get(name).copied())
+pub(crate) fn pop_param_width_scope() {
+    PARAM_WIDTHS.with(|slot| {
+        slot.borrow_mut().pop();
+    });
 }
 
-fn shape_from_type(ty: &syn::Type) -> Option<(usize, bool)> {
+pub(crate) fn add_param_width(name: &str, width: Width) {
+    PARAM_WIDTHS.with(|slot| {
+        if let Some(scope) = slot.borrow_mut().last_mut() {
+            scope.push((name.to_owned(), width));
+        }
+    });
+}
+
+fn param_width(name: &str) -> Option<Width> {
+    PARAM_WIDTHS.with(|slot| {
+        slot.borrow().iter().rev().find_map(|scope| {
+            scope
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, width)| *width)
+        })
+    })
+}
+
+pub(crate) fn shape_from_type(ty: &syn::Type) -> Option<(usize, bool)> {
     match type_text(ty).as_str() {
         "i8" => Some((8, true)),
         "u8" => Some((8, false)),
@@ -595,6 +614,9 @@ fn shape_from_binding(
     ) {
         match expr {
             Expr::Block(block) => collect(&block.block, name, call, found),
+            Expr::Closure(closure) => {
+                collect_from_expr(&closure.body, name, call, found)
+            }
             Expr::If(item) => {
                 collect(&item.then_branch, name, call, found);
                 if let Some((_, branch)) = &item.else_branch {
