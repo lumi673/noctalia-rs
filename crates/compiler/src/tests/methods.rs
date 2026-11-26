@@ -2405,10 +2405,9 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 fn lowers_numeric_edge_methods() {
     let handler = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    let n: i64 = 7;
-    let clamped = n.saturating_sub(9);
-    let wrapped = n.wrapping_add(2);
-    let divided = n.div_ceil(3);
+    let clamped = 7_i64.saturating_sub(9);
+    let wrapped = 7_i64.wrapping_add(2);
+    let divided = 7_i64.div_ceil(3);
     let power = 2.0_f64.powi(3);
     let decimal = 100.0_f64.log10();
     let signed = (-1.0_f64).is_sign_positive();
@@ -2419,16 +2418,10 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     let emitted = &compiled.source;
+    assert!(emitted.contains("local clamped = (-2)"), "{emitted}");
+    assert!(emitted.contains("local wrapped = (9)"), "{emitted}");
     assert!(
-        emitted.contains("math.clamp((math.floor(n) - math.floor(9))"),
-        "{emitted}"
-    );
-    assert!(
-        emitted.contains("if __r >= 9223372036854775808"),
-        "{emitted}"
-    );
-    assert!(
-        emitted.contains("function() local __a, __b = math.floor(n)"),
+        emitted.contains("math.floor(7), math.floor(3)"),
         "{emitted}"
     );
     assert!(emitted.contains("math.pow(2.0, 3)"), "{emitted}");
@@ -2561,10 +2554,9 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn lowers_remaining_numeric_string_and_iterator_branches() {
     let handler = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    let a: i64 = 3;
-    let product = a.saturating_mul(4);
-    let underflow = a.wrapping_sub(9);
-    let order = a.cmp(&4);
+    let product = 3_i64.saturating_mul(4);
+    let underflow = 3_i64.wrapping_sub(9);
+    let order = 3_i64.cmp(&4);
     let left = 1.0_f64;
     let right = 2.0_f64;
     let partial = left.partial_cmp(&right);
@@ -2584,11 +2576,8 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     let emitted = &compiled.source;
-    assert!(
-        emitted.contains("math.clamp((math.floor(a) * math.floor(4))"),
-        "{emitted}"
-    );
-    assert!(emitted.contains("__a - __b"), "{emitted}");
+    assert!(emitted.contains("local product = (12)"), "{emitted}");
+    assert!(emitted.contains("local underflow = (-6)"), "{emitted}");
     assert!(
         emitted.contains("return nil end; if __a < __b"),
         "{emitted}"
@@ -2598,7 +2587,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "{emitted}"
     );
     assert!(emitted.contains("string.rep("), "{emitted}");
-    assert!(emitted.contains("utf8.codes(\"é\")"), "{emitted}");
+    assert!(emitted.contains("utf8.codes(__s)"), "{emitted}");
     assert!(
         emitted.contains("== \"Less\" then return \"Greater\""),
         "{emitted}"
@@ -2780,7 +2769,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains("if __r >= 9223372036854775808"),
+        compiled.source.contains("(-9223372036854775808)"),
         "{}",
         compiled.source
     );
@@ -2867,4 +2856,74 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         "{}",
         compiled.source
     );
+}
+
+#[test]
+fn review_round2_integer_boundaries() {
+    for literal in [
+        "9223372036854775807",
+        "9223372036854775808",
+        "-9223372036854775809",
+        "9007199254740993",
+    ] {
+        let handler = format!(
+            r#"fn handler(_ctx: &Context) -> Result<Vec<Op>> {{
+    let value = "{literal}".parse::<i64>().unwrap_or(0);
+    Ok(vec![Op::log(format!("{{}}", value))])
+}}
+"#
+        );
+        let error =
+            compile(&source(&handler), &options("handler", EntryKind::Service))
+                .expect_err("non-exact or out-of-range parse bails");
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = (i64::MAX - 1).wrapping_add(2);
+    let b = i64::MIN.wrapping_sub(2);
+    let c = i64::MIN.div_ceil(-1);
+    Ok(vec![Op::log(format!("{} {} {}", a, b, c))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("div_ceil overflow bails");
+    assert!(error.message.contains("overflow"), "{}", error.message);
+}
+
+#[test]
+fn review_round2_get_or_init_receiver_classes() {
+    let parameter = r#"
+static CELL: OnceLock<i64> = OnceLock::new();
+fn take(cell: &OnceLock<i64>) -> i64 { *cell.get_or_init(|| 3) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let v = take(&CELL);
+    Ok(vec![Op::log(format!("{}", v))])
+}
+"#;
+    let compiled =
+        compile(&source(parameter), &options("handler", EntryKind::Service))
+            .expect("parameter alias writes through");
+    assert!(
+        compiled.source.contains("__static_main__CELL = 3"),
+        "{}",
+        compiled.source
+    );
+
+    let call_result = r#"
+static CELL: OnceLock<i64> = OnceLock::new();
+fn cell() -> &'static OnceLock<i64> { &CELL }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let v = *cell().get_or_init(|| 3);
+    Ok(vec![Op::log(format!("{}", v))])
+}
+"#;
+    let error = compile(
+        &source(call_result),
+        &options("handler", EntryKind::Service),
+    )
+    .expect_err("call-result receiver bails");
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
 }

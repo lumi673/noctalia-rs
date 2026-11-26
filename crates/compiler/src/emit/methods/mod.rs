@@ -53,8 +53,14 @@ impl<'a> Emitter<'a> {
     fn alias_target(&self, lua: &str) -> Option<String> {
         let needle = format!("local {lua} = ");
         for line in self.out.lines().rev() {
+            if line.contains("local function ") {
+                break;
+            }
             if let Some(position) = line.find(&needle) {
                 let value = line[position + needle.len()..].trim();
+                if value.contains('(') || value == "nil" {
+                    return None;
+                }
                 if value.starts_with("__static_")
                     || value.contains('[')
                     || value.contains('.')
@@ -209,18 +215,49 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    /// Invoke a closure whose argument is a `(key, value)` pair, typing the
-    /// first tuple element as a string.
+    fn pair_key_ty(&self, expr: &Expr) -> Ty {
+        match strip_reference(expr) {
+            Expr::MethodCall(call) => match call.method.to_string().as_str() {
+                "enumerate" => Ty::INT,
+                "zip" => Ty::VALUE,
+                "map" | "filter" | "filter_map" | "take" | "skip"
+                | "flatten" | "copied" | "cloned" | "rev" | "take_while"
+                | "skip_while" | "flat_map" => self.pair_key_ty(&call.receiver),
+                "iter" | "into_iter" => {
+                    if let Expr::Path(path) = strip_reference(&call.receiver)
+                        && let Some(name) = path.path.get_ident()
+                        && self
+                            .lookup(&name.to_string())
+                            .is_some_and(|ty| ty.base == Base::Table)
+                    {
+                        Ty::LIST_OF_KEYS
+                    } else {
+                        Ty::VALUE
+                    }
+                }
+                _ => Ty::VALUE,
+            },
+            Expr::Call(_) => Ty::VALUE,
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|name| self.lookup(&name.to_string()))
+                .unwrap_or(Ty::VALUE),
+            _ => Ty::VALUE,
+        }
+    }
+
     fn invoke_pair_arg(
         &mut self,
         arg: &Expr,
         value: &str,
+        key_ty: Ty,
     ) -> Result<(String, Ty), Error> {
         if let Expr::Closure(closure) = arg {
             return self.closure_value_typed(
                 closure,
                 std::slice::from_ref(&value.to_owned()),
-                &[Some(Ty::LIST_OF_KEYS)],
+                &[Some(key_ty)],
             );
         }
         self.invoke_arg(arg, std::slice::from_ref(&value.to_owned()))
@@ -251,6 +288,16 @@ impl<'a> Emitter<'a> {
                 let target = self
                     .alias_target(receiver)
                     .unwrap_or_else(|| receiver.to_owned());
+                if target == receiver
+                    && is_identifier(receiver)
+                    && (self.lookup(receiver).is_some()
+                        || receiver.starts_with("__t"))
+                {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "get_or_init() needs an assignable static or field lvalue",
+                    ));
+                }
                 let closure = arg(args, 0, call)?;
                 self.line(&format!("if {target} == nil then"));
                 self.indent = self.indent.saturating_add(1);
@@ -467,13 +514,13 @@ impl<'a> Emitter<'a> {
             self.line(&format!("local {result}"));
             self.line(&format!("local {seen} = 0"));
             let body = |emitter: &mut Self, value: &str| -> Result<(), Error> {
-                emitter.line(&format!("{seen} = {seen} + 1"));
                 emitter.line(&format!("if {seen} == ({wanted}) then"));
                 emitter.indent = emitter.indent.saturating_add(1);
                 emitter.line(&format!("{result} = {value}"));
                 emitter.line("break");
                 emitter.indent = emitter.indent.saturating_sub(1);
                 emitter.line("end");
+                emitter.line(&format!("{seen} = {seen} + 1"));
                 Ok(())
             };
             self.emit_iter(&call.receiver, false, &body)?;
@@ -624,6 +671,7 @@ impl<'a> Emitter<'a> {
             Expr::MethodCall(call) => match call.method.to_string().as_str() {
                 "map" | "filter_map" => {
                     let pair = self.pair_source(&call.receiver);
+                    let key_ty = self.pair_key_ty(&call.receiver);
                     let skip_nil = call.method == "filter_map";
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
@@ -631,7 +679,7 @@ impl<'a> Emitter<'a> {
                                  value: &str|
                      -> Result<(), Error> {
                         let (text, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value)?
+                            emitter.invoke_pair_arg(closure, value, key_ty)?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -657,13 +705,14 @@ impl<'a> Emitter<'a> {
                 }
                 "filter" => {
                     let pair = self.pair_source(&call.receiver);
+                    let key_ty = self.pair_key_ty(&call.receiver);
                     let closure =
                         arg(&call.args.iter().collect::<Vec<_>>(), 0, call)?;
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
                         let (condition, _) = if pair {
-                            emitter.invoke_pair_arg(closure, value)?
+                            emitter.invoke_pair_arg(closure, value, key_ty)?
                         } else {
                             emitter.invoke_arg(
                                 closure,
@@ -819,8 +868,9 @@ impl<'a> Emitter<'a> {
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
+                        body(emitter, &format!("{{ {index}, {value} }}"))?;
                         emitter.line(&format!("{index} = {index} + 1"));
-                        body(emitter, &format!("{{ {index}, {value} }}"))
+                        Ok(())
                     };
                     return self.emit_iter(&call.receiver, pair, &inner);
                 }
@@ -830,15 +880,17 @@ impl<'a> Emitter<'a> {
                     let other_table = self.temp();
                     let index = self.temp();
                     self.line(&format!("local {other_table} = {other}"));
-                    self.line(&format!("local {index} = 0"));
+                    self.line(&format!("local {index} = 1"));
                     let inner = |emitter: &mut Self,
                                  value: &str|
                      -> Result<(), Error> {
-                        emitter.line(&format!("{index} = {index} + 1"));
+                        emitter.line(&format!("if {value} == nil or {other_table}[{index}] == nil then break end"));
                         body(
                             emitter,
                             &format!("{{ {value}, {other_table}[{index}] }}"),
-                        )
+                        )?;
+                        emitter.line(&format!("{index} = {index} + 1"));
+                        Ok(())
                     };
                     return self.emit_iter(&call.receiver, pair, &inner);
                 }
@@ -868,7 +920,7 @@ impl<'a> Emitter<'a> {
                             emitter.line("end");
                         } else {
                             emitter.line(&format!(
-                                "if {condition} then {active} = false end"
+                                "if not ({condition}) then {active} = false end"
                             ));
                             emitter.line(&format!("if not {active} then"));
                             emitter.indent = emitter.indent.saturating_add(1);

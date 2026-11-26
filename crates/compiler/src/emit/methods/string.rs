@@ -1,5 +1,18 @@
 use super::*;
 
+fn literal_pattern(expr: &Expr) -> Option<String> {
+    let (text, ty) = constant(strip_reference(expr))?;
+    if ty.is_string()
+        && text.starts_with('"')
+        && text.ends_with('"')
+        && text.len() >= 2
+    {
+        Some(text[1..text.len() - 1].to_owned())
+    } else {
+        None
+    }
+}
+
 impl<'a> Emitter<'a> {
     pub(super) fn string_method(
         &mut self,
@@ -78,7 +91,7 @@ impl<'a> Emitter<'a> {
                 let needle = self.expr(arg(args, 0, call)?)?.0;
                 Ok((
                     format!(
-                        "(function() local __s, __needle = {receiver}, {needle}; local __out = {{}}; local __at = string.find(__s, __needle, 1, true); while __at do __out[#__out + 1] = {{ __at - 1, string.sub(__s, __at, __at + #__needle - 1) }}; __at = string.find(__s, __needle, __at + 1, true) end; return __out end)()"
+                        "(function() local __s, __needle = {receiver}, {needle}; local __out = {{}}; local __at = string.find(__s, __needle, 1, true); while __at do __out[#__out + 1] = {{ __at - 1, string.sub(__s, __at, __at + #__needle - 1) }}; __at = string.find(__s, __needle, __at + #__needle, true) end; return __out end)()"
                     ),
                     Ty::LIST,
                 ))
@@ -239,7 +252,17 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "split_terminator" => {
-                let separator = self.expr(arg(args, 0, call)?)?.0;
+                let separator_expr = arg(args, 0, call)?;
+                match literal_pattern(separator_expr).as_deref() {
+                    Some("") | None => {
+                        return Err(Error::at(
+                            call.method.span(),
+                            "split_terminator() needs a literal non-empty separator",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                let separator = self.expr(separator_expr)?.0;
                 if !ty.is_string() && ty.base != Base::Value {
                     return Err(Error::at(
                         call.method.span(),
@@ -270,7 +293,7 @@ impl<'a> Emitter<'a> {
             }
             "replacen" => {
                 let from_expr = arg(args, 0, call)?;
-                match literal_string(from_expr).as_deref() {
+                match literal_pattern(from_expr).as_deref() {
                     Some("") => {
                         return Err(Error::at(
                             call.method.span(),
@@ -314,7 +337,7 @@ impl<'a> Emitter<'a> {
                 let length = self.expr(arg(args, 0, call)?)?.0;
                 let start = call.method.span().start();
                 self.line(&format!(
-                    "(function() local __s, __n = {receiver}, math.floor({length}); if __n < 0 or __n > #__s then error(\"{}:{}:{}: byte index out of bounds\") end; local __next = string.byte(__s, __n + 1); if __n ~= #__s and __next >= 128 and __next <= 191 then error(\"{}:{}:{}: not a char boundary\") end; {receiver} = string.sub(__s, 1, __n) end)()",
+                    "(function() local __s, __n = {receiver}, math.floor({length}); if __n < 0 then error(\"{}:{}:{}: byte index out of bounds\") end; if __n > #__s then return end; local __next = string.byte(__s, __n + 1); if __n ~= #__s and __next >= 128 and __next <= 191 then error(\"{}:{}:{}: not a char boundary\") end; {receiver} = string.sub(__s, 1, __n) end)()",
                     self.module,
                     start.line,
                     start.column + 1,
@@ -339,14 +362,20 @@ impl<'a> Emitter<'a> {
                 let other = self.expr(arg(args, 0, call)?)?.0;
                 Ok((
                     format!(
-                        "(function() local __a, __b = {receiver}, {other}; if __a < __b then return \"Less\" end; if __a > __b then return \"Greater\" end; return \"Equal\" end)()"
+                        "(function() local __a, __b = {receiver}, {other}; if type(__a) ~= \"string\" and type(__a) ~= \"number\" then error(\"{}:{}:{}: cmp needs strings or numbers\") end; if type(__b) ~= \"string\" and type(__b) ~= \"number\" then error(\"{}:{}:{}: cmp needs strings or numbers\") end; if __a < __b then return \"Less\" end; if __a > __b then return \"Greater\" end; return \"Equal\" end)()",
+                        self.module,
+                        call.method.span().start().line,
+                        call.method.span().start().column + 1,
+                        self.module,
+                        call.method.span().start().line,
+                        call.method.span().start().column + 1,
                     ),
                     Ty::VALUE,
                 ))
             }
             "splitn" => {
-                let separator = self.expr(arg(args, 0, call)?)?.0;
-                let limit = self.expr(arg(args, 1, call)?)?.0;
+                let limit = self.expr(arg(args, 0, call)?)?.0;
+                let separator = self.expr(arg(args, 1, call)?)?.0;
                 if !ty.is_string() && ty.base != Base::Value {
                     return Err(Error::at(
                         call.method.span(),
@@ -366,7 +395,7 @@ impl<'a> Emitter<'a> {
             }
             "len_utf8" if ty.is_string() || ty.base == Base::Value => Ok((
                 format!(
-                    "(function() for __offset in utf8.codes({receiver}) do if __offset > 1 then return __offset - 1 end end; return #{receiver} end)()"
+                    "(function() local __s = {receiver}; for __offset in utf8.codes(__s) do if __offset > 1 then return __offset - 1 end end; return #__s end)()"
                 ),
                 Ty::INT,
             )),

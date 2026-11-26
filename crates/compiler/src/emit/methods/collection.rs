@@ -77,12 +77,6 @@ impl<'a> Emitter<'a> {
             | "as_bytes" | "into_bytes" | "copied" | "peekable"
             | "iter_mut" => Ok((receiver.to_owned(), ty)),
             "first" => Ok((format!("({receiver}[1])"), Ty::OPT_VALUE)),
-            "nth"
-                if matches!(ty.base, Base::List | Base::Ops | Base::Value) =>
-            {
-                let index = self.expr(arg(args, 0, call)?)?.0;
-                Ok((format!("({receiver}[({index}) + 1])"), Ty::OPT_VALUE))
-            }
             "last" => Ok((
                 format!(
                     "(function() local __v = {receiver}; if type(__v) == \"string\" then return string.byte(__v, #__v) end; return __v[#__v] end)()"
@@ -215,6 +209,7 @@ impl<'a> Emitter<'a> {
                 if matches!(ty.base, Base::List | Base::Ops | Base::Value)
                     && args.is_empty() =>
             {
+                let location = call.method.span().start();
                 let indices = self.temp();
                 let left = self.temp();
                 let right = self.temp();
@@ -229,11 +224,12 @@ impl<'a> Emitter<'a> {
                 ));
                 self.indent = self.indent.saturating_add(1);
                 self.line(&format!(
-                    "if ({receiver}[{left}]) < ({receiver}[{right}]) then return true end"
+                    "local __ka, __kb = {receiver}[{left}], {receiver}[{right}]; if type(__ka) ~= \"string\" and type(__ka) ~= \"number\" then error(\"{module}:{line}:{column}: unsupported sort key\") end; if __ka < __kb then return true end",
+                    module = self.module,
+                    line = location.line,
+                    column = location.column + 1
                 ));
-                self.line(&format!(
-                    "if ({receiver}[{right}]) < ({receiver}[{left}]) then return false end"
-                ));
+                self.line("if __kb < __ka then return false end");
                 self.line(&format!("return {left} < {right}"));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end)");
@@ -295,6 +291,7 @@ impl<'a> Emitter<'a> {
             "sort_by_key"
                 if matches!(ty.base, Base::List | Base::Ops | Base::Value) =>
             {
+                let location = call.method.span().start();
                 let closure = arg(args, 0, call)?;
                 let indices = self.temp();
                 let keys = self.temp();
@@ -311,7 +308,12 @@ impl<'a> Emitter<'a> {
                     closure,
                     std::slice::from_ref(&format!("{receiver}[{position}]")),
                 )?;
-                self.line(&format!("{keys}[{position}] = {key}"));
+                self.line(&format!(
+                    "if type({key}) ~= \"string\" and type({key}) ~= \"number\" then error(\"{}:{}:{}: unsupported sort key\") end; {keys}[{position}] = {key}",
+                    self.module,
+                    location.line,
+                    location.column + 1,
+                ));
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 self.indent = self.indent.saturating_sub(1);
@@ -553,15 +555,63 @@ impl<'a> Emitter<'a> {
             }
             "parse" => {
                 let parsed_ty = turbofish_type(call.turbofish.as_ref());
+                let target = call
+                    .turbofish
+                    .as_ref()
+                    .and_then(|arguments| match arguments.args.first() {
+                        Some(syn::GenericArgument::Type(ty)) => {
+                            Some(type_text(ty))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let (positive_limit, negative_limit, signed) = match target
+                    .as_str()
+                {
+                    "i8" => ("127", "128", true),
+                    "i16" => ("32767", "32768", true),
+                    "i32" => ("2147483647", "2147483648", true),
+                    "u8" => ("255", "0", false),
+                    "u16" => ("65535", "0", false),
+                    "u32" => ("4294967295", "0", false),
+                    "u64" | "usize" => ("18446744073709551615", "0", false),
+                    _ => ("9223372036854775807", "9223372036854775808", true),
+                };
                 let body = match parsed_ty.base {
-                    Base::Int => format!(
-                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") == nil then return nil, \"invalid digit found in string\" end; local __n = tonumber(__s); if __n == nil or __n > 9223372036854775807 or __n < -9223372036854775808 then return nil, \"number too large or small\" end; return math.floor(__n) end)()"
-                    ),
+                    Base::Int | Base::Value => {
+                        if let Some(literal) = literal_string(&call.receiver) {
+                            let digits = literal.trim_start_matches(['+', '-']);
+                            let negative = literal.starts_with('-');
+                            let limit = if negative {
+                                negative_limit
+                            } else {
+                                positive_limit
+                            };
+                            if (negative && !signed)
+                                || digits.len() > 16
+                                || (digits.len() == 16
+                                    && digits > "9007199254740992")
+                                || digits.len() > limit.len()
+                            {
+                                return Err(Error::at(
+                                    call.method.span(),
+                                    "parse() value cannot be represented exactly in Luau",
+                                ));
+                            }
+                        }
+                        let exact = format!(
+                            "(function() local __s = {receiver}; local __start, __finish, __sign, __digits = string.find(__s, \"^([+-]?)(%d+)$\"); if __start == nil then return nil, \"invalid digit found in string\" end; __digits = string.gsub(__digits, \"^0+\", \"\"); if __digits == \"\" then __digits = \"0\" end; if __sign == \"-\" and not {signed} then return nil, \"number too large or small\" end; local __limit = (__sign == \"-\") and \"{negative_limit}\" or \"{positive_limit}\"; if #__digits > #__limit or (#__digits == #__limit and __digits > __limit) then return nil, \"number too large or small\" end; local __exact = \"9007199254740992\"; if #__digits > #__exact or (#__digits == #__exact and __digits > __exact) then return nil, \"number cannot be represented exactly\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid digit found in string\" end; return math.floor(__n) end)()",
+                        );
+                        if parsed_ty.base == Base::Int {
+                            exact
+                        } else {
+                            format!(
+                                "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return {exact} end; if string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") == nil and string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") == nil then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; return __n end)()"
+                            )
+                        }
+                    }
                     Base::Float => format!(
-                        "(function() local __s = {receiver}; local __decimal = string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") ~= nil or string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") ~= nil; if not __decimal then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
-                    ),
-                    Base::Value => format!(
-                        "(function() local __s = {receiver}; local __decimal = string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") ~= nil or string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") ~= nil; if not __decimal then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return math.floor(__n) end; return __n end)()"
+                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+%.?%d*([eE][+-]?%d+)?$\") == nil and string.find(__s, \"^[+-]?%.%d+([eE][+-]?%d+)?$\") == nil then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
                     ),
                     _ => {
                         return Err(Error::at(

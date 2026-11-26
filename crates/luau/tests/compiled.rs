@@ -1179,7 +1179,10 @@ fn duplicated(ops: Vec<Op>) -> Vec<Value> {
 fn review_l1_stable_sort_matches_rust() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let mut items = vec![(0_i64, 3_i64), (0, 1), (0, 2)];
+    let mut items = vec![
+        (0_i64, 11_i64), (0, 10), (0, 9), (0, 8), (0, 7), (0, 6),
+        (0, 5), (0, 4), (0, 3), (0, 2), (0, 1), (0, 0),
+    ];
     items.sort_by_key(|item| item.0);
     let mut ops = Vec::new();
     for (_, id) in items {
@@ -1191,32 +1194,37 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let source = compiled_source("review_l1", handler, EntryKind::Service);
     let ctx = context("review_l1", "render", json!({}), json!({}));
     let luau = ops("review_l1", &source, &ctx);
-    let native = duplicated(vec![
-        Op::log("3".to_owned()),
-        Op::log("1".to_owned()),
-        Op::log("2".to_owned()),
-    ]);
+    let native =
+        duplicated((0..12).rev().map(|id| Op::log(id.to_string())).collect());
     assert_eq!(luau, native);
 }
 
 #[test]
 fn review_l2_retain_matches_rust() {
     let handler = r#"
+static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let mut numbers = vec![1_i64, 2, 3, 4];
-    numbers.retain(|number| *number % 2 == 0);
+    numbers.retain(|number| {
+        LAST.store(*number, std::sync::atomic::Ordering::Relaxed);
+        *number % 2 == 0
+    });
     let mut ops = Vec::new();
     for number in numbers {
         ops.push(Op::log(number.to_string()));
     }
+    ops.push(Op::log(LAST.load(std::sync::atomic::Ordering::Relaxed).to_string()));
     Ok(ops)
 }
 "#;
     let source = compiled_source("review_l2", handler, EntryKind::Service);
     let ctx = context("review_l2", "render", json!({}), json!({}));
     let luau = ops("review_l2", &source, &ctx);
-    let native =
-        duplicated(vec![Op::log("2".to_owned()), Op::log("4".to_owned())]);
+    let native = duplicated(vec![
+        Op::log("2".to_owned()),
+        Op::log("4".to_owned()),
+        Op::log("4".to_owned()),
+    ]);
     assert_eq!(luau, native);
 }
 
