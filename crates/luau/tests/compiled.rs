@@ -1396,6 +1396,60 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn runtime_integer_edges_match_rust() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let a = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let b = a + 1;
+    let product = a.saturating_mul(86400);
+    let wrapped = b.wrapping_sub(3);
+    let clamped = a.saturating_sub(2);
+    Ok(vec![Op::log(format!("{} {} {}", product, wrapped, clamped))])
+}
+"#;
+    let source = compiled_source("runtime_edges", handler, EntryKind::Service);
+    let ctx = Context::new(
+        Parts {
+            entry: "runtime_edges".to_owned(),
+            event: "render".to_owned(),
+            payload: json!({}),
+            config: json!({ "message": "Hello" }),
+            state: json!({}),
+            host: json!({ "now_ms": 1500 }),
+            data_dir: std::path::PathBuf::from("/tmp/noctalia-compiled"),
+        },
+        json!({}),
+    );
+    let luau = ops("runtime_edges", &source, &ctx);
+    let native = duplicated(vec![Op::log("432000 3 3".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn parse_boundaries_take_rust_error_paths() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let max = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    let over = "9223372036854775808".parse::<i64>().unwrap_or(7);
+    let under = "-9223372036854775809".parse::<i64>().unwrap_or(7);
+    let umax = "18446744073709551615".parse::<u64>().unwrap_or(0);
+    let uover = "18446744073709551616".parse::<u64>().unwrap_or(7);
+    let narrow = "256".parse::<u8>().unwrap_or(7);
+    let leading = "0000000000000000042".parse::<i64>().unwrap_or(0);
+    let exponent = "1e2".parse::<i64>().unwrap_or(7);
+    let ok = max > 9007199254740992 && umax > 9007199254740992;
+    let bad = over == 7 && under == 7 && uover == 7 && narrow == 7 && exponent == 7;
+    Ok(vec![Op::log(format!("{} {} {}", ok, bad, leading))])
+}
+"#;
+    let source = compiled_source("parse_bounds", handler, EntryKind::Service);
+    let ctx = context("parse_bounds", "render", json!({}), json!({}));
+    let luau = ops("parse_bounds", &source, &ctx);
+    let native = duplicated(vec![Op::log("true true 42".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
 fn review_round4_dispatch_checks() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

@@ -2847,7 +2847,12 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains("tonumber(__s)"),
+        !compiled.source.contains("tonumber(__s)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("string.byte(__digits, __i) - 48"),
         "{}",
         compiled.source
     );
@@ -2873,10 +2878,16 @@ fn review_round2_integer_boundaries() {
 }}
 "#
         );
-        let error =
+        let compiled =
             compile(&source(&handler), &options("handler", EntryKind::Service))
-                .expect_err("non-exact or out-of-range parse bails");
-        assert!(error.line > 0 && error.column > 0, "{error:?}");
+                .expect("parse literals compile");
+        assert!(
+            compiled.source.contains("9223372036854775807")
+                && compiled.source.contains("9223372036854775808")
+                && compiled.source.contains("string.byte(__digits, __i) - 48"),
+            "{}",
+            compiled.source
+        );
     }
 
     let handler = r#"
@@ -3014,7 +3025,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn review_round6_state_cleanup_and_failure_recovery() {
     let bad = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let value = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    let value = 1_i64.unsupported_integer_method();
     Ok(vec![Op::log(format!("{}", value))])
 }
 "#;
