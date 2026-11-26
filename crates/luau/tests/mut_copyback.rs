@@ -267,3 +267,23 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     .expect_err("aliased reborrow must fail");
     assert!(error.contains("mutable reborrows"), "{error}");
 }
+
+#[test]
+fn shadowed_mut_parameter_with_different_caller_name_is_rejected() {
+    let error = compile_result(
+        r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = 0;
+    let value = helper(&mut total);
+    Ok(vec![Op::log(value.to_string()), Op::log(total.to_string())])
+}
+"#,
+    )
+    .expect_err("shadowing must fail");
+    assert!(error.contains("shadowed"), "{error}");
+}

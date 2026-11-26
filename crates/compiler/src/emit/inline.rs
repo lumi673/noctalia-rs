@@ -385,6 +385,13 @@ impl<'a> Emitter<'a> {
                 _ => None,
             })
             .collect();
+        let mut_spans: Vec<(String, proc_macro2::Span)> = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                Binding::Mut { name, span, .. } => Some((name.clone(), *span)),
+                _ => None,
+            })
+            .collect();
         let body_start = self.out.len();
         let mut write_backs = Vec::new();
         let mut string_params = Vec::new();
@@ -495,17 +502,19 @@ impl<'a> Emitter<'a> {
                 ));
             }
         }
-        let mut block = helper.function.block.clone();
-        for (from, to, _) in &renames {
-            if let Some(shadow) = shadowed_local(&helper.function.block, from) {
+        for (name, _) in &mut_spans {
+            if let Some(shadow) = shadowed_local(&helper.function.block, name) {
                 return Err(Error::at(
                     shadow,
                     format!(
-                        "cannot preserve `&mut` aliasing for the `{from}` argument of `{}`: the parameter is shadowed",
+                        "cannot preserve `&mut` aliasing for the `{name}` argument of `{}`: the parameter is shadowed",
                         helper.name
                     ),
                 ));
             }
+        }
+        let mut block = helper.function.block.clone();
+        for (from, to, _) in &renames {
             rename_paths(&mut block, from, to);
         }
         self.value_helper = mode == Inline::Value;

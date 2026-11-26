@@ -990,3 +990,23 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(compiled.source.contains("((n + extra) + 2)"));
 }
+
+#[test]
+fn rejects_shadowed_mut_parameters_with_different_caller_names() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = 0;
+    let value = helper(&mut total);
+    Ok(vec![Op::log(value.to_string()), Op::log(total.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+}
