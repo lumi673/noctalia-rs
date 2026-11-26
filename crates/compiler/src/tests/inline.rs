@@ -291,8 +291,8 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
-    assert!(compiled.source.contains("word = word .. (\"x\")"));
-    assert!(compiled.source.contains("word = word .. (\"y\")"));
+    assert!(compiled.source.contains(" .. (\"x\")"));
+    assert!(compiled.source.contains(" .. (\"y\")"));
     assert!(compiled.source.contains("noctalia.log(word)"));
 }
 
@@ -314,7 +314,7 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
-    assert!(compiled.source.contains("value = { ready = true }"));
+    assert!(compiled.source.contains("= { ready = true }"));
     assert!(compiled.source.contains("do\n"));
 }
 
@@ -340,10 +340,10 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
-    assert!(compiled.source.contains("flag = true\n"));
-    assert!(compiled.source.contains("count = 1\n"));
-    assert!(compiled.source.contains("flag = flag"));
-    assert!(compiled.source.contains("count = count"));
+    assert!(compiled.source.contains("= true"));
+    assert!(compiled.source.contains("= 1"));
+    assert!(compiled.source.matches("flag = ").count() > 2);
+    assert!(compiled.source.matches("count = ").count() > 2);
 }
 
 #[test]
@@ -806,4 +806,124 @@ impl Preset {
     )
     .expect("compiles");
     assert!(compiled.source.contains("me.state"), "{}", compiled.source);
+}
+
+#[test]
+fn copies_back_after_one_line_iife_returns() {
+    let handler = r#"
+fn mark(flag: &mut bool, count: &mut i64, text: &str) {
+    let at = text.find("x");
+    *flag = at.is_some();
+    *count = 1;
+    if !*flag {
+        return;
+    }
+    *flag = false;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut flag = false;
+    let mut count = 0;
+    mark(&mut flag, &mut count, ctx.event.as_str());
+    Ok(vec![Op::log(flag.to_string()), Op::log(count.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.matches("flag = ").count() > 2,
+        "{}",
+        compiled.source
+    );
+    assert!(compiled.source.matches("count = ").count() > 2);
+}
+
+#[test]
+fn rejects_index_operands_that_are_mutated_in_the_same_call() {
+    let handler = r#"
+fn bump(value: &mut i64, index: &mut i64) {
+    *value = 5;
+    *index = 1;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut nums: Vec<i64> = vec![0, 0, 0];
+    let mut index = 0;
+    bump(&mut nums[index], &mut index);
+    Ok(vec![Op::log(nums[0].to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("cannot preserve `&mut` aliasing"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_immutable_index_operands() {
+    let handler = r#"
+fn bump(value: &mut i64, index: i64) {
+    *value = 5;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut nums: Vec<i64> = vec![0, 0, 0];
+    let index = 0;
+    bump(&mut nums[index], index);
+    Ok(vec![Op::log(nums[0].to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("nums[(index) + 1] = value"));
+}
+
+#[test]
+fn rejects_unsupported_string_mutators() {
+    let handler = r#"
+fn replace(text: &mut String) {
+    text.insert(1, 'x');
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    replace(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("String::insert"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_nested_helper_copy_backs_in_their_own_frame() {
+    let handler = r#"
+fn inner(n: &mut i64) -> i64 {
+    *n = 9;
+    *n
+}
+fn outer(n: &mut i64, p: &mut i64) -> i64 {
+    *n = inner(p);
+    *n
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = 0;
+    let mut source = 1;
+    let value = outer(&mut total, &mut source);
+    Ok(vec![Op::log(value.to_string()), Op::log(total.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("(function()"));
+    assert_eq!(compiled.source.matches("total = n").count(), 2);
 }
