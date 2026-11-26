@@ -340,6 +340,19 @@ impl<'a> Emitter<'a> {
                 ))
             }
             "truncate" if ty.is_string() && !ty.optional => {
+                if matches!(
+                    strip_reference(&call.receiver),
+                    Expr::MethodCall(inner)
+                        if matches!(
+                            inner.method.to_string().as_str(),
+                            "clone" | "to_owned" | "into_owned" | "unwrap" | "as_mut"
+                        )
+                ) {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "truncate() needs a writable string lvalue",
+                    ));
+                }
                 if receiver.contains('(') || receiver.starts_with('{') {
                     return Err(Error::at(
                         call.method.span(),
@@ -402,7 +415,7 @@ impl<'a> Emitter<'a> {
                 }
                 Ok((
                     format!(
-                        "(function() local __s, __sep, __n = {receiver}, {separator}, math.max(0, math.floor({limit})); local __out = {{}}; if __n == 0 then return __out end; local __start = 1; while __n > 1 do local __at = string.find(__s, __sep, __start, true); if not __at then break end; __out[#__out + 1] = string.sub(__s, __start, __at - 1); __start = __at + #__sep; __n = __n - 1 end; __out[#__out + 1] = string.sub(__s, __start); __out.__next = 1; return __out end)()"
+                        "(function() local __s = {receiver}; local __n = math.max(0, math.floor({limit})); local __sep = {separator}; local __out = {{}}; if __n == 0 then return __out end; local __start = 1; while __n > 1 do local __at = string.find(__s, __sep, __start, true); if not __at then break end; __out[#__out + 1] = string.sub(__s, __start, __at - 1); __start = __at + #__sep; __n = __n - 1 end; __out[#__out + 1] = string.sub(__s, __start); __out.__next = 1; return __out end)()"
                     ),
                     Ty::LIST,
                 ))

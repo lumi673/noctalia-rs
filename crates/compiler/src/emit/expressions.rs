@@ -994,12 +994,10 @@ impl<'a> Emitter<'a> {
             }
             Pat::Tuple(tuple) => {
                 for (index, element) in tuple.elems.iter().enumerate() {
-                    let item = ty.map(|outer| {
-                        if outer.element == Some(Base::Str) {
-                            if index == 0 { Ty::STR } else { Ty::VALUE }
-                        } else {
-                            outer
-                        }
+                    let item = ty.map(|outer| match outer.element {
+                        Some(base) if index == 0 => Ty::new(base),
+                        Some(_) => Ty::VALUE,
+                        None => outer,
                     });
                     self.bind_closure_pattern(
                         element,

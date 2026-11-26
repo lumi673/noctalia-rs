@@ -1394,3 +1394,24 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let native = duplicated(vec![Op::log("255 0 42 100".to_owned())]);
     assert_eq!(luau, native);
 }
+
+#[test]
+fn review_round4_dispatch_checks() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = "42".parse::<f64>().unwrap_or(7.0);
+    let b = "1.5e2".parse::<f64>().unwrap_or(0.0);
+    let c = 20_u8.saturating_mul(20);
+    let found = vec![vec![10_i64], vec![20]].into_iter().flatten().find(|x| **x == 10);
+    let nth = vec![vec![10_i64], vec![20]].into_iter().flatten().nth(0);
+    let taken = vec![1_i64, 2, 3].into_iter().take_while(|x| **x < 3).collect::<Vec<_>>();
+    let reversed = vec![1_i64, 2, 3].into_iter().map(|x| x + 1).rev().collect::<Vec<_>>();
+    Ok(vec![Op::log(format!("{} {} {} {} {} {} {}", a, b, c, found.unwrap_or(0), nth.unwrap_or(0), taken.len(), reversed[0]))])
+}
+"#;
+    let source = compiled_source("review_round4", handler, EntryKind::Service);
+    let ctx = context("review_round4", "render", json!({}), json!({}));
+    let luau = ops("review_round4", &source, &ctx);
+    let native = duplicated(vec![Op::log("42 150 255 10 10 2 4".to_owned())]);
+    assert_eq!(luau, native);
+}

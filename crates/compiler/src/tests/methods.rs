@@ -1221,7 +1221,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains("__t1 == nil and"),
+        compiled.source.contains("if __t1 == nil then"),
         "{}",
         compiled.source
     );
@@ -2521,7 +2521,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let emitted = &compiled.source;
     assert!(emitted.contains("__static_main__CELL == nil"), "{emitted}");
     assert!(
-        emitted.contains("__v >= (0.0) and __v < (300.0)"),
+        emitted.contains("__v >= __start and __v < __end"),
         "{emitted}"
     );
     assert!(emitted.contains("local kept ="), "{emitted}");
@@ -2970,4 +2970,42 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(predicate), &options("handler", EntryKind::Service))
             .expect_err("predicate separator bails");
     assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn review_round4_compiler_checks() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let a = "42".parse::<f64>().unwrap_or(7.0);
+    let b = "1.5e2".parse::<f64>().unwrap_or(0.0);
+    let c = 20_u8.saturating_mul(20);
+    let d = vec![1,2].into_iter().enumerate().map(|(i, w)| i + w).collect::<Vec<_>>();
+    let e = vec![vec![10], vec![20]].into_iter().flatten().nth(0);
+    let _ = (d, e);
+    Ok(vec![Op::log(format!("{} {} {}", a, b, c))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local __s = \"42\""),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("local c = (255)"),
+        "{}",
+        compiled.source
+    );
+
+    for handler in [
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = i32::MIN.div_ceil(-1); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let mut s = ctx.config_str(\"message\").unwrap_or_default(); s.clone().truncate(1); Ok(Vec::new()) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("faithful failure");
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
 }

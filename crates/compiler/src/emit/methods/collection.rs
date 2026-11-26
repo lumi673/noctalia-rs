@@ -7,7 +7,6 @@ impl<'a> Emitter<'a> {
         args: &[&Expr],
         range: &syn::ExprRange,
     ) -> Result<(String, Ty), Error> {
-        let value = self.expr(arg(args, 0, call)?)?.0;
         let start = match &range.start {
             Some(expr) => self.expr(expr)?.0,
             None => "(-math.huge)".to_owned(),
@@ -16,6 +15,7 @@ impl<'a> Emitter<'a> {
             Some(expr) => self.expr(expr)?.0,
             None => "math.huge".to_owned(),
         };
+        let value = self.expr(arg(args, 0, call)?)?.0;
         let upper = match range.limits {
             syn::RangeLimits::HalfOpen(_) => "<",
             syn::RangeLimits::Closed(_) => {
@@ -27,7 +27,7 @@ impl<'a> Emitter<'a> {
         };
         Ok((
             format!(
-                "(function() local __v = {value}; return (__v >= ({start}) and __v {upper} ({end})) end)()"
+                "(function() local __start, __end = {start}, {end}; local __v = {value}; return (__v >= __start and __v {upper} __end) end)()"
             ),
             Ty::BOOL,
         ))
@@ -588,12 +588,12 @@ impl<'a> Emitter<'a> {
                             exact
                         } else {
                             format!(
-                                "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return {exact} end; if string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; return __n end)()"
+                                "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") ~= nil then return {exact} end; if string.find(__s, \"^[+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid number literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid number literal\" end; return __n end)()"
                             )
                         }
                     }
                     Base::Float => format!(
-                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
+                        "(function() local __s = {receiver}; if string.find(__s, \"^[+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*$\") == nil and string.find(__s, \"^[+-]?%d+%.%d*[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%d+[eE][+-]?%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+$\") == nil and string.find(__s, \"^[+-]?%.%d+[eE][+-]?%d+$\") == nil then return nil, \"invalid float literal\" end; local __n = tonumber(__s); if __n == nil then return nil, \"invalid float literal\" end; return __n end)()"
                     ),
                     _ => {
                         return Err(Error::at(

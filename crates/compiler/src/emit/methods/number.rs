@@ -181,8 +181,10 @@ impl<'a> Emitter<'a> {
                 let result = if method.starts_with("wrapping_") {
                     let span = max - min + 1;
                     ((raw - min).rem_euclid(span)) + min
-                } else if matches!(method, "saturating_add" | "saturating_sub")
-                {
+                } else if matches!(
+                    method,
+                    "saturating_add" | "saturating_sub" | "saturating_mul"
+                ) {
                     raw.clamp(min, max)
                 } else {
                     raw
@@ -200,10 +202,11 @@ impl<'a> Emitter<'a> {
             }
             "div_ceil" if matches!(ty.base, Base::Int | Base::Value) => {
                 let other_expr = arg(args, 0, call)?;
-                if let (Some((left, _, _)), Some((right, _, _))) =
+                if let (Some((left, bits, signed)), Some((right, _, _))) =
                     (int_literal(&call.receiver), int_literal(other_expr))
                 {
-                    if left == i64::MIN as i128 && right == -1 {
+                    let (minimum, _) = int_bounds(bits, signed);
+                    if signed && left == minimum && right == -1 {
                         return Err(Error::at(
                             call.method.span(),
                             "integer division overflows",
@@ -270,30 +273,38 @@ impl<'a> Emitter<'a> {
             "total_cmp" if ty.base == Base::Float => {
                 let other_expr = arg(args, 0, call)?;
                 let other = self.expr(other_expr)?.0;
-                let nan_greater = matches!(
+                let receiver_abs = matches!(
                     strip_reference(&call.receiver),
                     Expr::MethodCall(inner) if inner.method == "abs"
+                );
+                let receiver_negative = matches!(
+                    strip_reference(&call.receiver),
+                    Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_))
                 );
                 let other_negative = matches!(
                     strip_reference(other_expr),
                     Expr::Unary(unary) if matches!(unary.op, UnOp::Neg(_))
                 );
-                let a_nan = if nan_greater {
+                let a_nan = if receiver_abs {
                     "\"Greater\""
-                } else {
-                    "error(\"NaN total order needs a sign bit\")"
-                };
-                let both_nan = if nan_greater && other_negative {
-                    "\"Greater\""
-                } else if nan_greater {
-                    "\"Equal\""
-                } else {
-                    "error(\"NaN total order needs a sign bit\")"
-                };
-                let b_nan = if nan_greater {
+                } else if receiver_negative {
                     "\"Less\""
                 } else {
-                    "error(\"NaN total order needs a sign bit\")"
+                    "\"Equal\""
+                };
+                let both_nan = if receiver_abs && other_negative {
+                    "\"Greater\""
+                } else if receiver_negative && !other_negative {
+                    "\"Less\""
+                } else {
+                    "\"Equal\""
+                };
+                let b_nan = if receiver_abs {
+                    "\"Less\""
+                } else if receiver_negative {
+                    "\"Greater\""
+                } else {
+                    "\"Equal\""
                 };
                 Ok((
                     format!(
