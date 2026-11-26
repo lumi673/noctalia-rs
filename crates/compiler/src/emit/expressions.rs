@@ -538,7 +538,12 @@ impl<'a> Emitter<'a> {
             } else {
                 format!("math.{function}({left}, {right})")
             };
-            return Ok(Some((text, Ty::VALUE)));
+            let ty = if name.starts_with("f64::") || name.starts_with("f32::") {
+                Ty::FLOAT
+            } else {
+                Ty::INT
+            };
+            return Ok(Some((text, ty)));
         }
         Ok(None)
     }
@@ -547,8 +552,14 @@ impl<'a> Emitter<'a> {
         &mut self,
         block: &syn::Block,
     ) -> Result<(String, Ty), Error> {
-        match block.stmts.last() {
-            Some(Stmt::Expr(value, _)) => self.expr(value),
+        let Some((last, rest)) = block.stmts.split_last() else {
+            return Ok(("nil".to_owned(), Ty::VALUE));
+        };
+        for stmt in rest {
+            self.stmt(stmt)?;
+        }
+        match last {
+            Stmt::Expr(value, _) => self.expr(value),
             _ => Ok(("nil".to_owned(), Ty::VALUE)),
         }
     }
@@ -1277,31 +1288,25 @@ impl<'a> Emitter<'a> {
         }
         self.expr(expr)
     }
-    fn emit_chain_parts(
-        &mut self,
-        parts: &[&Expr],
-        assignments: &mut Vec<(String, String)>,
-    ) -> Result<(), Error> {
+    fn emit_chain_parts(&mut self, parts: &[&Expr]) -> Result<(), Error> {
         let Some((part, rest)) = parts.split_first() else {
-            for (lua, text) in assignments.drain(..) {
-                self.line(&format!("{lua} = {text}"));
-            }
             self.line("return true");
             return Ok(());
         };
-        let condition = match part {
+        let (condition, bindings) = match part {
             Expr::Let(item) => {
                 let (condition, bindings, _) = self.let_condition_pair(item)?;
-                for (name, text) in bindings {
-                    assignments.push((self.bind_name(&name), text));
-                }
-                condition
+                (condition, bindings)
             }
-            other => self.expr(other)?.0,
+            other => (self.expr(other)?.0, Vec::new()),
         };
         self.line(&format!("if {condition} then"));
         self.indent = self.indent.saturating_add(1);
-        self.emit_chain_parts(rest, assignments)?;
+        for (name, text) in bindings {
+            let lua = self.bind_name(&name);
+            self.line(&format!("{lua} = {text}"));
+        }
+        self.emit_chain_parts(rest)?;
         self.indent = self.indent.saturating_sub(1);
         self.line("end");
         Ok(())
@@ -1319,19 +1324,22 @@ impl<'a> Emitter<'a> {
                 let mut names = Vec::new();
                 pattern_binding_names(&item.pat, &mut names);
                 for name in names {
-                    if self.lookup(&name).is_none() {
-                        let lua = self.bind_name(&name);
-                        self.line(&format!("local {lua} = nil"));
-                        self.push(&name, Ty::VALUE);
+                    if self.lookup(&name).is_some() {
+                        return Err(Error::at(
+                            binary.span(),
+                            "let-chain bindings cannot shadow an outer local",
+                        ));
                     }
+                    let lua = self.bind_name(&name);
+                    self.line(&format!("local {lua} = nil"));
+                    self.push(&name, Ty::VALUE);
                 }
             }
         }
         let saved_out = std::mem::take(&mut self.out);
         let saved_indent = self.indent;
         self.indent = 0;
-        let mut assignments = Vec::new();
-        self.emit_chain_parts(&parts, &mut assignments)?;
+        self.emit_chain_parts(&parts)?;
         self.line("return false");
         let body = std::mem::replace(&mut self.out, saved_out);
         self.indent = saved_indent;
@@ -1779,6 +1787,9 @@ fn match_returns_string(item: &syn::ExprMatch) -> bool {
                     )
                 }
                 Expr::Macro(mac) => macro_name(mac) == "format",
+                Expr::Call(call) => {
+                    path_last_name(&call.func).as_deref() == Some("String::new")
+                }
                 _ => false,
             })
         })

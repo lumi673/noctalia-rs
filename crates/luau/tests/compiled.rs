@@ -1350,8 +1350,8 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     } else {
         "miss".to_owned()
     };
-    let miss = if let Some(a) = None && let Some(b) = Some(5) {
-        format!("{a}{b}")
+    let miss = if let Some(c) = None && let Some(d) = Some(5) {
+        format!("{c}{d}")
     } else {
         "miss".to_owned()
     };
@@ -1405,7 +1405,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert_eq!(
         actual,
         duplicated(vec![Op::BarText {
-            text: "\"13\"|two|none".to_owned()
+            text: "13|two|none".to_owned()
         }])
     );
 }
@@ -1422,14 +1422,19 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     } else {
         "miss".to_owned()
     };
-    let miss = if let Some(_) = None && let Some(b) = { total = total + 1; Some(b2()) } {
-        format!("{b}")
+    let miss = if let Some(_) = None && let Some(c) = { total = total + 1; Some(b2()) } {
+        format!("{c}")
     } else {
         format!("{n}|{total}")
     };
+    let later = if let Some(x) = Some(3) && let Some(y) = Some(x + 1) {
+        y
+    } else {
+        0
+    };
     let iter = "éx".chars();
     {
-        let iter = "block";
+        let iter = "block".to_owned();
         let _ = iter;
     }
     let first = iter.next();
@@ -1449,7 +1454,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         1 if false => "one".to_owned(),
         _ => "fallback".to_owned(),
     };
-    Ok(vec![Op::BarText { text: format!("{hit}|{miss}|{first}{rest}|{indexed}|{guard}|{fallback}") }])
+    Ok(vec![Op::BarText { text: format!("{hit}|{miss}|{later}|{first}{rest}|{indexed}|{guard}|{fallback}") }])
 }
 
 fn b2() -> i64 {
@@ -1465,7 +1470,7 @@ fn b2() -> i64 {
     assert_eq!(
         actual,
         duplicated(vec![Op::BarText {
-            text: "12|7|0|éx|indexed-else|9|fallback".to_owned()
+            text: "12|7|100|4|éx|indexed-else|9|fallback".to_owned()
         }])
     );
 }

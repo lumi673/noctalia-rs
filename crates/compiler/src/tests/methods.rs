@@ -61,11 +61,7 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(compiled.source.contains("ipairs("));
     assert!(compiled.source.contains("if true then"));
-    assert!(
-        compiled.source.contains(
-            "if (function() return (noctalia.nowMs() > 0) end)() then"
-        )
-    );
+    assert!(compiled.source.contains("if (noctalia.nowMs() > 0) then"));
 }
 
 #[test]

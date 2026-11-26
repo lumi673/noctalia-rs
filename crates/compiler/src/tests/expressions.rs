@@ -566,3 +566,22 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         error.message
     );
 }
+
+#[test]
+fn rejects_let_chain_binding_shadowing() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let outer = 10;
+    let value = if let Some(outer) = Some(5) && let Some(extra) = Some(1) {
+        outer
+    } else {
+        outer
+    };
+    Ok(vec![Op::log(format!("{value}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("shadowing");
+    assert!(error.message.contains("cannot shadow"), "{}", error.message);
+}

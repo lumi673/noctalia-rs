@@ -941,84 +941,74 @@ impl<'a> Emitter<'a> {
         let (pattern, guard) = split_guard(&arm.pat);
         let (condition, bindings) =
             self.pattern_match(scrutinee, pattern, error)?;
+        if guard.is_none() {
+            self.line(&format!("if {condition} then"));
+            self.indent = self.indent.saturating_add(1);
+            self.push_scope();
+            for (name, text) in bindings {
+                let lua = self.bind_name(&name);
+                self.line(&format!("local {lua} = {text}"));
+                self.push(&name, self.binding_ty(pattern, &name, scrutinee_ty));
+            }
+            let body = self.arm_body(&arm.body, tail);
+            self.pop_scope();
+            self.indent = self.indent.saturating_sub(1);
+            if !rest.is_empty() {
+                self.line("else");
+                self.indent = self.indent.saturating_add(1);
+                let rest_result =
+                    self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                body?;
+                return rest_result;
+            }
+            self.line("end");
+            return body;
+        }
+        let matched = self.temp();
+        self.line(&format!("local {matched} = false"));
         self.line(&format!("if {condition} then"));
         self.indent = self.indent.saturating_add(1);
         self.push_scope();
-        self.push_scope();
-        let mut prepared = Vec::new();
         for (name, text) in bindings {
-            let binding = self.binding_ty(pattern, &name, scrutinee_ty);
             let lua = self.bind_name(&name);
-            self.push(&name, binding);
-            prepared.push((lua, name, text, binding));
+            self.line(&format!("local {lua} = {text}"));
+            self.push(&name, self.binding_ty(pattern, &name, scrutinee_ty));
         }
-        if let Some(guard) = guard {
-            let (guard_text, _) = self.expr(guard)?;
-            let params = prepared
-                .iter()
-                .map(|(lua, _, _, _)| lua.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let values = prepared
-                .iter()
-                .map(|(_, _, text, _)| text.clone())
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.line(&format!(
-                "if (function({params}) return {guard_text} end)({values}) then"
-            ));
+        let Some(guard) = guard else { unreachable!() };
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        self.indent = 0;
+        let guard_result = self.expr(guard);
+        let guard_lines = std::mem::replace(&mut self.out, saved_out);
+        self.indent = saved_indent;
+        let (guard_text, _) = guard_result?;
+        self.line(&format!("if {guard_text} then"));
+        self.indent = self.indent.saturating_add(1);
+        if !guard_lines.trim().is_empty() {
+            self.out.push_str(&guard_lines);
+        }
+        self.line(&format!("{matched} = true"));
+        let body = self.arm_body(&arm.body, tail);
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        self.pop_scope();
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        let rest_result = if !rest.is_empty() {
+            self.line(&format!("if not {matched} then"));
             self.indent = self.indent.saturating_add(1);
-            for (lua, _, text, _) in &prepared {
-                self.line(&format!("local {lua} = {text}"));
-            }
-            let body = self.arm_body(&arm.body, tail);
-            self.indent = self.indent.saturating_sub(1);
-            self.pop_scope();
-            self.line("else");
-            self.indent = self.indent.saturating_add(1);
-            let guard_rest = if !rest.is_empty() {
-                self.match_arms(rest, scrutinee, scrutinee_ty, error, tail)
-            } else {
-                Ok(())
-            };
+            let result =
+                self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
             self.indent = self.indent.saturating_sub(1);
             self.line("end");
-            if !rest.is_empty() {
-                self.line("else");
-                self.indent = self.indent.saturating_add(1);
-                let rest_result =
-                    self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-                body?;
-                guard_rest?;
-                rest_result?
-            } else {
-                body?;
-                guard_rest?
-            }
+            result
         } else {
-            for (lua, _, text, _) in &prepared {
-                self.line(&format!("local {lua} = {text}"));
-            }
-            let body = self.arm_body(&arm.body, tail);
-            self.pop_scope();
-            self.indent = self.indent.saturating_sub(1);
-            if !rest.is_empty() {
-                self.line("else");
-                self.indent = self.indent.saturating_add(1);
-                let rest_result =
-                    self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-                body?;
-                rest_result?
-            } else {
-                self.line("end");
-                body?
-            }
-        }
-        Ok(())
+            Ok(())
+        };
+        body?;
+        rest_result
     }
 
     pub(super) fn match_stmt(
