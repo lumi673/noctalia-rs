@@ -410,6 +410,11 @@ impl<'a> Emitter<'a> {
             ty.base = json_base_for_type(hint)?;
         }
         self.line(&format!("local {lua} = {text}"));
+        if let Expr::MethodCall(call) = strip_reference(&init.expr)
+            && call.method == "chars"
+        {
+            self.mark_chars(&lua);
+        }
         if ty.base == Base::Str {
             self.values.insert(name.clone(), text.clone());
             if lua != name {

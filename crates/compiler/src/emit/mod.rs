@@ -116,6 +116,7 @@ impl<'a> Emitter<'a> {
             emitted: false,
             temp: 0,
             kw_names: HashMap::new(),
+            chars: BTreeSet::new(),
             native_mode,
             known_native,
             native_found: BTreeMap::new(),
@@ -294,8 +295,23 @@ impl<'a> Emitter<'a> {
             .find_map(|scope| scope.get(name).copied())
     }
     pub(super) fn bind_name(&mut self, name: &str) -> String {
+        let mut suffix = 1;
         if !is_luau_keyword(name) {
-            return name.to_owned();
+            if !self.kw_names.values().any(|value| value == name) {
+                return name.to_owned();
+            }
+            let mut candidate = format!("{name}_{suffix}");
+            while self
+                .scopes
+                .iter()
+                .any(|scope| scope.contains_key(&candidate))
+                || self.kw_names.values().any(|value| value == &candidate)
+            {
+                suffix += 1;
+                candidate = format!("{name}_{suffix}");
+            }
+            self.kw_names.insert(name.to_owned(), candidate.clone());
+            return candidate;
         }
         if let Some(existing) = self.kw_names.get(name).cloned()
             && !self
@@ -306,7 +322,6 @@ impl<'a> Emitter<'a> {
             return existing;
         }
         let mut candidate = format!("__kw_{name}");
-        let mut suffix = 1;
         while self
             .scopes
             .iter()
@@ -321,14 +336,21 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn local_name(&self, name: &str) -> String {
+        if let Some(existing) = self.kw_names.get(name) {
+            return existing.clone();
+        }
         if is_luau_keyword(name) {
-            self.kw_names
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| format!("__kw_{name}"))
+            format!("__kw_{name}")
         } else {
             name.to_owned()
         }
+    }
+    pub(super) fn mark_chars(&mut self, name: &str) {
+        self.chars.insert(name.to_owned());
+    }
+
+    pub(super) fn is_chars(&self, name: &str) -> bool {
+        self.chars.contains(name)
     }
 
     pub(super) fn temp(&mut self) -> String {
@@ -498,6 +520,7 @@ pub(crate) struct Emitter<'a> {
     emitted: bool,
     temp: usize,
     kw_names: HashMap<String, String>,
+    chars: BTreeSet<String>,
     native_mode: NativeMode,
     known_native: &'a BTreeMap<String, NativeFn>,
     native_found: BTreeMap<String, NativeFn>,

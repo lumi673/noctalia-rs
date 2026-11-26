@@ -1169,3 +1169,98 @@ fn native_chain10(_ctx: &Context) -> Vec<Op> {
         Op::state("static", json!(3)),
     ]
 }
+
+#[test]
+fn chars_iterator_keeps_utf8_boundaries() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let multibyte = "éab";
+    let mut chars = multibyte.chars();
+    let first = format!("{}{}", chars.next().unwrap_or(' '), chars.as_str());
+    let rest = multibyte.chars().skip(1).as_str();
+    let taken = multibyte.chars().take(2).collect::<String>();
+    let full = multibyte.chars().collect::<String>();
+    let empty = "".chars().collect::<String>();
+    let ascii = "abc";
+    let ascii_rest = ascii.chars().skip(1).as_str();
+    Ok(vec![
+        Op::BarText { text: format!("{first}|{rest}|{taken}|{full}|{empty}") },
+        Op::BarText { text: format!("{ascii_rest}") },
+    ])
+}
+"#;
+    let source = compiled_source("chars", handler, EntryKind::Widget);
+    let actual = ops(
+        "chars",
+        &source,
+        &context("chars", "update", json!({}), json!({})),
+    );
+    let expected = rust_ops(vec![
+        Op::BarText {
+            text: "éab|ab|éa|éab|".to_owned(),
+        },
+        Op::BarText {
+            text: "bc".to_owned(),
+        },
+        Op::BarText {
+            text: "éab|ab|éa|éab|".to_owned(),
+        },
+        Op::BarText {
+            text: "bc".to_owned(),
+        },
+    ]);
+    assert_eq!(actual, expected, "source:\n{source}");
+}
+
+#[test]
+fn keyword_and_plain_bindings_do_not_share_lua_names() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let end = 1;
+    let __kw_end = 2;
+    let first = format!("{end}|{__kw_end}");
+    let nested = {
+        let __kw_end = 4;
+        let end = 3;
+        format!("{end}|{__kw_end}")
+    };
+    let reversed = {
+        let other_end = 5;
+        let end = 6;
+        format!("{end}|{other_end}")
+    };
+    Ok(vec![
+        Op::BarText { text: first },
+        Op::BarText { text: nested },
+        Op::BarText { text: reversed },
+    ])
+}
+"#;
+    let source = compiled_source("names", handler, EntryKind::Widget);
+    let actual = ops(
+        "names",
+        &source,
+        &context("names", "update", json!({}), json!({})),
+    );
+    let expected = rust_ops(vec![
+        Op::BarText {
+            text: "1|2".to_owned(),
+        },
+        Op::BarText {
+            text: "3|4".to_owned(),
+        },
+        Op::BarText {
+            text: "6|5".to_owned(),
+        },
+        Op::BarText {
+            text: "1|2".to_owned(),
+        },
+        Op::BarText {
+            text: "3|4".to_owned(),
+        },
+        Op::BarText {
+            text: "6|5".to_owned(),
+        },
+    ]);
+    assert_eq!(actual, expected);
+}

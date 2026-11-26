@@ -61,18 +61,86 @@ impl<'a> Emitter<'a> {
                 if ty.base == Base::Str {
                     return Ok((text, ty));
                 }
+                if self.is_chars(&text) {
+                    return Ok((
+                        format!(
+                            "table.concat({text}, \"\", ({text}.__next or 1))"
+                        ),
+                        Ty::STR,
+                    ));
+                }
                 Ok((format!("table.concat({text})"), Ty::STR))
             }
-            Expr::MethodCall(call)
-                if call.method == "as_str"
-                    && self.is_chars_receiver(&call.receiver) =>
-            {
-                let chars = self.expr(&call.receiver)?.0;
+            Expr::MethodCall(call) if call.method == "chars" => {
+                let (source, ty) = self.expr(&call.receiver)?;
+                if ty.base != Base::Str {
+                    return self.method(call);
+                }
                 let value = self.temp();
-                self.line(&format!("local {value} = {chars}"));
+                self.line(&format!("local {value} = {source}"));
+                let chars = self.temp();
+                self.line(&format!(
+                    "local {chars} = (function() local __parts = {{}}; for __position, __codepoint in utf8.codes({value}) do __parts[#__parts + 1] = utf8.char(__codepoint) end; __parts.__noctalia_chars = true; __parts.__next = 1; __parts.__byte_cursor = 1; __parts.__source = {value}; return __parts end)()"
+                ));
+                self.mark_chars(&chars);
+                Ok((chars, Ty::LIST))
+            }
+            Expr::MethodCall(call)
+                if matches!(
+                    call.method.to_string().as_str(),
+                    "next" | "skip" | "take"
+                ) =>
+            {
+                let (text, _) = self.expr(&call.receiver)?;
+                if !self.is_chars(&text) {
+                    return self.method(call);
+                }
+                let args = call.args.iter().collect::<Vec<_>>();
+                let method = call.method.to_string();
+                let body = if method == "next" {
+                    format!(
+                        "(function() local __list = {text}; local __position = __list.__next or 1; local __value = __list[__position]; if __value ~= nil then __list.__next = __position + 1; __list.__byte_cursor = (__list.__byte_cursor or 1) + #__value end; return __value end)()"
+                    )
+                } else {
+                    let count = self.expr(arg(&args, 0, call)?)?.0;
+                    let start = if method == "skip" {
+                        format!("(__list.__next or 1) + math.max(0, {count})")
+                    } else {
+                        "(__list.__next or 1)".to_owned()
+                    };
+                    let limit = if method == "take" {
+                        format!(
+                            "math.min(#__list, ({start}) + math.max(0, {count}) - 1)"
+                        )
+                    } else {
+                        "#__list".to_owned()
+                    };
+                    format!(
+                        "(function() local __list = {text}; local __out = {{}}; local __byte = __list.__byte_cursor or 1; for __i = 1, ({start}) - 1 do __byte = __byte + #(__list[__i] or \"\") end; for __i = {start}, {limit} do __out[#__out + 1] = __list[__i] end; __out.__noctalia_chars = true; __out.__next = 1; __out.__byte_cursor = 1; __out.__source = string.sub(__list.__source, __byte); return __out end)()"
+                    )
+                };
+                let value = self.temp();
+                self.line(&format!("local {value} = {body}"));
+                if method != "next" {
+                    self.mark_chars(&value);
+                }
+                Ok((
+                    value,
+                    if method == "next" {
+                        Ty::OPT_STR
+                    } else {
+                        Ty::LIST
+                    },
+                ))
+            }
+            Expr::MethodCall(call) if call.method == "as_str" => {
+                let (text, _) = self.expr(&call.receiver)?;
+                if !self.is_chars(&text) {
+                    return self.method(call);
+                }
                 Ok((
                     format!(
-                        "table.concat({value}, \"\", ({value}.__next or 1))"
+                        "string.sub({text}.__source, {text}.__byte_cursor or 1)"
                     ),
                     Ty::STR,
                 ))
@@ -1144,16 +1212,6 @@ impl<'a> Emitter<'a> {
         self.deferred = saved_deferred;
         result?;
         Ok((text, Ty::VALUE))
-    }
-
-    fn is_chars_receiver(&self, expr: &Expr) -> bool {
-        let Expr::Path(path) = strip_reference(expr) else {
-            return false;
-        };
-        let Some(name) = path.path.get_ident().map(ToString::to_string) else {
-            return false;
-        };
-        self.lookup(&name).is_some_and(|ty| ty.base == Base::List)
     }
 
     /// A closure body whose only statement is a call to a unit helper stays a
