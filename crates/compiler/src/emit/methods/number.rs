@@ -1,5 +1,22 @@
 use super::*;
 
+/// Rejects a limb value that Luau would round on conversion to its number
+/// model. The error carries the Rust method span so the failure is attributable
+/// to the exact construct that produced it.
+fn exact_guard(location: &str, construct: &str) -> String {
+    let location = location.replace('"', "\\\"");
+    let construct = construct.replace('"', "\\\"");
+    format!(
+        concat!(
+            "local function __bits(__v) local __n = 0 while __v >= 1 do __v = math.floor(__v / 2); __n = __n + 1 end return __n - 1 end;",
+            "local function __exact(__h, __l) local __e = (__h > 0) and (32 + __bits(__h)) or __bits(__l); if __e <= 52 then return true end; local __shift = __e - 52; if __shift <= 32 then return (__l % (2 ^ __shift)) == 0 end; return __l == 0 and (__h % (2 ^ (__shift - 32))) == 0 end;",
+            "if not __exact(__hi, __lo) then error(\"{location}: {construct} result is not exactly representable in Luau (1 construct)\") end;",
+        ),
+        location = location,
+        construct = construct,
+    )
+}
+
 /// Luau-only 64-bit magnitude arithmetic. Values are sign plus two 32-bit
 /// limbs, so carries and borrows never pass through a double. The result is
 /// converted to the Luau number model only after the operation completes.
@@ -7,8 +24,10 @@ fn exact_binary(
     method: &str,
     left: &str,
     right: &str,
+    right_literal: Option<i128>,
     bits: usize,
     signed: bool,
+    location: &str,
 ) -> String {
     let max = if signed {
         (1u128 << (bits - 1)) - 1
@@ -77,9 +96,9 @@ fn exact_binary(
         if signed {
             format!(
                 concat!(
-                    "if __over and __s < 0 then return -({min_hi} * __B + {min_lo}) end;",
-                    "if __over then return {max_hi} * __B + {max_lo} end;",
-                    "return __s * (__hi * __B + __lo);",
+                    "local __result = __s * (__hi * __B + __lo);",
+                    "if __over and __s < 0 then __result = -({min_hi} * __B + {min_lo}) end;",
+                    "if __over and __s >= 0 then __result = {max_hi} * __B + {max_lo} end;",
                 ),
                 min_hi = min_hi,
                 min_lo = min_lo,
@@ -89,9 +108,9 @@ fn exact_binary(
         } else {
             format!(
                 concat!(
-                    "if __over and __s < 0 then return {under} end;",
-                    "if __over then return {max_hi} * __B + {max_lo} end;",
-                    "return __hi * __B + __lo;",
+                    "local __result = __hi * __B + __lo;",
+                    "if __over and __s < 0 then __result = {under} end;",
+                    "if __over and __s >= 0 then __result = {max_hi} * __B + {max_lo} end;",
                 ),
                 under = "0",
                 max_hi = max_hi,
@@ -129,10 +148,27 @@ fn exact_binary(
             "__s = 0;".to_owned()
         };
         format!(
-            concat!("{mask}", "{sign}", "return __s * (__hi * __B + __lo);",),
+            concat!(
+                "{mask}",
+                "{sign}",
+                "local __result = __s * (__hi * __B + __lo);",
+            ),
             mask = mask,
             sign = sign,
         )
+    };
+    let guard = exact_guard(location, method);
+    let right_operand = match right_literal {
+        Some(value) => {
+            let sign = if value < 0 { -1 } else { 1 };
+            let magnitude = value.unsigned_abs();
+            format!(
+                "local __bs, __bhi, __blo = {sign}, {}, {};",
+                magnitude >> 32,
+                magnitude & 0xffff_ffff
+            )
+        }
+        None => format!("local __bs, __bhi, __blo = __pack({right});"),
     };
     format!(
         concat!(
@@ -182,24 +218,31 @@ fn exact_binary(
             "  return math.floor(__t / __B), __t % __B, __r2, __r1, __r0;",
             "end;",
             "local __as, __ahi, __all = __pack({left});",
-            "local __bs, __bhi, __blo = __pack({right});",
+            "{right_operand}",
             "local __s = 0;",
             "{operation}",
             "{bound_check}",
             "{finish}",
+            "{guard}",
+            "return __result;",
             "end)()",
         ),
         left = left,
-        right = right,
+        right_operand = right_operand,
         operation = operation,
         bound_check = bound_check,
         finish = finish,
+        guard = guard,
     )
     .replace(';', "\n")
 }
 
 /// Decimal validation and limb conversion for `parse::<T>()`.
-pub(super) fn exact_parse(receiver: &str, target: &str) -> String {
+pub(super) fn exact_parse(
+    receiver: &str,
+    target: &str,
+    location: &str,
+) -> String {
     let (positive, negative, signed) = match target {
         "i8" => ("127", "128", true),
         "i16" => ("32767", "32768", true),
@@ -210,6 +253,7 @@ pub(super) fn exact_parse(receiver: &str, target: &str) -> String {
         "u64" | "usize" => ("18446744073709551615", "0", false),
         _ => ("9223372036854775807", "9223372036854775808", true),
     };
+    let guard = exact_guard(location, &format!("parse::<{target}>"));
     format!(
         concat!(
             "(function()",
@@ -230,6 +274,7 @@ pub(super) fn exact_parse(receiver: &str, target: &str) -> String {
             "  __lo = __v - __c * __B;",
             "  __hi = (__hi * 10 + __c) % __B;",
             "end;",
+            "{guard}",
             "if __neg then return -(__hi * __B + __lo) end;",
             "return __hi * __B + __lo;",
             "end)()",
@@ -238,6 +283,7 @@ pub(super) fn exact_parse(receiver: &str, target: &str) -> String {
         signed = signed,
         negative = negative,
         positive = positive,
+        guard = guard,
     )
     .replace(';', "\n")
 }
@@ -412,6 +458,13 @@ impl<'a> Emitter<'a> {
             "saturating_add" | "saturating_sub" | "saturating_mul"
             | "wrapping_add" | "wrapping_sub" => {
                 let argument = arg(args, 0, call)?;
+                let span = call.method.span().start();
+                let location = format!(
+                    "{}.rs:{}:{}",
+                    self.module,
+                    span.line,
+                    span.column + 1
+                );
                 if let (Some((left, bits, signed)), Some((right, _, _))) =
                     (int_literal(&call.receiver), int_literal(argument))
                 {
@@ -437,12 +490,25 @@ impl<'a> Emitter<'a> {
                     } else {
                         raw.clamp(min, max)
                     };
+                    if result as f64 as i128 != result {
+                        return Err(Error::at(
+                            call.method.span(),
+                            format!(
+                                "`{method}` result {result} is not exactly representable in Luau (1 construct)"
+                            ),
+                        ));
+                    }
                     Ok((format!("({result})"), ty))
                 } else {
                     let (bits, signed) = int_shape(&call.receiver);
                     let other = self.expr(argument)?.0;
+                    let literal =
+                        int_literal(argument).map(|(value, _, _)| value);
                     Ok((
-                        exact_binary(method, receiver, &other, bits, signed),
+                        exact_binary(
+                            method, receiver, &other, literal, bits, signed,
+                            &location,
+                        ),
                         ty,
                     ))
                 }

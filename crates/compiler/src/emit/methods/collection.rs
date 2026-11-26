@@ -547,8 +547,16 @@ impl<'a> Emitter<'a> {
                     .unwrap_or_default();
                 let body = match parsed_ty.base {
                     Base::Int | Base::Value => {
-                        let exact =
-                            super::number::exact_parse(receiver, &target);
+                        let span = call.method.span().start();
+                        let location = format!(
+                            "{}.rs:{}:{}",
+                            self.module,
+                            span.line,
+                            span.column + 1
+                        );
+                        let exact = super::number::exact_parse(
+                            receiver, &target, &location,
+                        );
                         if parsed_ty.base == Base::Int {
                             exact
                         } else {

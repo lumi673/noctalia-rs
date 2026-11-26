@@ -1429,15 +1429,15 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn parse_boundaries_take_rust_error_paths() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let max = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    let exact = "9007199254740992".parse::<i64>().unwrap_or(0);
+    let uexact = "9007199254740992".parse::<u64>().unwrap_or(0);
     let over = "9223372036854775808".parse::<i64>().unwrap_or(7);
     let under = "-9223372036854775809".parse::<i64>().unwrap_or(7);
-    let umax = "18446744073709551615".parse::<u64>().unwrap_or(0);
     let uover = "18446744073709551616".parse::<u64>().unwrap_or(7);
     let narrow = "256".parse::<u8>().unwrap_or(7);
     let leading = "0000000000000000042".parse::<i64>().unwrap_or(0);
     let exponent = "1e2".parse::<i64>().unwrap_or(7);
-    let ok = max > 9007199254740992 && umax > 9007199254740992;
+    let ok = exact == 9007199254740992 && uexact == 9007199254740992;
     let bad = over == 7 && under == 7 && uover == 7 && narrow == 7 && exponent == 7;
     Ok(vec![Op::log(format!("{} {} {}", ok, bad, leading))])
 }
@@ -1447,6 +1447,44 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let luau = ops("parse_bounds", &source, &ctx);
     let native = duplicated(vec![Op::log("true true 42".to_owned())]);
     assert_eq!(luau, native);
+}
+
+#[test]
+fn nonexact_parse_result_fails_with_its_span() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("parse_nonexact", handler, EntryKind::Service);
+    let ctx = context("parse_nonexact", "render", json!({}), json!({}));
+    let error =
+        noctalia_rs_luau::dispatch(&ctx, &[("parse_nonexact", &source)])
+            .expect_err("nonexact parse result must fail")
+            .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("parse::<i64>"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn nonexact_runtime_product_fails_instead_of_rounding() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = count.saturating_mul(9007199254740993);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("exact_guard", handler, EntryKind::Service);
+    let ctx = context("exact_guard", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("exact_guard", &source)])
+        .expect_err("rounded product must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("saturating_mul"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
 }
 
 #[test]
