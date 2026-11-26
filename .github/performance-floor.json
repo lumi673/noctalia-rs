@@ -351,16 +351,16 @@
       "updatedAt": "2026-11-25T15:08:54.487Z"
     },
     "plugin_als_brightness_rust": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "57796e4a9a4fc70cd9af758b296f9f4d30f987eb",
       "method": 1,
-      "medianMs": 0.0313315,
-      "worstMedianMs": 0.0315015,
-      "p95Ms": 0.032368,
-      "worstP95Ms": 0.033510000000000005,
-      "p99Ms": 0.040109,
-      "worstP99Ms": 0.044527000000000004,
+      "medianMs": 0.0283975,
+      "worstMedianMs": 0.029042000000000002,
+      "p95Ms": 0.029556000000000002,
+      "worstP95Ms": 0.030528000000000003,
+      "p99Ms": 0.037313,
+      "worstP99Ms": 0.038894,
       "budgetMs": 0.5,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-26T02:51:37.866Z"
     },
     "plugin_mihomo_control_luau": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -399,16 +399,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_file_search_rust": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "57796e4a9a4fc70cd9af758b296f9f4d30f987eb",
       "method": 1,
-      "medianMs": 0.007746499999999999,
-      "worstMedianMs": 0.008062,
-      "p95Ms": 0.008542999999999999,
-      "worstP95Ms": 0.008643000000000001,
-      "p99Ms": 0.008863,
-      "worstP99Ms": 0.017785999999999996,
+      "medianMs": 0.0080975,
+      "worstMedianMs": 0.008436,
+      "p95Ms": 0.008610000000000001,
+      "worstP95Ms": 0.009146000000000001,
+      "p99Ms": 0.015503,
+      "worstP99Ms": 0.02109,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-26T02:51:37.866Z"
     },
     "generated_hello_bar_handwritten": {
       "sha": "8a6e0876e218c3e286e1eac36e31794010bee7ad",
