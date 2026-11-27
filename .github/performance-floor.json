@@ -471,16 +471,16 @@
       "updatedAt": "2026-11-24T17:00:24.601Z"
     },
     "generated_event_compiled": {
-      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
+      "sha": "1420b22c11d9558e85ef5fa65974ded08b33b423",
       "method": 1,
-      "medianMs": 0.004595500000000001,
-      "worstMedianMs": 0.004633,
-      "p95Ms": 0.004969,
-      "worstP95Ms": 0.005454,
-      "p99Ms": 0.005632,
-      "worstP99Ms": 0.00614,
+      "medianMs": 0.00475,
+      "worstMedianMs": 0.004837,
+      "p95Ms": 0.005221,
+      "worstP95Ms": 0.006392,
+      "p99Ms": 0.006051999999999999,
+      "worstP99Ms": 0.017993,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-25T15:08:54.487Z"
+      "updatedAt": "2026-11-27T01:12:01.913Z"
     },
     "bridge_event": {
       "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
