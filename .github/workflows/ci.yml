@@ -38,23 +38,66 @@ jobs:
           tool: cargo-tarpaulin
       - run: cargo tarpaulin --fail-under 80
 
-  performance:
-    name: Performance
+  performance-plan:
+    name: Performance plan
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       RUN_KIND: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Plan variants
+        id: plan
+        run: |
+          set -euo pipefail
+          mkdir -p performance
+          floor="$RUNNER_TEMP/performance-floor.json"
+          if git fetch --depth=1 origin floors; then
+            git show FETCH_HEAD:.github/performance-floor.json > "$floor" || rm -f "$floor"
+          fi
+          node .github/scripts/performance.cjs plan \
+            --floor "$floor" \
+            --head "$(git rev-parse HEAD)" \
+            --base "$BASE_SHA" \
+            --kind "$RUN_KIND" \
+            --meta performance/meta.json > /dev/null
+          echo "shards=$(node .github/scripts/performance.cjs shards \
+            --floor "$floor" \
+            --head "$(git rev-parse HEAD)" \
+            --base "$BASE_SHA" \
+            --count 16)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: performance-plan
+          path: |
+            performance/meta.json
+            performance/floor.json
+          retention-days: 1
+
+  performance-shard:
+    name: Performance shard ${{ matrix.shard.index }}
+    needs: performance-plan
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.performance-plan.outputs.shards) }}
+    env:
+      SHARD: ${{ toJSON(matrix.shard) }}
       # Every commit here builds the same dependencies and each benchmark run
-      # compiles a fixture, so one compiler cache serves the whole job.
+      # compiles a fixture, so one compiler cache serves the whole shard.
       RUSTC_WRAPPER: sccache
       CC: sccache cc
       CXX: sccache c++
       SCCACHE_CACHE_SIZE: 3G
     steps:
-      # pull_request checks out the merge commit, so base-only changes are
-      # included in the PR measurement.
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
@@ -65,20 +108,19 @@ jobs:
         with:
           tool: sccache
 
-      # Ceilings live on their own branch so a PR cannot move them.
+      - uses: actions/download-artifact@v6
+        with:
+          name: performance-plan
+          path: performance
+
+      # pull_request checks out the merge commit, so base-only changes are
+      # included in the PR measurement.
       - name: Plan variants
         run: |
+          set -euo pipefail
           mkdir -p performance/raw
-          floor="$RUNNER_TEMP/performance-floor.json"
-          if git fetch --depth=1 origin floors; then
-            git show FETCH_HEAD:.github/performance-floor.json > "$floor" || rm -f "$floor"
-          fi
-          node .github/scripts/performance.cjs plan \
-            --floor "$floor" \
-            --head "$(git rev-parse HEAD)" \
-            --base "$BASE_SHA" \
-            --kind "$RUN_KIND" \
-            --meta performance/meta.json > "$RUNNER_TEMP/variant-shas.txt"
+          printf '%s' "$SHARD" > performance/shard.json
+          node -e 'const fs=require("node:fs");const s=JSON.parse(process.env.SHARD);fs.writeFileSync(process.argv[1],s.shas.join("\n")+"\n")' "$RUNNER_TEMP/variant-shas.txt"
 
       - name: Prepare variants
         run: |
@@ -92,7 +134,8 @@ jobs:
             printf '%s %s\n' "$sha" "$dir" >> "$RUNNER_TEMP/variant-dirs.txt"
           done < "$RUNNER_TEMP/variant-shas.txt"
 
-      # Every commit is measured in the same session, so runner speed cancels out.
+      # Each workload and its reference are measured together on this runner,
+      # three times in the same session, so runner speed cancels out.
       - name: Measure
         run: |
           set -euo pipefail
@@ -115,10 +158,6 @@ jobs:
             done < "$RUNNER_TEMP/variant-dirs.txt"
           done
           node .github/scripts/performance-aggregate.cjs performance/raw performance 3
-          if [ "$RUN_KIND" = "pull_request" ]; then
-            cp "performance/$head.json" performance/pr.json
-            cp "performance/$BASE_SHA.json" performance/base.json
-          fi
 
       - name: Compiler cache stats
         if: always()
@@ -126,6 +165,39 @@ jobs:
           sccache --show-stats || true
           df -h "$RUNNER_TEMP" || true
           du -shc "$RUNNER_TEMP"/target-* "$RUNNER_TEMP"/fixture-* 2>/dev/null | sort -h | tail -n 6 || true
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: performance-shard-${{ matrix.shard.index }}
+          path: performance/*.json
+          retention-days: 1
+
+  performance-merge:
+    name: Performance report
+    needs: performance-shard
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      RUN_KIND: ${{ github.event_name == 'pull_request' && 'pull_request' || 'push' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: performance-shard-*
+          path: ${{ runner.temp }}/shards
+
+      - name: Merge measurements
+        run: |
+          set -euo pipefail
+          node .github/scripts/performance-merge.cjs "$RUNNER_TEMP/shards" performance
+          if [ "$RUN_KIND" = "pull_request" ]; then
+            head="$(git rev-parse HEAD)"
+            cp "performance/$head.json" performance/pr.json
+            cp "performance/$BASE_SHA.json" performance/base.json
+          fi
 
       - uses: actions/upload-artifact@v6
         with:

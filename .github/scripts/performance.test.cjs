@@ -318,6 +318,26 @@ test('a ceiling is recorded once, tightens budgets, and only moves on improvemen
   }
 })
 
+test('shards keep each ceiling with the PR and put main in the first shard', () => {
+  const other = 'd'.repeat(40)
+  const floor = {
+    version: 1,
+    method: perf.METHOD,
+    metrics: {
+      a: { sha: CEILING },
+      b: { sha: other },
+      c: { sha: CEILING },
+      d: { sha: HEAD },
+    },
+  }
+  const plan = perf.shardPlan(floor, 2, HEAD, BASE)
+  assert.deepEqual(plan.map((shard) => shard.index), [0, 1])
+  assert.equal(plan[0].shas[0], BASE)
+  assert.deepEqual([...plan[0].shas, ...plan[1].shas].sort(), [BASE, CEILING, other].sort())
+  assert.ok(plan.some((shard) => shard.shas.includes(CEILING)))
+  assert.ok(!plan.some((shard) => shard.shas.includes(HEAD)))
+})
+
 test('plan packs the ceiling into the artifact and the report uses it', () => {
   const root = path.join(process.cwd(), '.tmp')
   fs.mkdirSync(root, { recursive: true })

@@ -408,10 +408,11 @@ per surface. Use `--build-samples` and `--build-warmup` for the build surfaces,
 runs, which is what makes a second run fast. It uses its own scratch files and
 never reads the Noctalia config.
 
-CI runs the same harness three times on every pull request and publishes a
-`Performance audit` check and comment. The check compares the best round with a
-ceiling re-measured in the same session from the `floors` branch, and with each
-workload's budget. A workload fails when its median or p95 is more than
+CI shards the harness across runners. Each workload and its reference are
+measured together on one runner, three times on a release build, so runner speed
+cancels out. The check compares the best round with a ceiling re-measured in that
+session from the `floors` branch, and with each workload's budget. A workload
+fails when its median or p95 is more than
 10% slower than the reference worst round, or by more than either side's spread
 between rounds, whichever is larger, with a floor of 2 µs so a few microseconds
 of drift on the smallest workloads never fails on its own. A p99 failure also
