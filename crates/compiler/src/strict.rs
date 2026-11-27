@@ -273,6 +273,20 @@ static GROUPS: &[Group] = &[
 /// One API namespace and its members.
 pub type MemberTable = (&'static str, &'static [(&'static str, MemberKind)]);
 
+/// The API 57 constructor name when `name` is a declarative UI node member.
+pub fn node_member(name: &str) -> Option<&'static str> {
+    GROUPS
+        .iter()
+        .find(|group| group.root == "ui")
+        .and_then(|group| {
+            group
+                .members
+                .iter()
+                .find(|(member, kind)| *member == name && *kind == Node)
+                .map(|(member, _)| *member)
+        })
+}
+
 /// Every group, for the parity test.
 pub fn groups() -> impl Iterator<Item = MemberTable> {
     GROUPS.iter().map(|group| (group.root, group.members))

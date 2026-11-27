@@ -1404,6 +1404,9 @@ impl<'a> Emitter<'a> {
         &mut self,
         call: &ExprMethodCall,
     ) -> Result<(String, Ty), Error> {
+        if let Some(value) = self.props_method(call)? {
+            return Ok(value);
+        }
         if call.method == "collect"
             && let Some(value) = self.collect_method(call)?
         {
@@ -2604,15 +2607,18 @@ impl<'a> Emitter<'a> {
             }
             "OnceLock" | "LazyLock" => Ok(Some(("nil".to_owned(), Ty::VALUE))),
             "node" if name.contains("ui::") => {
-                let kind = self.expr(arg(args, 0, call)?)?.0;
-                let props = self.expr(arg(args, 1, call)?)?.0;
+                let kind_expr = arg(args, 0, call)?;
+                let kind = self.expr(kind_expr)?.0;
+                let props = self.expr(arg(args, 1, call)?)?;
                 let children = self.expr(arg(args, 2, call)?)?.0;
-                Ok(Some((
-                    format!(
-                        "{{ kind = {kind}, props = {props}, children = {children} }}"
-                    ),
-                    Ty::NODE,
-                )))
+                let node = self.dynamic_ui_node(
+                    kind_expr,
+                    kind,
+                    props,
+                    children,
+                    call.span(),
+                )?;
+                Ok(Some(node))
             }
             "Some" => self.expr(arg(args, 0, call)?).map(Some),
             "Ok" => self.expr(arg(args, 0, call)?).map(Some),

@@ -425,14 +425,15 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn strict_dynamic_ui_values_become_closures() {
     let handler = r#"
+use noctalia_rs::{Action, CallbackId, Props};
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     if ctx.event == "render" {
         let name = ctx.payload_str("action").unwrap_or_default();
         let id = format!("row-{name}");
-        let tree = ui::row(json!({
-            "onHover": ui::call(&name),
-            "onClick": ui::callback(&id),
-        }), Vec::new());
+        let props = Props::new()
+            .action("onHover", Action::dynamic(&name))
+            .callback("onClick", CallbackId::new(&id));
+        let tree = ui::row(props, Vec::new());
         return Ok(vec![Op::BarRender { tree }]);
     }
     if ctx.event == "action" {

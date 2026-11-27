@@ -14,6 +14,7 @@ mod statements;
 mod strict;
 mod timers;
 mod types;
+mod ui_props;
 
 fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
     Options {
