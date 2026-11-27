@@ -363,7 +363,7 @@ impl<'a> Emitter<'a> {
             self.line("do");
         }
         self.indent = self.indent.saturating_add(1);
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         self.local_statics.push(HashMap::new());
         super::methods::push_param_width_scope();
         let saved_module =
@@ -383,7 +383,8 @@ impl<'a> Emitter<'a> {
                     ty,
                     container,
                 } => {
-                    self.line(&format!("local {name} = {text}"));
+                    let lua = self.bind_name(&name);
+                    self.line(&format!("local {lua} = {text}"));
                     if container != StaticKind::Value {
                         self.containers.insert(name.clone(), container);
                     }
@@ -440,7 +441,7 @@ impl<'a> Emitter<'a> {
         self.tail_target = saved_target;
         self.constant_scopes.pop();
         self.module = saved_module;
-        self.scopes.pop();
+        self.pop_scope();
         self.local_statics.pop();
         self.indent = self.indent.saturating_sub(1);
         if iife {

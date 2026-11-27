@@ -1,0 +1,3 @@
+- In Rust-versus-Luau speed proofs, keep the source plugin algorithm, API call order, fixtures, and output identical. Only gains from generated Luau, bridge, or runtime work count as proof.
+- For compiler changes, fail closed with `file:line:column` when exact Luau semantics are unproven. Test nullness, integer width and signedness, binding identity, evaluation order, strict ABI markers, and generated-script parse. For each semantic fix, the regression test must fail on the pre-fix head.
+- For corpus parity claims, re-record md5, scan, and parse baselines when the compared SHA changes. Never reuse a baseline labelled with a different SHA.

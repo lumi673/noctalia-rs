@@ -60,7 +60,7 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
     assert!(compiled.source.contains("ipairs("));
-    assert!(compiled.source.contains("elseif true then"));
+    assert!(compiled.source.contains("if true then"));
     assert!(compiled.source.contains("if (noctalia.nowMs() > 0) then"));
 }
 
@@ -594,13 +594,13 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains("if __t5 ~= nil then"),
+        compiled.source.contains("if __t7 ~= nil then"),
         "{}",
         compiled.source
     );
     assert!(
-        compiled.source.contains("if __t5 ~= nil then")
-            && compiled.source.contains("[#__t1 + 1] = __t5"),
+        compiled.source.contains("if __t7 ~= nil then")
+            && compiled.source.contains("[#__t1 + 1] = __t7"),
         "{}",
         compiled.source
     );

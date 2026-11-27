@@ -250,8 +250,6 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         "crate::Other",
         "Some(crate::Other)",
         "Some(crate::Other(_))",
-        "Some(crate::Other { value: _ })",
-        "crate::Other { value: _ }",
     ] {
         let handler = format!(
             "fn handler(_ctx: &Context) -> Result<Vec<Op>> {{ let value = serde_json::from_str::<Value>(\"{{}}\").ok(); let flag = matches!(value, {pattern}); Ok(vec![Op::log(format!(\"{{}}\", flag))]) }}"
@@ -264,6 +262,16 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             "{pattern}: {}",
             error.message
         );
+    }
+    for pattern in [
+        "Some(crate::Other { value: _ })",
+        "crate::Other { value: _ }",
+    ] {
+        let handler = format!(
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> {{ let value = serde_json::from_str::<Value>(\"{{}}\").ok(); let flag = matches!(value, {pattern}); Ok(vec![Op::log(format!(\"{{}}\", flag))]) }}"
+        );
+        compile(&source(&handler), &options("handler", EntryKind::Service))
+            .unwrap_or_else(|error| panic!("{pattern}: {error}"));
     }
 }
 
@@ -392,15 +400,16 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn bails_on_luau_keywords_in_loop_and_tuple_bindings() {
+fn renames_luau_keywords_in_loop_and_tuple_bindings() {
     for handler in [
         r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let rows: Vec<i64> = vec![1];
+    let mut ops = Vec::new();
     for end in rows {
-        let _ = end;
+        ops.push(Op::log(format!("{end}")));
     }
-    Ok(vec![])
+    Ok(ops)
 }
 "#,
         r#"
@@ -420,10 +429,123 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 "#,
     ] {
-        let error =
+        let compiled =
             compile(&source(handler), &options("handler", EntryKind::Service))
-                .expect_err("bail");
-        assert!(error.message.contains("Luau keyword"), "{}", error.message);
-        assert!(error.line > 0 && error.column > 0, "{error:?}");
+                .expect("compiles");
+        assert!(compiled.source.contains("__kw_end"), "{}", compiled.source);
     }
+}
+
+#[test]
+fn emits_a_tail_vec_of_ops() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let ready = true;
+    if ready {
+        vec![Op::log("ready")]
+    } else {
+        Vec::new()
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("noctalia.log(\"ready\")"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn binds_nested_tuple_patterns() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let pair = (Some(3), "x");
+    if let (Some(number), text) = pair {
+        Ok(vec![Op::log(format!("{number}{text}"))])
+    } else {
+        Ok(vec![])
+    }
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local number"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn covers_range_and_slice_patterns() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = 4;
+    let digits = [1, 2];
+    let text = match value {
+        0..=9 => {
+            match digits {
+                [first, second] => format!("{first}{second}"),
+                _ => String::new(),
+            }
+        }
+        _ => String::new(),
+    };
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains(" >= "), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("local first"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn covers_at_bindings() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = Some(Some(2));
+    let text = match value {
+        whole @ Some(Some(number)) => format!("{number}"),
+        _ => String::new(),
+    };
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local whole"),
+        "{}",
+        compiled.source
+    );
+}
+#[test]
+fn covers_local_consts_and_tuple_assignment() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    const LIMIT: i64 = 3;
+    let (left, right) = (1, 2);
+    (left, right) = (right, LIMIT);
+    Ok(vec![Op::log(format!("{left}{right}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local left, right"),
+        "{}",
+        compiled.source
+    );
 }

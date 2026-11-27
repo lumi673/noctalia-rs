@@ -91,7 +91,7 @@ impl<'a> Emitter<'a> {
                     {
                         self.expr(expr)?
                     } else if let Some(ty) = self.lookup(&placeholder) {
-                        (placeholder.clone(), ty)
+                        (self.local_name(&placeholder), ty)
                     } else if let Some((text, ty)) = self.constant(&placeholder)
                     {
                         (text, ty)
@@ -164,14 +164,15 @@ impl<'a> Emitter<'a> {
             self.pattern_match(&value, &parsed.pat, None)?;
         self.line(&format!("if {condition} then"));
         self.indent = self.indent.saturating_add(1);
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         for (name, text) in bindings {
             let binding = self.binding_ty(&parsed.pat, &name, ty);
-            self.line(&format!("local {name} = {text}"));
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {text}"));
             self.push(&name, binding);
         }
         let guard = self.expr(&guard);
-        self.scopes.pop();
+        self.pop_scope();
         let (guard, _) = guard?;
         self.line(&format!("{result} = ({guard})"));
         self.indent = self.indent.saturating_sub(1);
