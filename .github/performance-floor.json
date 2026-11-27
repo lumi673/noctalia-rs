@@ -183,16 +183,16 @@
       "updatedAt": "2026-11-24T02:57:10.701Z"
     },
     "state_ops_rust": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "ef12435dfe1c1d7c25262f22d1e8bddd9a551848",
       "method": 1,
-      "medianMs": 0.00038,
-      "worstMedianMs": 0.00039,
-      "p95Ms": 0.000381,
-      "worstP95Ms": 0.000411,
-      "p99Ms": 0.000391,
-      "worstP99Ms": 0.003996,
+      "medianMs": 0.000402,
+      "worstMedianMs": 0.000406,
+      "p95Ms": 0.000429,
+      "worstP95Ms": 0.000437,
+      "p99Ms": 0.000447,
+      "worstP99Ms": 0.000453,
       "budgetMs": 1,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-27T00:42:45.720Z"
     },
     "ui_tree_luau": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -243,16 +243,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "service_update_luau": {
-      "sha": "d87f87704b030c22884ae6d653bddb0e908600ab",
+      "sha": "ef12435dfe1c1d7c25262f22d1e8bddd9a551848",
       "method": 1,
-      "medianMs": 0.0106205,
-      "worstMedianMs": 0.010867000000000002,
-      "p95Ms": 0.013231,
-      "worstP95Ms": 0.014477,
-      "p99Ms": 0.014904,
-      "worstP99Ms": 0.029532,
+      "medianMs": 0.010829,
+      "worstMedianMs": 0.0111645,
+      "p95Ms": 0.013241999999999999,
+      "worstP95Ms": 0.014898,
+      "p99Ms": 0.022844,
+      "worstP99Ms": 0.028947,
       "budgetMs": 10,
-      "updatedAt": "2026-11-25T20:24:08.298Z"
+      "updatedAt": "2026-11-27T00:42:45.720Z"
     },
     "service_update_rust": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -339,16 +339,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "plugin_als_brightness_luau": {
-      "sha": "332add94aeecbc5c2332b44ca1e226b94f92e3b0",
+      "sha": "ef12435dfe1c1d7c25262f22d1e8bddd9a551848",
       "method": 1,
-      "medianMs": 0.237042,
-      "worstMedianMs": 0.23892649999999999,
-      "p95Ms": 0.248593,
-      "worstP95Ms": 0.255327,
-      "p99Ms": 0.277548,
-      "worstP99Ms": 0.28996099999999997,
+      "medianMs": 0.18544400000000003,
+      "worstMedianMs": 0.1860385,
+      "p95Ms": 0.19680099999999998,
+      "worstP95Ms": 0.199922,
+      "p99Ms": 0.20199099999999998,
+      "worstP99Ms": 0.20906,
       "budgetMs": 2,
-      "updatedAt": "2026-11-26T22:35:24.495Z"
+      "updatedAt": "2026-11-27T00:42:45.720Z"
     },
     "plugin_als_brightness_rust": {
       "sha": "57796e4a9a4fc70cd9af758b296f9f4d30f987eb",
@@ -411,16 +411,16 @@
       "updatedAt": "2026-11-26T02:51:37.866Z"
     },
     "generated_hello_bar_handwritten": {
-      "sha": "f47e36d93bdeba658ed7b449590d82e3b863a9b7",
+      "sha": "ef12435dfe1c1d7c25262f22d1e8bddd9a551848",
       "method": 1,
-      "medianMs": 0.0022765,
-      "worstMedianMs": 0.0023185000000000002,
-      "p95Ms": 0.002394,
-      "worstP95Ms": 0.002424,
-      "p99Ms": 0.002435,
-      "worstP99Ms": 0.002492,
+      "medianMs": 0.0022755,
+      "worstMedianMs": 0.002282,
+      "p95Ms": 0.002357,
+      "worstP95Ms": 0.0023970000000000003,
+      "p99Ms": 0.002408,
+      "worstP99Ms": 0.018244999999999997,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-26T23:37:11.260Z"
+      "updatedAt": "2026-11-27T00:42:45.720Z"
     },
     "generated_hello_bar_compiled": {
       "sha": "f47e36d93bdeba658ed7b449590d82e3b863a9b7",
