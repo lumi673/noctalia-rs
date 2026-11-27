@@ -208,10 +208,12 @@ compiles. A function whose signature cannot cross JSON, or a handler body that
 cannot be split, keeps the whole-entry bridge. In `strict`, those constructs
 fail the build with `file:line:column`.
 
-`Op::query` is resolved statically. A literal host root and path become a direct
-API 57 call, and the handler's response path receives the result envelope through
-`noctalia.writeFile`. A dynamic root, a dynamic path, or an unknown member fails
-the build with `file:line:column`.
+In `strict`, `Op::query` is resolved statically. A literal host root and path
+become a direct API 57 call, and the handler's response path receives the result
+envelope through `noctalia.writeFile`. A dynamic root, a dynamic path, or an
+unknown member fails the build with `file:line:column`. `auto` rejects a compiled
+`Op::query`, so that function stays native or the entry keeps its bridge. `off`
+skips the compiler.
 
 At 0.4.0 the 1,067-entry community corpus has 316 strict entries with 316/316
 scripts valid, 1,067 auto entries with 332/332 scripts valid, and 1,067 off
