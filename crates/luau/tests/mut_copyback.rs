@@ -584,3 +584,47 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(!actual.is_empty());
     assert!(actual.iter().all(|message| message == "{n}"), "{actual:?}");
 }
+
+#[test]
+fn string_mutators_inside_control_flow_copy_back() {
+    let source = compiled(
+        r#"
+fn append(s: &mut String, flag: bool) {
+    if flag {
+        s.push('x');
+        s.clear();
+    }
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    append(&mut text, true);
+    Ok(vec![Op::log(text)])
+}
+"#,
+    );
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    assert!(
+        actual.iter().all(|message| message.is_empty()),
+        "{actual:?}"
+    );
+}
+
+#[test]
+fn mutable_tuple_argument_uses_integer_division() {
+    let source = compiled(
+        r#"
+fn half(t: &mut (i64, i64)) -> i64 {
+    t.0 / 2
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut pair = (9, 9);
+    let value = half(&mut pair);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#,
+    );
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    assert!(actual.iter().all(|message| message == "4"), "{actual:?}");
+}

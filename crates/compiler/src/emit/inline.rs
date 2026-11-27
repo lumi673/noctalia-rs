@@ -2,6 +2,8 @@ use super::*;
 
 const MAX_INLINE_DEPTH: usize = 8;
 const WRITE_BACK_MARKER: &str = "\u{1}wb";
+const FRAME_START: &str = "--__s6_frame_start";
+const FRAME_END: &str = "--__s6_frame_end";
 
 type MutPredicate<'a> = &'a dyn Fn(&ExprCall, usize) -> bool;
 type StringParams<'a> = &'a [(String, String, proc_macro2::Span, usize)];
@@ -356,6 +358,7 @@ impl<'a> Emitter<'a> {
         returns: Returns,
         check: BodyCheck,
     ) -> Result<(String, Ty), Error> {
+        let nested_frame = !self.inline_stack.is_empty();
         let nested_with_writebacks = self
             .inline_stack
             .last()
@@ -421,6 +424,9 @@ impl<'a> Emitter<'a> {
                 error
             }
         };
+        if nested_frame {
+            self.line(FRAME_START);
+        }
         let body_start = self.out.len();
         let mut write_backs = Vec::new();
         let mut string_params = Vec::new();
@@ -544,6 +550,20 @@ impl<'a> Emitter<'a> {
                             .insert(lua_name.clone(), shapes.clone());
                         self.tuple_expr_shapes.insert(lua_name.clone(), shapes);
                     }
+                    if let Some(types) = self.tuple_types.get(&text).cloned() {
+                        self.tuple_types.insert(lua_name.clone(), types);
+                    }
+                    let origin = self
+                        .tuple_expr_text
+                        .get(&text)
+                        .cloned()
+                        .unwrap_or_else(|| text.clone());
+                    if let Some(shapes) =
+                        self.tuple_expr_shapes.get(&origin).cloned()
+                    {
+                        self.tuple_expr_shapes.insert(lua_name.clone(), shapes);
+                    }
+                    self.tuple_expr_text.insert(lua_name.clone(), origin);
                     self.push(&local_name, ty);
                 }
             }
@@ -639,6 +659,9 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        if nested_frame {
+            self.line(FRAME_END);
+        }
         self.inline_stack.pop();
         self.value_helper = saved_value_helper;
         self.self_class = saved_class;
@@ -666,6 +689,17 @@ impl<'a> Emitter<'a> {
             } else {
                 self.line(&format!("return {value}"));
             }
+        }
+        if self.inline_stack.is_empty() {
+            let kept: String = self
+                .out
+                .lines()
+                .filter(|line| {
+                    line.trim() != FRAME_START && line.trim() != FRAME_END
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            self.out = kept;
         }
         let foreign = helper.module != self.home;
         result.map_err(|error| {
@@ -850,9 +884,14 @@ fn rename_tokens_inner(
         let is_separator = matches!(
             items.get(index + 1),
             Some(TokenTree::Punct(punct))
-                if punct.spacing() == proc_macro2::Spacing::Alone
-                    && (matches!(punct.as_char(), '=') && labels_allowed
-                        || punct.as_char() == ':')
+                if (punct.as_char() == ':'
+                    && !matches!(
+                        items.get(index + 2),
+                        Some(TokenTree::Punct(next)) if next.as_char() == ':'
+                    ))
+                    || (punct.as_char() == '='
+                        && labels_allowed
+                        && punct.spacing() == proc_macro2::Spacing::Alone)
         );
         let renamed = match token {
             TokenTree::Ident(ident)
@@ -1174,11 +1213,15 @@ fn implicit_macro_capture(
 
     #[allow(clippy::while_let_on_iterator)]
     fn literal_placeholders(literal: &str) -> Vec<String> {
-        let text = literal.trim_matches('"');
+        let raw = literal.trim_start().starts_with('r');
+        let text = literal
+            .trim_start_matches('r')
+            .trim_matches('#')
+            .trim_matches('"');
         let mut out = Vec::new();
         let mut chars = text.chars().peekable();
         while let Some(character) = chars.next() {
-            if character == '\\' {
+            if !raw && character == '\\' {
                 chars.next();
                 continue;
             }
@@ -1659,6 +1702,7 @@ fn copy_back_returns(
 ) -> (String, bool) {
     let mut out = String::with_capacity(body.len());
     let mut blocks: Vec<bool> = Vec::new();
+    let mut nested_depth = 0usize;
     let mut ends_in_return = false;
     for line in body.split_inclusive('\n') {
         let trimmed = line.trim_start_matches(' ');
@@ -1679,10 +1723,14 @@ fn copy_back_returns(
         {
             blocks.push(false);
         }
+        if content.trim() == FRAME_START {
+            nested_depth = nested_depth.saturating_add(1);
+        } else if content.trim() == FRAME_END {
+            nested_depth = nested_depth.saturating_sub(1);
+        }
         let mut line = content.to_owned();
-        let depth = indent.len() / 2;
-        for (name, _, _, binding_indent) in string_params {
-            if depth != *binding_indent {
+        for (name, _, _, _) in string_params {
+            if nested_depth > 0 {
                 continue;
             }
             if let Some(value) = line
@@ -1694,7 +1742,8 @@ fn copy_back_returns(
                 line = format!("{name} = \"\"");
             }
         }
-        let outside_function = !blocks.iter().any(|function| *function);
+        let outside_function =
+            nested_depth == 0 && !blocks.iter().any(|function| *function);
         let early_return = outside_function && scan.contains("then return end");
         ends_in_return = outside_function
             && scan.trim_start().starts_with("return")

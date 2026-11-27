@@ -1602,3 +1602,89 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compiled.source
     );
 }
+
+#[test]
+fn rewrites_string_mutators_inside_control_flow() {
+    let handler = r#"
+fn append(s: &mut String, flag: bool) {
+    if flag {
+        s.push('x');
+        s.clear();
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    append(&mut text, true);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("s = s .. (\"x\")"),
+        "{}",
+        compiled.source
+    );
+    assert!(compiled.source.contains("s = \"\""), "{}", compiled.source);
+}
+
+#[test]
+fn transfers_tuple_types_for_mutable_arguments() {
+    let handler = r#"
+fn half(t: &mut (i64, i64)) -> i64 {
+    t.0 / 2
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut pair = (9, 9);
+    let value = half(&mut pair);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("math.modf"), "{}", compiled.source);
+}
+
+#[test]
+fn rejects_raw_format_strings_with_captures() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!(r"\{n}")
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("implicit format captures"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_json_keys_without_spaces() {
+    let handler = r#"
+fn helper(n: &mut i64) -> Value {
+    *n = 5;
+    json!({n:*n})
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("n = __t2"), "{}", compiled.source);
+}
