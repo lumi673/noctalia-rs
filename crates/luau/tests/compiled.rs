@@ -1176,6 +1176,435 @@ fn duplicated(ops: Vec<Op>) -> Vec<Value> {
 }
 
 #[test]
+fn chars_iterator_keeps_utf8_boundaries() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let multibyte = "éab";
+    let mut chars = multibyte.chars();
+    let first = format!("{}{}", chars.next().unwrap_or(' '), chars.as_str());
+    let rest = multibyte.chars().skip(1).as_str();
+    let taken = multibyte.chars().take(2).collect::<String>();
+    let full = multibyte.chars().collect::<String>();
+    let empty = "".chars().collect::<String>();
+    let ascii = "abc";
+    let ascii_rest = ascii.chars().skip(1).as_str();
+    Ok(vec![
+        Op::BarText { text: format!("{first}|{rest}|{taken}|{full}|{empty}") },
+        Op::BarText { text: format!("{ascii_rest}") },
+    ])
+}
+"#;
+    let source = compiled_source("chars", handler, EntryKind::Widget);
+    let actual = ops(
+        "chars",
+        &source,
+        &context("chars", "update", json!({}), json!({})),
+    );
+    let expected = duplicated(vec![
+        Op::BarText {
+            text: "éab|ab|éa|éab|".to_owned(),
+        },
+        Op::BarText {
+            text: "bc".to_owned(),
+        },
+    ]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn keyword_and_plain_bindings_do_not_share_lua_names() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let end = 1;
+    let __kw_end = 2;
+    let first = format!("{end}|{__kw_end}");
+    let nested = {
+        let __kw_end = 4;
+        let end = 3;
+        format!("{end}|{__kw_end}")
+    };
+    let reversed = {
+        let other_end = 5;
+        let end = 6;
+        format!("{end}|{other_end}")
+    };
+    Ok(vec![
+        Op::BarText { text: first },
+        Op::BarText { text: nested },
+        Op::BarText { text: reversed },
+    ])
+}
+"#;
+    let source = compiled_source("names", handler, EntryKind::Widget);
+    let actual = ops(
+        "names",
+        &source,
+        &context("names", "update", json!({}), json!({})),
+    );
+    let expected = duplicated(vec![
+        Op::BarText {
+            text: "1|2".to_owned(),
+        },
+        Op::BarText {
+            text: "3|4".to_owned(),
+        },
+        Op::BarText {
+            text: "6|5".to_owned(),
+        },
+    ]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn chars_cursor_advances_once_after_next() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut iter = "é中ab".chars();
+    iter.next();
+    let skipped = iter.skip(1).as_str();
+    let mut taken_iter = "é中ab".chars();
+    taken_iter.next();
+    let taken = taken_iter.take(1).collect::<String>();
+    Ok(vec![Op::BarText { text: format!("{skipped}|{taken}") }])
+}
+"#;
+    let source = compiled_source("chars_cursor", handler, EntryKind::Widget);
+    let actual = ops(
+        "chars_cursor",
+        &source,
+        &context("chars_cursor", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "ab|中".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn local_names_shadow_ui_helpers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let callback = |value: &str| value.to_owned();
+    let call = |value: &str| value.to_owned();
+    let node = |value: &str| value.to_owned();
+    let button = |value: &str| value.to_owned();
+    Ok(vec![Op::BarText { text: format!(
+        "{}|{}|{}|{}",
+        callback("callback"), call("call"), node("node"), button("button")
+    ) }])
+}
+"#;
+    let source = compiled_source("locals", handler, EntryKind::Widget);
+    let actual = ops(
+        "locals",
+        &source,
+        &context("locals", "update", json!({}), json!({})),
+    );
+    let expected = duplicated(vec![Op::BarText {
+        text: "\"callback\"|\"call\"|\"node\"|\"button\"".to_owned(),
+    }]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn float_max_and_min_ignore_nan_like_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let larger = f64::max(f64::NAN, 2.0);
+    let smaller = f64::min(f64::NAN, 2.0);
+    let integer = i64::max(3, 4);
+    Ok(vec![Op::BarText { text: format!("{larger}|{smaller}|{integer}") }])
+}
+"#;
+    let source = compiled_source("nan", handler, EntryKind::Widget);
+    let actual = ops(
+        "nan",
+        &source,
+        &context("nan", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "2|2|4".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_z_scoping_and_let_chains() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    const LIMIT: i64 = 1;
+    let end = 1;
+    {
+        const LIMIT: i64 = 9;
+        let _ = LIMIT;
+    }
+    let __kw_end = 2;
+    let mut pair = (1, 2);
+    (pair.0, pair.1) = (pair.1, pair.0);
+    let hit = if let Some(a) = Some(4) && let Some(b) = Some(5) {
+        format!("{a}{b}")
+    } else {
+        "miss".to_owned()
+    };
+    let miss = if let Some(c) = None && let Some(d) = Some(5) {
+        format!("{c}{d}")
+    } else {
+        "miss".to_owned()
+    };
+    let first = pair.0;
+    let second = pair.1;
+    Ok(vec![Op::BarText { text: format!("{LIMIT}|{end}|{__kw_end}|{first}{second}|{hit}|{miss}") }])
+}
+"#;
+    let source = compiled_source("zscope", handler, EntryKind::Widget);
+    let actual = ops(
+        "zscope",
+        &source,
+        &context("zscope", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "1|1|2|21|45|miss".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_z_match_guards_and_slices() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let numbers = [1, 2, 3];
+    let slice = match numbers {
+        [first, .., last] => format!("{first}{last}"),
+        _ => String::new(),
+    };
+    let guarded = match 2 {
+        value if value == 1 => "one".to_owned(),
+        value if value == 2 => "two".to_owned(),
+        _ => "other".to_owned(),
+    };
+    let empty: Option<i64> = None;
+    let none = match empty {
+        Some(value) => format!("{value}"),
+        None => "none".to_owned(),
+    };
+    Ok(vec![Op::BarText { text: format!("{slice}|{guarded}|{none}") }])
+}
+"#;
+    let source = compiled_source("zguard", handler, EntryKind::Widget);
+    let actual = ops(
+        "zguard",
+        &source,
+        &context("zguard", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "13|two|none".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_gg_short_circuit_scopes_and_match_fallbacks() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let n = 7;
+    let mut total = 0;
+    let hit = if let Some(a) = Some(1) && let Some(b) = Some(2) {
+        total = total + 100;
+        format!("{a}{b}")
+    } else {
+        "miss".to_owned()
+    };
+    let miss = if let Some(_) = None && let Some(c) = { total = total + 1; Some(b2()) } {
+        format!("{c}")
+    } else {
+        format!("{n}|{total}")
+    };
+    let later = if let Some(x) = Some(3) && let Some(y) = Some(x + 1) {
+        y
+    } else {
+        0
+    };
+    let iter = "éx".chars();
+    {
+        let iter = "block".to_owned();
+        let _ = iter;
+    }
+    let first = iter.next();
+    let rest = iter.as_str();
+    let empty: Option<(i64,)> = None;
+    let indexed = if let Some((value,)) = empty {
+        format!("{value}")
+    } else {
+        "indexed-else".to_owned()
+    };
+    let outer = 9;
+    let guard = match 2 {
+        value if false => format!("{value}"),
+        _ => format!("{outer}"),
+    };
+    let fallback = match 2 {
+        1 if false => "one".to_owned(),
+        _ => "fallback".to_owned(),
+    };
+    Ok(vec![Op::BarText { text: format!("{hit}|{miss}|{later}|{first}{rest}|{indexed}|{guard}|{fallback}") }])
+}
+
+fn b2() -> i64 {
+    2
+}
+"#;
+    let source = compiled_source("gg", handler, EntryKind::Widget);
+    let actual = ops(
+        "gg",
+        &source,
+        &context("gg", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "12|7|100|4|éx|indexed-else|9|fallback".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_nn_branch_scopes_types_and_guard_setup() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let n = 7;
+    let picked = if true {
+        let n = 9;
+        n
+    } else {
+        0
+    };
+    let ratio = if let Some(x) = Some(5) && let Some(y) = Some(2) {
+        x / y
+    } else {
+        0
+    };
+    let guard_pick = match 2 {
+        n if { let accepted = n == 2; accepted } => 1,
+        _ => 0,
+    };
+    Ok(vec![Op::BarText { text: format!("{picked}|{n}|{ratio}|{guard_pick}") }])
+}
+"#;
+    let source = compiled_source("nn", handler, EntryKind::Widget);
+    let actual = ops(
+        "nn",
+        &source,
+        &context("nn", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "9|7|2|1".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_pp_branch_result_shapes_and_iterators() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let (a, b) = if true {
+        (5, 2)
+    } else {
+        (0, 1)
+    };
+    let ratio = a / b;
+    let chars = (if true {
+        let mut iter = "ab".chars();
+        iter.next();
+        iter
+    } else {
+        "xy".chars()
+    }).collect::<String>();
+    Ok(vec![Op::BarText { text: format!("{ratio}|{chars}") }])
+}
+"#;
+    let source = compiled_source("pp", handler, EntryKind::Widget);
+    let actual = ops(
+        "pp",
+        &source,
+        &context("pp", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "2|b".to_owned()
+        }])
+    );
+}
+
+#[test]
+fn review_qq_void_if_branches_stay_parseable() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = ctx.event == "never";
+    let _picked = if flag {
+        Op::log("a")
+    } else {
+        Op::log("b")
+    };
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let source = compiled_source("qq", handler, EntryKind::Widget);
+    let actual = ops(
+        "qq",
+        &source,
+        &context("qq", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::log("b".to_owned()), Op::log("done".to_owned())])
+    );
+}
+
+#[test]
+fn review_rr_runtime_if_shapes_and_block_iterators() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = ctx.event == "never";
+    let (a, b) = if flag {
+        (5, 2)
+    } else {
+        (7, 3)
+    };
+    let ratio = a / b;
+    let rest = {
+        let mut iter = "ab".chars();
+        iter.next();
+        iter
+    }.collect::<String>();
+    Ok(vec![Op::BarText { text: format!("{ratio}|{rest}") }])
+}
+"#;
+    let source = compiled_source("rr", handler, EntryKind::Widget);
+    let actual = ops(
+        "rr",
+        &source,
+        &context("rr", "update", json!({}), json!({})),
+    );
+    assert_eq!(
+        actual,
+        duplicated(vec![Op::BarText {
+            text: "2|b".to_owned()
+        }])
+    );
+}
+
+#[test]
 fn review_l1_stable_sort_matches_rust() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

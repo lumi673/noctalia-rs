@@ -411,10 +411,12 @@ never reads the Noctalia config.
 CI runs the same harness three times on every pull request and publishes a
 `Performance audit` check and comment. The check compares the best round with a
 ceiling re-measured in the same session from the `floors` branch, and with each
-workload's budget. A workload fails when its median, p95, or p99 is more than
+workload's budget. A workload fails when its median or p95 is more than
 10% slower than the reference worst round, or by more than either side's spread
 between rounds, whichever is larger, with a floor of 2 µs so a few microseconds
-of drift on the smallest workloads never fails on its own. It also fails when
-its median is more than 10% over budget while the reference is within budget.
+of drift on the smallest workloads never fails on its own. A p99 failure also
+needs 100 µs of absolute excess because a single delayed sample can move the
+slowest sample on a busy runner. It also fails when its median is more than
+10% over budget while the reference is within budget.
 Budgets only tighten. Pushes to main record a new ceiling. The benchmark
 scripts live in `.github/scripts`.

@@ -115,6 +115,8 @@ impl<'a> Emitter<'a> {
             uses_count_keys: false,
             emitted: false,
             temp: 0,
+            kw_scopes: vec![HashMap::new()],
+            char_scopes: vec![HashMap::new()],
             native_mode,
             known_native,
             native_found: BTreeMap::new(),
@@ -147,20 +149,20 @@ impl<'a> Emitter<'a> {
         &mut self,
         block: &syn::Block,
     ) -> Result<(), Error> {
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         self.local_statics.push(HashMap::new());
         let result = self.block_inner(block, false);
         self.local_statics.pop();
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 
     pub(crate) fn block(&mut self, block: &syn::Block) -> Result<(), Error> {
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         self.local_statics.push(HashMap::new());
         let result = self.block_inner(block, true);
         self.local_statics.pop();
-        self.scopes.pop();
+        self.pop_scope();
         result
     }
 
@@ -294,6 +296,106 @@ impl<'a> Emitter<'a> {
             .rev()
             .find_map(|scope| scope.get(name).copied())
     }
+    pub(super) fn bind_name(&mut self, name: &str) -> String {
+        let reserved = self
+            .kw_scopes
+            .iter()
+            .flat_map(|scope| scope.values().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut suffix = 1;
+        if !is_luau_keyword(name) {
+            if !reserved.contains(name) {
+                return name.to_owned();
+            }
+            let mut candidate = format!("{name}_{suffix}");
+            while self
+                .scopes
+                .iter()
+                .any(|scope| scope.contains_key(&candidate))
+                || reserved.contains(&candidate)
+            {
+                suffix += 1;
+                candidate = format!("{name}_{suffix}");
+            }
+            self.kw_scopes
+                .last_mut()
+                .expect("a scope always exists")
+                .insert(name.to_owned(), candidate.clone());
+            return candidate;
+        }
+        if let Some(existing) = self
+            .kw_scopes
+            .last()
+            .and_then(|scope| scope.get(name))
+            .cloned()
+        {
+            return existing;
+        }
+        let mut candidate = format!("__kw_{name}");
+        while self
+            .scopes
+            .iter()
+            .any(|scope| scope.contains_key(&candidate))
+            || reserved.contains(&candidate)
+        {
+            candidate = format!("__kw_{name}_{suffix}");
+            suffix += 1;
+        }
+        self.kw_scopes
+            .last_mut()
+            .expect("a scope always exists")
+            .insert(name.to_owned(), candidate.clone());
+        candidate
+    }
+
+    pub(super) fn local_name(&self, name: &str) -> String {
+        if let Some(existing) = self
+            .kw_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+        {
+            return existing.clone();
+        }
+        if is_luau_keyword(name) {
+            format!("__kw_{name}")
+        } else {
+            name.to_owned()
+        }
+    }
+    pub(super) fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+        self.kw_scopes.push(HashMap::new());
+        self.constant_scopes.push(HashMap::new());
+        self.char_scopes.push(HashMap::new());
+    }
+
+    pub(super) fn pop_scope(&mut self) {
+        self.scopes.pop();
+        self.kw_scopes.pop();
+        self.constant_scopes.pop();
+        self.char_scopes.pop();
+    }
+
+    pub(super) fn unmark_chars(&mut self, name: &str) {
+        if let Some(scope) = self.char_scopes.last_mut() {
+            scope.insert(name.to_owned(), false);
+        }
+    }
+
+    pub(super) fn mark_chars(&mut self, name: &str) {
+        if let Some(scope) = self.char_scopes.last_mut() {
+            scope.insert(name.to_owned(), true);
+        }
+    }
+
+    pub(super) fn is_chars(&self, name: &str) -> bool {
+        self.char_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+            .unwrap_or(false)
+    }
 
     pub(super) fn temp(&mut self) -> String {
         self.temp = self.temp.saturating_add(1);
@@ -319,7 +421,7 @@ pub(crate) fn empty_array() -> String {
 
 /// The shape of a tuple value, kept so nested destructuring can carry the
 /// nullness of an inner element through each step.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(crate) enum TupleShape {
     Leaf(Ty),
     Tuple(Vec<TupleShape>),
@@ -461,6 +563,8 @@ pub(crate) struct Emitter<'a> {
     uses_count_keys: bool,
     emitted: bool,
     temp: usize,
+    kw_scopes: Vec<HashMap<String, String>>,
+    char_scopes: Vec<HashMap<String, bool>>,
     native_mode: NativeMode,
     known_native: &'a BTreeMap<String, NativeFn>,
     native_found: BTreeMap<String, NativeFn>,
@@ -481,4 +585,4 @@ pub(crate) struct Emitter<'a> {
     has_host_callback: bool,
 }
 
-pub(crate) const MAX_INLINE_CALLS: usize = 200;
+pub(crate) const MAX_INLINE_CALLS: usize = 300;
