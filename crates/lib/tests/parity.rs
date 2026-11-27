@@ -1228,12 +1228,12 @@ fn official_manifest_fields_are_emittable() -> StdResult<(), Box<dyn Error>> {
 
 #[test]
 fn algorithm_preservation_is_documented() -> StdResult<(), Box<dyn Error>> {
-    let readme = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"),
+    let docs = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/README.md"),
     )?;
     assert!(
-        readme.contains(ALGORITHM_RULE),
-        "README must state the algorithm preservation rule"
+        docs.contains(ALGORITHM_RULE),
+        "docs/README.md must state the algorithm preservation rule"
     );
     Ok(())
 }
