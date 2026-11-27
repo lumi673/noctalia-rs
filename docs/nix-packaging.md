@@ -4,13 +4,13 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
     noctalia-rs.url = "github:lumi673/noctalia-rs";
   };
 
-  outputs = { self, nixpkgs, noctalia-rs }:
-    let system = builtins.currentSystem;
-    in {
-      packages.${system}.default = noctalia-rs.mkPlugin.${system} {
+  outputs = { self, nixpkgs, flake-utils, noctalia-rs }:
+    flake-utils.lib.eachDefaultSystem (system: {
+      packages.default = noctalia-rs.mkPlugin.${system} {
         pname = "my-plugin";
         version = "0.1.0";
         src = ./.;
@@ -18,7 +18,7 @@
         package = "my-plugin";
         helperName = "my-helper";
       };
-    };
+    });
 }
 ```
 

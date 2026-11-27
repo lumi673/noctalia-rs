@@ -34,9 +34,9 @@ with the same message.
 
 ```rust
 use noctalia_rs::{Context, Op, Result, native, luau};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Row {
     title: String,
 }

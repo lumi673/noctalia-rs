@@ -61,6 +61,7 @@ in the crate source. The generated plugin takes its version from `Cargo.toml`.
 Declare non-code files with `assets`. Shared Luau modules go in `luau_sources`.
 Entries without `handler` embed the script named in `entry` automatically. Only
 declared files are copied into the plugin directory.
+Both are root-level keys, so put them before the first `[[...]]` table.
 
 ```toml
 assets = ["icons/clock.svg"]
