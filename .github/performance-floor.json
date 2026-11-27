@@ -15,16 +15,16 @@
       "updatedAt": "2026-11-23T00:53:41.071Z"
     },
     "spool_dispatch": {
-      "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
+      "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
       "method": 1,
-      "medianMs": 0.041691500000000006,
-      "worstMedianMs": 0.042465499999999996,
-      "p95Ms": 0.056708,
-      "worstP95Ms": 0.068773,
-      "p99Ms": 0.081712,
-      "worstP99Ms": 0.10489699999999999,
+      "medianMs": 0.054232,
+      "worstMedianMs": 0.057667,
+      "p95Ms": 0.067552,
+      "worstP95Ms": 0.072119,
+      "p99Ms": 0.106811,
+      "worstP99Ms": 0.142976,
       "budgetMs": 10,
-      "updatedAt": "2026-11-25T19:55:25.262Z"
+      "updatedAt": "2026-11-27T14:03:35.410Z"
     },
     "luau_vm_creation": {
       "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
@@ -243,16 +243,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "service_update_luau": {
-      "sha": "ef12435dfe1c1d7c25262f22d1e8bddd9a551848",
+      "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
       "method": 1,
-      "medianMs": 0.010829,
-      "worstMedianMs": 0.0111645,
-      "p95Ms": 0.013241999999999999,
-      "worstP95Ms": 0.014898,
-      "p99Ms": 0.022844,
-      "worstP99Ms": 0.028947,
+      "medianMs": 0.010787,
+      "worstMedianMs": 0.011158999999999999,
+      "p95Ms": 0.014081,
+      "worstP95Ms": 0.014442,
+      "p99Ms": 0.024672999999999997,
+      "worstP99Ms": 0.02989,
       "budgetMs": 10,
-      "updatedAt": "2026-11-27T00:42:45.720Z"
+      "updatedAt": "2026-11-27T14:03:35.410Z"
     },
     "service_update_rust": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -351,16 +351,16 @@
       "updatedAt": "2026-11-27T00:42:45.720Z"
     },
     "plugin_als_brightness_rust": {
-      "sha": "57796e4a9a4fc70cd9af758b296f9f4d30f987eb",
+      "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
       "method": 1,
-      "medianMs": 0.0283975,
-      "worstMedianMs": 0.029042000000000002,
-      "p95Ms": 0.029556000000000002,
-      "worstP95Ms": 0.030528000000000003,
-      "p99Ms": 0.037313,
-      "worstP99Ms": 0.038894,
+      "medianMs": 0.039028,
+      "worstMedianMs": 0.039514,
+      "p95Ms": 0.040496000000000004,
+      "worstP95Ms": 0.04256,
+      "p99Ms": 0.047920000000000004,
+      "worstP99Ms": 0.048731000000000003,
       "budgetMs": 0.5,
-      "updatedAt": "2026-11-26T02:51:37.866Z"
+      "updatedAt": "2026-11-27T14:03:35.410Z"
     },
     "plugin_mihomo_control_luau": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -459,28 +459,28 @@
       "updatedAt": "2026-11-25T18:05:25.582Z"
     },
     "generated_event_handwritten": {
-      "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
+      "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
       "method": 1,
-      "medianMs": 0.0047065,
-      "worstMedianMs": 0.0048605,
-      "p95Ms": 0.005101,
-      "worstP95Ms": 0.005208999999999999,
-      "p99Ms": 0.005945,
-      "worstP99Ms": 0.009262000000000001,
+      "medianMs": 0.005374,
+      "worstMedianMs": 0.0053879999999999996,
+      "p95Ms": 0.005502999999999999,
+      "worstP95Ms": 0.005914,
+      "p99Ms": 0.006066,
+      "worstP99Ms": 0.008903,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-24T17:00:24.601Z"
+      "updatedAt": "2026-11-27T14:03:35.410Z"
     },
     "generated_event_compiled": {
-      "sha": "1420b22c11d9558e85ef5fa65974ded08b33b423",
+      "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
       "method": 1,
-      "medianMs": 0.00475,
-      "worstMedianMs": 0.004837,
-      "p95Ms": 0.005221,
-      "worstP95Ms": 0.006392,
-      "p99Ms": 0.006051999999999999,
-      "worstP99Ms": 0.017993,
+      "medianMs": 0.004734,
+      "worstMedianMs": 0.004769,
+      "p95Ms": 0.005346,
+      "worstP95Ms": 0.006179,
+      "p99Ms": 0.0061979999999999995,
+      "worstP99Ms": 0.018637,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-27T01:12:01.913Z"
+      "updatedAt": "2026-11-27T14:03:35.410Z"
     },
     "bridge_event": {
       "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
