@@ -350,6 +350,160 @@ impl<'a> Emitter<'a> {
         self.stmt(last)
     }
 
+    fn assigned_via_calls(
+        &self,
+        block: &syn::Block,
+        depth: usize,
+    ) -> std::collections::HashSet<String> {
+        fn arg_ident(expr: &Expr) -> Option<String> {
+            match strip_reference(expr) {
+                Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                    arg_ident(&unary.expr)
+                }
+                Expr::Paren(paren) => arg_ident(&paren.expr),
+                Expr::Group(group) => arg_ident(&group.expr),
+                Expr::Path(path) => {
+                    path.path.get_ident().map(ToString::to_string)
+                }
+                _ => None,
+            }
+        }
+
+        fn walk<'a>(
+            emitter: &'a Emitter<'a>,
+            expr: &Expr,
+            depth: usize,
+            out: &mut std::collections::HashSet<String>,
+        ) {
+            match expr {
+                Expr::Call(call) => {
+                    if depth < MAX_INLINE_DEPTH
+                        && let Some(helper) = emitter.helper(call)
+                    {
+                        let mut assigned =
+                            assigned_params(&helper.function.block);
+                        assigned.extend(emitter.assigned_via_calls(
+                            &helper.function.block,
+                            depth + 1,
+                        ));
+                        for ((pattern, ty), argument) in
+                            typed_args(&helper.function)
+                                .into_iter()
+                                .zip(&call.args)
+                        {
+                            if let syn::Pat::Ident(pattern) = pattern
+                                && matches!(
+                                    ty,
+                                    Type::Reference(reference)
+                                        if reference.mutability.is_some()
+                                )
+                                && assigned.contains(&pattern.ident.to_string())
+                                && let Some(name) = arg_ident(argument)
+                            {
+                                out.insert(name);
+                            }
+                        }
+                    }
+                    walk(emitter, &call.func, depth, out);
+                    for argument in &call.args {
+                        walk(emitter, argument, depth, out);
+                    }
+                }
+                Expr::MethodCall(call) => {
+                    walk(emitter, &call.receiver, depth, out);
+                    for argument in &call.args {
+                        walk(emitter, argument, depth, out);
+                    }
+                }
+                Expr::Block(item) => {
+                    body(emitter, &item.block, depth, out);
+                }
+                Expr::If(item) => {
+                    walk(emitter, &item.cond, depth, out);
+                    body(emitter, &item.then_branch, depth, out);
+                    if let Some((_, branch)) = &item.else_branch {
+                        walk(emitter, branch, depth, out);
+                    }
+                }
+                Expr::Match(item) => {
+                    walk(emitter, &item.expr, depth, out);
+                    for arm in &item.arms {
+                        walk(emitter, &arm.body, depth, out);
+                    }
+                }
+                Expr::ForLoop(item) => body(emitter, &item.body, depth, out),
+                Expr::While(item) => {
+                    walk(emitter, &item.cond, depth, out);
+                    body(emitter, &item.body, depth, out);
+                }
+                Expr::Loop(item) => body(emitter, &item.body, depth, out),
+                Expr::Closure(item) => walk(emitter, &item.body, depth, out),
+                Expr::Assign(item) => {
+                    walk(emitter, &item.left, depth, out);
+                    walk(emitter, &item.right, depth, out);
+                }
+                Expr::Unary(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Binary(item) => {
+                    walk(emitter, &item.left, depth, out);
+                    walk(emitter, &item.right, depth, out);
+                }
+                Expr::Paren(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Group(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Reference(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Try(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Return(item) => {
+                    if let Some(value) = &item.expr {
+                        walk(emitter, value, depth, out);
+                    }
+                }
+                Expr::Field(item) => walk(emitter, &item.base, depth, out),
+                Expr::Index(item) => {
+                    walk(emitter, &item.expr, depth, out);
+                    walk(emitter, &item.index, depth, out);
+                }
+                Expr::Array(item) => {
+                    for element in &item.elems {
+                        walk(emitter, element, depth, out);
+                    }
+                }
+                Expr::Tuple(item) => {
+                    for element in &item.elems {
+                        walk(emitter, element, depth, out);
+                    }
+                }
+                Expr::Struct(item) => {
+                    for field in &item.fields {
+                        walk(emitter, &field.expr, depth, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn body<'a>(
+            emitter: &'a Emitter<'a>,
+            block: &syn::Block,
+            depth: usize,
+            out: &mut std::collections::HashSet<String>,
+        ) {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Expr(expr, _) => walk(emitter, expr, depth, out),
+                    Stmt::Local(local) => {
+                        if let Some(init) = &local.init {
+                            walk(emitter, &init.expr, depth, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut out = std::collections::HashSet::new();
+        body(self, block, depth, &mut out);
+        out
+    }
+
     pub(super) fn inline(
         &mut self,
         helper: &Helper,
@@ -392,7 +546,8 @@ impl<'a> Emitter<'a> {
         let saved_target = self.tail_target.clone();
         self.tail_target = if iife { None } else { temp.clone() };
         let saved_value_helper = self.value_helper;
-        let assigned = assigned_params(&helper.function.block);
+        let mut assigned = assigned_params(&helper.function.block);
+        assigned.extend(self.assigned_via_calls(&helper.function.block, 0));
         let mut_names: std::collections::HashSet<String> = bindings
             .iter()
             .filter_map(|binding| match binding {

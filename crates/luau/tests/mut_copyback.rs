@@ -628,3 +628,24 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(!actual.is_empty());
     assert!(actual.iter().all(|message| message == "4"), "{actual:?}");
 }
+
+#[test]
+fn forwarding_to_a_replacing_helper_is_rejected() {
+    let error = compile_result(
+        r#"
+fn replace(q: &mut Value) {
+    *q = json!(7);
+}
+fn outer(p: &mut Value) {
+    replace(p);
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut value = json!(0);
+    outer(&mut value);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#,
+    )
+    .expect_err("forwarding must fail");
+    assert!(error.contains("nested calls"), "{error}");
+}

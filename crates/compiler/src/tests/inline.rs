@@ -1692,3 +1692,24 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
             .expect("compiles");
     assert!(compiled.source.contains("n = __t2"), "{}", compiled.source);
 }
+
+#[test]
+fn rejects_forwarding_to_a_replacing_helper() {
+    let handler = r#"
+fn replace(q: &mut Value) {
+    *q = json!(7);
+}
+fn outer(p: &mut Value) {
+    replace(p);
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut value = json!(0);
+    outer(&mut value);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("nested calls"), "{}", error.message);
+}
