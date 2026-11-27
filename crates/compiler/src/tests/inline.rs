@@ -1079,20 +1079,39 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn renames_parameters_inside_compound_expressions() {
     let handler = r#"
-fn helper(n: &mut i64) -> i64 {
-    let items = [*n, 2];
-    let pair = (*n, 3);
-    *n = items[0] + pair.1;
-    *n
+fn helper(end: &mut i64) -> i64 {
+    let items = [*end, 2];
+    let pair = (*end, 3);
+    *end = items[0] + pair.1;
+    *end
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
-    let mut n = 0;
-    let value = helper(&mut n);
-    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+    let mut ending = 0;
+    let value = helper(&mut ending);
+    Ok(vec![Op::log(value.to_string()), Op::log(ending.to_string())])
 }
 "#;
     let compiled =
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
-    assert!(compiled.source.contains("noctalia.log"));
+    assert!(
+        compiled.source.contains("local __kw_end = ending"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__kw_end = (items"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("ending = __kw_end"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        !compiled.source.contains("local end ="),
+        "{}",
+        compiled.source
+    );
 }
