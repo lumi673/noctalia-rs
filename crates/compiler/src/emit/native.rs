@@ -184,7 +184,9 @@ impl<'a> Emitter<'a> {
         for binding in bindings {
             match binding {
                 Binding::Context(_) => self.uses_native_context = true,
-                Binding::Local { text, .. } => values.push(text.clone()),
+                Binding::Local { text, .. } | Binding::Mut { text, .. } => {
+                    values.push(text.clone())
+                }
                 Binding::Ops(_) => {
                     return Err(Error::at(
                         span,

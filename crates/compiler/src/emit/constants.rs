@@ -60,7 +60,10 @@ impl<'a> Emitter<'a> {
                 .iter()
                 .map(|item| self.expr(item))
                 .collect::<Result<Vec<_>, Error>>();
-            let emitted = std::mem::replace(&mut self.out, saved_out);
+            let emitted = strip_frame_markers(&std::mem::replace(
+                &mut self.out,
+                saved_out,
+            ));
             self.indent = saved_indent;
             let values = result?;
             let shapes = values
@@ -78,10 +81,11 @@ impl<'a> Emitter<'a> {
                 "{{ {} }}",
                 values
                     .iter()
-                    .map(|(text, _)| text.clone())
+                    .map(|(text, _)| strip_frame_markers(text))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            let text = strip_frame_markers(&text);
             self.tuple_expr_shapes.insert(text.clone(), shapes);
             self.out.push_str(&emitted);
             return Ok(text);
@@ -145,13 +149,15 @@ impl<'a> Emitter<'a> {
         let saved_indent = self.indent;
         self.indent = 0;
         let result = self.expr(expr);
-        let lines = std::mem::replace(&mut self.out, saved_out);
+        let emitted =
+            strip_frame_markers(&std::mem::replace(&mut self.out, saved_out));
         self.indent = saved_indent;
         let (text, _) = result?;
-        if lines.trim().is_empty() {
+        let text = strip_frame_markers(&text);
+        if emitted.trim().is_empty() {
             Ok(text)
         } else {
-            Ok(format!("(function()\n{lines}  return {text}\nend)()"))
+            Ok(format!("(function()\n{emitted}  return {text}\nend)()"))
         }
     }
 
@@ -193,4 +199,10 @@ impl<'a> Emitter<'a> {
         }
         Ok(())
     }
+}
+
+fn strip_frame_markers(text: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| line.trim() != FRAME_START && line.trim() != FRAME_END)
+        .collect()
 }

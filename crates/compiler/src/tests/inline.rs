@@ -276,14 +276,86 @@ fn compiles_closures_in_helpers() {
 }
 
 #[test]
-fn rejects_mut_borrows_that_cannot_be_inlined() {
+fn copies_back_mut_string_borrows() {
     let handler = r#"
 fn helper(word: &mut String) {
     word.push('x');
+    word.push_str("y");
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let mut word = String::new();
     helper(&mut word);
+    Ok(vec![Op::log(word)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains(" .. (\"x\")"));
+    assert!(compiled.source.contains(" .. (\"y\")"));
+    assert!(compiled.source.contains("noctalia.log(word)"));
+}
+
+#[test]
+fn copies_back_mut_value_reassignment() {
+    let handler = r#"
+fn apply(value: &mut serde_json::Value, ok: bool) {
+    if !ok {
+        return;
+    }
+    *value = json!({ "ready": true });
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut value = json!({});
+    apply(&mut value, ctx.event == "render");
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("= { ready = true }"));
+    assert!(compiled.source.contains("do\n"));
+}
+
+#[test]
+fn copies_back_mut_scalars_after_early_returns() {
+    let handler = r#"
+fn mark(flag: &mut bool, count: &mut i64, early: bool) {
+    if early {
+        *flag = true;
+        *count = 1;
+        return;
+    }
+    *flag = false;
+    *count = 0;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut flag = false;
+    let mut count = 0;
+    mark(&mut flag, &mut count, ctx.event == "render");
+    Ok(vec![Op::log(flag.to_string()), Op::log(count.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("= true"));
+    assert!(compiled.source.contains("= 1"));
+    assert!(compiled.source.matches("flag = ").count() > 2);
+    assert!(compiled.source.matches("count = ").count() > 2);
+}
+
+#[test]
+fn rejects_mut_borrows_that_cannot_be_inlined() {
+    let handler = r#"
+fn helper(word: &mut &mut String) {
+    **word = "x".to_owned();
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut word = String::new();
+    let mut reference = &mut word;
+    helper(&mut reference);
     Ok(vec![Op::log(word)])
 }
 "#;
@@ -734,4 +806,910 @@ impl Preset {
     )
     .expect("compiles");
     assert!(compiled.source.contains("me.state"), "{}", compiled.source);
+}
+
+#[test]
+fn copies_back_after_one_line_iife_returns() {
+    let handler = r#"
+fn mark(flag: &mut bool, count: &mut i64, text: &str) {
+    let at = text.find("x");
+    *flag = at.is_some();
+    *count = 1;
+    if !*flag {
+        return;
+    }
+    *flag = false;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut flag = false;
+    let mut count = 0;
+    mark(&mut flag, &mut count, ctx.event.as_str());
+    Ok(vec![Op::log(flag.to_string()), Op::log(count.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.matches("flag = ").count() > 2,
+        "{}",
+        compiled.source
+    );
+    assert!(compiled.source.matches("count = ").count() > 2);
+}
+
+#[test]
+fn rejects_index_operands_that_are_mutated_in_the_same_call() {
+    let handler = r#"
+fn bump(value: &mut i64, index: &mut i64) {
+    *value = 5;
+    *index = 1;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut nums: Vec<i64> = vec![0, 0, 0];
+    let mut index = 0;
+    bump(&mut nums[index], &mut index);
+    Ok(vec![Op::log(nums[0].to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("cannot preserve `&mut` aliasing"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_immutable_index_operands() {
+    let handler = r#"
+fn bump(value: &mut i64, index: i64) {
+    *value = 5;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut nums: Vec<i64> = vec![0, 0, 0];
+    let index = 0;
+    bump(&mut nums[index], index);
+    Ok(vec![Op::log(nums[0].to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("nums[(index) + 1] = value"));
+}
+
+#[test]
+fn rejects_unsupported_string_mutators() {
+    let handler = r#"
+fn replace(text: &mut String) {
+    text.insert(1, 'x');
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    replace(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("String::insert"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_nested_helper_copy_backs_in_their_own_frame() {
+    let handler = r#"
+fn inner(n: &mut i64) -> i64 {
+    *n = 9;
+    *n
+}
+fn outer(n: &mut i64, p: &mut i64) -> i64 {
+    let mut local = *p;
+    *n = inner(&mut local);
+    *n
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = 0;
+    let mut source = 1;
+    let value = outer(&mut total, &mut source);
+    Ok(vec![Op::log(value.to_string()), Op::log(total.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("(function()"));
+    assert_eq!(compiled.source.matches("total = n").count(), 2);
+}
+
+#[test]
+fn rejects_shadowed_mut_parameters() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+}
+
+#[test]
+fn rejects_aliased_mut_string_reborrows() {
+    let handler = r#"
+fn helper(text: &mut String) {
+    let alias = &mut *text;
+    alias.push_str("x");
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("mutable reborrows"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_non_shadowing_mut_parameters() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let extra = 2;
+    *n + extra + 2
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = 0;
+    let value = helper(&mut total);
+    Ok(vec![Op::log(value.to_string()), Op::log(total.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("((n + extra) + 2)"));
+}
+
+#[test]
+fn rejects_shadowed_mut_parameters_with_different_caller_names() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut total = 0;
+    let value = helper(&mut total);
+    Ok(vec![Op::log(value.to_string()), Op::log(total.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+}
+
+#[test]
+fn covers_alias_checks_in_nested_blocks() {
+    let shadow = r#"
+fn helper(n: &mut i64) -> i64 {
+    if *n > 0 {
+        let n = 2;
+        *n = 3;
+    }
+    *n = 1;
+    *n
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let error = compile(&source(shadow), &options("widget", EntryKind::Widget))
+        .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+
+    let reborrow = r#"
+fn helper(text: &mut String) {
+    if true {
+        let alias = &mut *text;
+        alias.push_str("x");
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(reborrow), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("mutable reborrows"),
+        "{}",
+        error.message
+    );
+
+    let mutator = r#"
+fn helper(text: &mut String) {
+    if true {
+        text.remove(0);
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(mutator), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("String::remove"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn renames_parameters_inside_compound_expressions() {
+    let handler = r#"
+fn helper(end: &mut i64) -> i64 {
+    let items = [*end, 2];
+    let pair = (*end, 3);
+    *end = items[0] + pair.1;
+    *end
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ending = 0;
+    let value = helper(&mut ending);
+    Ok(vec![Op::log(value.to_string()), Op::log(ending.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local __kw_end = ending"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__kw_end = (items"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("ending = __kw_end"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        !compiled.source.contains("local end ="),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn rejects_computed_index_destinations() {
+    let handler = r#"
+fn bump(value: &mut i64, keys: &[usize]) {
+    *value = 5;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut nums: Vec<i64> = vec![0, 0, 0];
+    let keys = [0usize];
+    bump(&mut nums[keys[0]], &keys);
+    Ok(vec![Op::log(nums[0].to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("computed index"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn rejects_slice_destinations() {
+    let handler = r#"
+fn fill(text: &mut String) {
+    text.push_str("x");
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = "abc".to_owned();
+    fill(&mut text[..]);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("slice destinations"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn rejects_scalar_mut_reborrows() {
+    let handler = r#"
+fn helper(n: &mut i64) {
+    let alias = &mut *n;
+    *alias = 5;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    helper(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("mutable reborrows"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn rejects_destination_bases_shadowed_in_helpers() {
+    let handler = r#"
+struct State { value: i64 }
+fn helper(value: &mut i64) {
+    let state = State { value: 2 };
+    *value = state.value;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut state = State { value: 0 };
+    helper(&mut state.value);
+    Ok(vec![Op::log(state.value.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+}
+
+#[test]
+fn attaches_foreign_shadow_errors_to_the_helper_module() {
+    let main = r#"
+mod util;
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    util::helper(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let util = r#"
+pub fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+"#;
+    let modules = [Module {
+        path: "util",
+        source: util,
+    }];
+    let error = compile(
+        &source(main),
+        &module_options("widget", EntryKind::Widget, &modules),
+    )
+    .expect_err("bail");
+    assert_eq!(error.file.as_deref(), Some("util"), "{}", error.message);
+}
+
+#[test]
+fn rejects_reborrows_passed_to_nested_helpers() {
+    let handler = r#"
+fn inner(n: &mut i64) {
+    *n = 5;
+}
+fn helper(n: &mut i64) {
+    inner(&mut *n);
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    helper(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("nested calls"), "{}", error.message);
+}
+
+#[test]
+fn copies_back_tuple_assignments() {
+    let handler = r#"
+fn helper(a: &mut Value, b: &mut Value) {
+    (*a, *b) = (json!(1), json!(2));
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut left = json!(0);
+    let mut right = json!(0);
+    helper(&mut left, &mut right);
+    Ok(vec![Op::log(left.to_string()), Op::log(right.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("left = a"), "{}", compiled.source);
+    assert!(compiled.source.contains("right = b"), "{}", compiled.source);
+}
+
+#[test]
+fn ignores_function_text_inside_string_literals() {
+    let handler = r#"
+fn helper(text: &mut String) {
+    let marker = "function()";
+    *text = marker.to_owned();
+    return;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("text = __t"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn does_not_treat_returning_as_a_return_statement() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    let mut returning = 0;
+    returning = 2;
+    *n = returning;
+    *n
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("n = __t"), "{}", compiled.source);
+}
+
+#[test]
+fn forwards_nested_tail_iife_results() {
+    let handler = r#"
+fn inner(n: &mut i64) -> Result<Vec<Op>> {
+    *n = 9;
+    Ok(vec![Op::log(n.to_string())])
+}
+fn outer(n: &mut i64) -> Result<Vec<Op>> {
+    let mut local = *n;
+    *n = 9;
+    inner(&mut local)
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    outer(&mut n)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("= __t")
+            && compiled.source.contains("return __t"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn renames_comparisons_inside_macro_tokens() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!("{value}", value = *n == 5)
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("__t2 == 5"), "{}", compiled.source);
+}
+
+#[test]
+fn rejects_implicit_format_captures_of_mut_parameters() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!("{n}")
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text), Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("implicit format captures"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn renames_range_endpoints_in_loops() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 3;
+    let mut total = 0;
+    for i in 0..*n {
+        total += i;
+    }
+    total
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("__t"), "{}", compiled.source);
+}
+
+#[test]
+fn copies_back_before_elseif_returns() {
+    let handler = r#"
+fn helper(n: &mut i64, early: bool) {
+    *n = 5;
+    if early {
+        return;
+    } else if n > 0 {
+        return;
+    }
+    *n = 0;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    helper(&mut n, ctx.event == "render");
+    if ctx.event != "render" {
+        helper(&mut n, false);
+    }
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    let count = compiled.source.matches("n = ").count();
+    assert!(count > 2, "{}", compiled.source);
+}
+
+#[test]
+fn nested_forward_error_keeps_caller_module() {
+    let main = r#"
+mod util;
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    util::outer(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let util = r#"
+fn inner(n: &mut i64) {
+    *n = 5;
+}
+pub fn outer(n: &mut i64) {
+    inner(n);
+}
+"#;
+    let modules = [Module {
+        path: "util",
+        source: util,
+    }];
+    let error = compile(
+        &source(main),
+        &module_options("widget", EntryKind::Widget, &modules),
+    )
+    .expect_err("bail");
+    assert_eq!(error.file, None, "{}", error.message);
+    assert!(error.message.contains("nested calls"), "{}", error.message);
+}
+
+#[test]
+fn carries_tuple_shapes_through_mutable_bindings() {
+    let handler = r#"
+fn half(t: &mut (i64, i64)) -> i64 {
+    t.0 / 2
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut pair = (6, 9);
+    let value = half(&mut pair);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("noctalia.log"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn renames_macro_block_assignments() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 0;
+    let value = format!("{}", { *n = 5; *n });
+    value.parse().unwrap_or_default()
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("= 5"), "{}", compiled.source);
+}
+
+#[test]
+fn keeps_json_field_keys_when_renaming_values() {
+    let handler = r#"
+fn helper(n: &mut i64) -> Value {
+    *n = 5;
+    json!({ n: *n })
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("{ n = __t2 }"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn allows_two_mutable_string_parameters() {
+    let handler = r#"
+fn append(dst: &mut String, src: &mut String) {
+    dst.push_str(src);
+    src.clear();
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut left = "a".to_owned();
+    let mut right = "b".to_owned();
+    append(&mut left, &mut right);
+    Ok(vec![Op::log(left), Op::log(right)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("noctalia.log"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn allows_escaped_braces_in_format_strings() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!("{{n}}")
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("{n}"), "{}", compiled.source);
+}
+
+#[test]
+fn nested_vec_inserts_are_not_rewritten_as_string_appends() {
+    let handler = r#"
+fn collect(s: &mut Vec<String>, value: &str) {
+    s.push(value.to_owned());
+}
+fn outer(s: &mut String, rows: &mut Vec<String>) {
+    s.push_str("x");
+    collect(rows, s);
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    let mut rows: Vec<String> = Vec::new();
+    outer(&mut text, &mut rows);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("table.insert(s, value)"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn rewrites_string_mutators_inside_control_flow() {
+    let handler = r#"
+fn append(s: &mut String, flag: bool) {
+    if flag {
+        s.push('x');
+        s.clear();
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    append(&mut text, true);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("s = s .. (\"x\")"),
+        "{}",
+        compiled.source
+    );
+    assert!(compiled.source.contains("s = \"\""), "{}", compiled.source);
+}
+
+#[test]
+fn transfers_tuple_types_for_mutable_arguments() {
+    let handler = r#"
+fn half(t: &mut (i64, i64)) -> i64 {
+    t.0 / 2
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut pair = (9, 9);
+    let value = half(&mut pair);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("math.modf"), "{}", compiled.source);
+}
+
+#[test]
+fn rejects_raw_format_strings_with_captures() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!(r"\{n}")
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("implicit format captures"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn keeps_json_keys_without_spaces() {
+    let handler = r#"
+fn helper(n: &mut i64) -> Value {
+    *n = 5;
+    json!({n:*n})
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("n = __t2"), "{}", compiled.source);
+}
+
+#[test]
+fn rejects_forwarding_to_a_replacing_helper() {
+    let handler = r#"
+fn replace(q: &mut Value) {
+    *q = json!(7);
+}
+fn outer(p: &mut Value) {
+    replace(p);
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut value = json!(0);
+    outer(&mut value);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("nested calls"), "{}", error.message);
 }
