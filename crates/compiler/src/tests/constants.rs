@@ -220,12 +220,54 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 #[test]
 fn static_initializers_do_not_carry_frame_markers() {
     let handler = r#"
+fn make(n: &mut i64) -> Value {
+    *n = 5;
+    json!(*n)
+}
 static CONFIG: Value = match true {
-    true => json!({ "a": 1 }),
-    false => json!({}),
+    true => {
+        let mut n = 0;
+        make(&mut n)
+    }
+    false => json!(0),
 };
 fn helper(v: &mut Value) -> Value {
     *v = CONFIG;
+    v.clone()
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut value = json!({});
+    let out = helper(&mut value);
+    Ok(vec![Op::log(out.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        !compiled.source.contains("__s6_frame"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn tuple_static_initializers_do_not_carry_frame_markers() {
+    let handler = r#"
+fn make(n: &mut i64) -> Value {
+    *n = 5;
+    json!(*n)
+}
+static INNER: Value = match true {
+    true => {
+        let mut n = 0;
+        make(&mut n)
+    }
+    false => json!(0),
+};
+static PAIR: (Value, Value) = (INNER, json!(1));
+fn helper(v: &mut Value) -> Value {
+    *v = INNER;
     v.clone()
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {

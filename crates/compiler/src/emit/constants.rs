@@ -60,7 +60,10 @@ impl<'a> Emitter<'a> {
                 .iter()
                 .map(|item| self.expr(item))
                 .collect::<Result<Vec<_>, Error>>();
-            let emitted = std::mem::replace(&mut self.out, saved_out);
+            let emitted = strip_frame_markers(&std::mem::replace(
+                &mut self.out,
+                saved_out,
+            ));
             self.indent = saved_indent;
             let values = result?;
             let shapes = values
@@ -78,10 +81,11 @@ impl<'a> Emitter<'a> {
                 "{{ {} }}",
                 values
                     .iter()
-                    .map(|(text, _)| text.clone())
+                    .map(|(text, _)| strip_frame_markers(text))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            let text = strip_frame_markers(&text);
             self.tuple_expr_shapes.insert(text.clone(), shapes);
             self.out.push_str(&emitted);
             return Ok(text);
