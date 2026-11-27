@@ -2,6 +2,8 @@ use super::*;
 
 const MAX_INLINE_DEPTH: usize = 8;
 const WRITE_BACK_MARKER: &str = "\u{1}wb";
+
+type MutPredicate<'a> = &'a dyn Fn(&ExprCall, usize) -> bool;
 impl<'a> Emitter<'a> {
     pub(super) fn helper(&self, call: &ExprCall) -> Option<Helper> {
         let Expr::Path(path) = &*call.func else {
@@ -479,28 +481,47 @@ impl<'a> Emitter<'a> {
                     }
                     if scalar || assigned.contains(&name) {
                         let target = target.ok_or_else(|| {
-                            attach(Error::at(
+                            Error::at(
                                 span,
                                 format!(
                                     "cannot preserve `&mut` aliasing for the `{}` argument of `{}`",
                                     name, helper.name
                                 ),
-                            ))
+                            )
                         })?;
                         if operands.iter().any(|operand| {
                             operand != &name
                                 && (assigned.contains(operand)
                                     || mut_names.contains(operand))
                         }) {
-                            return Err(attach(Error::at(
+                            return Err(Error::at(
                                 span,
                                 format!(
                                     "cannot preserve `&mut` aliasing for the `{}` argument of `{}`",
                                     name, helper.name
                                 ),
-                            )));
+                            ));
                         }
-                        if passes_mut_to_call(&helper.function.block, &name) {
+                        let forwarded = call_args_mut(
+                            &helper.function.block,
+                            &name,
+                            &|call, index| {
+                                self.helper(call)
+                                    .and_then(|target| {
+                                        typed_args(&target.function)
+                                            .get(index)
+                                            .map(|(_, ty)| (*ty).clone())
+                                    })
+                                    .is_some_and(|ty| {
+                                        matches!(
+                                            ty,
+                                            Type::Reference(reference)
+                                                if reference.mutability.is_some()
+                                        )
+                                    })
+                            },
+                        );
+                        if forwarded {
                             return Err(attach(Error::at(
                                 span,
                                 format!(
@@ -754,12 +775,12 @@ fn unsupported_lvalue(expr: &Expr) -> Option<&'static str> {
                     Expr::Range(_) => {
                         return Some("slice destinations are not assignable");
                     }
-                    Expr::Index(_) | Expr::Call(_) | Expr::MethodCall(_) => {
+                    Expr::Path(_) => {}
+                    _ => {
                         return Some(
                             "computed index operands cannot be snapshotted",
                         );
                     }
-                    _ => {}
                 }
                 walk(&index.expr)
             }
@@ -793,34 +814,39 @@ fn rename_tokens(
 ) -> proc_macro2::TokenStream {
     use proc_macro2::TokenTree;
     let mut after_separator = false;
-    tokens
-        .into_iter()
-        .map(|token| {
-            let renamed = match token {
-                TokenTree::Ident(ident)
-                    if ident == from && !after_separator =>
-                {
-                    TokenTree::Ident(proc_macro2::Ident::new(to, ident.span()))
-                }
-                TokenTree::Ident(ident) => TokenTree::Ident(ident),
-                TokenTree::Group(group) => {
-                    let mut renamed = proc_macro2::Group::new(
-                        group.delimiter(),
-                        rename_tokens(group.stream(), from, to),
-                    );
-                    renamed.set_span(group.span());
-                    TokenTree::Group(renamed)
-                }
-                other => other,
-            };
-            after_separator = matches!(
-                &renamed,
-                TokenTree::Punct(punct)
-                    if punct.as_char() == '.' || punct.as_char() == ':'
-            );
-            renamed
-        })
-        .collect()
+    let mut iter = tokens.into_iter().peekable();
+    let mut out = proc_macro2::TokenStream::new();
+    while let Some(token) = iter.next() {
+        let before_label = matches!(
+            iter.peek(),
+            Some(TokenTree::Punct(punct))
+                if punct.as_char() == ':' || punct.as_char() == '='
+        );
+        let renamed = match token {
+            TokenTree::Ident(ident)
+                if ident == from && !after_separator && !before_label =>
+            {
+                TokenTree::Ident(proc_macro2::Ident::new(to, ident.span()))
+            }
+            TokenTree::Ident(ident) => TokenTree::Ident(ident),
+            TokenTree::Group(group) => {
+                let mut renamed = proc_macro2::Group::new(
+                    group.delimiter(),
+                    rename_tokens(group.stream(), from, to),
+                );
+                renamed.set_span(group.span());
+                TokenTree::Group(renamed)
+            }
+            other => other,
+        };
+        after_separator = matches!(
+            &renamed,
+            TokenTree::Punct(punct)
+                if punct.as_char() == '.' || punct.as_char() == ':'
+        );
+        out.extend(std::iter::once(renamed));
+    }
+    out
 }
 
 fn rename_paths(block: &mut syn::Block, from: &str, to: &str) {
@@ -902,6 +928,7 @@ fn rename_paths(block: &mut syn::Block, from: &str, to: &str) {
                     visit(&mut field.expr, from, to);
                 }
             }
+            Expr::Cast(item) => visit(&mut item.expr, from, to),
             Expr::Macro(item) => {
                 item.mac.tokens = rename_tokens(
                     std::mem::take(&mut item.mac.tokens),
@@ -1096,98 +1123,106 @@ fn mut_reborrow(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
     statements(block, name)
 }
 
-fn passes_mut_to_call(block: &syn::Block, name: &str) -> bool {
+fn call_args_mut(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
     fn argument(expr: &Expr, name: &str) -> bool {
-        let Expr::Reference(reference) = expr else {
-            return false;
-        };
-        if reference.mutability.is_none() {
-            return false;
-        }
-        match strip_reference(&reference.expr) {
+        match strip_reference(expr) {
             Expr::Path(path) => {
                 path.path.get_ident().is_some_and(|id| id == name)
             }
             Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
-                let Expr::Path(path) = strip_reference(&unary.expr) else {
-                    return false;
-                };
-                path.path.get_ident().is_some_and(|id| id == name)
+                argument(&unary.expr, name)
             }
+            Expr::Paren(paren) => argument(&paren.expr, name),
+            Expr::Group(group) => argument(&group.expr, name),
             _ => false,
         }
     }
 
-    fn walk(expr: &Expr, name: &str) -> bool {
+    fn walk(expr: &Expr, name: &str, is_mut: MutPredicate) -> bool {
         match expr {
             Expr::Call(item) => {
-                item.args.iter().any(|arg| argument(arg, name))
-                    || walk(&item.func, name)
-                    || item.args.iter().any(|arg| walk(arg, name))
+                item.args.iter().enumerate().any(|(index, arg)| {
+                    is_mut(item, index) && argument(arg, name)
+                }) || walk(&item.func, name, is_mut)
+                    || item.args.iter().any(|arg| walk(arg, name, is_mut))
             }
             Expr::MethodCall(item) => {
-                item.args.iter().any(|arg| argument(arg, name))
-                    || walk(&item.receiver, name)
-                    || item.args.iter().any(|arg| walk(arg, name))
+                item.args.iter().enumerate().any(|(index, arg)| {
+                    is_mut_param(index) && argument(arg, name)
+                }) || walk(&item.receiver, name, is_mut)
+                    || item.args.iter().any(|arg| walk(arg, name, is_mut))
             }
-            Expr::Block(item) => body(&item.block, name),
+            Expr::Block(item) => body(&item.block, name, is_mut),
             Expr::If(item) => {
-                walk(&item.cond, name)
-                    || body(&item.then_branch, name)
+                walk(&item.cond, name, is_mut)
+                    || body(&item.then_branch, name, is_mut)
                     || item
                         .else_branch
                         .as_ref()
-                        .is_some_and(|(_, branch)| walk(branch, name))
+                        .is_some_and(|(_, branch)| walk(branch, name, is_mut))
             }
             Expr::Match(item) => {
-                walk(&item.expr, name)
-                    || item.arms.iter().any(|arm| walk(&arm.body, name))
+                walk(&item.expr, name, is_mut)
+                    || item.arms.iter().any(|arm| walk(&arm.body, name, is_mut))
             }
-            Expr::ForLoop(item) => body(&item.body, name),
+            Expr::ForLoop(item) => body(&item.body, name, is_mut),
             Expr::While(item) => {
-                walk(&item.cond, name) || body(&item.body, name)
+                walk(&item.cond, name, is_mut) || body(&item.body, name, is_mut)
             }
-            Expr::Loop(item) => body(&item.body, name),
-            Expr::Closure(item) => walk(&item.body, name),
+            Expr::Loop(item) => body(&item.body, name, is_mut),
+            Expr::Closure(item) => walk(&item.body, name, is_mut),
             Expr::Assign(item) => {
-                walk(&item.left, name) || walk(&item.right, name)
+                walk(&item.left, name, is_mut)
+                    || walk(&item.right, name, is_mut)
             }
-            Expr::Unary(item) => walk(&item.expr, name),
+            Expr::Unary(item) => walk(&item.expr, name, is_mut),
             Expr::Binary(item) => {
-                walk(&item.left, name) || walk(&item.right, name)
+                walk(&item.left, name, is_mut)
+                    || walk(&item.right, name, is_mut)
             }
-            Expr::Paren(item) => walk(&item.expr, name),
-            Expr::Group(item) => walk(&item.expr, name),
-            Expr::Reference(item) => walk(&item.expr, name),
-            Expr::Try(item) => walk(&item.expr, name),
-            Expr::Return(item) => {
-                item.expr.as_ref().is_some_and(|value| walk(value, name))
-            }
-            Expr::Field(item) => walk(&item.base, name),
+            Expr::Paren(item) => walk(&item.expr, name, is_mut),
+            Expr::Group(item) => walk(&item.expr, name, is_mut),
+            Expr::Reference(item) => walk(&item.expr, name, is_mut),
+            Expr::Try(item) => walk(&item.expr, name, is_mut),
+            Expr::Return(item) => item
+                .expr
+                .as_ref()
+                .is_some_and(|value| walk(value, name, is_mut)),
+            Expr::Field(item) => walk(&item.base, name, is_mut),
             Expr::Index(item) => {
-                walk(&item.expr, name) || walk(&item.index, name)
+                walk(&item.expr, name, is_mut)
+                    || walk(&item.index, name, is_mut)
             }
-            Expr::Array(item) => item.elems.iter().any(|item| walk(item, name)),
-            Expr::Tuple(item) => item.elems.iter().any(|item| walk(item, name)),
-            Expr::Struct(item) => {
-                item.fields.iter().any(|field| walk(&field.expr, name))
+            Expr::Array(item) => {
+                item.elems.iter().any(|item| walk(item, name, is_mut))
             }
+            Expr::Tuple(item) => {
+                item.elems.iter().any(|item| walk(item, name, is_mut))
+            }
+            Expr::Struct(item) => item
+                .fields
+                .iter()
+                .any(|field| walk(&field.expr, name, is_mut)),
             _ => false,
         }
     }
 
-    fn body(block: &syn::Block, name: &str) -> bool {
+    fn is_mut_param(index: usize) -> bool {
+        index == 0
+    }
+
+    fn body(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
         block.stmts.iter().any(|stmt| match stmt {
-            Stmt::Expr(expr, _) => walk(expr, name),
+            Stmt::Expr(expr, _) => walk(expr, name, is_mut),
             Stmt::Local(local) => local
                 .init
                 .as_ref()
-                .is_some_and(|init| walk(&init.expr, name)),
+                .is_some_and(|init| walk(&init.expr, name, is_mut)),
             _ => false,
         })
     }
 
-    body(block, name)
+    body(block, name, is_mut)
 }
 
 fn unsupported_string_mutator(
@@ -1204,8 +1239,15 @@ fn unsupported_string_mutator(
                     && path.path.get_ident().is_some_and(|id| id == name)
                 {
                     let method = call.method.to_string();
-                    if !matches!(method.as_str(), "push" | "push_str" | "clear")
-                    {
+                    if matches!(
+                        method.as_str(),
+                        "insert"
+                            | "insert_str"
+                            | "remove"
+                            | "truncate"
+                            | "drain"
+                            | "replace_range"
+                    ) {
                         *out = Some(method);
                         return;
                     }
@@ -1373,6 +1415,18 @@ fn assigned_params(block: &syn::Block) -> std::collections::HashSet<String> {
                     out.insert(name.to_string());
                 }
             }
+            Expr::Tuple(tuple) => {
+                for element in &tuple.elems {
+                    target(element, out);
+                }
+            }
+            Expr::Paren(paren) => target(&paren.expr, out),
+            Expr::Group(group) => target(&group.expr, out),
+            Expr::Array(array) => {
+                for element in &array.elems {
+                    target(element, out);
+                }
+            }
             _ => {}
         }
     }
@@ -1457,7 +1511,9 @@ fn copy_back_returns(
                 line = format!("{name} = \"\"");
             }
         }
-        ends_in_return = !blocks.iter().any(|function| *function)
+        let outside_function = !blocks.iter().any(|function| *function);
+        let early_return = outside_function && scan.contains("then return end");
+        ends_in_return = outside_function
             && scan.trim_start().starts_with("return")
             && !scan
                 .trim_start()
@@ -1467,7 +1523,7 @@ fn copy_back_returns(
                         c.is_ascii_alphanumeric() || c == '_'
                     })
                 });
-        if ends_in_return {
+        if ends_in_return || early_return {
             for (target, name) in write_backs {
                 out.push_str(indent);
                 out.push_str(target);

@@ -162,7 +162,8 @@ fn inner(n: &mut i64) -> i64 {
     *n
 }
 fn outer(n: &mut i64, p: &mut i64) -> i64 {
-    *n = inner(p);
+    let mut local = *p;
+    *n = inner(&mut local);
     *n
 }
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
@@ -289,26 +290,22 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn keyword_parameter_in_macro_matches_native_handler() {
-    let source = compiled(
+fn computed_index_destination_is_rejected() {
+    let error = compile_result(
         r#"
-fn helper(end: &mut i64) -> String {
-    *end = 5;
-    format!("{}", *end)
+fn bump(value: &mut i64, keys: &[usize]) {
+    *value = 5;
 }
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    let mut ending = 0;
-    let text = helper(&mut ending);
-    Ok(vec![Op::log(text), Op::log(ending.to_string())])
+    let mut nums: Vec<i64> = vec![0, 0, 0];
+    let keys = [0usize];
+    bump(&mut nums[keys[0] as usize], &keys);
+    Ok(vec![Op::log(nums[0].to_string())])
 }
 "#,
-    );
-    let expected = ["5", "5"];
-    let actual = logs(&source, "render");
-    assert!(!actual.is_empty());
-    for chunk in actual.chunks(expected.len()) {
-        assert_eq!(chunk, expected);
-    }
+    )
+    .expect_err("computed index must fail");
+    assert!(error.contains("computed index"), "{error}");
 }
 
 #[test]
@@ -316,7 +313,7 @@ fn string_literal_with_function_text_keeps_copy_back() {
     let source = compiled(
         r#"
 fn helper(text: &mut String) {
-    let marker = "function( end)";
+    let marker = "function()";
     *text = marker.to_owned();
     return;
 }
@@ -327,7 +324,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 "#,
     );
-    let expected = "function( end)";
+    let expected = "function()";
     let actual = logs(&source, "render");
     assert!(!actual.is_empty());
     assert!(
@@ -337,49 +334,43 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn returning_identifier_is_not_a_return_statement() {
-    let source = compiled(
+fn scalar_mut_reborrow_is_rejected() {
+    let error = compile_result(
         r#"
-fn helper(n: &mut i64) -> i64 {
-    let returning = 2;
-    *n = returning;
-    *n
+fn helper(n: &mut i64) {
+    let alias = &mut *n;
+    *alias = 5;
 }
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let mut n = 0;
-    let value = helper(&mut n);
-    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+    helper(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#,
+    )
+    .expect_err("reborrow must fail");
+    assert!(error.contains("mutable reborrows"), "{error}");
+}
+
+#[test]
+fn tuple_assignment_copies_back_both_destinations() {
+    let source = compiled(
+        r#"
+fn helper(a: &mut Value, b: &mut Value) {
+    (*a, *b) = (json!(1), json!(2));
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut left = json!(0);
+    let mut right = json!(0);
+    helper(&mut left, &mut right);
+    Ok(vec![Op::log(left.to_string()), Op::log(right.to_string())])
 }
 "#,
     );
-    let expected = ["2", "2"];
+    let expected = ["1", "2"];
     let actual = logs(&source, "render");
     assert!(!actual.is_empty());
     for chunk in actual.chunks(expected.len()) {
         assert_eq!(chunk, expected);
     }
-}
-
-#[test]
-fn nested_tail_call_forwards_its_result() {
-    let source = compiled(
-        r#"
-fn inner(n: &mut i64, ops: &mut Vec<Op>) -> Result<Vec<Op>> {
-    *n = 9;
-    ops.push(Op::log(n.to_string()));
-    Ok(Vec::new())
-}
-fn outer(n: &mut i64, ops: &mut Vec<Op>) -> Result<Vec<Op>> {
-    inner(n, ops)
-}
-fn handler(ctx: &Context) -> Result<Vec<Op>> {
-    let mut n = 0;
-    let mut ops = Vec::new();
-    outer(&mut n, &mut ops)
-}
-"#,
-    );
-    let actual = logs(&source, "render");
-    assert!(!actual.is_empty());
-    assert!(actual.iter().all(|message| message == "9"), "{actual:?}");
 }

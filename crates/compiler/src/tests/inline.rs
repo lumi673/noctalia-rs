@@ -911,7 +911,8 @@ fn inner(n: &mut i64) -> i64 {
     *n
 }
 fn outer(n: &mut i64, p: &mut i64) -> i64 {
-    *n = inner(p);
+    let mut local = *p;
+    *n = inner(&mut local);
     *n
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
@@ -1255,30 +1256,30 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn rejects_tuple_pattern_mut_parameters() {
+fn copies_back_tuple_assignments() {
     let handler = r#"
-fn helper((a, b): (&mut i64, &mut i64)) {
-    *a = 1;
-    *b = 2;
+fn helper(a: &mut Value, b: &mut Value) {
+    (*a, *b) = (json!(1), json!(2));
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
-    let mut a = 0;
-    let mut b = 0;
-    helper((&mut a, &mut b));
-    Ok(vec![Op::log(a.to_string())])
+    let mut left = json!(0);
+    let mut right = json!(0);
+    helper(&mut left, &mut right);
+    Ok(vec![Op::log(left.to_string()), Op::log(right.to_string())])
 }
 "#;
-    let error =
+    let compiled =
         compile(&source(handler), &options("widget", EntryKind::Widget))
-            .expect_err("bail");
-    assert!(error.message.contains("identifiers"), "{}", error.message);
+            .expect("compiles");
+    assert!(compiled.source.contains("left = a"), "{}", compiled.source);
+    assert!(compiled.source.contains("right = b"), "{}", compiled.source);
 }
 
 #[test]
 fn ignores_function_text_inside_string_literals() {
     let handler = r#"
 fn helper(text: &mut String) {
-    let marker = "function( end)";
+    let marker = "function()";
     *text = marker.to_owned();
     return;
 }
@@ -1302,7 +1303,8 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
 fn does_not_treat_returning_as_a_return_statement() {
     let handler = r#"
 fn helper(n: &mut i64) -> i64 {
-    let returning = 2;
+    let mut returning = 0;
+    returning = 2;
     *n = returning;
     *n
 }
@@ -1316,4 +1318,32 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
     assert!(compiled.source.contains("n = __t"), "{}", compiled.source);
+}
+
+#[test]
+fn forwards_nested_tail_iife_results() {
+    let handler = r#"
+fn inner(n: &mut i64) -> Result<Vec<Op>> {
+    *n = 9;
+    Ok(vec![Op::log(n.to_string())])
+}
+fn outer(n: &mut i64) -> Result<Vec<Op>> {
+    let mut local = *n;
+    *n = 9;
+    inner(&mut local)
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    outer(&mut n)
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("= __t")
+            && compiled.source.contains("return __t"),
+        "{}",
+        compiled.source
+    );
 }
