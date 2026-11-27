@@ -528,11 +528,15 @@ bridge for them.
 | S6 mutable helpers | `b09a559` | 313 / 1,067 | 29.33% | 328 / 328 | 1,067 / 1,067 |
 | S9 exact integers | `c9ad4a5` | 316 / 1,067 | 29.62% | 332 / 332 | 1,067 / 1,067 |
 
-Auto and off reach 1,067 / 1,067 at every stage. A strict failure stays on the
-auto bridge and never changes what a handler computes. Every strict script is
-parsed in the Luau VM. The final 316 and 332 counts come from S9's scan at
-`c9ad4a5`. Earlier counts come from the stage scans recorded in git history and
-T1's baselines, re-recorded whenever the compared SHA moved.
+Auto and off reach 1,067 / 1,067 at every stage. These are separate mode
+outcomes. In `strict`, an entry that cannot be translated stops the build; it
+never silently switches to auto. In `auto`, a function whose signature can cross
+JSON can run as a native call in the helper while the rest of the handler stays
+in Luau. A handler that cannot be split keeps the whole-entry bridge through
+`bridge.luau`. `off` bridges every entry. Every strict script is parsed in the
+Luau VM. The final 316 and 332 counts come from S9's scan at `c9ad4a5`. Earlier
+counts come from the stage scans recorded in git history and T1's baselines,
+re-recorded whenever the compared SHA moved.
 
 ### Bridge performance, S7 before and after
 

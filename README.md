@@ -201,9 +201,11 @@ call without blocking. In `strict` the real boolean result can be used in any
 expression position.
 
 Arbitrary trait iterators, dynamic dispatch, trait methods without a Luau
-equivalent, and ops that need a response path are never approximated. In `auto`
-they move the whole function to the plugin binary and the rest of the handler
-still compiles; in `strict` they fail the build with `file:line:column`.
+equivalent, and ops that need a response path are never approximated. In `auto`,
+a function whose signature can cross JSON runs as a native call in the helper and
+the rest of the handler still compiles. A function whose signature cannot cross
+JSON, or a handler body that cannot be split, keeps the whole-entry bridge. In
+`strict`, all of them fail the build with `file:line:column`.
 
 At 0.4.0 the 1,067-entry community corpus has 316 strict entries with 316/316
 scripts valid, 1,067 auto entries with 332/332 scripts valid, and 1,067 off
