@@ -190,6 +190,14 @@ impl<'a> Emitter<'a> {
                     "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
                 ));
             }
+            if let Some(reason) = unsupported_lvalue(argument) {
+                return Err(Error::at(
+                    argument.span(),
+                    format!(
+                        "cannot preserve `&mut` aliasing for this argument: {reason}"
+                    ),
+                ));
+            }
             let (text, value) = self.expr(argument)?;
             let target = mutable_lvalue(argument).then(|| text.clone());
             let operands = lvalue_operands(argument);
@@ -351,7 +359,8 @@ impl<'a> Emitter<'a> {
             .is_some_and(|key| key.ends_with(WRITE_BACK_MARKER));
         let iife = check.needs_iife || nested_with_writebacks;
         let saved_class = self.self_class.clone();
-        let temp = (mode == Inline::Value).then(|| self.temp());
+        let temp = (mode == Inline::Value || (mode == Inline::Tail && iife))
+            .then(|| self.temp());
         if let Some(name) = &temp {
             if iife {
                 self.line(&format!("local {name}"));
@@ -392,6 +401,23 @@ impl<'a> Emitter<'a> {
                 _ => None,
             })
             .collect();
+        let dest_names: std::collections::HashSet<String> = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                Binding::Mut { operands, .. } => Some(operands.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let foreign = helper.module != self.home;
+        let module = helper.module.clone();
+        let attach = |error: Error| {
+            if foreign {
+                error.with_file(&module)
+            } else {
+                error
+            }
+        };
         let body_start = self.out.len();
         let mut write_backs = Vec::new();
         let mut string_params = Vec::new();
@@ -453,26 +479,35 @@ impl<'a> Emitter<'a> {
                     }
                     if scalar || assigned.contains(&name) {
                         let target = target.ok_or_else(|| {
-                            Error::at(
+                            attach(Error::at(
                                 span,
                                 format!(
                                     "cannot preserve `&mut` aliasing for the `{}` argument of `{}`",
                                     name, helper.name
                                 ),
-                            )
+                            ))
                         })?;
                         if operands.iter().any(|operand| {
                             operand != &name
                                 && (assigned.contains(operand)
                                     || mut_names.contains(operand))
                         }) {
-                            return Err(Error::at(
+                            return Err(attach(Error::at(
                                 span,
                                 format!(
                                     "cannot preserve `&mut` aliasing for the `{}` argument of `{}`",
                                     name, helper.name
                                 ),
-                            ));
+                            )));
+                        }
+                        if passes_mut_to_call(&helper.function.block, &name) {
+                            return Err(attach(Error::at(
+                                span,
+                                format!(
+                                    "cannot preserve `&mut` aliasing for the `{}` argument of `{}`: nested calls may mutate it",
+                                    name, helper.name
+                                ),
+                            )));
                         }
                         write_backs.push((target, lua_name.clone()));
                     }
@@ -480,39 +515,42 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        for (_, original, span) in &string_params {
-            if let Some(reborrow) =
-                mut_reborrow(&helper.function.block, original)
-            {
-                return Err(Error::at(
+        for (name, _) in &mut_spans {
+            if let Some(reborrow) = mut_reborrow(&helper.function.block, name) {
+                return Err(attach(Error::at(
                     reborrow,
                     format!(
-                        "cannot preserve `&mut` aliasing for the `{original}` argument of `{}`: mutable reborrows of a String cannot be inlined",
+                        "cannot preserve `&mut` aliasing for the `{name}` argument of `{}`: mutable reborrows cannot be inlined",
                         helper.name
                     ),
-                ));
+                )));
             }
+        }
+        for (_, original, span) in &string_params {
             if let Some(method) =
                 unsupported_string_mutator(&helper.function.block, original)
             {
-                return Err(Error::at(
+                return Err(attach(Error::at(
                     *span,
                     format!(
                         "cannot preserve `&mut` aliasing for the `{original}` argument of `{}`: String::{method} has no faithful rewrite",
                         helper.name
                     ),
-                ));
+                )));
             }
         }
-        for (name, _) in &mut_spans {
+        let mut shadow_names = std::collections::HashSet::new();
+        shadow_names.extend(mut_names.iter().cloned());
+        shadow_names.extend(dest_names.iter().cloned());
+        for name in &shadow_names {
             if let Some(shadow) = shadowed_local(&helper.function.block, name) {
-                return Err(Error::at(
+                return Err(attach(Error::at(
                     shadow,
                     format!(
-                        "cannot preserve `&mut` aliasing for the `{name}` argument of `{}`: the parameter is shadowed",
+                        "cannot preserve `&mut` aliasing for the `{name}` argument of `{}`: the name is shadowed",
                         helper.name
                     ),
-                ));
+                )));
             }
         }
         let mut block = helper.function.block.clone();
@@ -576,6 +614,16 @@ impl<'a> Emitter<'a> {
             }
         } else {
             self.line("end");
+        }
+        if mode == Inline::Tail
+            && iife
+            && let Some(value) = &temp
+        {
+            if let Some(target) = self.tail_target.clone() {
+                self.line(&format!("{target} = {value}"));
+            } else {
+                self.line(&format!("return {value}"));
+            }
         }
         let foreign = helper.module != self.home;
         result.map_err(|error| {
@@ -694,6 +742,36 @@ fn is_mut_scalar(name: &str) -> bool {
     )
 }
 
+fn unsupported_lvalue(expr: &Expr) -> Option<&'static str> {
+    fn walk(expr: &Expr) -> Option<&'static str> {
+        match strip_reference(expr) {
+            Expr::Field(field) => walk(&field.base),
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                walk(&unary.expr)
+            }
+            Expr::Index(index) => {
+                match strip_reference(&index.index) {
+                    Expr::Range(_) => {
+                        return Some("slice destinations are not assignable");
+                    }
+                    Expr::Index(_) | Expr::Call(_) | Expr::MethodCall(_) => {
+                        return Some(
+                            "computed index operands cannot be snapshotted",
+                        );
+                    }
+                    _ => {}
+                }
+                walk(&index.expr)
+            }
+            Expr::Group(group) => walk(&group.expr),
+            Expr::Paren(paren) => walk(&paren.expr),
+            _ => None,
+        }
+    }
+
+    walk(expr)
+}
+
 fn mutable_lvalue(expr: &Expr) -> bool {
     match strip_reference(expr) {
         Expr::Path(_) => true,
@@ -706,6 +784,43 @@ fn mutable_lvalue(expr: &Expr) -> bool {
         Expr::Paren(paren) => mutable_lvalue(&paren.expr),
         _ => false,
     }
+}
+
+fn rename_tokens(
+    tokens: proc_macro2::TokenStream,
+    from: &str,
+    to: &str,
+) -> proc_macro2::TokenStream {
+    use proc_macro2::TokenTree;
+    let mut after_separator = false;
+    tokens
+        .into_iter()
+        .map(|token| {
+            let renamed = match token {
+                TokenTree::Ident(ident)
+                    if ident == from && !after_separator =>
+                {
+                    TokenTree::Ident(proc_macro2::Ident::new(to, ident.span()))
+                }
+                TokenTree::Ident(ident) => TokenTree::Ident(ident),
+                TokenTree::Group(group) => {
+                    let mut renamed = proc_macro2::Group::new(
+                        group.delimiter(),
+                        rename_tokens(group.stream(), from, to),
+                    );
+                    renamed.set_span(group.span());
+                    TokenTree::Group(renamed)
+                }
+                other => other,
+            };
+            after_separator = matches!(
+                &renamed,
+                TokenTree::Punct(punct)
+                    if punct.as_char() == '.' || punct.as_char() == ':'
+            );
+            renamed
+        })
+        .collect()
 }
 
 fn rename_paths(block: &mut syn::Block, from: &str, to: &str) {
@@ -786,6 +901,13 @@ fn rename_paths(block: &mut syn::Block, from: &str, to: &str) {
                 for field in &mut item.fields {
                     visit(&mut field.expr, from, to);
                 }
+            }
+            Expr::Macro(item) => {
+                item.mac.tokens = rename_tokens(
+                    std::mem::take(&mut item.mac.tokens),
+                    from,
+                    to,
+                );
             }
             _ => {}
         }
@@ -972,6 +1094,100 @@ fn mut_reborrow(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
     }
 
     statements(block, name)
+}
+
+fn passes_mut_to_call(block: &syn::Block, name: &str) -> bool {
+    fn argument(expr: &Expr, name: &str) -> bool {
+        let Expr::Reference(reference) = expr else {
+            return false;
+        };
+        if reference.mutability.is_none() {
+            return false;
+        }
+        match strip_reference(&reference.expr) {
+            Expr::Path(path) => {
+                path.path.get_ident().is_some_and(|id| id == name)
+            }
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                let Expr::Path(path) = strip_reference(&unary.expr) else {
+                    return false;
+                };
+                path.path.get_ident().is_some_and(|id| id == name)
+            }
+            _ => false,
+        }
+    }
+
+    fn walk(expr: &Expr, name: &str) -> bool {
+        match expr {
+            Expr::Call(item) => {
+                item.args.iter().any(|arg| argument(arg, name))
+                    || walk(&item.func, name)
+                    || item.args.iter().any(|arg| walk(arg, name))
+            }
+            Expr::MethodCall(item) => {
+                item.args.iter().any(|arg| argument(arg, name))
+                    || walk(&item.receiver, name)
+                    || item.args.iter().any(|arg| walk(arg, name))
+            }
+            Expr::Block(item) => body(&item.block, name),
+            Expr::If(item) => {
+                walk(&item.cond, name)
+                    || body(&item.then_branch, name)
+                    || item
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|(_, branch)| walk(branch, name))
+            }
+            Expr::Match(item) => {
+                walk(&item.expr, name)
+                    || item.arms.iter().any(|arm| walk(&arm.body, name))
+            }
+            Expr::ForLoop(item) => body(&item.body, name),
+            Expr::While(item) => {
+                walk(&item.cond, name) || body(&item.body, name)
+            }
+            Expr::Loop(item) => body(&item.body, name),
+            Expr::Closure(item) => walk(&item.body, name),
+            Expr::Assign(item) => {
+                walk(&item.left, name) || walk(&item.right, name)
+            }
+            Expr::Unary(item) => walk(&item.expr, name),
+            Expr::Binary(item) => {
+                walk(&item.left, name) || walk(&item.right, name)
+            }
+            Expr::Paren(item) => walk(&item.expr, name),
+            Expr::Group(item) => walk(&item.expr, name),
+            Expr::Reference(item) => walk(&item.expr, name),
+            Expr::Try(item) => walk(&item.expr, name),
+            Expr::Return(item) => {
+                item.expr.as_ref().is_some_and(|value| walk(value, name))
+            }
+            Expr::Field(item) => walk(&item.base, name),
+            Expr::Index(item) => {
+                walk(&item.expr, name) || walk(&item.index, name)
+            }
+            Expr::Array(item) => item.elems.iter().any(|item| walk(item, name)),
+            Expr::Tuple(item) => item.elems.iter().any(|item| walk(item, name)),
+            Expr::Struct(item) => {
+                item.fields.iter().any(|field| walk(&field.expr, name))
+            }
+            _ => false,
+        }
+    }
+
+    fn body(block: &syn::Block, name: &str) -> bool {
+        block.stmts.iter().any(|stmt| match stmt {
+            Stmt::Expr(expr, _) => walk(expr, name),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| walk(&init.expr, name)),
+            _ => false,
+        })
+    }
+
+    body(block, name)
 }
 
 fn unsupported_string_mutator(
@@ -1180,6 +1396,30 @@ fn assigned_params(block: &syn::Block) -> std::collections::HashSet<String> {
     out
 }
 
+fn strip_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in text.chars() {
+        if quoted {
+            out.push(' ');
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+        } else if character == '"' {
+            quoted = true;
+            out.push(' ');
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
 fn copy_back_returns(
     body: &str,
     write_backs: &[(String, String)],
@@ -1193,15 +1433,16 @@ fn copy_back_returns(
         let indent = &line[..line.len() - trimmed.len()];
         let newline = trimmed.ends_with('\n');
         let content = trimmed.strip_suffix('\n').unwrap_or(trimmed);
-        let one_line = content.contains(" end") || content.contains("end)");
-        if (content.contains("function(") || content.contains("(function()"))
+        let scan = strip_strings(content);
+        let one_line = scan.contains(" end") || scan.contains("end)");
+        if (scan.contains("function(") || scan.contains("(function()"))
             && !one_line
         {
             blocks.push(true);
         } else if !one_line
-            && (content == "do"
-                || content.ends_with(" then")
-                || content.ends_with(" do"))
+            && (scan == "do"
+                || scan.ends_with(" then")
+                || scan.ends_with(" do"))
         {
             blocks.push(false);
         }
@@ -1217,14 +1458,16 @@ fn copy_back_returns(
             }
         }
         ends_in_return = !blocks.iter().any(|function| *function)
-            && trimmed.starts_with("return");
-        if ends_in_return
-            && !trimmed.strip_prefix("return").is_some_and(|rest| {
-                rest.starts_with(|c: char| {
-                    c.is_ascii_alphanumeric() || c == '_'
-                })
-            })
-        {
+            && scan.trim_start().starts_with("return")
+            && !scan
+                .trim_start()
+                .strip_prefix("return")
+                .is_some_and(|rest| {
+                    rest.starts_with(|c: char| {
+                        c.is_ascii_alphanumeric() || c == '_'
+                    })
+                });
+        if ends_in_return {
             for (target, name) in write_backs {
                 out.push_str(indent);
                 out.push_str(target);

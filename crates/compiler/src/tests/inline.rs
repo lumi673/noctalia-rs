@@ -1115,3 +1115,205 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compiled.source
     );
 }
+
+#[test]
+fn rejects_computed_index_destinations() {
+    let handler = r#"
+fn bump(value: &mut i64, keys: &[usize]) {
+    *value = 5;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut nums: Vec<i64> = vec![0, 0, 0];
+    let keys = [0usize];
+    bump(&mut nums[keys[0]], &keys);
+    Ok(vec![Op::log(nums[0].to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("computed index"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn rejects_slice_destinations() {
+    let handler = r#"
+fn fill(text: &mut String) {
+    text.push_str("x");
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = "abc".to_owned();
+    fill(&mut text[..]);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("slice destinations"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn rejects_scalar_mut_reborrows() {
+    let handler = r#"
+fn helper(n: &mut i64) {
+    let alias = &mut *n;
+    *alias = 5;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    helper(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("mutable reborrows"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn rejects_destination_bases_shadowed_in_helpers() {
+    let handler = r#"
+struct State { value: i64 }
+fn helper(value: &mut i64) {
+    let state = State { value: 2 };
+    *value = state.value;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut state = State { value: 0 };
+    helper(&mut state.value);
+    Ok(vec![Op::log(state.value.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+}
+
+#[test]
+fn attaches_foreign_shadow_errors_to_the_helper_module() {
+    let main = r#"
+mod util;
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    util::helper(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let util = r#"
+pub fn helper(n: &mut i64) -> i64 {
+    *n = 1;
+    let n = 2;
+    n + 3
+}
+"#;
+    let modules = [Module {
+        path: "util",
+        source: util,
+    }];
+    let error = compile(
+        &source(main),
+        &module_options("widget", EntryKind::Widget, &modules),
+    )
+    .expect_err("bail");
+    assert_eq!(error.file.as_deref(), Some("util"), "{}", error.message);
+}
+
+#[test]
+fn rejects_reborrows_passed_to_nested_helpers() {
+    let handler = r#"
+fn inner(n: &mut i64) {
+    *n = 5;
+}
+fn helper(n: &mut i64) {
+    inner(&mut *n);
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    helper(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("nested calls"), "{}", error.message);
+}
+
+#[test]
+fn rejects_tuple_pattern_mut_parameters() {
+    let handler = r#"
+fn helper((a, b): (&mut i64, &mut i64)) {
+    *a = 1;
+    *b = 2;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut a = 0;
+    let mut b = 0;
+    helper((&mut a, &mut b));
+    Ok(vec![Op::log(a.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(error.message.contains("identifiers"), "{}", error.message);
+}
+
+#[test]
+fn ignores_function_text_inside_string_literals() {
+    let handler = r#"
+fn helper(text: &mut String) {
+    let marker = "function( end)";
+    *text = marker.to_owned();
+    return;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("text = __t"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn does_not_treat_returning_as_a_return_statement() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    let returning = 2;
+    *n = returning;
+    *n
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("n = __t"), "{}", compiled.source);
+}

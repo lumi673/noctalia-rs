@@ -287,3 +287,99 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     .expect_err("shadowing must fail");
     assert!(error.contains("shadowed"), "{error}");
 }
+
+#[test]
+fn keyword_parameter_in_macro_matches_native_handler() {
+    let source = compiled(
+        r#"
+fn helper(end: &mut i64) -> String {
+    *end = 5;
+    format!("{}", *end)
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut ending = 0;
+    let text = helper(&mut ending);
+    Ok(vec![Op::log(text), Op::log(ending.to_string())])
+}
+"#,
+    );
+    let expected = ["5", "5"];
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    for chunk in actual.chunks(expected.len()) {
+        assert_eq!(chunk, expected);
+    }
+}
+
+#[test]
+fn string_literal_with_function_text_keeps_copy_back() {
+    let source = compiled(
+        r#"
+fn helper(text: &mut String) {
+    let marker = "function( end)";
+    *text = marker.to_owned();
+    return;
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#,
+    );
+    let expected = "function( end)";
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    assert!(
+        actual.iter().all(|message| message == expected),
+        "{actual:?}"
+    );
+}
+
+#[test]
+fn returning_identifier_is_not_a_return_statement() {
+    let source = compiled(
+        r#"
+fn helper(n: &mut i64) -> i64 {
+    let returning = 2;
+    *n = returning;
+    *n
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#,
+    );
+    let expected = ["2", "2"];
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    for chunk in actual.chunks(expected.len()) {
+        assert_eq!(chunk, expected);
+    }
+}
+
+#[test]
+fn nested_tail_call_forwards_its_result() {
+    let source = compiled(
+        r#"
+fn inner(n: &mut i64, ops: &mut Vec<Op>) -> Result<Vec<Op>> {
+    *n = 9;
+    ops.push(Op::log(n.to_string()));
+    Ok(Vec::new())
+}
+fn outer(n: &mut i64, ops: &mut Vec<Op>) -> Result<Vec<Op>> {
+    inner(n, ops)
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let mut ops = Vec::new();
+    outer(&mut n, &mut ops)
+}
+"#,
+    );
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    assert!(actual.iter().all(|message| message == "9"), "{actual:?}");
+}
