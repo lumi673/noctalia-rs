@@ -497,3 +497,80 @@ nix develop --command cargo run --release -p noctalia-bench --offline -- \
 The corpus is treated as read-only. The scan and its scratch files live in
 `.tmp`, and the corpus manifest, lock file, and every tracked file are restored
 and checked by md5 before the scan ends.
+
+## 0.4.0 final baseline
+
+Main `c9ad4a5` contains S0 through S9 and S7's bridge work. Plugin API stays at
+57\. The corpus has 366 plugin crates and 1,067 handler entries. The release is
+additive: every mode, public API, helper feature, and bridge mechanism stays.
+The only behavior change is that strict translates more entries and emits no
+bridge for them.
+
+### Final adoption by mode
+
+| Mode | Entries OK | Total | Valid scripts | Output |
+| :-- | --: | --: | --: | :-- |
+| strict | 316 | 1,067 | 316 / 316 | Standalone API 57 Luau. No bridge, helper, markers, `onHostCallback`, native stubs, or bridge response-file plumbing. A strict `Op::query` still writes its response envelope through API 57 `writeFile`. |
+| auto | 1,067 | 1,067 | 332 / 332 | Default. Fully compiled, hybrid, and bridged entries; helper, bridge, spool, and response files stay. |
+| off | 1,067 | 1,067 | 0 | No compiler. Every entry uses the bridge. |
+
+### Adoption by merge stage
+
+| Stage | Merge commit | Strict OK / total | Adoption | Auto valid scripts | Off |
+| :-- | :-- | --: | --: | --: | :-- |
+| S0 emit split | `e4a6593` | 195 / 1,067 | 18.28% | 234 / 236 | 1,067 / 1,067 |
+| S7 bridge speed | `976307e` | 195 / 1,067 | 18.28% | 234 / 236 | 1,067 / 1,067 |
+| S1 strict ABI | `d87f877` | 206 / 1,067 | 19.31% | 236 / 236 | 1,067 / 1,067 |
+| S2 `serde_json` | `8a6e087` | 221 / 1,067 | 20.71% | 246 / 246 | 1,067 / 1,067 |
+| S3 `std::fs` and `std::path` | `57796e4` | 221 / 1,067 | 20.71% | 247 / 247 | 1,067 / 1,067 |
+| S4 methods and iterators | `4bc71c4` | 232 / 1,067 | 21.74% | 252 / 252 | 1,067 / 1,067 |
+| S5 scoping and syntax | `1420b22` | 308 / 1,067 | 28.87% | 324 / 324 | 1,067 / 1,067 |
+| S6 mutable helpers | `b09a559` | 313 / 1,067 | 29.33% | 328 / 328 | 1,067 / 1,067 |
+| S9 exact integers | `c9ad4a5` | 316 / 1,067 | 29.62% | 332 / 332 | 1,067 / 1,067 |
+
+Auto and off reach 1,067 / 1,067 at every stage. These are separate mode
+outcomes. In `strict`, an entry that cannot be translated stops the build; it
+never silently switches to auto. In `auto`, a function whose signature can cross
+JSON can run as a native call in the helper while the rest of the handler stays
+in Luau. A handler that cannot be split keeps the whole-entry bridge through
+`bridge.luau`. `off` bridges every entry. Every strict script is parsed in the
+Luau VM. The final 316 and 332 counts come from S9's scan at `c9ad4a5`. Earlier
+counts come from the stage scans recorded in git history and T1's baselines,
+re-recorded whenever the compared SHA moved.
+
+### Bridge performance, S7 before and after
+
+Best of three paired runs, release build, 200 samples and 20 warmups per
+surface. Times are in microseconds.
+
+| Surface | Median before | Median after | p95 before | p95 after | p99 before | p99 after |
+| :-- | --: | --: | --: | --: | --: | --: |
+| `spool_dispatch` | 78.03 | 41.30 | 97.26 | 54.80 | 105.77 | 69.44 |
+| `bridge_event` | 119.38 | 92.53 | 130.26 | 102.33 | 132.57 | 107.38 |
+| `generated_hello_bar` compiled | 1.89 | 1.92 | 1.99 | 2.02 | 2.07 | 2.07 |
+| `generated_ui_panel` compiled | 9.88 | 9.70 | 14.28 | 12.98 | 15.67 | 15.36 |
+
+The compiled surfaces stay at about 1.9 us and 10 us. S7 did not touch the
+compiled path. Strict entries use neither `spool_dispatch` nor `bridge_event`.
+
+### Accepted source-change classes
+
+The corpus was not edited. These classes are plugin-side work a maintainer can
+choose to do. No host API, global, permission, or `plugin_api` value changes.
+
+| Class | Measured count | Recommendation |
+| :-- | --: | :-- |
+| JSON null inside a container | 22 entries at the first-error baseline | Edit those plugins to avoid computed nulls in tables and arrays. The compiler fails at `file:line:column` rather than dropping a key. Keep the entry on auto until it is edited. |
+| `Context::Parts` and `set_op_sink` | 5 plugins: `keymap`, `mullvad`, `pixel-shift`, `bangumi-progress`, `wallpaper-deck`. 14 files use `Context::Parts`, 3 use `set_op_sink`. | Rewrite to a normal `Context` and direct `Op` emission for strict. Modeling a cloned context and stdout op sink in Luau would not be faithful. |
+| Cooperative coroutine helpers | 4 plugins: `terminal-widgets`, `keymap`, `pixel-shift`, `wallpaper-deck`. `yield_now` in 10 files, `Coroutine::spawn` in 9, `ClockBudget` in 4. | Use callback-driven handlers for strict, or keep the entry on auto with its helper. Strict uses real acceptance booleans and closures, not coroutine parking. |
+| Byte exactness through the host | 31 plugins use byte APIs. | `ByteBuf` maps to Lua byte strings and `__noctalia_rs_bytes` stays for JSON crossings. Check non-UTF-8 values against a real Noctalia host before relying on strict. No host change is assumed. |
+| Integer edge methods | 2 entries failed faithfully at S4. Exact limb lowering in S9 recovers 3 entries in total. 0 integer-edge first errors remain at `c9ad4a5`. | No source edit is needed. Fail closed when width, signedness, or exactness is unproven; lower exactly with 32-bit limbs otherwise. Auto and off keep native Rust arithmetic. |
+
+The recovered integer entries are `ccf-deadlines/widget[0]`,
+`hyprland-minimize/widget[0]`, and `currency-exchange/panel[0]`.
+
+### Gates and coverage
+
+`cargo fmt --check`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and both performance script tests pass on the
+docs branch. Tarpaulin was recorded at 81.59% (13,930 / 17,074 lines) on S9.
+Docs-only changes do not rerun coverage.

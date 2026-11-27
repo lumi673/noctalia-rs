@@ -117,13 +117,24 @@ fn main() -> ExitCode {
 compile = "auto"
 ```
 
-`auto` compiles each handler it finds, splits the functions it cannot translate
-into native calls, and bridges only the entries it cannot split. The build
-prints one `cargo:warning` per function that crossed the boundary and one per
-entry that kept the bridge stub, each with the entry id and the reason.
-`strict` fails the build on the first function it cannot translate, ignores
-`#[native]`, and emits no bridge, so it measures pure-Luau coverage. It also rejects entries without a
-handler. `off` skips the compiler and bridges every entry.
+| Mode | What ships |
+| :-- | :-- |
+| `strict` | Standalone API 57 Luau for every translated entry. No `lib/bridge.luau`, helper binary, host-callback markers, `onHostCallback`, or native stubs, and no bridge response-file plumbing. A strict `Op::query` still writes its response envelope with the API 57 `writeFile` member. An entry that cannot be translated fails the build with `file:line:column`. Entries without a handler are rejected. `#[native]` is ignored; `#[luau]` still requires Luau. |
+| `auto` (default) | Compiles each handler it can, splits functions it cannot translate into native calls through the helper, and keeps the whole-entry bridge for the rest. |
+| `off` | Skips the compiler and bridges every entry. |
+
+`auto` and `off` keep the full bridge machinery. `bridge.luau` turns callback and
+action markers into real API 57 functions before the host sees them. Native
+stubs cross the helper boundary as JSON requests over the spool, and
+`Op::Query` responses use response files. `crates/luau` enforces the API 57
+contract per path: a strict script that uses a marker or defines
+`onHostCallback` fails a test, while an auto script still passes through the
+bridge.
+
+In `auto`, the build prints one `cargo:warning` per function that crossed the
+helper boundary and one per entry that kept the bridge stub, each with the entry
+id and the reason. Strict stops on the first failure, and `off` skips the
+compiler.
 
 The handler signature is `fn handler(ctx: &Context) -> Result<Vec<Op>>`. The
 build walks the module tree from `src/main.rs` or `src/lib.rs`, follows `mod`
@@ -178,27 +189,44 @@ bindings, nested `or` patterns and constant patterns compare directly, and a
 crate function passed as a callback value, such as `map(lua_text)`, is inlined
 at the call.
 
-Host callbacks use stable names. `Op::run`, `Op::run_stream`, `Op::http`, and
-`Op::state_watch` emit `{ __host_callback = "name" }`, and the runtime delivers
-that name to the entry's `onHostCallback(payload)` global, so a compiled
-`host_callback` branch sees the same payload the Rust handler does.
-`ctx.run_async_start`, `ctx.run_stream_start`, and `ctx.http_start` compile when
-their acceptance result is dropped, because compiled Luau starts the call
-without blocking.
+Host callbacks use stable names. In `auto` and `off`, `Op::run`, `Op::run_stream`,
+`Op::http`, and `Op::state_watch` emit `{ __host_callback = "name" }`, and the
+runtime delivers that name to the entry's `onHostCallback(payload)` global, so a
+compiled `host_callback` branch sees the same payload the Rust handler does. In
+`strict`, those ops emit real closures and named plugin globals. The script
+contains no marker table and no `onHostCallback` global.
 
-Arbitrary trait iterators, dynamic dispatch, trait methods without a Luau
-equivalent, and ops that need a response path are never approximated. In
-`auto` they move the whole function to the plugin binary and the rest of the
-handler still compiles; in `strict` they fail the build with
-`file:line:column`. `BASELINE.md` has the per-stage adoption table for the community corpus: 195
-fully compiled entries, 41 hybrid entries, and 831 that still bridge the whole
-handler. The largest remaining blocker is that a candidate helper must be
-`pub(crate)`; the next is `&mut` parameters, which cannot cross without
-silently dropping the writes.
+`ctx.run_async_start`, `ctx.run_stream_start`, and `ctx.http_start` compile in
+`auto` when their acceptance result is dropped, because compiled Luau starts the
+call without blocking. In `strict` the real boolean result can be used in any
+expression position.
+
+Arbitrary trait iterators, dynamic dispatch, and trait methods without a Luau
+equivalent are never approximated. In `auto`, a function whose signature can
+cross JSON runs as a native call in the helper and the rest of the handler still
+compiles. A function whose signature cannot cross JSON, or a handler body that
+cannot be split, keeps the whole-entry bridge. In `strict`, those constructs
+fail the build with `file:line:column`.
+
+In `strict`, `Op::query` is resolved statically. A literal host root and path
+become a direct API 57 call, and the handler's response path receives the result
+envelope through `noctalia.writeFile`. A dynamic root, a dynamic path, or an
+unknown member fails the build with `file:line:column`. `auto` rejects a compiled
+`Op::query`, so that function stays native or the entry keeps its bridge. `off`
+skips the compiler.
+
+At 0.4.0 the 1,067-entry community corpus has 316 strict entries with 316/316
+scripts valid, 1,067 auto entries with 332/332 scripts valid, and 1,067 off
+entries. `auto` mixes fully compiled, hybrid, and bridged entries. `strict`
+emits no bridge for any script it translates. `BASELINE.md` records the
+per-stage adoption, the performance table, and the source-change classes that
+still need a plugin edit.
 
 ## Native functions
 
-A handler compiles in one of three tiers:
+A handler compiles in one of three tiers. The helper boundary exists only in
+`auto` and `off`. A strict build never writes a native request, starts a helper,
+or loads `bridge.luau`.
 
 - **Fully compiled**: every function reached from the handler translates to
   Luau. The script needs no helper and runs at hand-written Luau speed.
@@ -218,9 +246,7 @@ calls a native function still compiles: the call becomes a call to the stub.
 Recursion between native functions is fine, because the helper runs real Rust.
 The build prints one line per function that crossed the boundary, for example:
 
-```
-entry widget: native `git::fetch_prs` (cache 0 ms): call to `reqwest::blocking::get` is not supported by the Luau compiler
-```
+    entry widget: native `git::fetch_prs` (cache 0 ms): call to `reqwest::blocking::get` is not supported by the Luau compiler
 
 A native function must be visible from the crate root, because the generated
 dispatch table lives there. Functions at the crate root can stay private.
@@ -340,7 +366,6 @@ cached call performs no round trip at all.
 
 A native function argument that contains a large table is part of the cache
 key, so change the arguments only when the result should change.
-
 
 Build and install:
 
