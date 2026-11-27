@@ -442,10 +442,11 @@ impl<'a> Emitter<'a> {
                     } else {
                         name.clone()
                     };
-                    self.line(&format!("local {local_name} = {text}"));
+                    let lua_name = self.bind_name(&local_name);
+                    self.line(&format!("local {lua_name} = {text}"));
                     if scalar && ty.base == Base::Str {
                         string_params.push((
-                            local_name.clone(),
+                            lua_name.clone(),
                             name.clone(),
                             span,
                         ));
@@ -473,7 +474,7 @@ impl<'a> Emitter<'a> {
                                 ),
                             ));
                         }
-                        write_backs.push((target, local_name.clone()));
+                        write_backs.push((target, lua_name.clone()));
                     }
                     self.push(&local_name, ty);
                 }

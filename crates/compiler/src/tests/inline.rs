@@ -1010,3 +1010,89 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
             .expect_err("bail");
     assert!(error.message.contains("shadowed"), "{}", error.message);
 }
+
+#[test]
+fn covers_alias_checks_in_nested_blocks() {
+    let shadow = r#"
+fn helper(n: &mut i64) -> i64 {
+    if *n > 0 {
+        let n = 2;
+        *n = 3;
+    }
+    *n = 1;
+    *n
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let error = compile(&source(shadow), &options("widget", EntryKind::Widget))
+        .expect_err("bail");
+    assert!(error.message.contains("shadowed"), "{}", error.message);
+
+    let reborrow = r#"
+fn helper(text: &mut String) {
+    if true {
+        let alias = &mut *text;
+        alias.push_str("x");
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(reborrow), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("mutable reborrows"),
+        "{}",
+        error.message
+    );
+
+    let mutator = r#"
+fn helper(text: &mut String) {
+    if true {
+        text.remove(0);
+    }
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    helper(&mut text);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error =
+        compile(&source(mutator), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("String::remove"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn renames_parameters_inside_compound_expressions() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    let items = [*n, 2];
+    let pair = (*n, 3);
+    *n = items[0] + pair.1;
+    *n
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("noctalia.log"));
+}
