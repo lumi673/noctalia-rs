@@ -216,3 +216,30 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(source.contains("math.max(1, 2)"), "{source}");
     assert!(source.contains("{}"), "{source}");
 }
+
+#[test]
+fn static_initializers_do_not_carry_frame_markers() {
+    let handler = r#"
+static CONFIG: Value = match true {
+    true => json!({ "a": 1 }),
+    false => json!({}),
+};
+fn helper(v: &mut Value) -> Value {
+    *v = CONFIG;
+    v.clone()
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut value = json!({});
+    let out = helper(&mut value);
+    Ok(vec![Op::log(out.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        !compiled.source.contains("__s6_frame"),
+        "{}",
+        compiled.source
+    );
+}

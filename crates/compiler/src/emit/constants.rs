@@ -145,20 +145,15 @@ impl<'a> Emitter<'a> {
         let saved_indent = self.indent;
         self.indent = 0;
         let result = self.expr(expr);
-        let emitted = std::mem::replace(&mut self.out, saved_out);
-        let lines: String = emitted
-            .lines()
-            .filter(|line| {
-                line.trim() != FRAME_START && line.trim() != FRAME_END
-            })
-            .map(|line| format!("{line}\n"))
-            .collect();
+        let emitted =
+            strip_frame_markers(&std::mem::replace(&mut self.out, saved_out));
         self.indent = saved_indent;
         let (text, _) = result?;
-        if lines.trim().is_empty() {
+        let text = strip_frame_markers(&text);
+        if emitted.trim().is_empty() {
             Ok(text)
         } else {
-            Ok(format!("(function()\n{lines}  return {text}\nend)()"))
+            Ok(format!("(function()\n{emitted}  return {text}\nend)()"))
         }
     }
 
@@ -200,4 +195,10 @@ impl<'a> Emitter<'a> {
         }
         Ok(())
     }
+}
+
+fn strip_frame_markers(text: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| line.trim() != FRAME_START && line.trim() != FRAME_END)
+        .collect()
 }
