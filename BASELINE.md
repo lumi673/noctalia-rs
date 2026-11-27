@@ -510,7 +510,7 @@ bridge for them.
 
 | Mode | Entries OK | Total | Valid scripts | Output |
 | :-- | --: | --: | --: | :-- |
-| strict | 316 | 1,067 | 316 / 316 | Standalone API 57 Luau. No bridge, helper, markers, `onHostCallback`, or response files. |
+| strict | 316 | 1,067 | 316 / 316 | Standalone API 57 Luau. No bridge, helper, markers, `onHostCallback`, native stubs, or bridge response-file plumbing. A strict `Op::query` still writes its response envelope through API 57 `writeFile`. |
 | auto | 1,067 | 1,067 | 332 / 332 | Default. Fully compiled, hybrid, and bridged entries; helper, bridge, spool, and response files stay. |
 | off | 1,067 | 1,067 | 0 | No compiler. Every entry uses the bridge. |
 

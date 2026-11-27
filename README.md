@@ -119,7 +119,7 @@ compile = "auto"
 
 | Mode | What ships |
 | :-- | :-- |
-| `strict` | Standalone API 57 Luau for every translated entry. No `lib/bridge.luau`, helper binary, host-callback markers, `onHostCallback`, response files, or native stubs. An entry that cannot be translated fails the build with `file:line:column`. Entries without a handler are rejected. `#[native]` is ignored; `#[luau]` still requires Luau. |
+| `strict` | Standalone API 57 Luau for every translated entry. No `lib/bridge.luau`, helper binary, host-callback markers, `onHostCallback`, or native stubs, and no bridge response-file plumbing. A strict `Op::query` still writes its response envelope with the API 57 `writeFile` member. An entry that cannot be translated fails the build with `file:line:column`. Entries without a handler are rejected. `#[native]` is ignored; `#[luau]` still requires Luau. |
 | `auto` (default) | Compiles each handler it can, splits functions it cannot translate into native calls through the helper, and keeps the whole-entry bridge for the rest. |
 | `off` | Skips the compiler and bridges every entry. |
 
@@ -131,9 +131,10 @@ contract per path: a strict script that uses a marker or defines
 `onHostCallback` fails a test, while an auto script still passes through the
 bridge.
 
-The build prints one `cargo:warning` per function that crossed the helper
-boundary and one per entry that kept the bridge stub, each with the entry id
-and the reason.
+In `auto`, the build prints one `cargo:warning` per function that crossed the
+helper boundary and one per entry that kept the bridge stub, each with the entry
+id and the reason. Strict stops on the first failure, and `off` skips the
+compiler.
 
 The handler signature is `fn handler(ctx: &Context) -> Result<Vec<Op>>`. The
 build walks the module tree from `src/main.rs` or `src/lib.rs`, follows `mod`
@@ -200,12 +201,17 @@ contains no marker table and no `onHostCallback` global.
 call without blocking. In `strict` the real boolean result can be used in any
 expression position.
 
-Arbitrary trait iterators, dynamic dispatch, trait methods without a Luau
-equivalent, and ops that need a response path are never approximated. In `auto`,
-a function whose signature can cross JSON runs as a native call in the helper and
-the rest of the handler still compiles. A function whose signature cannot cross
-JSON, or a handler body that cannot be split, keeps the whole-entry bridge. In
-`strict`, all of them fail the build with `file:line:column`.
+Arbitrary trait iterators, dynamic dispatch, and trait methods without a Luau
+equivalent are never approximated. In `auto`, a function whose signature can
+cross JSON runs as a native call in the helper and the rest of the handler still
+compiles. A function whose signature cannot cross JSON, or a handler body that
+cannot be split, keeps the whole-entry bridge. In `strict`, those constructs
+fail the build with `file:line:column`.
+
+`Op::query` is resolved statically. A literal host root and path become a direct
+API 57 call, and the handler's response path receives the result envelope through
+`noctalia.writeFile`. A dynamic root, a dynamic path, or an unknown member fails
+the build with `file:line:column`.
 
 At 0.4.0 the 1,067-entry community corpus has 316 strict entries with 316/316
 scripts valid, 1,067 auto entries with 332/332 scripts valid, and 1,067 off
