@@ -522,13 +522,13 @@ impl<'a> Emitter<'a> {
                             },
                         );
                         if forwarded {
-                            return Err(attach(Error::at(
+                            return Err(Error::at(
                                 span,
                                 format!(
                                     "cannot preserve `&mut` aliasing for the `{}` argument of `{}`: nested calls may mutate it",
                                     name, helper.name
                                 ),
-                            )));
+                            ));
                         }
                         write_backs.push((target, lua_name.clone()));
                     }
@@ -575,7 +575,16 @@ impl<'a> Emitter<'a> {
             }
         }
         let mut block = helper.function.block.clone();
-        for (from, to, _) in &renames {
+        for (from, to, span) in &renames {
+            if implicit_macro_capture(&helper.function.block, from).is_some() {
+                return Err(Error::at(
+                    *span,
+                    format!(
+                        "cannot preserve `&mut` aliasing for the `{from}` argument of `{}`: implicit format captures cannot be renamed",
+                        helper.name
+                    ),
+                ));
+            }
             rename_paths(&mut block, from, to);
         }
         self.value_helper = mode == Inline::Value;
@@ -813,22 +822,23 @@ fn rename_tokens(
     to: &str,
 ) -> proc_macro2::TokenStream {
     use proc_macro2::TokenTree;
-    let mut after_separator = false;
-    let mut iter = tokens.into_iter().peekable();
+    let items: Vec<TokenTree> = tokens.into_iter().collect();
     let mut out = proc_macro2::TokenStream::new();
-    while let Some(token) = iter.next() {
-        let before_label = matches!(
-            iter.peek(),
+    let mut after_separator = false;
+    for (index, token) in items.iter().enumerate() {
+        let is_label = matches!(
+            items.get(index + 1),
             Some(TokenTree::Punct(punct))
-                if punct.as_char() == ':' || punct.as_char() == '='
+                if punct.as_char() == '='
+                    && punct.spacing() == proc_macro2::Spacing::Alone
         );
         let renamed = match token {
             TokenTree::Ident(ident)
-                if ident == from && !after_separator && !before_label =>
+                if ident == from && !after_separator && !is_label =>
             {
                 TokenTree::Ident(proc_macro2::Ident::new(to, ident.span()))
             }
-            TokenTree::Ident(ident) => TokenTree::Ident(ident),
+            TokenTree::Ident(ident) => TokenTree::Ident(ident.clone()),
             TokenTree::Group(group) => {
                 let mut renamed = proc_macro2::Group::new(
                     group.delimiter(),
@@ -837,7 +847,7 @@ fn rename_tokens(
                 renamed.set_span(group.span());
                 TokenTree::Group(renamed)
             }
-            other => other,
+            other => other.clone(),
         };
         after_separator = matches!(
             &renamed,
@@ -871,7 +881,10 @@ fn rename_paths(block: &mut syn::Block, from: &str, to: &str) {
                     visit(&mut arm.body, from, to);
                 }
             }
-            Expr::ForLoop(item) => visit_block(&mut item.body, from, to),
+            Expr::ForLoop(item) => {
+                visit(&mut item.expr, from, to);
+                visit_block(&mut item.body, from, to);
+            }
             Expr::While(item) => {
                 visit(&mut item.cond, from, to);
                 visit_block(&mut item.body, from, to);
@@ -929,6 +942,14 @@ fn rename_paths(block: &mut syn::Block, from: &str, to: &str) {
                 }
             }
             Expr::Cast(item) => visit(&mut item.expr, from, to),
+            Expr::Range(item) => {
+                if let Some(start) = &mut item.start {
+                    visit(start, from, to);
+                }
+                if let Some(end) = &mut item.end {
+                    visit(end, from, to);
+                }
+            }
             Expr::Macro(item) => {
                 item.mac.tokens = rename_tokens(
                     std::mem::take(&mut item.mac.tokens),
@@ -1121,6 +1142,105 @@ fn mut_reborrow(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
     }
 
     statements(block, name)
+}
+
+fn implicit_macro_capture(
+    block: &syn::Block,
+    name: &str,
+) -> Option<proc_macro2::Span> {
+    use proc_macro2::TokenTree;
+
+    fn tokens(stream: proc_macro2::TokenStream, name: &str) -> bool {
+        let items: Vec<TokenTree> = stream.into_iter().collect();
+        let explicit = items.iter().enumerate().any(|(index, token)| {
+            matches!(token, TokenTree::Ident(ident) if ident == name)
+                && matches!(
+                    items.get(index + 1),
+                    Some(TokenTree::Punct(punct)) if punct.as_char() == '='
+                )
+        });
+        if explicit {
+            return false;
+        }
+        items.iter().any(|token| match token {
+            TokenTree::Literal(literal) => {
+                literal.to_string().contains(&format!("{{{name}}}"))
+            }
+            TokenTree::Group(group) => tokens(group.stream(), name),
+            _ => false,
+        })
+    }
+
+    fn walk(expr: &Expr, name: &str) -> bool {
+        match expr {
+            Expr::Macro(item) => tokens(item.mac.tokens.clone(), name),
+            Expr::Block(item) => body(&item.block, name),
+            Expr::If(item) => {
+                walk(&item.cond, name)
+                    || body(&item.then_branch, name)
+                    || item
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|(_, branch)| walk(branch, name))
+            }
+            Expr::Match(item) => {
+                walk(&item.expr, name)
+                    || item.arms.iter().any(|arm| walk(&arm.body, name))
+            }
+            Expr::ForLoop(item) => {
+                walk(&item.expr, name) || body(&item.body, name)
+            }
+            Expr::While(item) => {
+                walk(&item.cond, name) || body(&item.body, name)
+            }
+            Expr::Loop(item) => body(&item.body, name),
+            Expr::Call(item) => {
+                walk(&item.func, name)
+                    || item.args.iter().any(|arg| walk(arg, name))
+            }
+            Expr::MethodCall(item) => {
+                walk(&item.receiver, name)
+                    || item.args.iter().any(|arg| walk(arg, name))
+            }
+            Expr::Assign(item) => {
+                walk(&item.left, name) || walk(&item.right, name)
+            }
+            Expr::Unary(item) => walk(&item.expr, name),
+            Expr::Binary(item) => {
+                walk(&item.left, name) || walk(&item.right, name)
+            }
+            Expr::Paren(item) => walk(&item.expr, name),
+            Expr::Group(item) => walk(&item.expr, name),
+            Expr::Reference(item) => walk(&item.expr, name),
+            Expr::Try(item) => walk(&item.expr, name),
+            Expr::Return(item) => {
+                item.expr.as_ref().is_some_and(|value| walk(value, name))
+            }
+            Expr::Field(item) => walk(&item.base, name),
+            Expr::Index(item) => {
+                walk(&item.expr, name) || walk(&item.index, name)
+            }
+            Expr::Array(item) => item.elems.iter().any(|item| walk(item, name)),
+            Expr::Tuple(item) => item.elems.iter().any(|item| walk(item, name)),
+            Expr::Struct(item) => {
+                item.fields.iter().any(|field| walk(&field.expr, name))
+            }
+            _ => false,
+        }
+    }
+
+    fn body(block: &syn::Block, name: &str) -> bool {
+        block.stmts.iter().any(|stmt| match stmt {
+            Stmt::Expr(expr, _) => walk(expr, name),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| walk(&init.expr, name)),
+            _ => false,
+        })
+    }
+
+    body(block, name).then_some(proc_macro2::Span::call_site())
 }
 
 fn call_args_mut(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
@@ -1494,6 +1614,7 @@ fn copy_back_returns(
         {
             blocks.push(true);
         } else if !one_line
+            && !scan.trim_start().starts_with("elseif")
             && (scan == "do"
                 || scan.ends_with(" then")
                 || scan.ends_with(" do"))

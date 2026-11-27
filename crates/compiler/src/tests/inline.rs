@@ -1347,3 +1347,124 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
         compiled.source
     );
 }
+
+#[test]
+fn renames_comparisons_inside_macro_tokens() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!("{value}", value = *n == 5)
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("__t2 == 5"), "{}", compiled.source);
+}
+
+#[test]
+fn rejects_implicit_format_captures_of_mut_parameters() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!("{n}")
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text), Op::log(n.to_string())])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect_err("bail");
+    assert!(
+        error.message.contains("implicit format captures"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn renames_range_endpoints_in_loops() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 3;
+    let mut total = 0;
+    for i in 0..*n {
+        total += i;
+    }
+    total
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("__t"), "{}", compiled.source);
+}
+
+#[test]
+fn copies_back_before_elseif_returns() {
+    let handler = r#"
+fn helper(n: &mut i64, early: bool) {
+    *n = 5;
+    if early {
+        return;
+    } else if n > 0 {
+        return;
+    }
+    *n = 0;
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    helper(&mut n, true);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    let count = compiled.source.matches("n = ").count();
+    assert!(count > 2, "{}", compiled.source);
+}
+
+#[test]
+fn nested_forward_error_keeps_caller_module() {
+    let main = r#"
+mod util;
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    util::outer(&mut n);
+    Ok(vec![Op::log(n.to_string())])
+}
+"#;
+    let util = r#"
+fn inner(n: &mut i64) {
+    *n = 5;
+}
+pub fn outer(n: &mut i64) {
+    inner(n);
+}
+"#;
+    let modules = [Module {
+        path: "util",
+        source: util,
+    }];
+    let error = compile(
+        &source(main),
+        &module_options("widget", EntryKind::Widget, &modules),
+    )
+    .expect_err("bail");
+    assert_eq!(error.file, None, "{}", error.message);
+    assert!(error.message.contains("nested calls"), "{}", error.message);
+}
