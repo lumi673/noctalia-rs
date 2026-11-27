@@ -243,16 +243,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "service_update_luau": {
-      "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
+      "sha": "9b566798663f140e5eaee0e6f972833040782540",
       "method": 1,
-      "medianMs": 0.010787,
-      "worstMedianMs": 0.011158999999999999,
-      "p95Ms": 0.014081,
-      "worstP95Ms": 0.014442,
-      "p99Ms": 0.024672999999999997,
-      "worstP99Ms": 0.02989,
+      "medianMs": 0.011837,
+      "worstMedianMs": 0.012038,
+      "p95Ms": 0.01577,
+      "worstP95Ms": 0.016912,
+      "p99Ms": 0.028433,
+      "worstP99Ms": 0.036689,
       "budgetMs": 10,
-      "updatedAt": "2026-11-27T14:03:35.410Z"
+      "updatedAt": "2026-11-27T20:00:48.892Z"
     },
     "service_update_rust": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -315,16 +315,16 @@
       "updatedAt": "2026-11-26T22:35:24.495Z"
     },
     "plugin_vietnamese_lunar_calendar_luau": {
-      "sha": "cd8a9771a3d9c5f3b68eb5af0b749d549b64878c",
+      "sha": "9b566798663f140e5eaee0e6f972833040782540",
       "method": 1,
-      "medianMs": 11.165367000000002,
-      "worstMedianMs": 11.2381175,
-      "p95Ms": 11.431713,
-      "worstP95Ms": 12.001077,
-      "p99Ms": 11.703519,
-      "worstP99Ms": 16.092129,
+      "medianMs": 10.941203000000002,
+      "worstMedianMs": 11.4546565,
+      "p95Ms": 11.434964,
+      "worstP95Ms": 11.593457,
+      "p99Ms": 11.489932,
+      "worstP99Ms": 11.72828,
       "budgetMs": 60,
-      "updatedAt": "2026-11-27T19:39:07.320Z"
+      "updatedAt": "2026-11-27T20:00:48.892Z"
     },
     "plugin_vietnamese_lunar_calendar_rust": {
       "sha": "c9ad4a5c931b57587a08f6764cd14fd717bf749c",
@@ -363,16 +363,16 @@
       "updatedAt": "2026-11-27T14:03:35.410Z"
     },
     "plugin_mihomo_control_luau": {
-      "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
+      "sha": "9b566798663f140e5eaee0e6f972833040782540",
       "method": 1,
-      "medianMs": 1.618123,
-      "worstMedianMs": 1.688037,
-      "p95Ms": 1.716174,
-      "worstP95Ms": 1.7413299999999998,
-      "p99Ms": 1.766116,
-      "worstP99Ms": 2.4257400000000002,
+      "medianMs": 1.623922,
+      "worstMedianMs": 1.633021,
+      "p95Ms": 1.66935,
+      "worstP95Ms": 1.6756410000000002,
+      "p99Ms": 1.689101,
+      "worstP99Ms": 1.726126,
       "budgetMs": 8,
-      "updatedAt": "2026-11-23T21:12:02.373Z"
+      "updatedAt": "2026-11-27T20:00:48.892Z"
     },
     "plugin_mihomo_control_rust": {
       "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
@@ -423,16 +423,16 @@
       "updatedAt": "2026-11-27T00:42:45.720Z"
     },
     "generated_hello_bar_compiled": {
-      "sha": "f47e36d93bdeba658ed7b449590d82e3b863a9b7",
+      "sha": "9b566798663f140e5eaee0e6f972833040782540",
       "method": 1,
-      "medianMs": 0.0022834999999999995,
-      "worstMedianMs": 0.0023085,
-      "p95Ms": 0.0023819999999999996,
-      "worstP95Ms": 0.0024300000000000003,
-      "p99Ms": 0.002411,
-      "worstP99Ms": 0.002451,
+      "medianMs": 0.0030205,
+      "worstMedianMs": 0.0030410000000000003,
+      "p95Ms": 0.003125,
+      "worstP95Ms": 0.003161,
+      "p99Ms": 0.00318,
+      "worstP99Ms": 0.003263,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-26T23:37:11.260Z"
+      "updatedAt": "2026-11-27T20:00:48.892Z"
     },
     "generated_ui_panel_handwritten": {
       "sha": "660624a25eee83fc2d09a52601ba4744bcafd497",
@@ -483,16 +483,16 @@
       "updatedAt": "2026-11-27T14:03:35.410Z"
     },
     "bridge_event": {
-      "sha": "976307edc4de71b025b4413775cdd0164dee33c1",
+      "sha": "9b566798663f140e5eaee0e6f972833040782540",
       "method": 1,
-      "medianMs": 0.10372650000000001,
-      "worstMedianMs": 0.1046515,
-      "p95Ms": 0.117031,
-      "worstP95Ms": 0.12245400000000001,
-      "p99Ms": 0.12988799999999998,
-      "worstP99Ms": 0.133177,
+      "medianMs": 0.1040875,
+      "worstMedianMs": 0.104685,
+      "p95Ms": 0.120808,
+      "worstP95Ms": 0.126217,
+      "p99Ms": 0.129724,
+      "worstP99Ms": 0.133176,
       "budgetMs": 5,
-      "updatedAt": "2026-11-25T19:55:25.262Z"
+      "updatedAt": "2026-11-27T20:00:48.892Z"
     }
   }
 }
