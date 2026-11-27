@@ -1,6 +1,12 @@
 use super::*;
 
 const MAX_INLINE_DEPTH: usize = 8;
+const WRITE_BACK_MARKER: &str = "\u{1}wb";
+pub(super) const FRAME_START: &str = "--__s6_frame_start";
+pub(super) const FRAME_END: &str = "--__s6_frame_end";
+
+type MutPredicate<'a> = &'a dyn Fn(&ExprCall, usize) -> bool;
+type StringParams<'a> = &'a [(String, String, proc_macro2::Span, usize)];
 impl<'a> Emitter<'a> {
     pub(super) fn helper(&self, call: &ExprCall) -> Option<Helper> {
         let Expr::Path(path) = &*call.func else {
@@ -42,7 +48,11 @@ impl<'a> Emitter<'a> {
             ));
         }
         let key = format!("{}::{}", helper.module, helper.name);
-        if self.inline_stack.contains(&key) {
+        if self
+            .inline_stack
+            .iter()
+            .any(|entry| entry.split('\u{1}').next() == Some(key.as_str()))
+        {
             return Err(Error::at(
                 *span,
                 format!("recursive helper `{}` cannot be inlined", helper.name),
@@ -174,33 +184,39 @@ impl<'a> Emitter<'a> {
         if let Type::Reference(reference) = ty
             && reference.mutability.is_some()
         {
-            let base = type_text(ty);
-            if !matches!(
-                base.as_str(),
-                "String"
-                    | "str"
-                    | "Vec"
-                    | "HashMap"
-                    | "BTreeMap"
-                    | "Value"
-                    | "Op"
-                    | "Context"
-                    | "Path"
-                    | "PathBuf"
+            if matches!(
+                &*reference.elem,
+                Type::Reference(_)
+                    | Type::ImplTrait(_)
+                    | Type::TraitObject(_)
+                    | Type::Ptr(_)
             ) {
-                let (text, value) = self.expr(argument)?;
-                return Ok(Binding::Local {
-                    width,
-                    name,
-                    text,
-                    ty: value,
-                    container: StaticKind::Value,
-                });
+                return Err(Error::at(
+                    ty.span(),
+                    "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
+                ));
             }
-            return Err(Error::at(
-                ty.span(),
-                "`&mut` helper parameters other than `&mut Vec<Op>` cannot be inlined",
-            ));
+            if let Some(reason) = unsupported_lvalue(argument) {
+                return Err(Error::at(
+                    argument.span(),
+                    format!(
+                        "cannot preserve `&mut` aliasing for this argument: {reason}"
+                    ),
+                ));
+            }
+            let (text, value) = self.expr(argument)?;
+            let target = mutable_lvalue(argument).then(|| text.clone());
+            let operands = lvalue_operands(argument);
+            let scalar = is_mut_scalar(&type_text(&reference.elem));
+            return Ok(Binding::Mut {
+                name,
+                text,
+                ty: value,
+                target,
+                scalar,
+                operands,
+                span: argument.span(),
+            });
         }
         let (text, value) = self.expr(argument)?;
         let argument_null = value.null || text == "nil";
@@ -336,6 +352,160 @@ impl<'a> Emitter<'a> {
         self.stmt(last)
     }
 
+    fn assigned_via_calls(
+        &self,
+        block: &syn::Block,
+        depth: usize,
+    ) -> std::collections::HashSet<String> {
+        fn arg_ident(expr: &Expr) -> Option<String> {
+            match strip_reference(expr) {
+                Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                    arg_ident(&unary.expr)
+                }
+                Expr::Paren(paren) => arg_ident(&paren.expr),
+                Expr::Group(group) => arg_ident(&group.expr),
+                Expr::Path(path) => {
+                    path.path.get_ident().map(ToString::to_string)
+                }
+                _ => None,
+            }
+        }
+
+        fn walk<'a>(
+            emitter: &'a Emitter<'a>,
+            expr: &Expr,
+            depth: usize,
+            out: &mut std::collections::HashSet<String>,
+        ) {
+            match expr {
+                Expr::Call(call) => {
+                    if depth < MAX_INLINE_DEPTH
+                        && let Some(helper) = emitter.helper(call)
+                    {
+                        let mut assigned =
+                            assigned_params(&helper.function.block);
+                        assigned.extend(emitter.assigned_via_calls(
+                            &helper.function.block,
+                            depth + 1,
+                        ));
+                        for ((pattern, ty), argument) in
+                            typed_args(&helper.function)
+                                .into_iter()
+                                .zip(&call.args)
+                        {
+                            if let syn::Pat::Ident(pattern) = pattern
+                                && matches!(
+                                    ty,
+                                    Type::Reference(reference)
+                                        if reference.mutability.is_some()
+                                )
+                                && assigned.contains(&pattern.ident.to_string())
+                                && let Some(name) = arg_ident(argument)
+                            {
+                                out.insert(name);
+                            }
+                        }
+                    }
+                    walk(emitter, &call.func, depth, out);
+                    for argument in &call.args {
+                        walk(emitter, argument, depth, out);
+                    }
+                }
+                Expr::MethodCall(call) => {
+                    walk(emitter, &call.receiver, depth, out);
+                    for argument in &call.args {
+                        walk(emitter, argument, depth, out);
+                    }
+                }
+                Expr::Block(item) => {
+                    body(emitter, &item.block, depth, out);
+                }
+                Expr::If(item) => {
+                    walk(emitter, &item.cond, depth, out);
+                    body(emitter, &item.then_branch, depth, out);
+                    if let Some((_, branch)) = &item.else_branch {
+                        walk(emitter, branch, depth, out);
+                    }
+                }
+                Expr::Match(item) => {
+                    walk(emitter, &item.expr, depth, out);
+                    for arm in &item.arms {
+                        walk(emitter, &arm.body, depth, out);
+                    }
+                }
+                Expr::ForLoop(item) => body(emitter, &item.body, depth, out),
+                Expr::While(item) => {
+                    walk(emitter, &item.cond, depth, out);
+                    body(emitter, &item.body, depth, out);
+                }
+                Expr::Loop(item) => body(emitter, &item.body, depth, out),
+                Expr::Closure(item) => walk(emitter, &item.body, depth, out),
+                Expr::Assign(item) => {
+                    walk(emitter, &item.left, depth, out);
+                    walk(emitter, &item.right, depth, out);
+                }
+                Expr::Unary(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Binary(item) => {
+                    walk(emitter, &item.left, depth, out);
+                    walk(emitter, &item.right, depth, out);
+                }
+                Expr::Paren(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Group(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Reference(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Try(item) => walk(emitter, &item.expr, depth, out),
+                Expr::Return(item) => {
+                    if let Some(value) = &item.expr {
+                        walk(emitter, value, depth, out);
+                    }
+                }
+                Expr::Field(item) => walk(emitter, &item.base, depth, out),
+                Expr::Index(item) => {
+                    walk(emitter, &item.expr, depth, out);
+                    walk(emitter, &item.index, depth, out);
+                }
+                Expr::Array(item) => {
+                    for element in &item.elems {
+                        walk(emitter, element, depth, out);
+                    }
+                }
+                Expr::Tuple(item) => {
+                    for element in &item.elems {
+                        walk(emitter, element, depth, out);
+                    }
+                }
+                Expr::Struct(item) => {
+                    for field in &item.fields {
+                        walk(emitter, &field.expr, depth, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn body<'a>(
+            emitter: &'a Emitter<'a>,
+            block: &syn::Block,
+            depth: usize,
+            out: &mut std::collections::HashSet<String>,
+        ) {
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Expr(expr, _) => walk(emitter, expr, depth, out),
+                    Stmt::Local(local) => {
+                        if let Some(init) = &local.init {
+                            walk(emitter, &init.expr, depth, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut out = std::collections::HashSet::new();
+        body(self, block, depth, &mut out);
+        out
+    }
+
     pub(super) fn inline(
         &mut self,
         helper: &Helper,
@@ -344,9 +514,15 @@ impl<'a> Emitter<'a> {
         returns: Returns,
         check: BodyCheck,
     ) -> Result<(String, Ty), Error> {
-        let iife = check.needs_iife;
+        let nested_frame = !self.inline_stack.is_empty();
+        let nested_with_writebacks = self
+            .inline_stack
+            .last()
+            .is_some_and(|key| key.ends_with(WRITE_BACK_MARKER));
+        let iife = check.needs_iife || nested_with_writebacks;
         let saved_class = self.self_class.clone();
-        let temp = (mode == Inline::Value).then(|| self.temp());
+        let temp = (mode == Inline::Value || (mode == Inline::Tail && iife))
+            .then(|| self.temp());
         if let Some(name) = &temp {
             if iife {
                 self.line(&format!("local {name}"));
@@ -372,6 +548,47 @@ impl<'a> Emitter<'a> {
         self.constant_scopes.push(scope);
         let saved_target = self.tail_target.clone();
         self.tail_target = if iife { None } else { temp.clone() };
+        let saved_value_helper = self.value_helper;
+        let mut assigned = assigned_params(&helper.function.block);
+        assigned.extend(self.assigned_via_calls(&helper.function.block, 0));
+        let mut_names: std::collections::HashSet<String> = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                Binding::Mut { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut_spans: Vec<(String, proc_macro2::Span)> = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                Binding::Mut { name, span, .. } => Some((name.clone(), *span)),
+                _ => None,
+            })
+            .collect();
+        let dest_names: std::collections::HashSet<String> = bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                Binding::Mut { operands, .. } => Some(operands.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let foreign = helper.module != self.home;
+        let module = helper.module.clone();
+        let attach = |error: Error| {
+            if foreign {
+                error.with_file(&module)
+            } else {
+                error
+            }
+        };
+        if nested_frame {
+            self.line(FRAME_START);
+        }
+        let body_start = self.out.len();
+        let mut write_backs = Vec::new();
+        let mut string_params = Vec::new();
+        let mut renames = Vec::new();
         for binding in bindings {
             match binding {
                 Binding::Context(name) => self.push(&name, Ty::CONTEXT),
@@ -405,35 +622,208 @@ impl<'a> Emitter<'a> {
                         super::methods::add_param_width(&name, width);
                     }
                 }
+                Binding::Mut {
+                    name,
+                    text,
+                    ty,
+                    target,
+                    scalar,
+                    operands,
+                    span,
+                } => {
+                    let local_name = if target.as_deref() == Some(name.as_str())
+                    {
+                        let fresh = self.temp();
+                        renames.push((name.clone(), fresh.clone(), span));
+                        fresh
+                    } else {
+                        name.clone()
+                    };
+                    let lua_name = self.bind_name(&local_name);
+                    self.line(&format!("local {lua_name} = {text}"));
+                    if scalar && ty.base == Base::Str {
+                        string_params.push((
+                            lua_name.clone(),
+                            name.clone(),
+                            span,
+                            self.indent,
+                        ));
+                    }
+                    if scalar || assigned.contains(&name) {
+                        let target = target.ok_or_else(|| {
+                            Error::at(
+                                span,
+                                format!(
+                                    "cannot preserve `&mut` aliasing for the `{}` argument of `{}`",
+                                    name, helper.name
+                                ),
+                            )
+                        })?;
+                        if operands.iter().any(|operand| {
+                            operand != &name
+                                && (assigned.contains(operand)
+                                    || mut_names.contains(operand))
+                        }) {
+                            return Err(Error::at(
+                                span,
+                                format!(
+                                    "cannot preserve `&mut` aliasing for the `{}` argument of `{}`",
+                                    name, helper.name
+                                ),
+                            ));
+                        }
+                        let forwarded = call_args_mut(
+                            &helper.function.block,
+                            &name,
+                            &|call, index| {
+                                self.helper(call)
+                                    .and_then(|target| {
+                                        typed_args(&target.function)
+                                            .get(index)
+                                            .map(|(_, ty)| (*ty).clone())
+                                    })
+                                    .is_some_and(|ty| {
+                                        matches!(
+                                            ty,
+                                            Type::Reference(reference)
+                                                if reference.mutability.is_some()
+                                        )
+                                    })
+                            },
+                        );
+                        if forwarded {
+                            return Err(Error::at(
+                                span,
+                                format!(
+                                    "cannot preserve `&mut` aliasing for the `{}` argument of `{}`: nested calls may mutate it",
+                                    name, helper.name
+                                ),
+                            ));
+                        }
+                        write_backs.push((target, lua_name.clone()));
+                    }
+                    if let Some(shapes) = self
+                        .tuple_expr_shapes
+                        .get(&text)
+                        .cloned()
+                        .or_else(|| self.last_tuple_shape.take())
+                    {
+                        self.tuple_types
+                            .insert(lua_name.clone(), shapes.clone());
+                        self.tuple_expr_shapes.insert(lua_name.clone(), shapes);
+                    }
+                    if let Some(types) = self.tuple_types.get(&text).cloned() {
+                        self.tuple_types.insert(lua_name.clone(), types);
+                    }
+                    let origin = self
+                        .tuple_expr_text
+                        .get(&text)
+                        .cloned()
+                        .unwrap_or_else(|| text.clone());
+                    if let Some(shapes) =
+                        self.tuple_expr_shapes.get(&origin).cloned()
+                    {
+                        self.tuple_expr_shapes.insert(lua_name.clone(), shapes);
+                    }
+                    self.tuple_expr_text.insert(lua_name.clone(), origin);
+                    self.push(&local_name, ty);
+                }
             }
         }
-        let saved_value_helper = self.value_helper;
+        for (name, _) in &mut_spans {
+            if let Some(reborrow) = mut_reborrow(&helper.function.block, name) {
+                return Err(attach(Error::at(
+                    reborrow,
+                    format!(
+                        "cannot preserve `&mut` aliasing for the `{name}` argument of `{}`: mutable reborrows cannot be inlined",
+                        helper.name
+                    ),
+                )));
+            }
+        }
+        for (_, original, span, _) in &string_params {
+            if let Some(method) =
+                unsupported_string_mutator(&helper.function.block, original)
+            {
+                return Err(attach(Error::at(
+                    *span,
+                    format!(
+                        "cannot preserve `&mut` aliasing for the `{original}` argument of `{}`: String::{method} has no faithful rewrite",
+                        helper.name
+                    ),
+                )));
+            }
+        }
+        let mut shadow_names = std::collections::HashSet::new();
+        shadow_names.extend(mut_names.iter().cloned());
+        shadow_names.extend(dest_names.iter().cloned());
+        for name in &shadow_names {
+            if let Some(shadow) = shadowed_local(&helper.function.block, name) {
+                return Err(attach(Error::at(
+                    shadow,
+                    format!(
+                        "cannot preserve `&mut` aliasing for the `{name}` argument of `{}`: the name is shadowed",
+                        helper.name
+                    ),
+                )));
+            }
+        }
+        let mut block = helper.function.block.clone();
+        for (from, to, span) in &renames {
+            if implicit_macro_capture(&helper.function.block, from).is_some() {
+                return Err(Error::at(
+                    *span,
+                    format!(
+                        "cannot preserve `&mut` aliasing for the `{from}` argument of `{}`: implicit format captures cannot be renamed",
+                        helper.name
+                    ),
+                ));
+            }
+            rename_paths(&mut block, from, to);
+        }
         self.value_helper = mode == Inline::Value;
         let key = format!("{}::{}", helper.module, helper.name);
-        self.inline_stack.push(key);
+        let stack_key = if write_backs.is_empty() {
+            key
+        } else {
+            format!("{key}{WRITE_BACK_MARKER}")
+        };
+        self.inline_stack.push(stack_key);
         self.inline_budget = self.inline_budget.saturating_sub(1);
         let result = match mode {
-            Inline::Value => {
-                self.block_inner(&helper.function.block, true).map(|()| {
-                    (
-                        temp.clone().unwrap_or_default(),
-                        match returns {
-                            Returns::Value(ty) => ty,
-                            _ => Ty::VALUE,
-                        },
-                    )
-                })
-            }
+            Inline::Value => self.block_inner(&block, true).map(|()| {
+                (
+                    temp.clone().unwrap_or_default(),
+                    match returns {
+                        Returns::Value(ty) => ty,
+                        _ => Ty::VALUE,
+                    },
+                )
+            }),
             Inline::Tail => self
-                .block_inner(&helper.function.block, true)
+                .block_inner(&block, true)
                 .map(|()| (String::new(), Ty::VOID)),
             Inline::Statement => self
-                .block_inner(&helper.function.block, false)
+                .block_inner(&block, false)
                 .map(|()| (String::new(), Ty::VOID)),
-            Inline::Ops => self
-                .ops_body(&helper.function.block)
-                .map(|()| (String::new(), Ty::VOID)),
+            Inline::Ops => {
+                self.ops_body(&block).map(|()| (String::new(), Ty::VOID))
+            }
         };
+        if !write_backs.is_empty() {
+            let body = self.out.split_off(body_start);
+            let (body, ends_in_return) =
+                copy_back_returns(&body, &write_backs, &string_params);
+            self.out.push_str(&body);
+            if !ends_in_return {
+                for (target, name) in &write_backs {
+                    self.line(&format!("{target} = {name}"));
+                }
+            }
+        }
+        if nested_frame {
+            self.line(FRAME_END);
+        }
         self.inline_stack.pop();
         super::methods::pop_param_width_scope();
         self.value_helper = saved_value_helper;
@@ -452,6 +842,27 @@ impl<'a> Emitter<'a> {
             }
         } else {
             self.line("end");
+        }
+        if mode == Inline::Tail
+            && iife
+            && let Some(value) = &temp
+        {
+            if let Some(target) = self.tail_target.clone() {
+                self.line(&format!("{target} = {value}"));
+            } else {
+                self.line(&format!("return {value}"));
+            }
+        }
+        if self.inline_stack.is_empty() {
+            let kept: String = self
+                .out
+                .lines()
+                .filter(|line| {
+                    line.trim() != FRAME_START && line.trim() != FRAME_END
+                })
+                .map(|line| format!("{line}\n"))
+                .collect();
+            self.out = kept;
         }
         let foreign = helper.module != self.home;
         result.map_err(|error| {
@@ -534,6 +945,999 @@ pub(crate) enum Binding {
         ty: Ty,
         container: StaticKind,
     },
+    Mut {
+        name: String,
+        text: String,
+        ty: Ty,
+        target: Option<String>,
+        scalar: bool,
+        operands: Vec<String>,
+        span: proc_macro2::Span,
+    },
+}
+
+fn is_mut_scalar(name: &str) -> bool {
+    matches!(
+        name,
+        "String"
+            | "str"
+            | "bool"
+            | "char"
+            | "Path"
+            | "PathBuf"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
+}
+
+fn unsupported_lvalue(expr: &Expr) -> Option<&'static str> {
+    fn walk(expr: &Expr) -> Option<&'static str> {
+        match strip_reference(expr) {
+            Expr::Field(field) => walk(&field.base),
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                walk(&unary.expr)
+            }
+            Expr::Index(index) => {
+                match strip_reference(&index.index) {
+                    Expr::Range(_) => {
+                        return Some("slice destinations are not assignable");
+                    }
+                    Expr::Path(_) => {}
+                    _ => {
+                        return Some(
+                            "computed index operands cannot be snapshotted",
+                        );
+                    }
+                }
+                walk(&index.expr)
+            }
+            Expr::Group(group) => walk(&group.expr),
+            Expr::Paren(paren) => walk(&paren.expr),
+            _ => None,
+        }
+    }
+
+    walk(expr)
+}
+
+fn mutable_lvalue(expr: &Expr) -> bool {
+    match strip_reference(expr) {
+        Expr::Path(_) => true,
+        Expr::Field(field) => mutable_lvalue(&field.base),
+        Expr::Index(index) => mutable_lvalue(&index.expr),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+            mutable_lvalue(&unary.expr)
+        }
+        Expr::Group(group) => mutable_lvalue(&group.expr),
+        Expr::Paren(paren) => mutable_lvalue(&paren.expr),
+        _ => false,
+    }
+}
+
+fn rename_tokens(
+    tokens: proc_macro2::TokenStream,
+    from: &str,
+    to: &str,
+) -> proc_macro2::TokenStream {
+    rename_tokens_inner(tokens, from, to, true)
+}
+
+fn rename_tokens_inner(
+    tokens: proc_macro2::TokenStream,
+    from: &str,
+    to: &str,
+    labels_allowed: bool,
+) -> proc_macro2::TokenStream {
+    use proc_macro2::TokenTree;
+    let items: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut out = proc_macro2::TokenStream::new();
+    let mut after_separator = false;
+    for (index, token) in items.iter().enumerate() {
+        let is_separator = matches!(
+            items.get(index + 1),
+            Some(TokenTree::Punct(punct))
+                if (punct.as_char() == ':'
+                    && !matches!(
+                        items.get(index + 2),
+                        Some(TokenTree::Punct(next)) if next.as_char() == ':'
+                    ))
+                    || (punct.as_char() == '='
+                        && labels_allowed
+                        && punct.spacing() == proc_macro2::Spacing::Alone)
+        );
+        let renamed = match token {
+            TokenTree::Ident(ident)
+                if ident == from && !after_separator && !is_separator =>
+            {
+                TokenTree::Ident(proc_macro2::Ident::new(to, ident.span()))
+            }
+            TokenTree::Ident(ident) => TokenTree::Ident(ident.clone()),
+            TokenTree::Group(group) => {
+                let mut renamed = proc_macro2::Group::new(
+                    group.delimiter(),
+                    rename_tokens_inner(group.stream(), from, to, false),
+                );
+                renamed.set_span(group.span());
+                TokenTree::Group(renamed)
+            }
+            other => other.clone(),
+        };
+        after_separator = matches!(
+            &renamed,
+            TokenTree::Punct(punct)
+                if punct.as_char() == '.' || punct.as_char() == ':'
+        );
+        out.extend(std::iter::once(renamed));
+    }
+    out
+}
+
+fn rename_paths(block: &mut syn::Block, from: &str, to: &str) {
+    fn visit(expr: &mut Expr, from: &str, to: &str) {
+        match expr {
+            Expr::Path(path) => {
+                if path.path.get_ident().is_some_and(|id| id == from) {
+                    path.path = syn::parse_str(to).expect("fresh local name");
+                }
+            }
+            Expr::Block(item) => visit_block(&mut item.block, from, to),
+            Expr::If(item) => {
+                visit(&mut item.cond, from, to);
+                visit_block(&mut item.then_branch, from, to);
+                if let Some((_, branch)) = &mut item.else_branch {
+                    visit(branch, from, to);
+                }
+            }
+            Expr::Match(item) => {
+                visit(&mut item.expr, from, to);
+                for arm in &mut item.arms {
+                    visit(&mut arm.body, from, to);
+                }
+            }
+            Expr::ForLoop(item) => {
+                visit(&mut item.expr, from, to);
+                visit_block(&mut item.body, from, to);
+            }
+            Expr::While(item) => {
+                visit(&mut item.cond, from, to);
+                visit_block(&mut item.body, from, to);
+            }
+            Expr::Loop(item) => visit_block(&mut item.body, from, to),
+            Expr::Closure(item) => visit(&mut item.body, from, to),
+            Expr::MethodCall(item) => {
+                visit(&mut item.receiver, from, to);
+                for argument in &mut item.args {
+                    visit(argument, from, to);
+                }
+            }
+            Expr::Call(item) => {
+                visit(&mut item.func, from, to);
+                for argument in &mut item.args {
+                    visit(argument, from, to);
+                }
+            }
+            Expr::Assign(item) => {
+                visit(&mut item.left, from, to);
+                visit(&mut item.right, from, to);
+            }
+            Expr::Unary(item) => visit(&mut item.expr, from, to),
+            Expr::Binary(item) => {
+                visit(&mut item.left, from, to);
+                visit(&mut item.right, from, to);
+            }
+            Expr::Paren(item) => visit(&mut item.expr, from, to),
+            Expr::Group(item) => visit(&mut item.expr, from, to),
+            Expr::Reference(item) => visit(&mut item.expr, from, to),
+            Expr::Try(item) => visit(&mut item.expr, from, to),
+            Expr::Return(item) => {
+                if let Some(value) = &mut item.expr {
+                    visit(value, from, to);
+                }
+            }
+            Expr::Field(item) => visit(&mut item.base, from, to),
+            Expr::Index(item) => {
+                visit(&mut item.expr, from, to);
+                visit(&mut item.index, from, to);
+            }
+            Expr::Array(item) => {
+                for element in &mut item.elems {
+                    visit(element, from, to);
+                }
+            }
+            Expr::Tuple(item) => {
+                for element in &mut item.elems {
+                    visit(element, from, to);
+                }
+            }
+            Expr::Struct(item) => {
+                for field in &mut item.fields {
+                    visit(&mut field.expr, from, to);
+                }
+            }
+            Expr::Cast(item) => visit(&mut item.expr, from, to),
+            Expr::Range(item) => {
+                if let Some(start) = &mut item.start {
+                    visit(start, from, to);
+                }
+                if let Some(end) = &mut item.end {
+                    visit(end, from, to);
+                }
+            }
+            Expr::Macro(item) => {
+                item.mac.tokens = rename_tokens(
+                    std::mem::take(&mut item.mac.tokens),
+                    from,
+                    to,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn visit_block(block: &mut syn::Block, from: &str, to: &str) {
+        for stmt in &mut block.stmts {
+            match stmt {
+                Stmt::Expr(item, _) => visit(item, from, to),
+                Stmt::Local(local) => {
+                    if let Some(init) = &mut local.init {
+                        visit(&mut init.expr, from, to);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    visit_block(block, from, to);
+}
+
+fn lvalue_operands(expr: &Expr) -> Vec<String> {
+    fn walk(expr: &Expr, out: &mut Vec<String>) {
+        match strip_reference(expr) {
+            Expr::Path(path) => {
+                if let Some(name) = path.path.get_ident() {
+                    out.push(name.to_string());
+                }
+            }
+            Expr::Field(field) => walk(&field.base, out),
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                walk(&unary.expr, out);
+            }
+            Expr::Index(index) => {
+                walk(&index.expr, out);
+                walk(&index.index, out);
+            }
+            Expr::Group(group) => walk(&group.expr, out),
+            Expr::Paren(paren) => walk(&paren.expr, out),
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(expr, &mut out);
+    out
+}
+
+fn pattern_ident(pattern: &Pat) -> Option<&syn::Ident> {
+    match pattern {
+        Pat::Ident(item) => Some(&item.ident),
+        Pat::Type(item) => pattern_ident(&item.pat),
+        Pat::Paren(item) => pattern_ident(&item.pat),
+        _ => None,
+    }
+}
+
+fn shadowed_local(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+    fn statements(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+        for stmt in &block.stmts {
+            if let Stmt::Local(local) = stmt
+                && pattern_ident(&local.pat).is_some_and(|id| id == name)
+            {
+                return Some(local.pat.span());
+            }
+            if let Some(span) = expressions(stmt, name) {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    fn expressions(stmt: &Stmt, name: &str) -> Option<proc_macro2::Span> {
+        match stmt {
+            Stmt::Expr(expr, _) => exprs(expr, name),
+            Stmt::Local(local) => {
+                local.init.as_ref().and_then(|init| exprs(&init.expr, name))
+            }
+            _ => None,
+        }
+    }
+
+    fn exprs(expr: &Expr, name: &str) -> Option<proc_macro2::Span> {
+        match expr {
+            Expr::Block(item) => statements(&item.block, name),
+            Expr::If(item) => {
+                statements(&item.then_branch, name).or_else(|| {
+                    item.else_branch.as_ref().and_then(|(_, branch)| {
+                        match &**branch {
+                            Expr::Block(block) => {
+                                statements(&block.block, name)
+                            }
+                            other => exprs(other, name),
+                        }
+                    })
+                })
+            }
+            Expr::Match(item) => {
+                item.arms.iter().find_map(|arm| match &*arm.body {
+                    Expr::Block(block) => statements(&block.block, name),
+                    other => exprs(other, name),
+                })
+            }
+            Expr::ForLoop(item) => statements(&item.body, name),
+            Expr::While(item) => statements(&item.body, name),
+            Expr::Loop(item) => statements(&item.body, name),
+            _ => None,
+        }
+    }
+
+    statements(block, name)
+}
+
+fn mut_reborrow(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+    fn statements(block: &syn::Block, name: &str) -> Option<proc_macro2::Span> {
+        for stmt in &block.stmts {
+            if let Stmt::Local(local) = stmt
+                && let Some(init) = &local.init
+                && reborrow(&init.expr, name)
+            {
+                return Some(init.expr.span());
+            }
+            if let Some(span) = match stmt {
+                Stmt::Expr(expr, _) => exprs(expr, name),
+                Stmt::Local(local) => {
+                    local.init.as_ref().and_then(|init| exprs(&init.expr, name))
+                }
+                _ => None,
+            } {
+                return Some(span);
+            }
+        }
+        None
+    }
+
+    fn reborrow(expr: &Expr, name: &str) -> bool {
+        let Expr::Reference(reference) = expr else {
+            return false;
+        };
+        if reference.mutability.is_none() {
+            return false;
+        }
+        match strip_reference(&reference.expr) {
+            Expr::Path(path) => {
+                path.path.get_ident().is_some_and(|id| id == name)
+            }
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                let Expr::Path(path) = strip_reference(&unary.expr) else {
+                    return false;
+                };
+                path.path.get_ident().is_some_and(|id| id == name)
+            }
+            _ => false,
+        }
+    }
+
+    fn exprs(expr: &Expr, name: &str) -> Option<proc_macro2::Span> {
+        match expr {
+            Expr::Block(item) => statements(&item.block, name),
+            Expr::If(item) => {
+                statements(&item.then_branch, name).or_else(|| {
+                    item.else_branch.as_ref().and_then(|(_, branch)| {
+                        match &**branch {
+                            Expr::Block(block) => {
+                                statements(&block.block, name)
+                            }
+                            other => exprs(other, name),
+                        }
+                    })
+                })
+            }
+            Expr::Match(item) => {
+                item.arms.iter().find_map(|arm| match &*arm.body {
+                    Expr::Block(block) => statements(&block.block, name),
+                    other => exprs(other, name),
+                })
+            }
+            Expr::ForLoop(item) => statements(&item.body, name),
+            Expr::While(item) => statements(&item.body, name),
+            Expr::Loop(item) => statements(&item.body, name),
+            _ => None,
+        }
+    }
+
+    statements(block, name)
+}
+
+fn implicit_macro_capture(
+    block: &syn::Block,
+    name: &str,
+) -> Option<proc_macro2::Span> {
+    use proc_macro2::TokenTree;
+
+    #[allow(clippy::while_let_on_iterator)]
+    fn literal_placeholders(literal: &str) -> Vec<String> {
+        let raw = literal.trim_start().starts_with('r');
+        let text = literal
+            .trim_start_matches('r')
+            .trim_matches('#')
+            .trim_matches('"');
+        let mut out = Vec::new();
+        let mut chars = text.chars().peekable();
+        while let Some(character) = chars.next() {
+            if !raw && character == '\\' {
+                chars.next();
+                continue;
+            }
+            if character == '{' && chars.peek() == Some(&'{') {
+                chars.next();
+                continue;
+            }
+            if character == '{' {
+                let mut placeholder = String::new();
+                while let Some(next) = chars.next() {
+                    if next == '}' {
+                        break;
+                    }
+                    if next == ':' {
+                        break;
+                    }
+                    placeholder.push(next);
+                }
+                if !placeholder.is_empty()
+                    && placeholder
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.push(placeholder);
+                }
+            }
+        }
+        out
+    }
+
+    fn tokens(stream: proc_macro2::TokenStream, name: &str) -> bool {
+        let items: Vec<TokenTree> = stream.into_iter().collect();
+        let explicit = items.iter().enumerate().any(|(index, token)| {
+            matches!(token, TokenTree::Ident(ident) if ident == name)
+                && matches!(
+                    items.get(index + 1),
+                    Some(TokenTree::Punct(punct))
+                        if punct.as_char() == '='
+                            && punct.spacing() == proc_macro2::Spacing::Alone
+                )
+        });
+        items.iter().any(|token| match token {
+            TokenTree::Literal(literal) => {
+                !explicit
+                    && literal_placeholders(&literal.to_string())
+                        .iter()
+                        .any(|key| key == name)
+            }
+            TokenTree::Group(group) => tokens(group.stream(), name),
+            _ => false,
+        })
+    }
+
+    fn walk(expr: &Expr, name: &str) -> bool {
+        match expr {
+            Expr::Macro(item) => tokens(item.mac.tokens.clone(), name),
+            Expr::Block(item) => body(&item.block, name),
+            Expr::If(item) => {
+                walk(&item.cond, name)
+                    || body(&item.then_branch, name)
+                    || item
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|(_, branch)| walk(branch, name))
+            }
+            Expr::Match(item) => {
+                walk(&item.expr, name)
+                    || item.arms.iter().any(|arm| walk(&arm.body, name))
+            }
+            Expr::ForLoop(item) => {
+                walk(&item.expr, name) || body(&item.body, name)
+            }
+            Expr::While(item) => {
+                walk(&item.cond, name) || body(&item.body, name)
+            }
+            Expr::Loop(item) => body(&item.body, name),
+            Expr::Call(item) => {
+                walk(&item.func, name)
+                    || item.args.iter().any(|arg| walk(arg, name))
+            }
+            Expr::MethodCall(item) => {
+                walk(&item.receiver, name)
+                    || item.args.iter().any(|arg| walk(arg, name))
+            }
+            Expr::Assign(item) => {
+                walk(&item.left, name) || walk(&item.right, name)
+            }
+            Expr::Unary(item) => walk(&item.expr, name),
+            Expr::Binary(item) => {
+                walk(&item.left, name) || walk(&item.right, name)
+            }
+            Expr::Paren(item) => walk(&item.expr, name),
+            Expr::Group(item) => walk(&item.expr, name),
+            Expr::Reference(item) => walk(&item.expr, name),
+            Expr::Try(item) => walk(&item.expr, name),
+            Expr::Return(item) => {
+                item.expr.as_ref().is_some_and(|value| walk(value, name))
+            }
+            Expr::Field(item) => walk(&item.base, name),
+            Expr::Index(item) => {
+                walk(&item.expr, name) || walk(&item.index, name)
+            }
+            Expr::Array(item) => item.elems.iter().any(|item| walk(item, name)),
+            Expr::Tuple(item) => item.elems.iter().any(|item| walk(item, name)),
+            Expr::Struct(item) => {
+                item.fields.iter().any(|field| walk(&field.expr, name))
+            }
+            _ => false,
+        }
+    }
+
+    fn body(block: &syn::Block, name: &str) -> bool {
+        block.stmts.iter().any(|stmt| match stmt {
+            Stmt::Expr(expr, _) => walk(expr, name),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| walk(&init.expr, name)),
+            _ => false,
+        })
+    }
+
+    body(block, name).then_some(proc_macro2::Span::call_site())
+}
+
+fn call_args_mut(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
+    fn argument(expr: &Expr, name: &str) -> bool {
+        match strip_reference(expr) {
+            Expr::Path(path) => {
+                path.path.get_ident().is_some_and(|id| id == name)
+            }
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                argument(&unary.expr, name)
+            }
+            Expr::Paren(paren) => argument(&paren.expr, name),
+            Expr::Group(group) => argument(&group.expr, name),
+            _ => false,
+        }
+    }
+
+    fn walk(expr: &Expr, name: &str, is_mut: MutPredicate) -> bool {
+        match expr {
+            Expr::Call(item) => {
+                item.args.iter().enumerate().any(|(index, arg)| {
+                    is_mut(item, index) && argument(arg, name)
+                }) || walk(&item.func, name, is_mut)
+                    || item.args.iter().any(|arg| walk(arg, name, is_mut))
+            }
+            Expr::MethodCall(item) => {
+                item.args.iter().any(|arg| {
+                    matches!(arg, Expr::Reference(reference) if reference.mutability.is_some())
+                        && argument(arg, name)
+                }) || walk(&item.receiver, name, is_mut)
+                    || item.args.iter().any(|arg| walk(arg, name, is_mut))
+            }
+            Expr::Block(item) => body(&item.block, name, is_mut),
+            Expr::If(item) => {
+                walk(&item.cond, name, is_mut)
+                    || body(&item.then_branch, name, is_mut)
+                    || item
+                        .else_branch
+                        .as_ref()
+                        .is_some_and(|(_, branch)| walk(branch, name, is_mut))
+            }
+            Expr::Match(item) => {
+                walk(&item.expr, name, is_mut)
+                    || item.arms.iter().any(|arm| walk(&arm.body, name, is_mut))
+            }
+            Expr::ForLoop(item) => body(&item.body, name, is_mut),
+            Expr::While(item) => {
+                walk(&item.cond, name, is_mut) || body(&item.body, name, is_mut)
+            }
+            Expr::Loop(item) => body(&item.body, name, is_mut),
+            Expr::Closure(item) => walk(&item.body, name, is_mut),
+            Expr::Assign(item) => {
+                walk(&item.left, name, is_mut)
+                    || walk(&item.right, name, is_mut)
+            }
+            Expr::Unary(item) => walk(&item.expr, name, is_mut),
+            Expr::Binary(item) => {
+                walk(&item.left, name, is_mut)
+                    || walk(&item.right, name, is_mut)
+            }
+            Expr::Paren(item) => walk(&item.expr, name, is_mut),
+            Expr::Group(item) => walk(&item.expr, name, is_mut),
+            Expr::Reference(item) => walk(&item.expr, name, is_mut),
+            Expr::Try(item) => walk(&item.expr, name, is_mut),
+            Expr::Return(item) => item
+                .expr
+                .as_ref()
+                .is_some_and(|value| walk(value, name, is_mut)),
+            Expr::Field(item) => walk(&item.base, name, is_mut),
+            Expr::Index(item) => {
+                walk(&item.expr, name, is_mut)
+                    || walk(&item.index, name, is_mut)
+            }
+            Expr::Array(item) => {
+                item.elems.iter().any(|item| walk(item, name, is_mut))
+            }
+            Expr::Tuple(item) => {
+                item.elems.iter().any(|item| walk(item, name, is_mut))
+            }
+            Expr::Struct(item) => item
+                .fields
+                .iter()
+                .any(|field| walk(&field.expr, name, is_mut)),
+            _ => false,
+        }
+    }
+
+    fn body(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
+        block.stmts.iter().any(|stmt| match stmt {
+            Stmt::Expr(expr, _) => walk(expr, name, is_mut),
+            Stmt::Local(local) => local
+                .init
+                .as_ref()
+                .is_some_and(|init| walk(&init.expr, name, is_mut)),
+            _ => false,
+        })
+    }
+
+    body(block, name, is_mut)
+}
+
+fn unsupported_string_mutator(
+    block: &syn::Block,
+    name: &str,
+) -> Option<String> {
+    fn walk(expr: &Expr, name: &str, out: &mut Option<String>) {
+        if out.is_some() {
+            return;
+        }
+        match expr {
+            Expr::MethodCall(call) => {
+                if let Expr::Path(path) = strip_reference(&call.receiver)
+                    && path.path.get_ident().is_some_and(|id| id == name)
+                {
+                    let method = call.method.to_string();
+                    if matches!(
+                        method.as_str(),
+                        "insert"
+                            | "insert_str"
+                            | "remove"
+                            | "truncate"
+                            | "drain"
+                            | "replace_range"
+                    ) {
+                        *out = Some(method);
+                        return;
+                    }
+                }
+                walk(&call.receiver, name, out);
+                for argument in &call.args {
+                    walk(argument, name, out);
+                }
+            }
+            Expr::Block(item) => body(&item.block, name, out),
+            Expr::If(item) => {
+                walk(&item.cond, name, out);
+                body(&item.then_branch, name, out);
+                if let Some((_, branch)) = &item.else_branch {
+                    walk(branch, name, out);
+                }
+            }
+            Expr::Match(item) => {
+                walk(&item.expr, name, out);
+                for arm in &item.arms {
+                    walk(&arm.body, name, out);
+                }
+            }
+            Expr::ForLoop(item) => body(&item.body, name, out),
+            Expr::While(item) => {
+                walk(&item.cond, name, out);
+                body(&item.body, name, out);
+            }
+            Expr::Loop(item) => body(&item.body, name, out),
+            Expr::Closure(item) => walk(&item.body, name, out),
+            Expr::Call(item) => {
+                walk(&item.func, name, out);
+                for argument in &item.args {
+                    walk(argument, name, out);
+                }
+            }
+            Expr::Assign(item) => {
+                walk(&item.left, name, out);
+                walk(&item.right, name, out);
+            }
+            Expr::Unary(item) => walk(&item.expr, name, out),
+            Expr::Binary(item) => {
+                walk(&item.left, name, out);
+                walk(&item.right, name, out);
+            }
+            Expr::Paren(item) => walk(&item.expr, name, out),
+            Expr::Group(item) => walk(&item.expr, name, out),
+            Expr::Reference(item) => walk(&item.expr, name, out),
+            Expr::Try(item) => walk(&item.expr, name, out),
+            Expr::Return(item) => {
+                if let Some(value) = &item.expr {
+                    walk(value, name, out);
+                }
+            }
+            Expr::Field(item) => walk(&item.base, name, out),
+            Expr::Index(item) => {
+                walk(&item.expr, name, out);
+                walk(&item.index, name, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn body(block: &syn::Block, name: &str, out: &mut Option<String>) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Expr(expr, _) => walk(expr, name, out),
+                Stmt::Local(local) => {
+                    if let Some(init) = &local.init {
+                        walk(&init.expr, name, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = None;
+    body(block, name, &mut out);
+    out
+}
+
+fn assigned_params(block: &syn::Block) -> std::collections::HashSet<String> {
+    fn collect(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::Assign(item) => {
+                target(&item.left, out);
+                collect(&item.right, out);
+            }
+            Expr::Closure(item) => collect(&item.body, out),
+            Expr::Block(item) => body(&item.block, out),
+            Expr::If(item) => {
+                collect(&item.cond, out);
+                body(&item.then_branch, out);
+                if let Some((_, branch)) = &item.else_branch {
+                    collect(branch, out);
+                }
+            }
+            Expr::Match(item) => {
+                collect(&item.expr, out);
+                for arm in &item.arms {
+                    collect(&arm.body, out);
+                }
+            }
+            Expr::ForLoop(item) => body(&item.body, out),
+            Expr::While(item) => body(&item.body, out),
+            Expr::Loop(item) => body(&item.body, out),
+            Expr::MethodCall(item) => {
+                collect(&item.receiver, out);
+                for argument in &item.args {
+                    collect(argument, out);
+                }
+            }
+            Expr::Call(item) => {
+                collect(&item.func, out);
+                for argument in &item.args {
+                    collect(argument, out);
+                }
+            }
+            Expr::Unary(item) => collect(&item.expr, out),
+            Expr::Binary(item) => {
+                collect(&item.left, out);
+                collect(&item.right, out);
+            }
+            Expr::Paren(item) => collect(&item.expr, out),
+            Expr::Group(item) => collect(&item.expr, out),
+            Expr::Reference(item) => collect(&item.expr, out),
+            Expr::Try(item) => collect(&item.expr, out),
+            Expr::Return(item) => {
+                if let Some(value) = &item.expr {
+                    collect(value, out);
+                }
+            }
+            Expr::Field(item) => collect(&item.base, out),
+            Expr::Index(item) => {
+                collect(&item.expr, out);
+                collect(&item.index, out);
+            }
+            Expr::Array(item) => {
+                for element in &item.elems {
+                    collect(element, out);
+                }
+            }
+            Expr::Tuple(item) => {
+                for element in &item.elems {
+                    collect(element, out);
+                }
+            }
+            Expr::Struct(item) => {
+                for field in &item.fields {
+                    collect(&field.expr, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn target(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+        match strip_reference(expr) {
+            Expr::Unary(unary) if matches!(unary.op, UnOp::Deref(_)) => {
+                target(&unary.expr, out);
+            }
+            Expr::Path(path) => {
+                if let Some(name) = path.path.get_ident() {
+                    out.insert(name.to_string());
+                }
+            }
+            Expr::Tuple(tuple) => {
+                for element in &tuple.elems {
+                    target(element, out);
+                }
+            }
+            Expr::Paren(paren) => target(&paren.expr, out),
+            Expr::Group(group) => target(&group.expr, out),
+            Expr::Array(array) => {
+                for element in &array.elems {
+                    target(element, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn body(block: &syn::Block, out: &mut std::collections::HashSet<String>) {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Expr(expr, _) => collect(expr, out),
+                Stmt::Local(local) => {
+                    if let Some(init) = &local.init {
+                        collect(&init.expr, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut out = std::collections::HashSet::new();
+    body(block, &mut out);
+    out
+}
+
+fn strip_strings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in text.chars() {
+        if quoted {
+            out.push(' ');
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+        } else if character == '"' {
+            quoted = true;
+            out.push(' ');
+        } else {
+            out.push(character);
+        }
+    }
+    out
+}
+
+fn copy_back_returns(
+    body: &str,
+    write_backs: &[(String, String)],
+    string_params: StringParams,
+) -> (String, bool) {
+    let mut out = String::with_capacity(body.len());
+    let mut blocks: Vec<bool> = Vec::new();
+    let mut nested_depth = 0usize;
+    let mut ends_in_return = false;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = &line[..line.len() - trimmed.len()];
+        let newline = trimmed.ends_with('\n');
+        let content = trimmed.strip_suffix('\n').unwrap_or(trimmed);
+        let scan = strip_strings(content);
+        let one_line = scan.contains(" end") || scan.contains("end)");
+        if (scan.contains("function(") || scan.contains("(function()"))
+            && !one_line
+        {
+            blocks.push(true);
+        } else if !one_line
+            && !scan.trim_start().starts_with("elseif")
+            && (scan == "do"
+                || scan.ends_with(" then")
+                || scan.ends_with(" do"))
+        {
+            blocks.push(false);
+        }
+        if content.trim() == FRAME_START {
+            nested_depth = nested_depth.saturating_add(1);
+        } else if content.trim() == FRAME_END {
+            nested_depth = nested_depth.saturating_sub(1);
+        }
+        let mut line = content.to_owned();
+        for (name, _, _, _) in string_params {
+            if nested_depth > 0 {
+                continue;
+            }
+            if let Some(value) = line
+                .strip_prefix(&format!("table.insert({name}, "))
+                .and_then(|rest| rest.strip_suffix(')'))
+            {
+                line = format!("{name} = {name} .. ({value})");
+            } else if line == format!("table.clear({name})") {
+                line = format!("{name} = \"\"");
+            }
+        }
+        let outside_function =
+            nested_depth == 0 && !blocks.iter().any(|function| *function);
+        let early_return = outside_function && scan.contains("then return end");
+        ends_in_return = outside_function
+            && scan.trim_start().starts_with("return")
+            && !scan
+                .trim_start()
+                .strip_prefix("return")
+                .is_some_and(|rest| {
+                    rest.starts_with(|c: char| {
+                        c.is_ascii_alphanumeric() || c == '_'
+                    })
+                });
+        if ends_in_return || early_return {
+            for (target, name) in write_backs {
+                out.push_str(indent);
+                out.push_str(target);
+                out.push_str(" = ");
+                out.push_str(name);
+                out.push('\n');
+            }
+        }
+        out.push_str(indent);
+        out.push_str(&line);
+        if newline {
+            out.push('\n');
+        }
+        if content.starts_with("end") {
+            blocks.pop();
+        }
+    }
+    (out, ends_in_return)
 }
 
 #[derive(Default)]

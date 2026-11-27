@@ -327,7 +327,7 @@ ${table.join('\n')}
 
 ${ceilingLine}
 
-All workloads run three times on a release build in the same CI session, and the best round is used. The reference is a ceiling commit re-measured in this session when one exists, otherwise main from this session. A workload fails when its median or p95 is more than 10% slower than the reference worst round, or by more than either side's spread between rounds, whichever is larger, with a floor of 2 µs. A p99 failure also needs 100 µs of absolute excess, since p99 is the slowest of 60 samples and one delayed sample can move it. It warns at half the margin. It also fails when its median is more than 10% over budget while the reference is within budget. Budgets can only be tightened. Benchmarks use generated fixtures and never read a Noctalia config.`
+All workloads run three times on a release build in one CI session, and the best round is used. Each workload and its reference stay on the same runner, so runner speed cancels out. The reference is a ceiling commit re-measured in that session when one exists, otherwise main from that session. A workload fails when its median or p95 is more than 10% slower than the reference worst round, or by more than either side's spread between rounds, whichever is larger, with a floor of 2 µs. A p99 failure also needs 100 µs of absolute excess, since p99 is the slowest of 60 samples and one delayed sample can move it. It warns at half the margin. It also fails when its median is more than 10% over budget while the reference is within budget. Budgets can only be tightened. Benchmarks use generated fixtures and never read a Noctalia config.`
 }
 
 function parseArgs(argv) {
@@ -362,6 +362,25 @@ function runPlan(args) {
     .filter((sha) => sha && sha !== meta.headSha)
     .sort())
     console.log(sha)
+}
+
+function shardPlan(floor, count, headSha, baseSha) {
+  if (!Number.isSafeInteger(count) || count < 1 || count > 32)
+    fail('shard count must be an integer between 1 and 32')
+  const shas = [...new Set(Object.values(floor.metrics).map((record) => record.sha))]
+    .filter((sha) => sha !== headSha && sha !== baseSha)
+    .sort()
+  const shards = Array.from({ length: count }, (_, index) => ({ index, shas: [] }))
+  if (baseSha && baseSha !== headSha) shards[0].shas.push(baseSha)
+  shas.forEach((sha, index) => shards[index % count].shas.push(sha))
+  return shards
+}
+
+function runShards(args) {
+  if (!args.head || !SHA.test(args.head)) fail('--head must be a commit SHA')
+  if (args.base && !SHA.test(args.base)) fail('--base must be a commit SHA')
+  const floor = readFloor(args.floor)
+  console.log(JSON.stringify(shardPlan(floor, Number(args.count), args.head, args.base)))
 }
 
 function runReport(args) {
@@ -451,9 +470,10 @@ function main() {
   const [command, ...rest] = process.argv.slice(2)
   const args = parseArgs(rest)
   if (command === 'plan') return runPlan(args)
+  if (command === 'shards') return runShards(args)
   if (command === 'report') return runReport(args)
   if (command === 'floor') return runFloor(args)
-  fail('Use plan, report, or floor.')
+  fail('Use plan, shards, report, or floor.')
 }
 
 module.exports = {
@@ -468,6 +488,8 @@ module.exports = {
   updateFloor: runFloor,
   plan: runPlan,
   report: runReport,
+  shardPlan,
+  shards: runShards,
 }
 
 if (require.main === module) {
