@@ -459,7 +459,10 @@ fn helper(n: &mut i64, early: bool) {
 }
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let mut n = 0;
-    helper(&mut n, true);
+    helper(&mut n, ctx.event == "render");
+    if ctx.event != "render" {
+        helper(&mut n, false);
+    }
     Ok(vec![Op::log(n.to_string())])
 }
 "#,
@@ -490,4 +493,94 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     for chunk in actual.chunks(expected.len()) {
         assert_eq!(chunk, expected);
     }
+}
+
+#[test]
+fn macro_block_assignment_uses_renamed_binding() {
+    let source = compiled(
+        r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 0;
+    format!("{}", { *n = 5; *n }).parse().unwrap_or_default()
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#,
+    );
+    let expected = ["5", "5"];
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    for chunk in actual.chunks(expected.len()) {
+        assert_eq!(chunk, expected);
+    }
+}
+
+#[test]
+fn json_field_key_keeps_original_name() {
+    let source = compiled(
+        r#"
+fn helper(n: &mut i64) -> Value {
+    *n = 5;
+    json!({ n: *n })
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#,
+    );
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    assert!(
+        actual.iter().all(|message| message.contains("\"n\":5")),
+        "{actual:?}"
+    );
+}
+
+#[test]
+fn two_mutable_strings_append_and_clear() {
+    let source = compiled(
+        r#"
+fn append(dst: &mut String, src: &mut String) {
+    dst.push_str(src);
+    src.clear();
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut left = "a".to_owned();
+    let mut right = "b".to_owned();
+    append(&mut left, &mut right);
+    Ok(vec![Op::log(left), Op::log(right)])
+}
+"#,
+    );
+    let expected = ["ab", ""];
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    for chunk in actual.chunks(expected.len()) {
+        assert_eq!(chunk, expected);
+    }
+}
+
+#[test]
+fn escaped_format_braces_are_not_captures() {
+    let source = compiled(
+        r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!("{{n}}")
+}
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text)])
+}
+"#,
+    );
+    let actual = logs(&source, "render");
+    assert!(!actual.is_empty());
+    assert!(actual.iter().all(|message| message == "{n}"), "{actual:?}");
 }

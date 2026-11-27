@@ -1427,7 +1427,10 @@ fn helper(n: &mut i64, early: bool) {
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let mut n = 0;
-    helper(&mut n, true);
+    helper(&mut n, ctx.event == "render");
+    if ctx.event != "render" {
+        helper(&mut n, false);
+    }
     Ok(vec![Op::log(n.to_string())])
 }
 "#;
@@ -1467,4 +1470,135 @@ pub fn outer(n: &mut i64) {
     .expect_err("bail");
     assert_eq!(error.file, None, "{}", error.message);
     assert!(error.message.contains("nested calls"), "{}", error.message);
+}
+
+#[test]
+fn carries_tuple_shapes_through_mutable_bindings() {
+    let handler = r#"
+fn half(t: &mut (i64, i64)) -> i64 {
+    t.0 / 2
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut pair = (6, 9);
+    let value = half(&mut pair);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("noctalia.log"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn renames_macro_block_assignments() {
+    let handler = r#"
+fn helper(n: &mut i64) -> i64 {
+    *n = 0;
+    let value = format!("{}", { *n = 5; *n });
+    value.parse().unwrap_or_default()
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string()), Op::log(n.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("= 5"), "{}", compiled.source);
+}
+
+#[test]
+fn keeps_json_field_keys_when_renaming_values() {
+    let handler = r#"
+fn helper(n: &mut i64) -> Value {
+    *n = 5;
+    json!({ n: *n })
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let value = helper(&mut n);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("n = __t2"), "{}", compiled.source);
+}
+
+#[test]
+fn allows_two_mutable_string_parameters() {
+    let handler = r#"
+fn append(dst: &mut String, src: &mut String) {
+    dst.push_str(src);
+    src.clear();
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut left = "a".to_owned();
+    let mut right = "b".to_owned();
+    append(&mut left, &mut right);
+    Ok(vec![Op::log(left), Op::log(right)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("noctalia.log"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn allows_escaped_braces_in_format_strings() {
+    let handler = r#"
+fn helper(n: &mut i64) -> String {
+    *n = 5;
+    format!("{{n}}")
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut n = 0;
+    let text = helper(&mut n);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(compiled.source.contains("{n}"), "{}", compiled.source);
+}
+
+#[test]
+fn nested_vec_inserts_are_not_rewritten_as_string_appends() {
+    let handler = r#"
+fn collect(s: &mut Vec<String>, value: &str) {
+    s.push(value.to_owned());
+}
+fn outer(s: &mut String, rows: &mut Vec<String>) {
+    s.push_str("x");
+    collect(rows, s);
+}
+fn widget(ctx: &Context) -> Result<Vec<Op>> {
+    let mut text = String::new();
+    let mut rows: Vec<String> = Vec::new();
+    outer(&mut text, &mut rows);
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("table.insert(s, value)"),
+        "{}",
+        compiled.source
+    );
 }

@@ -4,6 +4,7 @@ const MAX_INLINE_DEPTH: usize = 8;
 const WRITE_BACK_MARKER: &str = "\u{1}wb";
 
 type MutPredicate<'a> = &'a dyn Fn(&ExprCall, usize) -> bool;
+type StringParams<'a> = &'a [(String, String, proc_macro2::Span, usize)];
 impl<'a> Emitter<'a> {
     pub(super) fn helper(&self, call: &ExprCall) -> Option<Helper> {
         let Expr::Path(path) = &*call.func else {
@@ -477,6 +478,7 @@ impl<'a> Emitter<'a> {
                             lua_name.clone(),
                             name.clone(),
                             span,
+                            self.indent,
                         ));
                     }
                     if scalar || assigned.contains(&name) {
@@ -532,6 +534,16 @@ impl<'a> Emitter<'a> {
                         }
                         write_backs.push((target, lua_name.clone()));
                     }
+                    if let Some(shapes) = self
+                        .tuple_expr_shapes
+                        .get(&text)
+                        .cloned()
+                        .or_else(|| self.last_tuple_shape.take())
+                    {
+                        self.tuple_types
+                            .insert(lua_name.clone(), shapes.clone());
+                        self.tuple_expr_shapes.insert(lua_name.clone(), shapes);
+                    }
                     self.push(&local_name, ty);
                 }
             }
@@ -547,7 +559,7 @@ impl<'a> Emitter<'a> {
                 )));
             }
         }
-        for (_, original, span) in &string_params {
+        for (_, original, span, _) in &string_params {
             if let Some(method) =
                 unsupported_string_mutator(&helper.function.block, original)
             {
@@ -821,20 +833,30 @@ fn rename_tokens(
     from: &str,
     to: &str,
 ) -> proc_macro2::TokenStream {
+    rename_tokens_inner(tokens, from, to, true)
+}
+
+fn rename_tokens_inner(
+    tokens: proc_macro2::TokenStream,
+    from: &str,
+    to: &str,
+    labels_allowed: bool,
+) -> proc_macro2::TokenStream {
     use proc_macro2::TokenTree;
     let items: Vec<TokenTree> = tokens.into_iter().collect();
     let mut out = proc_macro2::TokenStream::new();
     let mut after_separator = false;
     for (index, token) in items.iter().enumerate() {
-        let is_label = matches!(
+        let is_separator = matches!(
             items.get(index + 1),
             Some(TokenTree::Punct(punct))
-                if punct.as_char() == '='
-                    && punct.spacing() == proc_macro2::Spacing::Alone
+                if punct.spacing() == proc_macro2::Spacing::Alone
+                    && (matches!(punct.as_char(), '=') && labels_allowed
+                        || punct.as_char() == ':')
         );
         let renamed = match token {
             TokenTree::Ident(ident)
-                if ident == from && !after_separator && !is_label =>
+                if ident == from && !after_separator && !is_separator =>
             {
                 TokenTree::Ident(proc_macro2::Ident::new(to, ident.span()))
             }
@@ -842,7 +864,7 @@ fn rename_tokens(
             TokenTree::Group(group) => {
                 let mut renamed = proc_macro2::Group::new(
                     group.delimiter(),
-                    rename_tokens(group.stream(), from, to),
+                    rename_tokens_inner(group.stream(), from, to, false),
                 );
                 renamed.set_span(group.span());
                 TokenTree::Group(renamed)
@@ -1150,21 +1172,60 @@ fn implicit_macro_capture(
 ) -> Option<proc_macro2::Span> {
     use proc_macro2::TokenTree;
 
+    #[allow(clippy::while_let_on_iterator)]
+    fn literal_placeholders(literal: &str) -> Vec<String> {
+        let text = literal.trim_matches('"');
+        let mut out = Vec::new();
+        let mut chars = text.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character == '\\' {
+                chars.next();
+                continue;
+            }
+            if character == '{' && chars.peek() == Some(&'{') {
+                chars.next();
+                continue;
+            }
+            if character == '{' {
+                let mut placeholder = String::new();
+                while let Some(next) = chars.next() {
+                    if next == '}' {
+                        break;
+                    }
+                    if next == ':' {
+                        break;
+                    }
+                    placeholder.push(next);
+                }
+                if !placeholder.is_empty()
+                    && placeholder
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    out.push(placeholder);
+                }
+            }
+        }
+        out
+    }
+
     fn tokens(stream: proc_macro2::TokenStream, name: &str) -> bool {
         let items: Vec<TokenTree> = stream.into_iter().collect();
         let explicit = items.iter().enumerate().any(|(index, token)| {
             matches!(token, TokenTree::Ident(ident) if ident == name)
                 && matches!(
                     items.get(index + 1),
-                    Some(TokenTree::Punct(punct)) if punct.as_char() == '='
+                    Some(TokenTree::Punct(punct))
+                        if punct.as_char() == '='
+                            && punct.spacing() == proc_macro2::Spacing::Alone
                 )
         });
-        if explicit {
-            return false;
-        }
         items.iter().any(|token| match token {
             TokenTree::Literal(literal) => {
-                literal.to_string().contains(&format!("{{{name}}}"))
+                !explicit
+                    && literal_placeholders(&literal.to_string())
+                        .iter()
+                        .any(|key| key == name)
             }
             TokenTree::Group(group) => tokens(group.stream(), name),
             _ => false,
@@ -1267,8 +1328,9 @@ fn call_args_mut(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
                     || item.args.iter().any(|arg| walk(arg, name, is_mut))
             }
             Expr::MethodCall(item) => {
-                item.args.iter().enumerate().any(|(index, arg)| {
-                    is_mut_param(index) && argument(arg, name)
+                item.args.iter().any(|arg| {
+                    matches!(arg, Expr::Reference(reference) if reference.mutability.is_some())
+                        && argument(arg, name)
                 }) || walk(&item.receiver, name, is_mut)
                     || item.args.iter().any(|arg| walk(arg, name, is_mut))
             }
@@ -1325,10 +1387,6 @@ fn call_args_mut(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
                 .any(|field| walk(&field.expr, name, is_mut)),
             _ => false,
         }
-    }
-
-    fn is_mut_param(index: usize) -> bool {
-        index == 0
     }
 
     fn body(block: &syn::Block, name: &str, is_mut: MutPredicate) -> bool {
@@ -1597,7 +1655,7 @@ fn strip_strings(text: &str) -> String {
 fn copy_back_returns(
     body: &str,
     write_backs: &[(String, String)],
-    string_params: &[(String, String, proc_macro2::Span)],
+    string_params: StringParams,
 ) -> (String, bool) {
     let mut out = String::with_capacity(body.len());
     let mut blocks: Vec<bool> = Vec::new();
@@ -1622,7 +1680,11 @@ fn copy_back_returns(
             blocks.push(false);
         }
         let mut line = content.to_owned();
-        for (name, _, _) in string_params {
+        let depth = indent.len() / 2;
+        for (name, _, _, binding_indent) in string_params {
+            if depth != *binding_indent {
+                continue;
+            }
             if let Some(value) = line
                 .strip_prefix(&format!("table.insert({name}, "))
                 .and_then(|rest| rest.strip_suffix(')'))
