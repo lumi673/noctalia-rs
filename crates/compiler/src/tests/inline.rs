@@ -1530,7 +1530,11 @@ fn widget(ctx: &Context) -> Result<Vec<Op>> {
     let compiled =
         compile(&source(handler), &options("widget", EntryKind::Widget))
             .expect("compiles");
-    assert!(compiled.source.contains("n = __t2"), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("{ n = __t2 }"),
+        "{}",
+        compiled.source
+    );
 }
 
 #[test]

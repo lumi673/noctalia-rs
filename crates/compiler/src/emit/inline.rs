@@ -2,8 +2,8 @@ use super::*;
 
 const MAX_INLINE_DEPTH: usize = 8;
 const WRITE_BACK_MARKER: &str = "\u{1}wb";
-const FRAME_START: &str = "--__s6_frame_start";
-const FRAME_END: &str = "--__s6_frame_end";
+pub(super) const FRAME_START: &str = "--__s6_frame_start";
+pub(super) const FRAME_END: &str = "--__s6_frame_end";
 
 type MutPredicate<'a> = &'a dyn Fn(&ExprCall, usize) -> bool;
 type StringParams<'a> = &'a [(String, String, proc_macro2::Span, usize)];

@@ -145,7 +145,14 @@ impl<'a> Emitter<'a> {
         let saved_indent = self.indent;
         self.indent = 0;
         let result = self.expr(expr);
-        let lines = std::mem::replace(&mut self.out, saved_out);
+        let emitted = std::mem::replace(&mut self.out, saved_out);
+        let lines: String = emitted
+            .lines()
+            .filter(|line| {
+                line.trim() != FRAME_START && line.trim() != FRAME_END
+            })
+            .map(|line| format!("{line}\n"))
+            .collect();
         self.indent = saved_indent;
         let (text, _) = result?;
         if lines.trim().is_empty() {
