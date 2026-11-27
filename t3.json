@@ -3,7 +3,7 @@
   "scripts": [
     {
       "name": "Cleanup",
-      "command": "rm -rf .tmp target",
+      "command": "command rm -rf .tmp target",
       "icon": "play",
       "runOnWorktreeCreate": false,
       "runOnSettle": true
