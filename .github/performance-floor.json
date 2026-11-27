@@ -243,16 +243,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "service_update_luau": {
-      "sha": "9b566798663f140e5eaee0e6f972833040782540",
+      "sha": "c677f29649fcd3f94f82d7e360bb9c066b20ba03",
       "method": 1,
-      "medianMs": 0.011837,
-      "worstMedianMs": 0.012038,
-      "p95Ms": 0.01577,
-      "worstP95Ms": 0.016912,
-      "p99Ms": 0.028433,
-      "worstP99Ms": 0.036689,
+      "medianMs": 0.008798,
+      "worstMedianMs": 0.008978000000000002,
+      "p95Ms": 0.012589,
+      "worstP95Ms": 0.013541000000000001,
+      "p99Ms": 0.014242000000000001,
+      "worstP99Ms": 0.021352,
       "budgetMs": 10,
-      "updatedAt": "2026-11-27T20:00:48.892Z"
+      "updatedAt": "2026-11-27T22:22:50.807Z"
     },
     "service_update_rust": {
       "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
@@ -339,16 +339,16 @@
       "updatedAt": "2026-11-27T19:00:29.213Z"
     },
     "plugin_als_brightness_luau": {
-      "sha": "ef12435dfe1c1d7c25262f22d1e8bddd9a551848",
+      "sha": "c677f29649fcd3f94f82d7e360bb9c066b20ba03",
       "method": 1,
-      "medianMs": 0.18544400000000003,
-      "worstMedianMs": 0.1860385,
-      "p95Ms": 0.19680099999999998,
-      "worstP95Ms": 0.199922,
-      "p99Ms": 0.20199099999999998,
-      "worstP99Ms": 0.20906,
+      "medianMs": 0.152771,
+      "worstMedianMs": 0.153827,
+      "p95Ms": 0.160082,
+      "worstP95Ms": 0.162665,
+      "p99Ms": 0.16576000000000002,
+      "worstP99Ms": 0.172881,
       "budgetMs": 2,
-      "updatedAt": "2026-11-27T00:42:45.720Z"
+      "updatedAt": "2026-11-27T22:22:50.807Z"
     },
     "plugin_als_brightness_rust": {
       "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
@@ -411,16 +411,16 @@
       "updatedAt": "2026-11-26T02:51:37.866Z"
     },
     "generated_hello_bar_handwritten": {
-      "sha": "ef12435dfe1c1d7c25262f22d1e8bddd9a551848",
+      "sha": "c677f29649fcd3f94f82d7e360bb9c066b20ba03",
       "method": 1,
-      "medianMs": 0.0022755,
-      "worstMedianMs": 0.002282,
-      "p95Ms": 0.002357,
-      "worstP95Ms": 0.0023970000000000003,
-      "p99Ms": 0.002408,
-      "worstP99Ms": 0.018244999999999997,
+      "medianMs": 0.0018624999999999998,
+      "worstMedianMs": 0.001893,
+      "p95Ms": 0.0019130000000000002,
+      "worstP95Ms": 0.001973,
+      "p99Ms": 0.001973,
+      "worstP99Ms": 0.012048,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-27T00:42:45.720Z"
+      "updatedAt": "2026-11-27T22:22:50.807Z"
     },
     "generated_hello_bar_compiled": {
       "sha": "9b566798663f140e5eaee0e6f972833040782540",
