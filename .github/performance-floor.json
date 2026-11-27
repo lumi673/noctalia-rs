@@ -99,16 +99,16 @@
       "updatedAt": "2026-11-25T19:55:25.262Z"
     },
     "json_decode_rust": {
-      "sha": "19295f6593bc94438d476f5eff77001c00bd89a2",
+      "sha": "cd8a9771a3d9c5f3b68eb5af0b749d549b64878c",
       "method": 1,
-      "medianMs": 0.0011555,
-      "worstMedianMs": 0.001167,
-      "p95Ms": 0.0012109999999999998,
-      "worstP95Ms": 0.0012449999999999998,
-      "p99Ms": 0.001248,
-      "worstP99Ms": 0.001288,
+      "medianMs": 0.000855,
+      "worstMedianMs": 0.000877,
+      "p95Ms": 0.0009320000000000001,
+      "worstP95Ms": 0.000946,
+      "p99Ms": 0.0009730000000000001,
+      "worstP99Ms": 0.0011429999999999997,
       "budgetMs": 1,
-      "updatedAt": "2026-11-24T23:55:42.123Z"
+      "updatedAt": "2026-11-27T19:39:07.320Z"
     },
     "snapshot_reads_rust": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -315,16 +315,16 @@
       "updatedAt": "2026-11-26T22:35:24.495Z"
     },
     "plugin_vietnamese_lunar_calendar_luau": {
-      "sha": "20b1c4226ce89b261cace57e3dadd4ddfe516223",
+      "sha": "cd8a9771a3d9c5f3b68eb5af0b749d549b64878c",
       "method": 1,
-      "medianMs": 6.650220999999999,
-      "worstMedianMs": 6.7124695,
-      "p95Ms": 6.752779,
-      "worstP95Ms": 6.827328,
-      "p99Ms": 6.790385000000001,
-      "worstP99Ms": 7.524002,
+      "medianMs": 11.165367000000002,
+      "worstMedianMs": 11.2381175,
+      "p95Ms": 11.431713,
+      "worstP95Ms": 12.001077,
+      "p99Ms": 11.703519,
+      "worstP99Ms": 16.092129,
       "budgetMs": 60,
-      "updatedAt": "2026-11-24T03:34:48.410Z"
+      "updatedAt": "2026-11-27T19:39:07.320Z"
     },
     "plugin_vietnamese_lunar_calendar_rust": {
       "sha": "c9ad4a5c931b57587a08f6764cd14fd717bf749c",
@@ -459,16 +459,16 @@
       "updatedAt": "2026-11-25T18:05:25.582Z"
     },
     "generated_event_handwritten": {
-      "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
+      "sha": "cd8a9771a3d9c5f3b68eb5af0b749d549b64878c",
       "method": 1,
-      "medianMs": 0.005374,
-      "worstMedianMs": 0.0053879999999999996,
-      "p95Ms": 0.005502999999999999,
-      "worstP95Ms": 0.005914,
-      "p99Ms": 0.006066,
-      "worstP99Ms": 0.008903,
+      "medianMs": 0.004824,
+      "worstMedianMs": 0.0049239999999999996,
+      "p95Ms": 0.005059,
+      "worstP95Ms": 0.006822999999999999,
+      "p99Ms": 0.007304000000000001,
+      "worstP99Ms": 0.008967000000000001,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-27T14:03:35.410Z"
+      "updatedAt": "2026-11-27T19:39:07.320Z"
     },
     "generated_event_compiled": {
       "sha": "f7f75739862f8a5aa8ca6012fe5c463447d91ada",
