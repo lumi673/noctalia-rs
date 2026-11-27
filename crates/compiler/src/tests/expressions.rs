@@ -422,16 +422,192 @@ fn bails_on_array_initializers_and_comparators_with_positions() {
 }
 
 #[test]
-fn bails_on_luau_keyword_identifiers() {
+fn renames_luau_keyword_identifiers() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let end = 1;
     Ok(vec![Op::log(format!("{end}"))])
 }
 "#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local __kw_end = 1"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("noctalia.log(__kw_end)"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn compiles_byte_literals() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let marker = b'#';
+    let label = b"ready";
+    Ok(vec![Op::log(format!("{marker}{label}"))])
+}
+"#;
     let error =
         compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect_err("bail");
-    assert!(error.message.contains("Luau keyword"), "{}", error.message);
-    assert!(error.line > 0 && error.column > 0, "{error:?}");
+            .expect_err("byte string");
+    assert!(error.message.contains("byte strings"), "{}", error.message);
+}
+#[test]
+fn compiles_std_wrappers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let boxed = Box::new(2);
+    let cloned = Arc::clone(&boxed);
+    let now = std::time::SystemTime::now();
+    let larger = f64::max(1.0, 2.0);
+    let path = PathBuf::new();
+    Ok(vec![Op::log(format!("{cloned}{now}{larger}{path}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(compiled.source.contains("math.max"), "{}", compiled.source);
+    assert!(
+        compiled.source.contains("noctalia.nowMs()"),
+        "{}",
+        compiled.source
+    );
+}
+#[test]
+fn compiles_std_function_references() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = Some(serde_json::Value::Null);
+    let empty = value.map_or(true, Value::is_null);
+    let floored = Some(1.5_f64).map(f64::floor);
+    Ok(vec![Op::log(format!("{empty}{floored}"))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("math.floor(__value)"),
+        "{}",
+        compiled.source
+    );
+}
+#[test]
+fn compiles_collect_string_and_ordering_paths() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = "abc".chars().take(2).collect::<String>();
+    let _order = std::sync::atomic::Ordering::Relaxed;
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("table.concat"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("\"Relaxed\""),
+        "{}",
+        compiled.source
+    );
+}
+#[test]
+fn compiles_imported_ui_helpers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let id = callback("on_click");
+    let tree = node("label", json!({ "text": "ok" }), Vec::new());
+    Ok(vec![Op::BarRender { tree }, Op::state_watch("k", id)])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("__host_callback"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("kind = \"label\""),
+        "{}",
+        compiled.source
+    );
+}
+#[test]
+fn compiles_remaining_std_wrappers() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let smaller = i64::min(3, 4);
+    let bytes = std::str::from_utf8(&[104, 105]).unwrap_or("");
+    let buffer = ByteBuf::new(vec![104u8]);
+    let options = OpenOptions::new();
+    let _ = options;
+    Ok(vec![Op::log(format!("{smaller}{bytes}{buffer}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("unsupported UTF-8 conversion");
+    assert!(
+        error.message.contains("UTF-8 conversion"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn rejects_let_chain_binding_shadowing() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let outer = 10;
+    let value = if let Some(outer) = Some(5) && let Some(extra) = Some(1) {
+        outer
+    } else {
+        outer
+    };
+    Ok(vec![Op::log(format!("{value}"))])
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("shadowing");
+    assert!(error.message.contains("cannot shadow"), "{}", error.message);
+}
+
+#[test]
+fn void_if_branches_do_not_emit_empty_assignments() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let flag = ctx.event == "never";
+    let _picked = if flag {
+        Op::log("a")
+    } else {
+        Op::log("b")
+    };
+    Ok(vec![])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        !compiled.source.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("__t") && line.ends_with('=')
+        }),
+        "{}",
+        compiled.source
+    );
 }

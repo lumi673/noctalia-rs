@@ -115,3 +115,73 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(generated.contains("#__value == 0"), "{generated}");
     assert!(generated.contains("local list = __t"), "{generated}");
 }
+
+#[test]
+fn accepts_duplicate_globs_of_one_function() {
+    let handler = r#"
+use crate::a::*;
+use crate::b::*;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = shared();
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let modules = [
+        Module {
+            path: "common",
+            source: "pub fn shared() -> String { \"ok\".to_owned() }",
+        },
+        Module {
+            path: "a",
+            source: "pub use crate::common::*;",
+        },
+        Module {
+            path: "b",
+            source: "pub use crate::common::*;",
+        },
+    ];
+    let compiled = compile(
+        &source(handler),
+        &module_options("handler", EntryKind::Service, &modules),
+    )
+    .expect("compiles");
+    assert!(
+        compiled.source.contains("noctalia.log(text)")
+            && compiled.source.contains("\"ok\""),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn rejects_duplicate_globs_of_different_functions() {
+    let handler = r#"
+use crate::a::*;
+use crate::b::*;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = shared();
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let modules = [
+        Module {
+            path: "a",
+            source: "pub fn shared() -> String { \"a\".to_owned() }",
+        },
+        Module {
+            path: "b",
+            source: "pub fn shared() -> String { \"b\".to_owned() }",
+        },
+    ];
+    let error = compile(
+        &source(handler),
+        &module_options("handler", EntryKind::Service, &modules),
+    )
+    .expect_err("ambiguous");
+    assert!(
+        error.message.contains("no function in the crate matches"),
+        "{}",
+        error.message
+    );
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}

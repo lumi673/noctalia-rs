@@ -382,5 +382,5 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let generated = &compiled.source;
     assert!(generated.contains("(function()"), "{generated}");
     assert!(generated.contains("text == \"true\""), "{generated}");
-    assert!(generated.contains("local __t"), "{generated}");
+    assert!(generated.contains("local text"), "{generated}");
 }

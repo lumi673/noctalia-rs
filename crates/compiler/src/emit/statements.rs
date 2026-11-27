@@ -5,6 +5,18 @@ impl<'a> Emitter<'a> {
         match stmt {
             Stmt::Local(local) => self.local(local),
             Stmt::Item(syn::Item::Static(item)) => self.local_static(item),
+            Stmt::Item(syn::Item::Const(item)) => {
+                let value = constant(&item.expr).ok_or_else(|| {
+                    Error::at(item.span(), "unsupported local constant")
+                })?;
+                if let Some(scope) = self.constant_scopes.last_mut() {
+                    scope.insert(item.ident.to_string(), value);
+                } else {
+                    self.constants.insert(item.ident.to_string(), value);
+                }
+                Ok(())
+            }
+            Stmt::Item(syn::Item::Use(_)) => Ok(()),
             Stmt::Expr(expr, _) if diverges(expr) => {
                 self.line("do");
                 self.indent = self.indent.saturating_add(1);
@@ -34,6 +46,17 @@ impl<'a> Emitter<'a> {
             && self.inline_call(call, Inline::Tail)?.is_some()
         {
             return Ok(());
+        }
+        if let Expr::Macro(mac) = expr
+            && macro_name(mac) == "vec"
+        {
+            let items = parse_vec(mac)?;
+            if items.iter().any(is_op_expr) {
+                for item in &items {
+                    self.op_expr(item)?;
+                }
+                return Ok(());
+            }
         }
         match expr {
             Expr::Call(call) if is_ok_call(call) => {
@@ -182,6 +205,7 @@ impl<'a> Emitter<'a> {
                 ty
             };
             let mut names = Vec::new();
+            let mut lua_names = Vec::new();
             for element in &tuple.elems {
                 match element {
                     Pat::Ident(pattern) => {
@@ -194,9 +218,13 @@ impl<'a> Emitter<'a> {
                                 .insert(name.clone(), parts.to_vec());
                         }
                         self.push(&name, element_ty(index));
-                        names.push(name);
+                        names.push(name.clone());
+                        lua_names.push(self.bind_name(&name));
                     }
-                    Pat::Wild(_) => names.push("_".to_owned()),
+                    Pat::Wild(_) => {
+                        names.push("_".to_owned());
+                        lua_names.push("_".to_owned());
+                    }
                     other => {
                         return Err(Error::at(
                             other.span(),
@@ -217,7 +245,7 @@ impl<'a> Emitter<'a> {
                         self.push(name, element_ty(index));
                     }
                 }
-                self.line(&format!("local {} = {text}", names.join(", ")));
+                self.line(&format!("local {} = {text}", lua_names.join(", ")));
                 return Ok(());
             }
             let temp = self.temp();
@@ -229,7 +257,7 @@ impl<'a> Emitter<'a> {
                 .collect::<Vec<_>>();
             self.line(&format!(
                 "local {} = {}",
-                names.join(", "),
+                lua_names.join(", "),
                 values.join(", ")
             ));
             return Ok(());
@@ -244,12 +272,6 @@ impl<'a> Emitter<'a> {
                 ));
             }
         };
-        if is_luau_keyword(&name) {
-            return Err(Error::at(
-                local.pat.span(),
-                format!("identifier `{name}` is a Luau keyword"),
-            ));
-        }
         let Some(init) = &local.init else {
             let ty = hint.map_or(Ty::VALUE, type_hint);
             if let Some(kind) = hint.map(static_kind)
@@ -258,13 +280,15 @@ impl<'a> Emitter<'a> {
                 self.containers.insert(name.clone(), kind);
             }
             self.push(&name, ty);
-            self.line(&format!("local {name} = nil"));
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = nil"));
             return Ok(());
         };
         if let Expr::Call(call) = &*init.expr
             && is_vec_new(call)
         {
-            self.line(&format!("local {name} = {}", empty_array()));
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {}", empty_array()));
             self.push(&name, Ty::OPS);
             return Ok(());
         }
@@ -276,12 +300,14 @@ impl<'a> Emitter<'a> {
                 for item in &items {
                     self.op_expr(item)?;
                 }
-                self.line(&format!("local {name} = nil"));
+                let lua = self.bind_name(&name);
+                self.line(&format!("local {lua} = nil"));
                 self.push(&name, Ty::OPS);
                 return Ok(());
             }
             let (text, ty) = self.list(&items)?;
-            self.line(&format!("local {name} = {text}"));
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {text}"));
             self.push(&name, ty);
             return Ok(());
         }
@@ -289,7 +315,8 @@ impl<'a> Emitter<'a> {
             let hint =
                 hint.ok_or_else(|| bare_default_error(init.expr.span()))?;
             let text = default_value(self, hint, init.expr.span())?;
-            self.line(&format!("local {name} = {text}"));
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {text}"));
             self.push(&name, type_hint(hint));
             return Ok(());
         }
@@ -299,6 +326,7 @@ impl<'a> Emitter<'a> {
         }
         let result = self.expr(&init.expr);
         self.value_needed = saved_value;
+        let lua = self.bind_name(&name);
         let (text, mut ty) = result?;
         if let Expr::Tuple(items) = strip_reference(&init.expr) {
             let element_types = self.tuple_shapes(
@@ -390,9 +418,17 @@ impl<'a> Emitter<'a> {
         {
             ty.base = json_base_for_type(hint)?;
         }
-        self.line(&format!("local {name} = {text}"));
+        self.line(&format!("local {lua} = {text}"));
+        if self.is_chars(&text) {
+            self.mark_chars(&lua);
+        } else if ty.base != Base::List {
+            self.unmark_chars(&lua);
+        }
         if ty.base == Base::Str {
             self.values.insert(name.clone(), text.clone());
+            if lua != name {
+                self.values.insert(lua.clone(), text.clone());
+            }
         }
         if let Some(kind) = hint.map(static_kind)
             && kind != StaticKind::Value
@@ -430,16 +466,17 @@ impl<'a> Emitter<'a> {
         };
         let (condition, bindings) =
             self.pattern_match(&value, pattern, error.as_deref())?;
-        for (name, text) in bindings {
-            let binding = self.binding_ty(pattern, &name, ty);
-            self.line(&format!("local {name} = {text}"));
-            self.push(&name, binding);
-        }
         self.line(&format!("if not ({condition}) then"));
         self.indent = self.indent.saturating_add(1);
         self.expr_stmt(diverge)?;
         self.indent = self.indent.saturating_sub(1);
         self.line("end");
+        for (name, text) in bindings {
+            let binding = self.binding_ty(pattern, &name, ty);
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {text}"));
+            self.push(&name, binding);
+        }
         Ok(())
     }
 
@@ -502,11 +539,11 @@ impl<'a> Emitter<'a> {
             Expr::Block(block) => {
                 self.line("do");
                 self.indent = self.indent.saturating_add(1);
-                self.scopes.push(HashMap::new());
+                self.push_scope();
                 self.local_statics.push(HashMap::new());
                 let result = self.block_inner(&block.block, false);
                 self.local_statics.pop();
-                self.scopes.pop();
+                self.pop_scope();
                 self.indent = self.indent.saturating_sub(1);
                 self.line("end");
                 result
@@ -579,6 +616,20 @@ impl<'a> Emitter<'a> {
                 return Ok(());
             }
         }
+        if let Expr::Macro(mac) = expr
+            && macro_name(mac) == "vec"
+        {
+            let items = parse_vec(mac)?;
+            if items.iter().any(is_op_expr) {
+                for item in &items {
+                    self.op_expr(item)?;
+                }
+                if self.tail_target.is_none() {
+                    self.line("return");
+                }
+                return Ok(());
+            }
+        }
         let (text, _) = self.expr(expr)?;
         if let Some(target) = self.tail_target.clone() {
             self.line(&format!("{target} = {text}"));
@@ -610,6 +661,12 @@ impl<'a> Emitter<'a> {
         let value = args.first().ok_or_else(|| {
             Error::at(proc_macro2::Span::call_site(), "Ok() needs a value")
         })?;
+        if matches!(value, Expr::Tuple(tuple) if tuple.elems.is_empty()) {
+            if emit_return {
+                self.line("return");
+            }
+            return Ok(());
+        }
         if let Expr::Call(call) = value
             && let Some(helper) = self.helper(call)
             && matches!(return_kind(&helper.function)?, Returns::VecOps)
@@ -700,10 +757,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    pub(super) fn let_condition(
+    pub(super) fn let_condition_pair(
         &mut self,
         item: &syn::ExprLet,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, PatternBindings, Ty), Error> {
         let (text, ty) = self.expr(&item.expr)?;
         let value = self.temp();
         let error = if ty.result {
@@ -716,14 +773,30 @@ impl<'a> Emitter<'a> {
         };
         let (condition, bindings) =
             self.pattern_match(&value, &item.pat, error.as_deref())?;
+        Ok((condition, bindings, ty))
+    }
+
+    pub(super) fn let_condition(
+        &mut self,
+        item: &syn::ExprLet,
+    ) -> Result<String, Error> {
+        let (condition, bindings, ty) = self.let_condition_pair(item)?;
         let class = self.pending_class.take();
         for (name, text) in bindings {
             let binding = self.binding_ty(&item.pat, &name, ty);
-            self.line(&format!("local {name} = {text}"));
-            self.push(&name, binding);
-            if let Some(class) = &class {
-                self.classes.insert(name.clone(), class.clone());
+            let lua = self.bind_name(&name);
+            if is_identifier(&text) {
+                self.line(&format!("local {lua} = {text}"));
+                if let Some(class) = &class {
+                    self.classes.insert(lua.clone(), class.clone());
+                }
+            } else {
+                if self.lookup(&name).is_none() {
+                    self.line(&format!("local {lua} = nil"));
+                }
+                self.line(&format!("if {condition} then {lua} = {text} end"));
             }
+            self.push(&name, binding);
         }
         Ok(condition)
     }
@@ -740,7 +813,7 @@ impl<'a> Emitter<'a> {
         };
         let (condition, _) = match condition {
             Expr::Let(item) => (self.let_condition(item)?, Ty::BOOL),
-            _ => self.expr(condition)?,
+            other => self.expr(other)?,
         };
         let keyword = if elseif { "elseif" } else { "if" };
         self.line(&format!("{keyword} {condition} then"));
@@ -854,6 +927,90 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn match_arms(
+        &mut self,
+        arms: &[&syn::Arm],
+        scrutinee: &str,
+        scrutinee_ty: Ty,
+        error: Option<&str>,
+        tail: bool,
+    ) -> Result<(), Error> {
+        let Some((arm, rest)) = arms.split_first() else {
+            return Ok(());
+        };
+        let (pattern, guard) = split_guard(&arm.pat);
+        let (condition, bindings) =
+            self.pattern_match(scrutinee, pattern, error)?;
+        if guard.is_none() {
+            self.line(&format!("if {condition} then"));
+            self.indent = self.indent.saturating_add(1);
+            self.push_scope();
+            for (name, text) in bindings {
+                let lua = self.bind_name(&name);
+                self.line(&format!("local {lua} = {text}"));
+                self.push(&name, self.binding_ty(pattern, &name, scrutinee_ty));
+            }
+            let body = self.arm_body(&arm.body, tail);
+            self.pop_scope();
+            self.indent = self.indent.saturating_sub(1);
+            if !rest.is_empty() {
+                self.line("else");
+                self.indent = self.indent.saturating_add(1);
+                let rest_result =
+                    self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
+                self.indent = self.indent.saturating_sub(1);
+                self.line("end");
+                body?;
+                return rest_result;
+            }
+            self.line("end");
+            return body;
+        }
+        let matched = self.temp();
+        self.line(&format!("local {matched} = false"));
+        self.line(&format!("if {condition} then"));
+        self.indent = self.indent.saturating_add(1);
+        self.push_scope();
+        for (name, text) in bindings {
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = {text}"));
+            self.push(&name, self.binding_ty(pattern, &name, scrutinee_ty));
+        }
+        let Some(guard) = guard else { unreachable!() };
+        let saved_out = std::mem::take(&mut self.out);
+        let saved_indent = self.indent;
+        self.indent = 0;
+        let guard_result = self.expr(guard);
+        let guard_lines = std::mem::replace(&mut self.out, saved_out);
+        self.indent = saved_indent;
+        let (guard_text, _) = guard_result?;
+        if !guard_lines.trim().is_empty() {
+            self.out.push_str(&guard_lines);
+        }
+        self.line(&format!("if {guard_text} then"));
+        self.indent = self.indent.saturating_add(1);
+        self.line(&format!("{matched} = true"));
+        let body = self.arm_body(&arm.body, tail);
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        self.pop_scope();
+        self.indent = self.indent.saturating_sub(1);
+        self.line("end");
+        let rest_result = if !rest.is_empty() {
+            self.line(&format!("if not {matched} then"));
+            self.indent = self.indent.saturating_add(1);
+            let result =
+                self.match_arms(rest, scrutinee, scrutinee_ty, error, tail);
+            self.indent = self.indent.saturating_sub(1);
+            self.line("end");
+            result
+        } else {
+            Ok(())
+        };
+        body?;
+        rest_result
+    }
+
     pub(super) fn match_stmt(
         &mut self,
         item: &syn::ExprMatch,
@@ -897,7 +1054,6 @@ impl<'a> Emitter<'a> {
             None
         };
         let event_match = self.is_event_expr(&item.expr);
-        let mut opened = false;
         if event_match {
             for arm in &item.arms {
                 if let Some(patterns) = pattern_strings(&arm.pat)? {
@@ -907,52 +1063,32 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        for arm in &item.arms {
-            let (pattern, guard) = split_guard(&arm.pat);
-            let (condition, bindings) = self.pattern_match(
-                &scrutinee,
-                pattern,
-                result_error.as_deref(),
-            )?;
-            let keyword = if opened { "elseif" } else { "if" };
-            self.line(&format!("{keyword} {condition} then"));
-            self.indent = self.indent.saturating_add(1);
-            self.scopes.push(HashMap::new());
-            for (name, text) in bindings {
-                let binding = self.binding_ty(pattern, &name, scrutinee_ty);
-                self.line(&format!("local {name} = {text}"));
-                self.push(&name, binding);
-            }
-            if let Some(guard) = guard {
-                let (text, _) = self.expr(guard)?;
-                self.line(&format!("if {text} then"));
-                self.indent = self.indent.saturating_add(1);
-            }
-            let result = self.arm_body(&arm.body, tail);
-            if guard.is_some() {
-                self.indent = self.indent.saturating_sub(1);
-                self.line("end");
-            }
-            self.scopes.pop();
-            result?;
-            self.indent = self.indent.saturating_sub(1);
-            opened = true;
-        }
-        if opened {
-            self.line("end");
-        }
+        let arms = item.arms.iter().collect::<Vec<_>>();
+        self.match_arms(
+            &arms,
+            &scrutinee,
+            scrutinee_ty,
+            result_error.as_deref(),
+            tail,
+        )?;
         Ok(())
     }
 
     fn binding_name(&self, pattern: &syn::PatIdent) -> Result<String, Error> {
         let name = pattern.ident.to_string();
-        if is_luau_keyword(&name) {
-            return Err(Error::at(
-                pattern.span(),
-                format!("identifier `{name}` is a Luau keyword"),
-            ));
-        }
         Ok(name)
+    }
+
+    fn pattern_bound(&self, expr: &Expr) -> Option<(String, Ty)> {
+        constant(expr).or_else(|| {
+            if let Expr::Path(path) = expr {
+                path.path
+                    .get_ident()
+                    .and_then(|ident| self.pattern_constant(&ident.to_string()))
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn pattern_match(
@@ -986,6 +1122,12 @@ impl<'a> Emitter<'a> {
             }
             Pat::Ident(pattern) => {
                 let name = self.binding_name(pattern)?;
+                if let Some((_, subpat)) = &pattern.subpat {
+                    let (condition, mut bindings) =
+                        self.pattern_match(value, subpat, error)?;
+                    bindings.insert(0, (name.clone(), value.to_owned()));
+                    return Ok((condition, bindings));
+                }
                 match name.as_str() {
                     "None" | "Null" => {
                         Ok((format!("({value} == nil)"), Vec::new()))
@@ -1050,7 +1192,7 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::TupleStruct(item)
                 if error.is_some()
@@ -1072,7 +1214,7 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::TupleStruct(item) => {
                 let name = item
@@ -1098,13 +1240,30 @@ impl<'a> Emitter<'a> {
                         conditions
                             .push(format!("(type({value}) == \"{lua_type}\")"));
                     }
+                    "Ok" => conditions.push(format!("({value} ~= nil)")),
+                    "Err" => conditions.push(format!("({value} == nil)")),
                     _ => {
-                        return Err(Error::at(
-                            item.span(),
-                            format!(
-                                "match pattern `{name}` is not supported by the Luau compiler"
-                            ),
-                        ));
+                        let segments = item
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>();
+                        if let Some(variant) =
+                            self.program.enum_variant(&self.module, &segments)
+                        {
+                            conditions.push(format!(
+                                "({value} == {})",
+                                quote(&variant)
+                            ));
+                        } else {
+                            return Err(Error::at(
+                                item.span(),
+                                format!(
+                                    "match pattern `{name}` is not supported by the Luau compiler"
+                                ),
+                            ));
+                        }
                     }
                 }
                 for element in &item.elems {
@@ -1115,19 +1274,96 @@ impl<'a> Emitter<'a> {
                         &mut bindings,
                     )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
+            }
+            Pat::Slice(slice) => {
+                let mut conditions = Vec::new();
+                let mut bindings = Vec::new();
+                let rest = slice
+                    .elems
+                    .iter()
+                    .position(|element| matches!(element, Pat::Rest(_)));
+                let fixed = slice.elems.len() - usize::from(rest.is_some());
+                conditions.push(format!("(#({value}) >= {fixed})"));
+                for (index, element) in slice.elems.iter().enumerate() {
+                    if matches!(element, Pat::Rest(_)) {
+                        continue;
+                    }
+                    let item = match rest {
+                        Some(rest) if index > rest => {
+                            let after = slice.elems.len() - rest - 1;
+                            let offset = index - rest - 1;
+                            format!(
+                                "({value})[#({value}) - {after} + 1 + {offset}]"
+                            )
+                        }
+                        _ => format!("({value})[{}]", index + 1),
+                    };
+                    if !pattern_is_none(element) {
+                        conditions.push(format!("({item} ~= nil)"));
+                    }
+                    self.nested_pattern(
+                        &item,
+                        element,
+                        &mut conditions,
+                        &mut bindings,
+                    )?;
+                }
+                Ok((condition_text(&conditions), bindings))
             }
             Pat::Tuple(tuple) => {
                 let mut conditions = Vec::new();
                 let mut bindings = Vec::new();
                 for (index, element) in tuple.elems.iter().enumerate() {
                     let item = format!("({value})[{}]", index + 1);
-                    conditions.push(format!("({item} ~= nil)"));
-                    if let Pat::Ident(pattern) = element {
-                        bindings.push((self.binding_name(pattern)?, item));
-                    }
+                    self.nested_pattern(
+                        &item,
+                        element,
+                        &mut conditions,
+                        &mut bindings,
+                    )?;
                 }
-                Ok((format!("({})", conditions.join(" and ")), bindings))
+                Ok((condition_text(&conditions), bindings))
+            }
+            Pat::Range(range) => {
+                let mut conditions = Vec::new();
+                if let Some(start) = range.start.as_deref()
+                    && let Some((text, _)) = self.pattern_bound(start)
+                {
+                    conditions.push(format!("({value} >= {text})"));
+                }
+                if let Some(end) = range.end.as_deref()
+                    && let Some((text, _)) = self.pattern_bound(end)
+                {
+                    let operator = if matches!(
+                        range.limits,
+                        syn::RangeLimits::Closed(_)
+                    ) {
+                        "<="
+                    } else {
+                        "<"
+                    };
+                    conditions.push(format!("({value} {operator} {text})"));
+                }
+                Ok((condition_text(&conditions), Vec::new()))
+            }
+            Pat::Struct(item) => {
+                let mut conditions =
+                    vec![format!("(type({value}) == \"table\")")];
+                let mut bindings = Vec::new();
+                for field in &item.fields {
+                    let Member::Named(name) = &field.member else {
+                        continue;
+                    };
+                    let member = pattern_field(value, &name.to_string());
+                    self.nested_pattern(
+                        &member,
+                        &field.pat,
+                        &mut conditions,
+                        &mut bindings,
+                    )?;
+                }
+                Ok((condition_text(&conditions), bindings))
             }
             _ => Err(Error::at(
                 pattern.span(),
@@ -1248,6 +1484,24 @@ impl<'a> Emitter<'a> {
         match pattern {
             Pat::Ident(pattern) => {
                 let name = self.binding_name(pattern)?;
+                match name.as_str() {
+                    "None" | "Null" => {
+                        conditions.push(format!("({value} == nil)"));
+                        return Ok(());
+                    }
+                    "Some" => {
+                        conditions.push(format!("({value} ~= nil)"));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if let Some((_, subpat)) = &pattern.subpat
+                    && self.pattern_constant(&name).is_none()
+                {
+                    bindings.push((name.clone(), value.to_owned()));
+                    self.nested_pattern(value, subpat, conditions, bindings)?;
+                    return Ok(());
+                }
                 match self.pattern_constant(&name) {
                     Some((text, _)) => {
                         conditions.push(format!("({value} == {text})"));
@@ -1310,12 +1564,27 @@ impl<'a> Emitter<'a> {
                     }
                     "Some" => conditions.push(format!("({value} ~= nil)")),
                     _ => {
-                        return Err(Error::at(
-                            path.span(),
-                            format!(
-                                "match pattern `{name}` is not supported by the Luau compiler"
-                            ),
-                        ));
+                        let segments = path
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>();
+                        if let Some(variant) =
+                            self.program.enum_variant(&self.module, &segments)
+                        {
+                            conditions.push(format!(
+                                "({value} == {})",
+                                quote(&variant)
+                            ));
+                        } else {
+                            return Err(Error::at(
+                                path.span(),
+                                format!(
+                                    "match pattern `{name}` is not supported by the Luau compiler"
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -1341,19 +1610,108 @@ impl<'a> Emitter<'a> {
                         conditions
                             .push(format!("(type({value}) == \"{lua_type}\")"));
                     }
+                    "Ok" => conditions.push(format!("({value} ~= nil)")),
+                    "Err" => conditions.push(format!("({value} == nil)")),
                     _ => {
-                        return Err(Error::at(
-                            item.span(),
-                            format!(
-                                "match pattern `{name}` is not supported by the Luau compiler"
-                            ),
-                        ));
+                        let segments = item
+                            .path
+                            .segments
+                            .iter()
+                            .map(|segment| segment.ident.to_string())
+                            .collect::<Vec<_>>();
+                        if let Some(variant) =
+                            self.program.enum_variant(&self.module, &segments)
+                        {
+                            conditions.push(format!(
+                                "({value} == {})",
+                                quote(&variant)
+                            ));
+                        } else {
+                            return Err(Error::at(
+                                item.span(),
+                                format!(
+                                    "match pattern `{name}` is not supported by the Luau compiler"
+                                ),
+                            ));
+                        }
                     }
                 }
                 for element in &item.elems {
                     self.nested_pattern(value, element, conditions, bindings)?;
                 }
             }
+            Pat::Tuple(tuple) => {
+                for (index, element) in tuple.elems.iter().enumerate() {
+                    let item = format!("({value})[{}]", index + 1);
+                    if !pattern_is_none(element) {
+                        conditions.push(format!("({item} ~= nil)"));
+                    }
+                    self.nested_pattern(&item, element, conditions, bindings)?;
+                }
+            }
+            Pat::Slice(slice) => {
+                let rest = slice
+                    .elems
+                    .iter()
+                    .position(|element| matches!(element, Pat::Rest(_)));
+                let fixed = slice.elems.len() - usize::from(rest.is_some());
+                conditions.push(format!("(#({value}) >= {fixed})"));
+                for (index, element) in slice.elems.iter().enumerate() {
+                    if matches!(element, Pat::Rest(_)) {
+                        continue;
+                    }
+                    let item = match rest {
+                        Some(rest) if index > rest => {
+                            let after = slice.elems.len() - rest - 1;
+                            let offset = index - rest - 1;
+                            format!(
+                                "({value})[#({value}) - {after} + 1 + {offset}]"
+                            )
+                        }
+                        _ => format!("({value})[{}]", index + 1),
+                    };
+                    if !pattern_is_none(element) {
+                        conditions.push(format!("({item} ~= nil)"));
+                    }
+                    self.nested_pattern(&item, element, conditions, bindings)?;
+                }
+            }
+            Pat::Struct(item) => {
+                conditions.push(format!("(type({value}) == \"table\")"));
+                for field in &item.fields {
+                    let Member::Named(name) = &field.member else {
+                        continue;
+                    };
+                    let member = pattern_field(value, &name.to_string());
+                    self.nested_pattern(
+                        &member, &field.pat, conditions, bindings,
+                    )?;
+                }
+            }
+            Pat::Range(range) => {
+                if let Some(start) = range.start.as_deref()
+                    && let Some((text, _)) = self.pattern_bound(start)
+                {
+                    conditions.push(format!("({value} >= {text})"));
+                }
+                if let Some(end) = range.end.as_deref()
+                    && let Some((text, _)) = self.pattern_bound(end)
+                {
+                    let operator = if matches!(
+                        range.limits,
+                        syn::RangeLimits::Closed(_)
+                    ) {
+                        "<="
+                    } else {
+                        "<"
+                    };
+                    conditions.push(format!("({value} {operator} {text})"));
+                }
+            }
+            Pat::Type(typed) => {
+                self.nested_pattern(value, &typed.pat, conditions, bindings)?;
+            }
+            Pat::Rest(_) => {}
             _ => {
                 return Err(Error::at(
                     pattern.span(),
@@ -1424,7 +1782,8 @@ impl<'a> Emitter<'a> {
                 format!("({end}) - 1")
             };
             self.push(name, Ty::INT);
-            self.line(&format!("for {name} = {start}, {end} do"));
+            let lua_name = self.bind_name(name);
+            self.line(&format!("for {lua_name} = {start}, {end} do"));
             self.indent = self.indent.saturating_add(1);
             self.statement_block(&item.body)?;
             self.indent = self.indent.saturating_sub(1);
@@ -1439,6 +1798,13 @@ impl<'a> Emitter<'a> {
         }
         let is_iterator = false;
         let (text, ty) = self.expr(iterable)?;
+        let lua_bindings = bindings
+            .iter()
+            .map(|binding| match binding.as_deref() {
+                Some(name) => self.bind_name(name),
+                None => "_".to_owned(),
+            })
+            .collect::<Vec<_>>();
         if is_iterator {
             let values = self.temp();
             self.line(&format!(
@@ -1482,10 +1848,7 @@ impl<'a> Emitter<'a> {
                     )
             );
             if sorted {
-                let names = bindings
-                    .iter()
-                    .map(|name| name.clone().unwrap_or_else(|| "_".to_owned()))
-                    .collect::<Vec<_>>();
+                let names = lua_bindings.clone();
                 let keys = self.temp();
                 let index = self.temp();
                 self.line(&format!("local {keys} = {{}}"));
@@ -1499,16 +1862,18 @@ impl<'a> Emitter<'a> {
                 self.indent = self.indent.saturating_add(1);
                 match names.as_slice() {
                     [name] => {
-                        self.push(name, Ty::VALUE);
+                        if let Some(raw) = bindings.iter().flatten().next() {
+                            self.push(raw, Ty::VALUE);
+                        }
                         self.line(&format!(
                             "local {name} = {source}[{keys}[{index}]]"
                         ));
                     }
                     [first, second] => {
-                        for (position, name) in
+                        for (position, raw) in
                             bindings.iter().flatten().enumerate()
                         {
-                            self.push(name, self.key_ty(position));
+                            self.push(raw, self.key_ty(position));
                         }
                         self.line(&format!("local {first} = {keys}[{index}]"));
                         self.line(&format!(
@@ -1527,10 +1892,7 @@ impl<'a> Emitter<'a> {
                 self.line("end");
                 return Ok(());
             }
-            let names = bindings
-                .iter()
-                .map(|name| name.clone().unwrap_or_else(|| "_".to_owned()))
-                .collect::<Vec<_>>();
+            let names = lua_bindings.clone();
             let keys = self.temp();
             let position = self.temp();
             self.line(&format!("local {keys} = {{}}"));
@@ -1544,12 +1906,16 @@ impl<'a> Emitter<'a> {
             self.indent = self.indent.saturating_add(1);
             match names.as_slice() {
                 [name] => {
-                    self.push(name, Ty::STR);
+                    if let Some(raw) = bindings.iter().flatten().next() {
+                        self.push(raw, Ty::STR);
+                    }
                     self.line(&format!("local {name} = {keys}[{position}]"));
                 }
                 [first, second] => {
-                    self.push(first, Ty::STR);
-                    self.push(second, Ty::VALUE);
+                    for (position, raw) in bindings.iter().flatten().enumerate()
+                    {
+                        self.push(raw, self.key_ty(position));
+                    }
                     self.line(&format!("local {first} = {keys}[{position}]"));
                     self.line(&format!("local {second} = {source}[{first}]"));
                 }
@@ -1567,6 +1933,7 @@ impl<'a> Emitter<'a> {
         }
         if ty.base == Base::Table && bindings.len() == 1 {
             let name = bindings[0].clone().unwrap_or_default();
+            let lua_name = lua_bindings[0].clone();
             let keys = self.temp();
             let index = self.temp();
             self.line(&format!("local {keys} = {{}}"));
@@ -1579,7 +1946,7 @@ impl<'a> Emitter<'a> {
             self.line(&format!("for {index} = 1, #{keys} do"));
             self.indent = self.indent.saturating_add(1);
             self.push(&name, Ty::VALUE);
-            self.line(&format!("local {name} = {source}[{keys}[{index}]]"));
+            self.line(&format!("local {lua_name} = {source}[{keys}[{index}]]"));
             self.statement_block(&item.body)?;
             self.indent = self.indent.saturating_sub(1);
             self.line("end");
@@ -1604,7 +1971,8 @@ impl<'a> Emitter<'a> {
                 let Some(name) = name else { continue };
                 self.push(name, Ty::VALUE);
                 self.line(&format!(
-                    "local {name} = {source}[{index}][{}]",
+                    "local {} = {source}[{index}][{}]",
+                    lua_bindings[position],
                     position + 1
                 ));
             }
@@ -1617,8 +1985,8 @@ impl<'a> Emitter<'a> {
             self.indent = self.indent.saturating_sub(1);
             self.line("else");
             self.indent = self.indent.saturating_add(1);
-            let first = bindings[0].clone().unwrap_or_else(|| "_".to_owned());
-            let second = bindings[1].clone().unwrap_or_else(|| "_".to_owned());
+            let first = lua_bindings[0].clone();
+            let second = lua_bindings[1].clone();
             for (position, name) in bindings.iter().flatten().enumerate() {
                 self.push(name, self.key_ty(position));
             }
@@ -1657,7 +2025,7 @@ impl<'a> Emitter<'a> {
                 Ty::VALUE
             };
             self.push(name, binding_ty);
-            self.line(&format!("local {name} = {value}"));
+            self.line(&format!("local {} = {value}", lua_bindings[position]));
         }
         self.line(&format!(
             "if {source}.__next ~= nil then {source}.__next = {index} + 1 end"
@@ -1699,6 +2067,35 @@ impl<'a> Emitter<'a> {
         op: &str,
     ) -> Result<(), Error> {
         self.emitted = true;
+        if op == "="
+            && let Expr::Tuple(tuple) = strip_reference(left)
+        {
+            let (text, _) = self.expr(right)?;
+            let source = self.temp();
+            self.uses_deep_clone = true;
+            self.line(&format!("local {source} = {text}"));
+            let mut values = Vec::new();
+            for index in 0..tuple.elems.len() {
+                let value = self.temp();
+                self.line(&format!(
+                    "local {value} = deep_clone({source}[{}])",
+                    index + 1
+                ));
+                values.push(value);
+            }
+            for (index, element) in tuple.elems.iter().enumerate() {
+                let mut local = false;
+                let target =
+                    self.assign_target(strip_reference(element), &mut local)?;
+                self.line(&format!("{target} = {}", values[index]));
+                if local
+                    && let Some(name) = path_ident(strip_reference(element))
+                {
+                    self.push(&name, Ty::VALUE);
+                }
+            }
+            return Ok(());
+        }
         let mut is_local = false;
         let target =
             self.assign_target(strip_reference(left), &mut is_local)?;
@@ -1831,7 +2228,7 @@ impl<'a> Emitter<'a> {
                     ));
                 }
                 *is_local = true;
-                Ok(name)
+                Ok(self.local_name(&name))
             }
             Expr::Field(field) => {
                 let base =
@@ -1891,6 +2288,47 @@ fn simple_condition(expr: &Expr) -> bool {
         }
         Expr::Field(field) => simple_condition(&field.base),
         _ => false,
+    }
+}
+fn pattern_is_none(pattern: &Pat) -> bool {
+    match strip_reference_pattern(pattern) {
+        Pat::Ident(ident) => ident.ident == "None" || ident.ident == "Null",
+        Pat::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            segment.ident == "None" || segment.ident == "Null"
+        }),
+        Pat::TupleStruct(item) => {
+            item.path.segments.last().is_some_and(|segment| {
+                segment.ident == "None" || segment.ident == "Null"
+            })
+        }
+        Pat::Struct(item) => item.path.segments.last().is_some_and(|segment| {
+            segment.ident == "None" || segment.ident == "Null"
+        }),
+        Pat::Paren(paren) => pattern_is_none(&paren.pat),
+        _ => false,
+    }
+}
+
+fn strip_reference_pattern(pattern: &Pat) -> &Pat {
+    match pattern {
+        Pat::Reference(reference) => strip_reference_pattern(&reference.pat),
+        other => other,
+    }
+}
+
+fn pattern_field(value: &str, name: &str) -> String {
+    if is_luau_keyword(name) {
+        format!("{value}[{}]", quote(name))
+    } else {
+        format!("{value}.{name}")
+    }
+}
+
+fn condition_text(conditions: &[String]) -> String {
+    if conditions.is_empty() {
+        "true".to_owned()
+    } else {
+        format!("({})", conditions.join(" and "))
     }
 }
 

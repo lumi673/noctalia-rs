@@ -59,6 +59,30 @@ fn assert_strict_contract(source: &str) {
     }
 }
 
+#[test]
+fn strict_imported_ui_markers_use_action_globals() {
+    let handler = r#"
+use noctalia_rs::ui::{call, callback};
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "action" {
+        return Ok(vec![Op::log("action")]);
+    }
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let id = callback("on_click");
+    let tree = ui::row(json!({ "onClick": call("refresh") }), Vec::new());
+    let _ = id;
+    Ok(vec![Op::BarRender { tree }])
+}
+"#;
+    let source = strict_source(handler, EntryKind::Widget);
+    assert_strict_contract(&source);
+    assert!(source.contains("__strict_action_refresh"), "{source}");
+    assert!(source.contains("__strict_callback"), "{source}");
+}
+
 fn context(event: &str, payload: Value) -> Context {
     Context::new(
         Parts {
