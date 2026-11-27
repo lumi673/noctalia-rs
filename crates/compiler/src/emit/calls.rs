@@ -119,6 +119,7 @@ impl<'a> Emitter<'a> {
                 ));
             };
             bindings.push(Binding::Local {
+                width: None,
                 name: pattern.ident.to_string(),
                 text: value.clone(),
                 ty: Ty::VALUE,

@@ -2421,7 +2421,9 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(emitted.contains("local clamped = (-2)"), "{emitted}");
     assert!(emitted.contains("local wrapped = (9)"), "{emitted}");
     assert!(
-        emitted.contains("math.floor(7), math.floor(3)"),
+        emitted.contains("__pack(__left)")
+            && emitted.contains("end)(7, 3)")
+            && emitted.contains("__divmag"),
         "{emitted}"
     );
     assert!(emitted.contains("math.pow(2.0, 3)"), "{emitted}");
@@ -2847,7 +2849,12 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         compile(&source(handler), &options("handler", EntryKind::Service))
             .expect("compiles");
     assert!(
-        compiled.source.contains("tonumber(__s)"),
+        !compiled.source.contains("tonumber(__s)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("string.byte(__digits, __i) - 48"),
         "{}",
         compiled.source
     );
@@ -2856,6 +2863,216 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         "{}",
         compiled.source
     );
+}
+
+#[test]
+fn review_exact_guard_rejects_folded_results() {
+    for handler in [
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9007199254740992_i64.wrapping_add(1); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = (9007199254740992_i64 - 1).saturating_mul(3); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = i64::MIN.wrapping_sub(1); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("folded result above 2^53 bails");
+        assert!(
+            error.message.contains("not exactly representable"),
+            "{}",
+            error.message
+        );
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
+}
+
+#[test]
+fn review_exact_guard_accepts_folded_boundaries() {
+    for (handler, literal) in [
+        (
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = i64::MAX.wrapping_add(1); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+            "(-9223372036854775808)",
+        ),
+        (
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9007199254740992_i64.wrapping_add(9007199254740992); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+            "(18014398509481984)",
+        ),
+    ] {
+        let compiled =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect("exact folded boundary compiles");
+        assert!(compiled.source.contains(literal), "{}", compiled.source);
+    }
+}
+
+#[test]
+fn review_exact_guard_rejects_inexact_div_ceil() {
+    let handler = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9007199254740993_i64.div_ceil(2); Ok(vec![Op::log(format!(\"{}\", v))]) }";
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("inexact div_ceil operand bails");
+    assert!(
+        error.message.contains("exact operands"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn review_exact_guard_emits_limb_order_and_operand_checks() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let b = 4294967295_u32;
+    let value = 4294967295_u32.saturating_mul(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("__exact(__ahi, __all)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("if __over and __s > 0 then __hi = 0"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__lo = 4294967295"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_closure_shadowing_shape() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let f = || { let a = 255_i64; a.saturating_add(1) };
+    let inner = f();
+    let outer = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", inner, outer))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("2147483647"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__lo = 255"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_param_width_does_not_leak() {
+    let first = source(
+        "fn clean(max: usize) -> usize { max.saturating_sub(1) }\n\
+         fn handler(_ctx: &Context) -> Result<Vec<Op>> {\
+             let v = clean(0);\
+             Ok(vec![Op::log(format!(\"{}\", v))])\
+         }",
+    );
+    compile(&first, &options("handler", EntryKind::Service))
+        .expect("first compiles");
+    let second = source(
+        "fn handler(_ctx: &Context) -> Result<Vec<Op>> {\
+             let max: u8 = 255;\
+             let v = max.saturating_add(1);\
+             Ok(vec![Op::log(format!(\"{}\", v))])\
+         }",
+    );
+    let compiled = compile(&second, &options("handler", EntryKind::Service))
+        .expect("second compiles");
+    assert!(
+        compiled.source.contains("__lo = 255"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_nested_binding_shape_and_scope_restore() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let inner = { let a = 255_i64; a.saturating_add(1) };
+    let outer = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", inner, outer))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("2147483647"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("__lo = 255"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_inlined_usize_parameter_shape() {
+    let handler = r#"
+fn clean(max: usize) -> usize { max.saturating_sub(1) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = clean(0);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("local max = 0"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_div_ceil_guards_limb_width() {
+    let handler = "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 7_i64.div_ceil(2); Ok(vec![Op::log(format!(\"{}\", v))]) }";
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("__ah >= __B"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn review_inexact_path_constants_bail() {
+    for handler in [
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let n = ctx.config_str(\"message\").unwrap_or_default().len() as i64; let v = i64::MAX.wrapping_add(n); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> { let n = ctx.config_str(\"message\").unwrap_or_default().len() as u64; let v = u64::MAX.saturating_add(n); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+    ] {
+        let error =
+            compile(&source(handler), &options("handler", EntryKind::Service))
+                .expect_err("inexact path constant bails");
+        assert!(
+            error.message.contains("not exactly representable"),
+            "{}",
+            error.message
+        );
+        assert!(error.line > 0 && error.column > 0, "{error:?}");
+    }
 }
 
 #[test]
@@ -2873,27 +3090,46 @@ fn review_round2_integer_boundaries() {
 }}
 "#
         );
-        let error =
+        let compiled =
             compile(&source(&handler), &options("handler", EntryKind::Service))
-                .expect_err("non-exact or out-of-range parse bails");
-        assert!(error.line > 0 && error.column > 0, "{error:?}");
+                .expect("parse literals compile");
+        assert!(
+            compiled.source.contains("9223372036854775807")
+                && compiled.source.contains("9223372036854775808")
+                && compiled.source.contains("string.byte(__digits, __i) - 48"),
+            "{}",
+            compiled.source
+        );
     }
 
-    let handler = r#"
+    let wrap = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let a = (i64::MAX - 1).wrapping_add(2);
     let b = i64::MIN.wrapping_sub(2);
-    let c = i64::MIN.div_ceil(-1);
-    Ok(vec![Op::log(format!("{} {} {}", a, b, c))])
+    Ok(vec![Op::log(format!("{}", b))])
 }
 "#;
-    let error =
-        compile(&source(handler), &options("handler", EntryKind::Service))
-            .expect_err("div_ceil overflow bails");
+    let error = compile(&source(wrap), &options("handler", EntryKind::Service))
+        .expect_err("wrapped value bails");
     assert!(
-        error.message.contains("overflow") || error.message.contains("exactly"),
+        error.message.contains("not exactly representable"),
         "{}",
         error.message
+    );
+
+    let divide = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let d = -1_i64;
+    let c = i64::MIN.div_ceil(d);
+    Ok(vec![Op::log(format!("{}", c))])
+}
+"#;
+    let compiled =
+        compile(&source(divide), &options("handler", EntryKind::Service))
+            .expect("runtime overflow guard is emitted");
+    assert!(
+        compiled.source.contains("div_ceil overflows"),
+        "{}",
+        compiled.source
     );
 }
 
@@ -3015,13 +3251,14 @@ fn review_round6_state_cleanup_and_failure_recovery() {
     let bad = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let found = (0..2).find(|x| *x == 9);
-    let value = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    let value = "42".parse::<i64>().unwrap_or(0);
+    let bad = 1_i64.unsupported_integer_method();
     Ok(vec![Op::log(format!("{} {}", found.unwrap_or(0), value))])
 }
 "#;
     let error = compile(&source(bad), &options("handler", EntryKind::Service))
         .expect_err("bad handler bails");
-    assert!(error.line > 0 && error.column > 0, "{error:?}");
+    assert!(error.message.contains("unsupported"), "{}", error.message);
 
     let good = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

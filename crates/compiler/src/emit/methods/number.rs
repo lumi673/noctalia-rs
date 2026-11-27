@@ -1,5 +1,332 @@
 use super::*;
 
+/// Checks that a pair of 32-bit limbs round-trips through Luau's number model.
+/// Powers of two above 2^53 are exact even though most neighbours are not.
+const LIMB_EXACT: &str = concat!(
+    "local function __bits(__v) local __n = 0 while __v >= 1 do __v = math.floor(__v / 2); __n = __n + 1 end return __n - 1 end;",
+    "local function __exact(__h, __l) local __e = (__h > 0) and (32 + __bits(__h)) or __bits(__l); if __e <= 52 then return true end; local __shift = __e - 52; if __shift <= 32 then return (__l % (2 ^ __shift)) == 0 end; return __l == 0 and (__h % (2 ^ (__shift - 32))) == 0 end;",
+);
+
+/// Rejects a limb value that would change on conversion to a Luau number.
+fn exact_guard(
+    location: &str,
+    construct: &str,
+    high: &str,
+    low: &str,
+) -> String {
+    let location = location.replace('"', "\\\"");
+    let construct = construct.replace('"', "\\\"");
+    format!(
+        "if not __exact({high}, {low}) then error(\"{location}: {construct} is not exactly representable in Luau (1 construct)\") end;",
+    )
+}
+
+fn exact_i128(value: i128) -> bool {
+    value as f64 as i128 == value
+}
+
+/// Luau-only 64-bit magnitude arithmetic. Values are sign plus two 32-bit
+/// limbs, so carries and borrows never pass through a double. The result is
+/// converted to the Luau number model only after the operation completes.
+fn exact_binary(
+    method: &str,
+    left: &str,
+    right: &str,
+    right_literal: Option<i128>,
+    bits: usize,
+    signed: bool,
+    location: &str,
+) -> String {
+    let max = if signed {
+        (1u128 << (bits - 1)) - 1
+    } else {
+        (1u128 << bits) - 1
+    };
+    let min_magnitude = if signed { max + 1 } else { 0 };
+    let modulus = 1u128 << bits;
+    let limbs = |value: u128| (value >> 32, value & 0xffff_ffff);
+    let (max_hi, max_lo) = limbs(max);
+    let (min_hi, min_lo) = limbs(min_magnitude);
+    let (mod_hi, mod_lo) = limbs(modulus);
+    let saturating = method.starts_with("saturating_");
+    let right_sign = if method.ends_with("_sub") {
+        "-__bs"
+    } else {
+        "__bs"
+    };
+    let operation = if method.ends_with("_mul") {
+        concat!(
+            "local __r4, __r3, __r2, __r1, __r0 = __mulmag(__ahi, __all, __bhi, __blo);",
+            "local __hi, __lo = __r1, __r0;",
+            "if __ahi == 0 and __all == 0 and __bhi == 0 and __blo == 0 then __s = 0 elseif __ahi == 0 and __all == 0 then __s = __bs elseif __bhi == 0 and __blo == 0 then __s = __as else __s = (__as == __bs) and 1 or -1 end;",
+            "local __over = (__r4 ~= 0 or __r3 ~= 0 or __r2 ~= 0);",
+        )
+        .to_owned()
+    } else {
+        format!(
+            concat!(
+                "local __bs2 = {right_sign};",
+                "if __ahi == 0 and __all == 0 and __bhi == 0 and __blo == 0 then __s = 0 elseif __ahi == 0 and __all == 0 then __s = __bs2 elseif __bhi == 0 and __blo == 0 then __s = __as elseif __as == __bs2 then __s = __as elseif __cmp(__ahi, __all, __bhi, __blo) > 0 then __s = __as else __s = __bs2 end;",
+                "local __hi, __lo;",
+                "if __as ~= 0 and __as == __bs2 then",
+                "  __hi, __lo = __addmag(__ahi, __all, __bhi, __blo);",
+                "elseif __cmp(__ahi, __all, __bhi, __blo) >= 0 then",
+                "  __hi, __lo = __submag(__ahi, __all, __bhi, __blo);",
+                "else",
+                "  __hi, __lo = __submag(__bhi, __blo, __ahi, __all);",
+                "end;",
+                "local __over = false;",
+            ),
+            right_sign = right_sign
+        )
+    };
+    let bound_check = if signed {
+        format!(
+            concat!(
+                "if __s < 0 and __cmp(__hi, __lo, {min_hi}, {min_lo}) > 0 then __over = true end;",
+                "if __s >= 0 and __cmp(__hi, __lo, {max_hi}, {max_lo}) > 0 then __over = true end;",
+            ),
+            min_hi = min_hi,
+            min_lo = min_lo,
+            max_hi = max_hi,
+            max_lo = max_lo,
+        )
+    } else {
+        format!(
+            concat!(
+                "if __s < 0 or __cmp(__hi, __lo, {max_hi}, {max_lo}) > 0 then __over = true end;",
+            ),
+            max_hi = max_hi,
+            max_lo = max_lo,
+        )
+    };
+    let finish = if saturating {
+        if signed {
+            format!(
+                concat!(
+                    "if __over and __s < 0 then __hi = {min_hi}; __lo = {min_lo}; __s = -1 end;",
+                    "if __over and __s >= 0 then __hi = {max_hi}; __lo = {max_lo}; __s = 1 end;",
+                    "local __result = __s * (__hi * __B + __lo);",
+                ),
+                min_hi = min_hi,
+                min_lo = min_lo,
+                max_hi = max_hi,
+                max_lo = max_lo,
+            )
+        } else {
+            format!(
+                concat!(
+                    "if __over and __s < 0 then __hi = 0; __lo = 0; __s = 0 end;",
+                    "if __over and __s > 0 then __hi = {max_hi}; __lo = {max_lo}; __s = 1 end;",
+                    "local __result = __hi * __B + __lo;",
+                ),
+                max_hi = max_hi,
+                max_lo = max_lo,
+            )
+        }
+    } else {
+        let small = mod_hi <= 1;
+        let lo_mod = if mod_lo == 0 {
+            "__B".to_owned()
+        } else {
+            mod_lo.to_string()
+        };
+        let mask = if small {
+            format!("__hi = 0; __lo = __lo % {lo_mod};")
+        } else {
+            format!("__hi = __hi % {mod_hi};")
+        };
+        let complement = if small {
+            format!("__hi = 0; if __lo ~= 0 then __lo = {lo_mod} - __lo end;")
+        } else {
+            format!(
+                "__hi = ({mod_hi} - __hi - ((__lo == 0) and 0 or 1)) % __B; if __lo ~= 0 then __lo = {lo_mod} - __lo else __lo = 0 end;"
+            )
+        };
+        let sign = if signed {
+            format!(
+                concat!(
+                    "if __cmp(__hi, __lo, {min_hi}, {min_lo}) >= 0 then",
+                    "  {complement}",
+                    "  __s = -__s;",
+                    "end;",
+                ),
+                min_hi = min_hi,
+                min_lo = min_lo,
+                complement = complement,
+            )
+        } else {
+            format!("if __s < 0 then {complement} end; __s = 1;")
+        };
+        format!(
+            concat!(
+                "{mask}",
+                "{sign}",
+                "local __result = __s * (__hi * __B + __lo);",
+            ),
+            mask = mask,
+            sign = sign,
+        )
+    };
+    let guard =
+        exact_guard(location, &format!("{method} result"), "__hi", "__lo");
+    let operand_guard = format!(
+        "{}{}",
+        exact_guard(location, &format!("{method} operand"), "__ahi", "__all",),
+        exact_guard(location, &format!("{method} operand"), "__bhi", "__blo",),
+    );
+    const LEFT_MARK: &str = "\u{e000}";
+    const RIGHT_MARK: &str = "\u{e001}";
+    let right_source = if right_literal.is_some() {
+        String::new()
+    } else {
+        right.to_owned()
+    };
+    let right_operand = match right_literal {
+        Some(value) => {
+            let sign = if value < 0 { -1 } else { 1 };
+            let magnitude = value.unsigned_abs();
+            format!(
+                "local __bs, __bhi, __blo = {sign}, {}, {};",
+                magnitude >> 32,
+                magnitude & 0xffff_ffff
+            )
+        }
+        None => format!("local __bs, __bhi, __blo = __pack({RIGHT_MARK});"),
+    };
+    let body = format!(
+        concat!(
+            "(function()",
+            "local __B = 4294967296;",
+            "{limb_exact}",
+            "local function __pack(__v)",
+            "  local __s = (__v < 0) and -1 or 1;",
+            "  if __v < 0 then __s = -1; __v = -__v end;",
+            "  local __m = math.floor(__v);",
+            "  local __hi = math.floor(__m / __B) % __B;",
+            "  local __lo = __m - math.floor(__m / __B) * __B;",
+            "  return __s, __hi, __lo;",
+            "end;",
+            "local function __cmp(__ah, __al, __bh, __bl)",
+            "  if __ah ~= __bh then return (__ah < __bh) and -1 or 1 end;",
+            "  if __al ~= __bl then return (__al < __bl) and -1 or 1 end;",
+            "  return 0;",
+            "end;",
+            "local function __addmag(__ah, __al, __bh, __bl)",
+            "  local __l = __al + __bl;",
+            "  local __c = math.floor(__l / __B);",
+            "  return __ah + __bh + __c, __l - __c * __B;",
+            "end;",
+            "local function __submag(__ah, __al, __bh, __bl)",
+            "  local __borrow = (__al < __bl) and 1 or 0;",
+            "  return __ah - __bh - __borrow, __al - __bl + __borrow * __B;",
+            "end;",
+            "local function __mul32(__a, __b)",
+            "  local __a0, __a1 = __a % 65536, math.floor(__a / 65536);",
+            "  local __b0, __b1 = __b % 65536, math.floor(__b / 65536);",
+            "  local __p0 = __a0 * __b0;",
+            "  local __t = __a0 * __b1 + __a1 * __b0 + math.floor(__p0 / 65536);",
+            "  return __a1 * __b1 + math.floor(__t / 65536), (__p0 % 65536) + (__t % 65536) * 65536;",
+            "end;",
+            "local function __mulmag(__ah, __al, __bh, __bl)",
+            "  local __p0h, __p0l = __mul32(__al, __bl);",
+            "  local __p1h, __p1l = __mul32(__al, __bh);",
+            "  local __p2h, __p2l = __mul32(__ah, __bl);",
+            "  local __p3h, __p3l = __mul32(__ah, __bh);",
+            "  local __r0 = __p0l;",
+            "  local __t = __p0h + __p1l + __p2l;",
+            "  local __r1, __c = __t % __B, math.floor(__t / __B);",
+            "  __t = __p1h + __p2h + __p3l + __c;",
+            "  local __r2;",
+            "  __r2, __c = __t % __B, math.floor(__t / __B);",
+            "  __t = __p3h + __c;",
+            "  return math.floor(__t / __B), __t % __B, __r2, __r1, __r0;",
+            "end;",
+            "local __as, __ahi, __all = __pack({left});",
+            "{right_operand}",
+            "{operand_guard}",
+            "local __s = 0;",
+            "{operation}",
+            "{bound_check}",
+            "{finish}",
+            "{guard}",
+            "return __result;",
+            "end)()",
+        ),
+        left = LEFT_MARK,
+        right_operand = right_operand,
+        operation = operation,
+        bound_check = bound_check,
+        finish = finish,
+        guard = guard,
+        limb_exact = LIMB_EXACT,
+        operand_guard = operand_guard,
+    );
+    let body = body.replace(';', "\n");
+    replace_marks(&body, &[(LEFT_MARK, left), (RIGHT_MARK, &right_source)])
+}
+
+/// Decimal validation and limb conversion for `parse::<T>()`.
+pub(super) fn exact_parse(
+    receiver: &str,
+    target: &str,
+    location: &str,
+) -> String {
+    let (positive, negative, signed) = match target {
+        "i8" => ("127", "128", true),
+        "i16" => ("32767", "32768", true),
+        "i32" => ("2147483647", "2147483648", true),
+        "u8" => ("255", "0", false),
+        "u16" => ("65535", "0", false),
+        "u32" => ("4294967295", "0", false),
+        "u64" | "usize" => ("18446744073709551615", "0", false),
+        _ => ("9223372036854775807", "9223372036854775808", true),
+    };
+    const RECEIVER_MARK: &str = "\u{e002}";
+    let guard = exact_guard(
+        location,
+        &format!("parse::<{target}> result"),
+        "__hi",
+        "__lo",
+    );
+    format!(
+        concat!(
+            "(function()",
+            "local __s = {RECEIVER_MARK};",
+            "local __start, __finish, __sign, __digits = string.find(__s, \"^([+-]?)(%d+)$\");",
+            "if __start == nil then return nil, \"invalid digit found in string\" end;",
+            "__digits = string.gsub(__digits, \"^0+\", \"\");",
+            "if __digits == \"\" then __digits = \"0\" end;",
+            "local __neg = __sign == \"-\";",
+            "if __neg and not {signed} then return nil, \"number too large or small\" end;",
+            "local __limit = __neg and \"{negative}\" or \"{positive}\";",
+            "if #__digits > #__limit or (#__digits == #__limit and __digits > __limit) then return nil, \"number too large or small\" end;",
+            "local __B = 4294967296;",
+            "{limb_exact}",
+            "local __hi, __lo = 0, 0;",
+            "for __i = 1, #__digits do",
+            "  local __v = __lo * 10 + (string.byte(__digits, __i) - 48);",
+            "  local __c = math.floor(__v / __B);",
+            "  __lo = __v - __c * __B;",
+            "  __hi = (__hi * 10 + __c) % __B;",
+            "end;",
+            "if __hi == 0 and __lo == 0 then return 0 end;",
+            "{guard}",
+            "if __neg then return -(__hi * __B + __lo) end;",
+            "return __hi * __B + __lo;",
+            "end)()",
+        ),
+        RECEIVER_MARK = RECEIVER_MARK,
+        signed = signed,
+        negative = negative,
+        positive = positive,
+        guard = guard,
+        limb_exact = LIMB_EXACT,
+    )
+    .replace(';', "\n")
+    .replace(RECEIVER_MARK, receiver)
+}
+
 fn int_literal(expr: &Expr) -> Option<(i128, usize, bool)> {
     match strip_reference(expr) {
         Expr::Lit(ExprLit {
@@ -56,6 +383,406 @@ fn int_literal(expr: &Expr) -> Option<(i128, usize, bool)> {
     }
 }
 
+fn has_inexact_literal(expr: &Expr) -> bool {
+    match strip_reference(expr) {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(_), ..
+        }) => int_literal(expr).is_some_and(|(value, _, _)| !exact_i128(value)),
+        Expr::Binary(binary) => {
+            has_inexact_literal(&binary.left)
+                || has_inexact_literal(&binary.right)
+                || has_large_literal(&binary.left)
+                || has_large_literal(&binary.right)
+        }
+        Expr::Paren(paren) => has_inexact_literal(&paren.expr),
+        Expr::Group(group) => has_inexact_literal(&group.expr),
+        Expr::Unary(unary) => has_inexact_literal(&unary.expr),
+        Expr::Path(_) => {
+            int_literal(expr).is_some_and(|(value, _, _)| !exact_i128(value))
+        }
+        _ => false,
+    }
+}
+
+fn has_large_literal(expr: &Expr) -> bool {
+    match strip_reference(expr) {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(_), ..
+        })
+        | Expr::Path(_) => int_literal(expr)
+            .is_some_and(|(value, _, _)| value.abs() >= 9007199254740992),
+        Expr::Binary(binary) => {
+            has_large_literal(&binary.left) || has_large_literal(&binary.right)
+        }
+        Expr::Paren(paren) => has_large_literal(&paren.expr),
+        Expr::Group(group) => has_large_literal(&group.expr),
+        Expr::Unary(unary) => has_large_literal(&unary.expr),
+        _ => false,
+    }
+}
+
+type Width = (usize, bool);
+type WidthScope = Vec<(String, Width)>;
+type Pos = (usize, usize);
+type ShapeCandidate = (Pos, Pos, Width);
+
+thread_local! {
+    static PARAM_WIDTHS: std::cell::RefCell<Vec<WidthScope>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn push_param_width_scope() {
+    PARAM_WIDTHS.with(|slot| slot.borrow_mut().push(Vec::new()));
+}
+
+pub(crate) fn pop_param_width_scope() {
+    PARAM_WIDTHS.with(|slot| {
+        slot.borrow_mut().pop();
+    });
+}
+
+pub(crate) fn add_param_width(name: &str, width: Width) {
+    PARAM_WIDTHS.with(|slot| {
+        if let Some(scope) = slot.borrow_mut().last_mut() {
+            scope.push((name.to_owned(), width));
+        }
+    });
+}
+
+fn param_width(name: &str) -> Option<Width> {
+    PARAM_WIDTHS.with(|slot| {
+        slot.borrow().iter().rev().find_map(|scope| {
+            scope
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, width)| *width)
+        })
+    })
+}
+
+pub(crate) fn shape_from_type(ty: &syn::Type) -> Option<(usize, bool)> {
+    match type_text(ty).as_str() {
+        "i8" => Some((8, true)),
+        "u8" => Some((8, false)),
+        "i16" => Some((16, true)),
+        "u16" => Some((16, false)),
+        "i32" => Some((32, true)),
+        "u32" => Some((32, false)),
+        "i64" | "isize" => Some((64, true)),
+        "u64" | "usize" => Some((64, false)),
+        _ => None,
+    }
+}
+
+fn shape_in_expr(expr: &Expr) -> Option<(usize, bool)> {
+    match strip_reference(expr) {
+        Expr::Unary(unary) => {
+            return shape_in_expr(&unary.expr).map(|(bits, _)| (bits, true));
+        }
+        Expr::Cast(cast) => return shape_from_type(&cast.ty),
+        Expr::Paren(paren) => return shape_in_expr(&paren.expr),
+        Expr::Group(group) => return shape_in_expr(&group.expr),
+        Expr::Binary(binary) => {
+            return shape_in_expr(&binary.left)
+                .or_else(|| shape_in_expr(&binary.right));
+        }
+        _ => {}
+    }
+    int_literal(expr).map(|(_, bits, signed)| (bits, signed))
+}
+
+fn shape_from_param(
+    program: &Program,
+    module: &str,
+    out: &str,
+    name: &str,
+) -> Option<(usize, bool)> {
+    for line in out.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("local function ")
+        else {
+            continue;
+        };
+        let Some(start) = rest.find('(') else {
+            continue;
+        };
+        let Some(end) = rest.find(')') else { continue };
+        if !rest[start + 1..end]
+            .split(',')
+            .any(|parameter| parameter.trim() == name)
+        {
+            continue;
+        }
+        let function_name = rest[..start].trim();
+        if let Some(resolved) =
+            program.resolve(module, &[function_name.to_owned()])
+        {
+            for (pattern, ty) in typed_args(resolved.function) {
+                let syn::Pat::Ident(ident) = pattern else {
+                    continue;
+                };
+                if ident.ident == name {
+                    return shape_from_type(ty);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn shape_from_binding(
+    program: &Program,
+    module: &str,
+    name: &str,
+    call: (usize, usize),
+) -> Option<(usize, bool)> {
+    fn inside(
+        start: (usize, usize),
+        end: (usize, usize),
+        at: (usize, usize),
+    ) -> bool {
+        start <= at && at <= end
+    }
+
+    fn collect(
+        block: &syn::Block,
+        name: &str,
+        call: (usize, usize),
+        found: &mut Vec<ShapeCandidate>,
+    ) {
+        let start = block.span().start();
+        let end = block.span().end();
+        let start = (start.line, start.column);
+        let end = (end.line, end.column);
+        if !inside(start, end, call) {
+            return;
+        }
+        for statement in &block.stmts {
+            if let syn::Stmt::Local(local) = statement {
+                let (pattern, annotation) = match &local.pat {
+                    syn::Pat::Type(typed) => {
+                        (&*typed.pat, shape_from_type(&typed.ty))
+                    }
+                    other => (other, None),
+                };
+                if let syn::Pat::Ident(ident) = pattern
+                    && ident.ident == name
+                {
+                    let at = local.span().start();
+                    let at = (at.line, at.column);
+                    let shape = annotation.or_else(|| {
+                        local
+                            .init
+                            .as_ref()
+                            .and_then(|init| shape_in_expr(&init.expr))
+                    });
+                    if at <= call
+                        && let Some(shape) = shape
+                    {
+                        found.push((start, at, shape));
+                    }
+                }
+            }
+            collect_from_statement(statement, name, call, found);
+        }
+    }
+
+    fn collect_from_statement(
+        statement: &syn::Stmt,
+        name: &str,
+        call: (usize, usize),
+        found: &mut Vec<ShapeCandidate>,
+    ) {
+        match statement {
+            syn::Stmt::Expr(expr, _) => {
+                collect_from_expr(expr, name, call, found)
+            }
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    collect_from_expr(&init.expr, name, call, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_from_expr(
+        expr: &Expr,
+        name: &str,
+        call: (usize, usize),
+        found: &mut Vec<ShapeCandidate>,
+    ) {
+        match expr {
+            Expr::Block(block) => collect(&block.block, name, call, found),
+            Expr::Closure(closure) => {
+                collect_from_expr(&closure.body, name, call, found)
+            }
+            Expr::If(item) => {
+                collect(&item.then_branch, name, call, found);
+                if let Some((_, branch)) = &item.else_branch {
+                    collect_from_expr(branch, name, call, found);
+                }
+            }
+            Expr::Loop(item) => collect(&item.body, name, call, found),
+            Expr::While(item) => collect(&item.body, name, call, found),
+            Expr::ForLoop(item) => collect(&item.body, name, call, found),
+            Expr::Match(item) => {
+                for arm in &item.arms {
+                    collect_from_expr(&arm.body, name, call, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut found = Vec::new();
+    for candidate in [
+        "handler",
+        "widget",
+        "service",
+        "panel",
+        "shortcut",
+        "launcher",
+        "desktop_widget",
+        "layer",
+        "render",
+        "update",
+    ] {
+        if let Ok(resolved) = program.handler(module, candidate) {
+            collect(&resolved.function.block, name, call, &mut found);
+        }
+    }
+    found
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))
+        .map(|(_, _, shape)| shape)
+}
+/// Exact `div_ceil` using 32-bit limbs. Double division cannot distinguish a
+/// rounded operand or quotient from an exact one above 2^53.
+fn exact_div_ceil(
+    location: &str,
+    left: &str,
+    right: &str,
+    bits: usize,
+    signed: bool,
+) -> String {
+    const LEFT_MARK: &str = "\u{e003}";
+    const RIGHT_MARK: &str = "\u{e004}";
+    let escaped = location.replace('"', "\\\"");
+    let operand_guard = format!(
+        "{}{}if __ah >= __B or __bh >= __B then error(\"{escaped}: div_ceil operand is not exactly representable in Luau (1 construct)\") end;",
+        exact_guard(location, "div_ceil operand", "__ah", "__al"),
+        exact_guard(location, "div_ceil operand", "__bh", "__bl")
+    );
+    let result_guard = exact_guard(location, "div_ceil result", "__qh", "__ql");
+    let overflow_guard = if signed {
+        let minimum = 1u128 << (bits - 1);
+        format!(
+            "if __as < 0 and __bs < 0 and __ah == {} and __al == {} and __bh == 0 and __bl == 1 then error(\"{escaped}: div_ceil overflows (1 construct)\") end;",
+            minimum >> 32,
+            minimum & 0xffff_ffff
+        )
+    } else {
+        String::new()
+    };
+    let body = format!(
+        concat!(
+            "(function(__left, __right)",
+            "local __B = 4294967296;",
+            "{limb_exact}",
+            "local function __pack(__v) local __s = (__v < 0) and -1 or 1; if __v < 0 then __v = -__v end; local __m = math.floor(__v); local __h = math.floor(__m / __B); local __l = __m - __h * __B; return __s, __h, __l end;",
+            "local function __submag(__ah, __al, __bh, __bl) local __borrow = (__al < __bl) and 1 or 0; return __ah - __bh - __borrow, __al - __bl + __borrow * __B end;",
+            "local function __divmag(__ah, __al, __bh, __bl)",
+            "  local __qh, __ql, __rh, __rl = 0, 0, 0, 0;",
+            "  for __i = 63, 0, -1 do",
+            "    local __carry = (__rl >= 2147483648) and 1 or 0;",
+            "    __rh = (__rh * 2 + __carry) % __B;",
+            "    __rl = (__rl * 2) % __B;",
+            "    if __i >= 32 then __rl = __rl + (math.floor(__ah / 2 ^ (__i - 32)) % 2) end;",
+            "    if __i < 32 then __rl = __rl + (math.floor(__al / 2 ^ __i) % 2) end;",
+            "    if __rh > __bh or (__rh == __bh and __rl >= __bl) then",
+            "      __rh, __rl = __submag(__rh, __rl, __bh, __bl);",
+            "      if __i >= 32 then __qh = __qh + 2 ^ (__i - 32) end;",
+            "      if __i < 32 then __ql = __ql + 2 ^ __i end;",
+            "    end;",
+            "  end;",
+            "  return __qh, __ql, __rh, __rl;",
+            "end;",
+            "local __as, __ah, __al = __pack(__left);",
+            "local __bs, __bh, __bl = __pack(__right);",
+            "{operand_guard}",
+            "{overflow_guard}",
+            "if __bh == 0 and __bl == 0 then error(\"divide by zero\") end;",
+            "local __qh, __ql, __rh, __rl = __divmag(__ah, __al, __bh, __bl);",
+            "if (__rh ~= 0 or __rl ~= 0) and __as == __bs then",
+            "  local __l = __ql + 1;",
+            "  local __c = math.floor(__l / __B);",
+            "  __ql = __l - __c * __B;",
+            "  __qh = __qh + __c;",
+            "end;",
+            "{result_guard}",
+            "if __qh == 0 and __ql == 0 then return 0 end;",
+            "return (__as * __bs) * (__qh * __B + __ql);",
+            "end)({LEFT_MARK}, {RIGHT_MARK})",
+        ),
+        LEFT_MARK = LEFT_MARK,
+        RIGHT_MARK = RIGHT_MARK,
+        limb_exact = LIMB_EXACT,
+        operand_guard = operand_guard,
+        overflow_guard = overflow_guard,
+        result_guard = result_guard,
+    );
+    let body = body.replace(';', "\n");
+    replace_marks(&body, &[(LEFT_MARK, left), (RIGHT_MARK, right)])
+}
+/// Substitutes all operand markers in one pass so an inserted operand cannot
+/// have its own text treated as a later marker.
+fn replace_marks(template: &str, marks: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    let mut rest = template;
+    while !rest.is_empty() {
+        let next = marks
+            .iter()
+            .filter_map(|(marker, value)| {
+                rest.find(marker).map(|position| (position, marker, *value))
+            })
+            .min_by_key(|(position, _, _)| *position);
+        match next {
+            Some((position, marker, value)) => {
+                out.push_str(&rest[..position]);
+                out.push_str(value);
+                rest = &rest[position + marker.len()..];
+            }
+            None => {
+                out.push_str(rest);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn int_suffix_shape(expr: &Expr) -> Option<(usize, bool)> {
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(value),
+        ..
+    }) = strip_reference(expr)
+    else {
+        return None;
+    };
+    match value.suffix() {
+        "i8" => Some((8, true)),
+        "u8" => Some((8, false)),
+        "i16" => Some((16, true)),
+        "u16" => Some((16, false)),
+        "i32" => Some((32, true)),
+        "u32" => Some((32, false)),
+        "i64" | "isize" => Some((64, true)),
+        "u64" | "usize" => Some((64, false)),
+        _ => None,
+    }
+}
+
 fn int_bounds(bits: usize, signed: bool) -> (i128, i128) {
     if signed {
         let max = (1i128 << (bits - 1)) - 1;
@@ -63,6 +790,27 @@ fn int_bounds(bits: usize, signed: bool) -> (i128, i128) {
     } else {
         (0, (1i128 << bits) - 1)
     }
+}
+fn int_shape(expr: &Expr) -> (usize, bool) {
+    if let Some((_, bits, signed)) = int_literal(expr) {
+        return (bits, signed);
+    }
+    match strip_reference(expr) {
+        Expr::Path(path) => path.path.segments.iter().rev().find_map(|part| {
+            let name = part.ident.to_string();
+            match name.as_str() {
+                "i8" | "u8" => Some((8, name.starts_with('i'))),
+                "i16" | "u16" => Some((16, name.starts_with('i'))),
+                "i32" | "u32" => Some((32, name.starts_with('i'))),
+                "i64" | "u64" | "isize" | "usize" => {
+                    Some((64, name.starts_with('i')))
+                }
+                _ => None,
+            }
+        }),
+        _ => None,
+    }
+    .unwrap_or((64, true))
 }
 impl<'a> Emitter<'a> {
     pub(super) fn number_method(
@@ -149,56 +897,101 @@ impl<'a> Emitter<'a> {
             "saturating_add" | "saturating_sub" | "saturating_mul"
             | "wrapping_add" | "wrapping_sub" => {
                 let argument = arg(args, 0, call)?;
-                let Some((left, bits, signed)) = int_literal(&call.receiver)
-                else {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "integer edge methods need exact compile-time operands",
-                    ));
-                };
-                let Some((right, _, _)) = int_literal(argument) else {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "integer edge methods need exact compile-time operands",
-                    ));
-                };
-                let (min, max) = int_bounds(bits, signed);
-                let raw = match method {
-                    "saturating_add" | "wrapping_add" => left
-                        .checked_add(right)
-                        .unwrap_or(if signed { max } else { min }),
-                    "saturating_sub" | "wrapping_sub" => left
-                        .checked_sub(right)
-                        .unwrap_or(if signed { min } else { max }),
-                    _ => left.checked_mul(right).unwrap_or(
-                        if signed && (left < 0) != (right < 0) {
-                            min
-                        } else {
-                            max
-                        },
-                    ),
-                };
-                let result = if method.starts_with("wrapping_") {
-                    let span = max - min + 1;
-                    ((raw - min).rem_euclid(span)) + min
-                } else if matches!(
-                    method,
-                    "saturating_add" | "saturating_sub" | "saturating_mul"
-                ) {
-                    raw.clamp(min, max)
-                } else {
-                    raw
-                };
-                if result.abs() > 9007199254740992
-                    && result != i64::MIN as i128
-                    && result != 9223372036854775808i128
+                let span = call.method.span().start();
+                let location = format!(
+                    "{}.rs:{}:{}",
+                    self.module,
+                    span.line,
+                    span.column + 1
+                );
+                if let (Some((left, bits, signed)), Some((right, _, _))) =
+                    (int_literal(&call.receiver), int_literal(argument))
                 {
-                    return Err(Error::at(
-                        call.method.span(),
-                        "integer result cannot be represented exactly in Luau",
-                    ));
+                    let (min, max) = int_bounds(bits, signed);
+                    let raw = match method {
+                        "saturating_add" | "wrapping_add" => left
+                            .checked_add(right)
+                            .unwrap_or(if signed { max } else { min }),
+                        "saturating_sub" | "wrapping_sub" => left
+                            .checked_sub(right)
+                            .unwrap_or(if signed { min } else { max }),
+                        _ => left.checked_mul(right).unwrap_or(
+                            if signed && (left < 0) != (right < 0) {
+                                min
+                            } else {
+                                max
+                            },
+                        ),
+                    };
+                    let result = if method.starts_with("wrapping_") {
+                        let span = max - min + 1;
+                        ((raw - min).rem_euclid(span)) + min
+                    } else {
+                        raw.clamp(min, max)
+                    };
+                    if !exact_i128(result) {
+                        return Err(Error::at(
+                            call.method.span(),
+                            format!(
+                                "`{method}` result {result} is not exactly representable in Luau (1 construct)"
+                            ),
+                        ));
+                    }
+                    Ok((format!("({result})"), ty))
+                } else {
+                    if has_inexact_literal(&call.receiver)
+                        || has_inexact_literal(argument)
+                    {
+                        return Err(Error::at(
+                            call.method.span(),
+                            format!(
+                                "`{method}` operand is not exactly representable in Luau (1 construct)"
+                            ),
+                        ));
+                    }
+                    let shape = match int_literal(&call.receiver)
+                        .map(|(_, bits, signed)| (bits, signed))
+                        .or_else(|| shape_in_expr(&call.receiver))
+                    {
+                        Some(shape) => shape,
+                        None => path_last_name(&call.receiver)
+                            .and_then(|name| {
+                                param_width(&name)
+                                    .or_else(|| {
+                                        let at = call.method.span().start();
+                                        shape_from_binding(
+                                            self.program,
+                                            &self.module,
+                                            &name,
+                                            (at.line, at.column),
+                                        )
+                                    })
+                                    .or_else(|| {
+                                        shape_from_param(
+                                            self.program,
+                                            &self.module,
+                                            &self.out,
+                                            &name,
+                                        )
+                                    })
+                            })
+                            .unwrap_or_else(|| int_shape(&call.receiver)),
+                    };
+                    let (bits, signed) =
+                        int_suffix_shape(argument).unwrap_or(shape);
+                    let lhs = self.temp();
+                    self.line(&format!("local {lhs} = {receiver}"));
+                    let other = self.expr(argument)?.0;
+                    let literal =
+                        int_literal(argument).map(|(value, _, _)| value);
+                    Ok((
+                        exact_binary(
+                            method, &lhs, &other, literal, bits, signed,
+                            &location,
+                        ),
+                        ty,
+                    ))
                 }
-                Ok((format!("({result})"), ty))
             }
             "div_ceil" if matches!(ty.base, Base::Int | Base::Value) => {
                 let other_expr = arg(args, 0, call)?;
@@ -212,20 +1005,34 @@ impl<'a> Emitter<'a> {
                             "integer division overflows",
                         ));
                     }
-                    if left.abs() > 9007199254740992
-                        || right.abs() > 9007199254740992
-                    {
+                    if !exact_i128(left) || !exact_i128(right) {
                         return Err(Error::at(
                             call.method.span(),
                             "integer division needs exact operands",
                         ));
                     }
                 }
+                if has_inexact_literal(&call.receiver)
+                    || has_inexact_literal(other_expr)
+                {
+                    return Err(Error::at(
+                        call.method.span(),
+                        "integer division needs exact operands",
+                    ));
+                }
                 let other = self.expr(other_expr)?.0;
+                let span = call.method.span().start();
+                let location = format!(
+                    "{}.rs:{}:{}",
+                    self.module,
+                    span.line,
+                    span.column + 1
+                );
+                let (bits, signed) = int_literal(&call.receiver)
+                    .map(|(_, bits, signed)| (bits, signed))
+                    .unwrap_or_else(|| int_shape(&call.receiver));
                 Ok((
-                    format!(
-                        "(function() local __a, __b = math.floor({receiver}), math.floor({other}); if __b == 0 then error(\"divide by zero\") end; local __q = (__a >= 0 and math.floor(__a / __b) or math.ceil(__a / __b)); local __r = __a - __q * __b; if __r ~= 0 and ((__r > 0) == (__b > 0)) then return __q + 1 end; return __q end)()"
-                    ),
+                    exact_div_ceil(&location, receiver, &other, bits, signed),
                     ty,
                 ))
             }

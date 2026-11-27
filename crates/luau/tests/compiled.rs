@@ -1825,6 +1825,637 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn runtime_integer_edges_match_rust() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let a = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let b = a + 1;
+    let product = a.saturating_mul(86400);
+    let wrapped = b.wrapping_sub(3);
+    let clamped = a.saturating_sub(2);
+    Ok(vec![Op::log(format!("{} {} {}", product, wrapped, clamped))])
+}
+"#;
+    let source = compiled_source("runtime_edges", handler, EntryKind::Service);
+    let ctx = Context::new(
+        Parts {
+            entry: "runtime_edges".to_owned(),
+            event: "render".to_owned(),
+            payload: json!({}),
+            config: json!({ "message": "Hello" }),
+            state: json!({}),
+            host: json!({ "now_ms": 1500 }),
+            data_dir: std::path::PathBuf::from("/tmp/noctalia-compiled"),
+        },
+        json!({}),
+    );
+    let luau = ops("runtime_edges", &source, &ctx);
+    let native = duplicated(vec![Op::log("432000 3 3".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn parse_boundaries_take_rust_error_paths() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let exact = "9007199254740992".parse::<i64>().unwrap_or(0);
+    let uexact = "9007199254740992".parse::<u64>().unwrap_or(0);
+    let over = "9223372036854775808".parse::<i64>().unwrap_or(7);
+    let under = "-9223372036854775809".parse::<i64>().unwrap_or(7);
+    let uover = "18446744073709551616".parse::<u64>().unwrap_or(7);
+    let narrow = "256".parse::<u8>().unwrap_or(7);
+    let leading = "0000000000000000042".parse::<i64>().unwrap_or(0);
+    let exponent = "1e2".parse::<i64>().unwrap_or(7);
+    let zero = "-0".parse::<i64>().unwrap_or(1);
+    let ok = exact == 9007199254740992 && uexact == 9007199254740992;
+    let bad = over == 7 && under == 7 && uover == 7 && narrow == 7 && exponent == 7;
+    Ok(vec![Op::log(format!("{} {} {} {}", ok, bad, leading, zero))])
+}
+"#;
+    let source = compiled_source("parse_bounds", handler, EntryKind::Service);
+    let ctx = context("parse_bounds", "render", json!({}), json!({}));
+    let luau = ops("parse_bounds", &source, &ctx);
+    let native = duplicated(vec![Op::log("true true 42 0".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn nonexact_parse_result_fails_with_its_span() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = "9223372036854775807".parse::<i64>().unwrap_or(0);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("parse_nonexact", handler, EntryKind::Service);
+    let ctx = context("parse_nonexact", "render", json!({}), json!({}));
+    let error =
+        noctalia_rs_luau::dispatch(&ctx, &[("parse_nonexact", &source)])
+            .expect_err("nonexact parse result must fail")
+            .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("parse::<i64>"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn nonexact_runtime_product_fails_instead_of_rounding() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = count.saturating_mul(9007199254740991);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("exact_guard", handler, EntryKind::Service);
+    let ctx = context("exact_guard", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("exact_guard", &source)])
+        .expect_err("rounded product must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("saturating_mul"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn nonexact_runtime_add_fails_instead_of_rounding() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = (9007199254740992 + count).wrapping_add(1);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::json;\n\n{handler}\n"
+    );
+    let error = compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "add_guard",
+            state_key: "hello.state",
+            kind: EntryKind::Service,
+            strings: &["message"],
+            settings: &["message"],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
+        },
+    )
+    .expect_err("rounded sum must fail");
+    assert!(
+        error.message.contains("not exactly representable"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn div_ceil_accepts_exact_boundaries() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = 9007199254740992_i64.div_ceil(2);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_exact", handler, EntryKind::Service);
+    let ctx = context("div_exact", "render", json!({}), json!({}));
+    let luau = ops("div_exact", &source, &ctx);
+    let native = duplicated(vec![Op::log("4503599627370496".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn parse_u8_rejects_exponent_notation() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = "100e1".parse::<u8>().unwrap_or(7);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("parse_u8", handler, EntryKind::Service);
+    let ctx = context("parse_u8", "render", json!({}), json!({}));
+    let luau = ops("parse_u8", &source, &ctx);
+    let native = duplicated(vec![Op::log("7".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn opposite_sign_saturation_keeps_left_sign() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = (-5_i64).saturating_add(3);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("sat_sign", handler, EntryKind::Service);
+    let ctx = context("sat_sign", "render", json!({}), json!({}));
+    let luau = ops("sat_sign", &source, &ctx);
+    let native = duplicated(vec![Op::log("-2".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn receiver_is_snapshotted_before_argument_effects() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut a = 5_i64;
+    let value = a.saturating_add({ a = 9; 1 });
+    Ok(vec![Op::log(format!("{} {}", value, a))])
+}
+"#;
+    let source =
+        compiled_source("receiver_snapshot", handler, EntryKind::Service);
+    let ctx = context("receiver_snapshot", "render", json!({}), json!({}));
+    let luau = ops("receiver_snapshot", &source, &ctx);
+    let native = duplicated(vec![Op::log("6 9".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn rounded_receiver_expression_fails_at_span() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = (9007199254740992 + count).saturating_sub(9007199254740992);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::json;\n\n{handler}\n"
+    );
+    let error = compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "rounded_receiver",
+            state_key: "hello.state",
+            kind: EntryKind::Service,
+            strings: &["message"],
+            settings: &["message"],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
+        },
+    )
+    .expect_err("rounded receiver must fail");
+    assert!(
+        error.message.contains("not exactly representable"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn receiver_binding_keeps_unsigned_width() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = 255_u8;
+    let value = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("u8_shape", handler, EntryKind::Service);
+    let ctx = context("u8_shape", "render", json!({}), json!({}));
+    let luau = ops("u8_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("255".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn nested_shadowing_and_scope_restore_match_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let inner = { let a = 255_i64; a.saturating_add(1) };
+    let outer = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", inner, outer))])
+}
+"#;
+    let source = compiled_source("nested_shape", handler, EntryKind::Service);
+    let ctx = context("nested_shape", "render", json!({}), json!({}));
+    let luau = ops("nested_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("256 255".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn inlined_usize_parameter_matches_rust() {
+    let handler = r#"
+fn clean(max: usize) -> usize { max.saturating_sub(1) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = clean(0);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("param_shape", handler, EntryKind::Service);
+    let ctx = context("param_shape", "render", json!({}), json!({}));
+    let luau = ops("param_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("0".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn closure_shadow_width_matches_rust() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let f = || { let a = 255_i64; a.saturating_add(1) };
+    let inner = f();
+    let outer = a.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", inner, outer))])
+}
+"#;
+    let source = compiled_source("closure_shape", handler, EntryKind::Service);
+    let ctx = context("closure_shape", "render", json!({}), json!({}));
+    let luau = ops("closure_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("256 255".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn post_inline_local_rebinding_matches_rust() {
+    let handler = r#"
+fn clean(max: usize) -> usize { max.saturating_sub(1) }
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let done = clean(0);
+    let max: u8 = 255;
+    let value = max.saturating_add(1);
+    Ok(vec![Op::log(format!("{} {}", done, value))])
+}
+"#;
+    let source = compiled_source("no_width_leak", handler, EntryKind::Service);
+    let ctx = context("no_width_leak", "render", json!({}), json!({}));
+    let luau = ops("no_width_leak", &source, &ctx);
+    let native = duplicated(vec![Op::log("0 255".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn receiver_width_survives_annotations_casts_and_shadows() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a: u8 = 255;
+    let step = 1_u8;
+    let annotated = a.wrapping_add(step);
+    let x = 255_i64;
+    let casted = (x as u8).wrapping_add(step);
+    let shadowed = 255_i64;
+    let shadowed = 255_u8;
+    let shadow = shadowed.wrapping_add(step);
+    let ok = annotated == 0 && casted == 0 && shadow == 0;
+    Ok(vec![Op::log(format!("{}", ok))])
+}
+"#;
+    let source =
+        compiled_source("receiver_shapes", handler, EntryKind::Service);
+    let ctx = context("receiver_shapes", "render", json!({}), json!({}));
+    let luau = ops("receiver_shapes", &source, &ctx);
+    let native = duplicated(vec![Op::log("true".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn unary_suffixed_receiver_keeps_signed_width() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = -128_i8;
+    let b = 1_i8;
+    let value = a.wrapping_sub(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("unary_shape", handler, EntryKind::Service);
+    let ctx = context("unary_shape", "render", json!({}), json!({}));
+    let luau = ops("unary_shape", &source, &ctx);
+    let native = duplicated(vec![Op::log("127".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn u32_wrapping_add_returns_zero_at_32_bits() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = 4294967295_u32;
+    let value = a.wrapping_add(1_u32);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("u32_wrap", handler, EntryKind::Service);
+    let ctx = context("u32_wrap", "render", json!({}), json!({}));
+    let luau = ops("u32_wrap", &source, &ctx);
+    let native = duplicated(vec![Op::log("0".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn wrapping_underflow_reduces_modulo_width() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = 0_u32.wrapping_sub(1);
+    let d = 4096_u64;
+    let b = 0_u64.wrapping_sub(d);
+    let c = i32::MIN.wrapping_sub(1);
+    let ok = a == 4294967295_u32 && b > 9223372036854775808_u64 && c == 2147483647_i32;
+    Ok(vec![Op::log(format!("{}", ok))])
+}
+"#;
+    let source = compiled_source("wrap_under", handler, EntryKind::Service);
+    let ctx = context("wrap_under", "render", json!({}), json!({}));
+    let luau = ops("wrap_under", &source, &ctx);
+    let native = duplicated(vec![Op::log("true".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn runtime_min_divided_by_negative_one_overflows() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let d = -1_i64;
+    let value = i64::MIN.div_ceil(d);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_overflow", handler, EntryKind::Service);
+    let ctx = context("div_overflow", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("div_overflow", &source)])
+        .expect_err("runtime division overflow must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("div_ceil overflows"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn marker_character_in_operand_stays_intact() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = "\u{e004}".len().div_ceil(2);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("marker_operand", handler, EntryKind::Service);
+    let ctx = context("marker_operand", "render", json!({}), json!({}));
+    let luau = ops("marker_operand", &source, &ctx);
+    let native = duplicated(vec![Op::log("2".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn helper_does_not_shadow_caller_locals() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let __B = 2_i64;
+    let value = 7_i64.div_ceil(__B);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("helper_scope", handler, EntryKind::Service);
+    let ctx = context("helper_scope", "render", json!({}), json!({}));
+    let luau = ops("helper_scope", &source, &ctx);
+    let native = duplicated(vec![Op::log("4".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn unsigned_saturating_sub_stays_at_zero() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let b = 7_u8;
+    let value = 5_u8.saturating_sub(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("sat_sub", handler, EntryKind::Service);
+    let ctx = context("sat_sub", "render", json!({}), json!({}));
+    let luau = ops("sat_sub", &source, &ctx);
+    let native = duplicated(vec![Op::log("0".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn div_ceil_rejects_rounded_quotient() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = 1152921504606846976_i64.div_ceil(3);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_inexact", handler, EntryKind::Service);
+    let ctx = context("div_inexact", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("div_inexact", &source)])
+        .expect_err("rounded quotient must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("div_ceil result"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn u64_wrapping_add_keeps_its_limb_result() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let n = ctx.config_str("message").unwrap_or_default().len() as u64 - 5;
+    let value = 9223372036854775808_u64.wrapping_add(n);
+    let ok = value == 9223372036854775808;
+    Ok(vec![Op::log(format!("{}", ok))])
+}
+"#;
+    let source = compiled_source("u64_wrap", handler, EntryKind::Service);
+    let ctx = context("u64_wrap", "render", json!({}), json!({}));
+    let luau = ops("u64_wrap", &source, &ctx);
+    let native = duplicated(vec![Op::log("true".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn div_ceil_uses_exact_limb_quotient() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = 18014398509481984_i64.div_ceil(3);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("div_limb", handler, EntryKind::Service);
+    let ctx = context("div_limb", "render", json!({}), json!({}));
+    let luau = ops("div_limb", &source, &ctx);
+    let native = duplicated(vec![Op::log("6004799503160662".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn div_ceil_rejects_rounded_large_quotients() {
+    for (entry, handler) in [
+        (
+            "div_i64_min",
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = (-9223372036854775808_i64).div_ceil(3); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        ),
+        (
+            "div_two_63",
+            "fn handler(_ctx: &Context) -> Result<Vec<Op>> { let v = 9223372036854775808_u64.div_ceil(3); Ok(vec![Op::log(format!(\"{}\", v))]) }",
+        ),
+    ] {
+        let source = compiled_source(entry, handler, EntryKind::Service);
+        let ctx = context(entry, "render", json!({}), json!({}));
+        let error = noctalia_rs_luau::dispatch(&ctx, &[(entry, &source)])
+            .expect_err("rounded quotient must fail")
+            .to_string();
+        assert!(error.contains("main.rs:"), "{error}");
+        assert!(error.contains("div_ceil result"), "{error}");
+        assert!(error.contains("1 construct"), "{error}");
+    }
+}
+
+#[test]
+fn saturation_clamps_limbs_before_guard() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let b = 4294967295_u32;
+    let value = 4294967295_u32.saturating_mul(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("sat_exact", handler, EntryKind::Service);
+    let ctx = context("sat_exact", "render", json!({}), json!({}));
+    let luau = ops("sat_exact", &source, &ctx);
+    let native = duplicated(vec![Op::log("4294967295".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn inexact_saturation_bound_fails_with_span() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let b = 4294967296_i64;
+    let value = 4294967296_i64.saturating_mul(b);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = compiled_source("sat_inexact", handler, EntryKind::Service);
+    let ctx = context("sat_inexact", "render", json!({}), json!({}));
+    let error = noctalia_rs_luau::dispatch(&ctx, &[("sat_inexact", &source)])
+        .expect_err("rounded saturation bound must fail")
+        .to_string();
+    assert!(error.contains("main.rs:"), "{error}");
+    assert!(error.contains("saturating_mul"), "{error}");
+    assert!(error.contains("1 construct"), "{error}");
+}
+
+#[test]
+fn inexact_operand_fails_before_limb_arithmetic() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let count = ctx.config_str("message").unwrap_or_default().len() as i64;
+    let value = (9007199254740993 + count).saturating_sub(9007199254740992);
+    Ok(vec![Op::log(format!("{}", value))])
+}
+"#;
+    let source = format!(
+        "use noctalia_rs::{{Context, Op, Result}};\nuse serde_json::json;\n\n{handler}\n"
+    );
+    let error = compile(
+        &source,
+        &Options {
+            handler: "handler",
+            entry: "operand_guard",
+            state_key: "hello.state",
+            kind: EntryKind::Service,
+            strings: &["message"],
+            settings: &["message"],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: None,
+        },
+    )
+    .expect_err("pre-rounded literal operand must fail");
+    assert!(
+        error.message.contains("not exactly representable"),
+        "{}",
+        error.message
+    );
+    assert!(error.line > 0 && error.column > 0, "{error:?}");
+}
+
+#[test]
+fn parse_accepts_exact_boundaries_above_2_53() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let u = "9223372036854775808".parse::<u64>().unwrap_or(0);
+    let d = "18014398509481984".parse::<i64>().unwrap_or(0);
+    let m = "-9223372036854775808".parse::<i64>().unwrap_or(0);
+    let ok = u == 9223372036854775808 && d == 18014398509481984 && m == -9223372036854775808;
+    Ok(vec![Op::log(format!("{}", ok))])
+}
+"#;
+    let source = compiled_source("parse_exact", handler, EntryKind::Service);
+    let ctx = context("parse_exact", "render", json!({}), json!({}));
+    let luau = ops("parse_exact", &source, &ctx);
+    let native = duplicated(vec![Op::log("true".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
+fn operand_source_with_semicolons_stays_intact() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let added = (";".len() as i64).wrapping_add(1);
+    let parsed = ";".parse::<i64>().unwrap_or(7);
+    Ok(vec![Op::log(format!("{} {}", added, parsed))])
+}
+"#;
+    let source =
+        compiled_source("semicolon_operand", handler, EntryKind::Service);
+    let ctx = context("semicolon_operand", "render", json!({}), json!({}));
+    let luau = ops("semicolon_operand", &source, &ctx);
+    let native = duplicated(vec![Op::log("2 7".to_owned())]);
+    assert_eq!(luau, native);
+}
+
+#[test]
 fn review_round4_dispatch_checks() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
