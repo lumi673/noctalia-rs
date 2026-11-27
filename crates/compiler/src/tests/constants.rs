@@ -258,16 +258,19 @@ fn make(n: &mut i64) -> Value {
     *n = 5;
     json!(*n)
 }
-static INNER: Value = match true {
-    true => {
-        let mut n = 0;
-        make(&mut n)
-    }
-    false => json!(0),
-};
-static PAIR: (Value, Value) = (INNER, json!(1));
+static PAIR: (Value, Value) = (
+    match true {
+        true => {
+            let mut n = 0;
+            make(&mut n)
+        }
+        false => json!(0),
+    },
+    json!(1),
+);
 fn helper(v: &mut Value) -> Value {
-    *v = INNER;
+    let pair = PAIR;
+    *v = pair.1;
     v.clone()
 }
 fn widget(ctx: &Context) -> Result<Vec<Op>> {
