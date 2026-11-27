@@ -76,7 +76,7 @@ function merge(input, output) {
     for (const sha of shard.shas) {
       const report = validateReport(readJson(path.join(dir, `${sha}.json`)), `${sha} in shard ${shard.index}`)
       for (const result of report.results)
-        if (ownerFor(result.name) === shard.index) add(sha, result)
+        if (sha === meta.baseSha || ownerFor(result.name) === shard.index) add(sha, result)
     }
   }
 
@@ -84,10 +84,6 @@ function merge(input, output) {
     if (!reports.get(meta.headSha)?.has(name)) fail(`the PR has no merged result for ${name}`)
   for (const [name, record] of Object.entries(floor.metrics))
     if (!reports.get(record.sha)?.has(name)) fail(`ceiling ${record.sha} has no merged result for ${name}`)
-  if (meta.baseSha)
-    for (const name of names)
-      if (!floor.metrics[name] && !reports.get(meta.baseSha)?.has(name))
-        fail(`main has no merged result for ${name}`)
 
   const baseline = validateReport(
     readJson(path.join(shards[0].dir, `${meta.headSha}.json`)),

@@ -44,30 +44,38 @@ function tempDir() {
   fs.mkdirSync(root, { recursive: true })
   return fs.mkdtempSync(path.join(root, 'perf-merge-'))
 }
+function ceilingRecord(sha) {
+  return { sha, method: perf.METHOD, medianMs: 1, worstMedianMs: 1, p95Ms: 1, worstP95Ms: 1, p99Ms: 1, worstP99Ms: 1, budgetMs: 10, updatedAt: NOW }
+}
+
 function floor() {
   return {
     version: 1,
     method: perf.METHOD,
     metrics: {
-      a_ceiling: { sha: CEILING, method: perf.METHOD, medianMs: 1, worstMedianMs: 1, p95Ms: 1, worstP95Ms: 1, p99Ms: 1, worstP99Ms: 1, budgetMs: 10, updatedAt: NOW },
-      b_ceiling: { sha: OTHER, method: perf.METHOD, medianMs: 1, worstMedianMs: 1, p95Ms: 1, worstP95Ms: 1, p99Ms: 1, worstP99Ms: 1, budgetMs: 10, updatedAt: NOW },
-      c_base: { sha: BASE, method: perf.METHOD, medianMs: 1, worstMedianMs: 1, p95Ms: 1, worstP95Ms: 1, p99Ms: 1, worstP99Ms: 1, budgetMs: 10, updatedAt: NOW },
+      a_ceiling: ceilingRecord(CEILING),
+      b_ceiling: ceilingRecord(OTHER),
+      c_base: ceilingRecord(BASE),
     },
   }
 }
 
-function shards(root) {
-  const meta = { kind: 'pull_request', headSha: HEAD, baseSha: BASE, floor: {}, budgets: {} }
-  const plan = perf.shardPlan(floor(), 2, HEAD, BASE)
-  assert.deepEqual(plan[0].shas, [BASE, CEILING])
-  assert.deepEqual(plan[1].shas, [OTHER])
+function shards(root, data = floor()) {
+  const meta = {
+    kind: 'pull_request',
+    headSha: HEAD,
+    baseSha: BASE,
+    floor: Object.fromEntries(Object.entries(data.metrics).map(([name, record]) => [name, record.sha])),
+    budgets: {},
+  }
+  const plan = perf.shardPlan(data, 2, HEAD, BASE)
   const dirs = []
   for (const shard of plan) {
     const dir = path.join(root, `performance-shard-${shard.index}`)
     fs.mkdirSync(dir, { recursive: true })
     write(path.join(dir, 'shard.json'), shard)
     write(path.join(dir, 'meta.json'), meta)
-    write(path.join(dir, 'floor.json'), floor())
+    write(path.join(dir, 'floor.json'), data)
     dirs.push(dir)
   }
   return dirs
@@ -100,10 +108,13 @@ test('merged measurements pair each workload with the reference from its own sha
     assert.deepEqual(values(HEAD), { a_ceiling: 1, b_ceiling: 1, c_base: 1 })
     assert.deepEqual(values(CEILING), { a_ceiling: 1 })
     assert.deepEqual(values(OTHER), { b_ceiling: 1 })
-    assert.deepEqual(values(BASE), { a_ceiling: 1, c_base: 1 })
+    assert.deepEqual(values(BASE), { a_ceiling: 1, b_ceiling: 1, c_base: 1 })
 
     perf.report({ dir: out, floor: path.join(out, 'floor.json'), out: path.join(out, 'comment.md'), result: path.join(out, 'result.txt') })
     assert.equal(fs.readFileSync(path.join(out, 'result.txt'), 'utf8').trim(), 'pass')
+    const body = fs.readFileSync(path.join(out, 'comment.md'), 'utf8')
+    for (const sha of [CEILING, OTHER, BASE])
+      assert.ok(body.includes(`ceiling \`${sha.slice(0, 7)}\``))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -121,6 +132,52 @@ test('a missing ceiling measurement fails the merge', () => {
     write(path.join(first, `${CEILING}.json`), report([metric('b_ceiling', 1)]))
     write(path.join(second, `${OTHER}.json`), report([metric('b_ceiling', 1)]))
     assert.throws(() => merge(root, path.join(root, 'performance')), /a_ceiling/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('the base report survives when all its metrics belong to another shard', () => {
+  const root = tempDir()
+  const out = path.join(root, 'performance')
+  try {
+    const data = {
+      version: 1,
+      method: perf.METHOD,
+      metrics: { a_ceiling: ceilingRecord(CEILING), b_ceiling: ceilingRecord(OTHER) },
+    }
+    const [first, second] = shards(root, data)
+    for (const dir of [first, second])
+      write(path.join(dir, `${HEAD}.json`), report([metric('a_ceiling', 1), metric('b_ceiling', 1)]))
+    write(path.join(first, `${BASE}.json`), report([metric('b_ceiling', 1)]))
+    write(path.join(first, `${CEILING}.json`), report([metric('a_ceiling', 1)]))
+    write(path.join(second, `${OTHER}.json`), report([metric('b_ceiling', 1)]))
+
+    assert.equal(merge(root, out), 4)
+    const base = JSON.parse(fs.readFileSync(path.join(out, `${BASE}.json`), 'utf8'))
+    assert.deepEqual(base.results.map((result) => result.name), ['b_ceiling'])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a workload missing from the base is still reported as new', () => {
+  const root = tempDir()
+  const out = path.join(root, 'performance')
+  try {
+    const [first, second] = shards(root)
+    for (const dir of [first, second])
+      write(path.join(dir, `${HEAD}.json`), report([
+        metric('a_ceiling', 1), metric('b_ceiling', 1), metric('c_base', 1), metric('new_workload', 1),
+      ]))
+    write(path.join(first, `${BASE}.json`), report([metric('c_base', 1)]))
+    write(path.join(first, `${CEILING}.json`), report([metric('a_ceiling', 1)]))
+    write(path.join(second, `${OTHER}.json`), report([metric('b_ceiling', 1)]))
+
+    assert.equal(merge(root, out), 4)
+    perf.report({ dir: out, floor: path.join(out, 'floor.json'), out: path.join(out, 'comment.md'), result: path.join(out, 'result.txt') })
+    assert.equal(fs.readFileSync(path.join(out, 'result.txt'), 'utf8').trim(), 'pass')
+    assert.match(fs.readFileSync(path.join(out, 'comment.md'), 'utf8'), /new_workload[\s\S]*🆕/)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
