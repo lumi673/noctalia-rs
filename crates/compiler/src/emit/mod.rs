@@ -132,6 +132,7 @@ impl<'a> Emitter<'a> {
             uses_translations_table: false,
             uses_unpack: false,
             uses_pcall: false,
+            uses_pure: BTreeSet::new(),
             uses_action_dispatch: false,
             uses_callback_dispatch: false,
             has_action,
@@ -274,6 +275,7 @@ impl<'a> Emitter<'a> {
             uses_translations_table: self.uses_translations_table,
             uses_unpack: self.uses_unpack,
             uses_pcall: self.uses_pcall,
+            uses_pure: self.uses_pure,
         }
     }
 
@@ -505,6 +507,7 @@ pub(crate) struct Body {
     pub uses_translations_table: bool,
     pub uses_unpack: bool,
     pub uses_pcall: bool,
+    pub uses_pure: BTreeSet<crate::pure::Helper>,
 }
 
 #[derive(Clone)]
@@ -580,6 +583,7 @@ pub(crate) struct Emitter<'a> {
     uses_translations_table: bool,
     uses_unpack: bool,
     uses_pcall: bool,
+    uses_pure: BTreeSet<crate::pure::Helper>,
     uses_action_dispatch: bool,
     uses_callback_dispatch: bool,
     has_action: bool,

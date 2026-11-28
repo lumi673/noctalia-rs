@@ -4,6 +4,7 @@ mod error;
 pub mod ir;
 mod luau_ast;
 mod program;
+mod pure;
 pub mod strict;
 
 use std::collections::BTreeMap;
@@ -719,6 +720,13 @@ fn compile_once(
         if bodies.iter().any(|slot| slot.body.uses_pcall) {
             out.push_str("local __pcall = pcall\n");
         }
+    }
+    if options.strict.is_some() {
+        let used = bodies
+            .iter()
+            .flat_map(|slot| slot.body.uses_pure.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        out.push_str(&pure::helpers(&used));
     }
     if let Some(strict) = &options.strict {
         let uses_config = bodies.iter().any(|slot| slot.body.uses_config_table);

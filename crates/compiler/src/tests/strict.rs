@@ -379,3 +379,115 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         .expect_err("prefix is not the asset");
     assert!(error.contains("not a declared asset"), "{error}");
 }
+
+#[test]
+fn strict_transpiles_allowed_serde_json_calls() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = json!({ "n": 1 });
+    let encoded = serde_json::to_vec(&value).unwrap_or_default();
+    let decoded = serde_json::from_slice::<serde_json::Value>(&encoded).unwrap_or_default();
+    let map = serde_json::Map::new();
+    let typed = serde_json::to_value("x").unwrap_or_default();
+    let back = serde_json::from_value::<String>(typed).unwrap_or_default();
+    let _ = (decoded, map);
+    Ok(vec![Op::log(format!("{encoded}{back}"))])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("noctalia.json.encode("), "{output}");
+    assert!(output.contains("noctalia.json.decode("), "{output}");
+    assert!(output.contains("map = {}"), "{output}");
+    assert!(!output.contains("__noctalia_helper"), "{output}");
+    assert!(!output.contains("local function host_call"), "{output}");
+    assert!(!output.contains("__strict_native"), "{output}");
+}
+
+#[test]
+fn strict_transpiles_byte_and_encoding_calls() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let bytes = ByteBuf::new(vec![0u8, 127, 255]);
+    let text = noctalia_rs::bytes::encode_hex(&bytes);
+    let back = noctalia_rs::bytes::decode_hex(&text);
+    Ok(vec![Op::log(format!("{text}{}", back.len()))])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(
+        output.contains("local function __pure_encode_hex"),
+        "{output}"
+    );
+    assert!(
+        output.contains("local function __pure_decode_hex"),
+        "{output}"
+    );
+    assert!(output.contains("local __t1 = bytes"), "{output}");
+    assert!(output.contains("= __pure_encode_hex(__t1)"), "{output}");
+    assert!(output.contains("= __pure_decode_hex(__t2)"), "{output}");
+    assert!(output.contains("string.char"), "{output}");
+}
+
+#[test]
+fn strict_rejects_an_unlisted_pure_crate_call_with_a_position() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = serde_json::from_reader("n").unwrap_or_default();
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("unlisted call");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(error.contains("strict pure-crate allowlist"), "{error}");
+}
+
+#[test]
+fn strict_to_value_rejects_a_json_null() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = serde_json::to_value(json!(null)).unwrap_or_default();
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("null from pure call");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(error.contains("cannot carry a JSON null"), "{error}");
+}
+
+#[test]
+fn strict_to_value_rejects_a_nested_json_null() {
+    let handler = r#"
+struct Row {
+    id: serde_json::Value,
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let row = Row { id: json!(null) };
+    let value = serde_json::to_value(row).unwrap_or_default();
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("nested null");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(error.contains("JSON-shaped scalar"), "{error}");
+}
+
+#[test]
+fn strict_pure_crates_keep_the_json_null_guard() {
+    let handler = r#"
+#[derive(Serialize, Deserialize)]
+struct Row {
+    id: i64,
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let row = Row { id: 1 };
+    let value = json!({ "id": null });
+    let _ = (row, value);
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("null in object");
+    assert!(error.contains("json null"), "{error}");
+    assert!(error.contains("widget.rs:"), "{error}");
+}
