@@ -994,6 +994,7 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 "#;
     let output = strict_source(source).expect("local helper");
     assert!(output.contains("noctalia.log"), "{output}");
+}
 
 #[test]
 fn strict_emits_recursive_helpers_as_local_functions() {
