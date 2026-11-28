@@ -1,5 +1,6 @@
 mod emit;
 mod error;
+pub mod ir;
 mod program;
 pub mod strict;
 
