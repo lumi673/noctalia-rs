@@ -879,6 +879,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(written["value"].get("label").is_none());
 }
 
+#[test]
 fn strict_local_helpers_run_recursion_and_ops_in_expression_position() {
     let handler = r#"
 fn fib(n: i64) -> i64 {
