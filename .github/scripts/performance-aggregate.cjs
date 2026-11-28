@@ -10,6 +10,10 @@ const RUN = /^([0-9a-f]{40})-(\d+)\.json$/u
 const WORKLOADS = {
   fresh_process_dispatch: ['dispatch through a newly started helper process', 20],
   spool_dispatch: ['dispatch through a persistent spool', 10],
+  native_cache_miss: ['run an uncached native helper call through the spool', 20],
+  native_cache_hit: ['reuse a cached native helper result through the spool', 20],
+  native_batch_sequential: ['run two adjacent native helper calls in separate requests', 20],
+  native_batch_batched: ['run two adjacent native helper calls in one request', 20],
   luau_vm_creation: ['create a Luau VM for a cold directory', 5],
   luau_vm_cache_reuse: ['reuse a cached Luau VM', 1],
   luau_runtime_dispatch: ['dispatch an on-demand Luau runtime', 2],
