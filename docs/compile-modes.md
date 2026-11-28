@@ -98,6 +98,18 @@ compiled `host_callback` branch sees the same payload the Rust handler does. In
 `strict`, those ops emit real closures and named plugin globals. The script
 contains no marker table and no `onHostCallback` global.
 
+`Callback<T>` and `Action<T>` carry the payload type instead of a hand-written
+id. `Callback::<T>::new()` and `Action::<T>::new()` derive the id from the outer
+name of `T`; `named("id")` keeps a fixed name. In auto and off they serialize to
+the same bridge markers. In strict, a callback becomes a closure over the
+generated id and an action becomes a plugin global with a stable hashed name.
+The `*_callback` variants of `Op::http`, `Op::run`, `Op::run_stream`, and
+`Op::state_watch` accept these handles directly. A typed callback needs a
+`host_callback` branch and a typed action needs an `action` branch; the compiler
+fails at the handle's source position otherwise. All helpers, including these
+dispatch functions, live in the one generated entry script. Authors do not add
+a helper Luau file, and strict does not read `luau_sources`.
+
 `ctx.run_async_start`, `ctx.run_stream_start`, and `ctx.http_start` compile in
 `auto` when their acceptance result is dropped, because compiled Luau starts the
 call without blocking. In `strict` the real boolean result can be used in any

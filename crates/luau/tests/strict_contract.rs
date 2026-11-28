@@ -761,3 +761,70 @@ fn strict_start_positions_emit_or_error_at_the_span() {
         }
     }
 }
+
+#[test]
+fn strict_typed_handles_dispatch_without_a_helper_luau_file() {
+    let source = strict_source(
+        r#"
+use noctalia_rs::{Action, Callback};
+
+struct RowClicked;
+struct Refresh;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let callback = Callback::<RowClicked>::new();
+        let tree = ui::button(json!({ "onClick": Action::<Refresh>::new() }));
+        return Ok(vec![
+            Op::http_callback(json!({"url": "x"}), &callback),
+            Op::BarRender { tree },
+        ]);
+    }
+    if ctx.event == "host_callback" {
+        let value = ctx.payload_arg(0).and_then(Value::as_str).unwrap_or_default();
+        return Ok(vec![Op::log(value)]);
+    }
+    if ctx.event == "action" {
+        let value = ctx.payload_arg(0).and_then(Value::as_str).unwrap_or_default();
+        return Ok(vec![Op::log(value)]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Widget,
+    );
+    assert_strict_contract(&source);
+    assert!(!source.contains("require("), "{source}");
+
+    let render = ops(&source, "render", json!({}));
+    let http = render
+        .iter()
+        .find(|op| op["path"] == json!(["http"]))
+        .expect("http op");
+    let id = http["args"][1]["__host_callback"]
+        .as_str()
+        .expect("callback id")
+        .to_owned();
+    let callbacks = ops(
+        &source,
+        "host_callback",
+        json!({ "id": id, "args": ["later"] }),
+    );
+    assert!(callbacks.iter().any(|op| op["message"] == json!("later")));
+    let action = render
+        .iter()
+        .find(|op| op["op"] == json!("bar_render"))
+        .and_then(|op| op["tree"]["props"]["onClick"].as_str())
+        .unwrap_or_else(|| panic!("action global in {render:?}"))
+        .to_owned();
+    assert!(action.starts_with("__strict_action_"), "{action}");
+    let actions = ops(
+        &source,
+        "action",
+        json!({
+            "name": action,
+            "args": [{ "__noctalia_rs_bytes": "4142" }],
+        }),
+    );
+    assert!(actions.iter().any(|op| op["message"] == json!("AB")));
+}

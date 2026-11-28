@@ -94,6 +94,31 @@ impl Runtime {
                 .into());
             }
         }
+        if ctx.event == "action"
+            && let Some(name) = ctx.payload.get("name").and_then(Json::as_str)
+            && name.starts_with("__strict_action_")
+            && let Ok(function) = self.lua.globals().get::<Function>(name)
+        {
+            let args = ctx
+                .payload
+                .get("args")
+                .and_then(Json::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|value| from_json_with_bytes(&self.lua, value))
+                .collect::<mlua::Result<Vec<_>>>()?;
+            if let Err(error) =
+                function.call::<MultiValue>(MultiValue::from_vec(args))
+            {
+                return Err(format!(
+                    "{} action {name}: {}",
+                    self.entry,
+                    traceback(&self.lua, &error)
+                )
+                .into());
+            }
+        }
 
         Ok(self.host.collector.take_ops())
     }

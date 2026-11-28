@@ -89,6 +89,37 @@ fn widget(_ctx: &Context) -> Result<Vec<Op>> {
         compiled.source
     );
 }
+#[test]
+fn compiles_typed_handles_to_bridge_markers() {
+    let handler = r#"
+use noctalia_rs::{Action, Callback};
+
+struct RowClicked;
+struct Refresh;
+
+fn widget(_ctx: &Context) -> Result<Vec<Op>> {
+    let callback = Callback::<RowClicked>::new();
+    let props = json!({ "onClick": Action::<Refresh>::new() });
+    let _ = callback;
+    Ok(vec![Op::BarRender { tree: ui::button(props) }])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("widget", EntryKind::Widget))
+            .expect("compiles");
+    assert!(
+        compiled.source.contains("{ __call = \"Refresh\" }"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("{ __host_callback = \"RowClicked\" }"),
+        "{}",
+        compiled.source
+    );
+}
 
 #[test]
 fn compiles_function_references_as_callbacks() {

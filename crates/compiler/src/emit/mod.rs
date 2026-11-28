@@ -65,6 +65,7 @@ impl<'a> Emitter<'a> {
             out: String::new(),
             indent: 1,
             scopes: vec![HashMap::new()],
+            callback_ids: vec![HashMap::new()],
             events: BTreeSet::new(),
             negative_events: BTreeSet::new(),
             uses_event: false,
@@ -366,6 +367,7 @@ impl<'a> Emitter<'a> {
     }
     pub(super) fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.callback_ids.push(HashMap::new());
         self.kw_scopes.push(HashMap::new());
         self.constant_scopes.push(HashMap::new());
         self.char_scopes.push(HashMap::new());
@@ -373,6 +375,7 @@ impl<'a> Emitter<'a> {
 
     pub(super) fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.callback_ids.pop();
         self.kw_scopes.pop();
         self.constant_scopes.pop();
         self.char_scopes.pop();
@@ -513,6 +516,7 @@ pub(crate) struct Emitter<'a> {
     out: String,
     indent: usize,
     scopes: Vec<HashMap<String, Ty>>,
+    callback_ids: Vec<HashMap<String, String>>,
     events: BTreeSet<String>,
     negative_events: BTreeSet<String>,
     uses_event: bool,

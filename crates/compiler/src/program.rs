@@ -23,6 +23,7 @@ struct Unit {
     statics: HashMap<String, ItemStatic>,
     enums: HashMap<String, Vec<String>>,
     newtypes: BTreeSet<String>,
+    unit_structs: BTreeSet<String>,
     tuple_structs: HashMap<String, usize>,
     structs: HashMap<String, StructDef>,
     impls: HashMap<String, HashMap<String, ItemFn>>,
@@ -39,6 +40,7 @@ impl Unit {
             statics: HashMap::new(),
             enums: HashMap::new(),
             newtypes: BTreeSet::new(),
+            unit_structs: BTreeSet::new(),
             tuple_structs: HashMap::new(),
             structs: HashMap::new(),
             impls: HashMap::new(),
@@ -535,7 +537,9 @@ fn collect(
                     .insert(item_static.ident.to_string(), item_static.clone());
             }
             Item::Struct(item_struct) => {
-                if let syn::Fields::Named(fields) = &item_struct.fields {
+                if matches!(item_struct.fields, syn::Fields::Unit) {
+                    unit.unit_structs.insert(item_struct.ident.to_string());
+                } else if let syn::Fields::Named(fields) = &item_struct.fields {
                     let derives = derives(&item_struct.attrs);
                     let derives_default = derives.contains("Default");
                     let derives_serialize = derives.contains("Serialize");
@@ -718,6 +722,19 @@ impl Program {
             }
         }
         found
+    }
+
+    /// Whether a type with this name is declared in the compiled crate.
+    pub(crate) fn has_type(&self, module: &str, name: &str) -> bool {
+        let declared = |unit: &Unit| {
+            unit.structs.contains_key(name)
+                || unit.enums.contains_key(name)
+                || unit.newtypes.contains(name)
+                || unit.unit_structs.contains(name)
+                || unit.tuple_structs.contains_key(name)
+        };
+        self.units.get(module).is_some_and(declared)
+            || self.units.values().any(declared)
     }
 
     /// Resolves an associated constant such as `State::EMPTY`.

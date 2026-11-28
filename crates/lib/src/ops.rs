@@ -1,4 +1,5 @@
 use crate::bytes::ByteBuf;
+use crate::callback::Callback;
 use crate::ui::{UiNode, callback};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -307,6 +308,67 @@ impl Op {
             "noctalia",
             &["state", "watch"],
             vec![Value::String(key.to_owned()), callback(callback_id)],
+        )
+    }
+
+    /// An HTTP request with a typed host callback.
+    #[inline]
+    #[must_use]
+    pub fn http_callback<T>(request: Value, callback: &Callback<T>) -> Self {
+        Self::host_call("noctalia", &["http"], vec![request, callback.value()])
+    }
+
+    /// A command with a typed host callback.
+    #[inline]
+    #[must_use]
+    pub fn run_callback<T>(command: Value, callback: &Callback<T>) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["runAsync"],
+            vec![command, callback.value()],
+        )
+    }
+
+    /// A command with a typed host callback and a timeout.
+    #[inline]
+    #[must_use]
+    pub fn run_callback_with_timeout<T>(
+        command: Value,
+        callback: &Callback<T>,
+        timeout_ms: Option<f64>,
+    ) -> Self {
+        let timeout = timeout_ms
+            .and_then(serde_json::Number::from_f64)
+            .map_or(Value::Null, Value::Number);
+        Self::host_call(
+            "noctalia",
+            &["runAsync"],
+            vec![command, callback.value(), timeout],
+        )
+    }
+
+    /// A stream with a typed host callback.
+    #[inline]
+    #[must_use]
+    pub fn run_stream_callback<T>(
+        command: Value,
+        callback: &Callback<T>,
+    ) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["runStream"],
+            vec![command, callback.value()],
+        )
+    }
+
+    /// A state watch with a typed host callback.
+    #[inline]
+    #[must_use]
+    pub fn state_watch_callback<T>(key: &str, callback: &Callback<T>) -> Self {
+        Self::host_call(
+            "noctalia",
+            &["state", "watch"],
+            vec![Value::String(key.to_owned()), callback.value()],
         )
     }
 
