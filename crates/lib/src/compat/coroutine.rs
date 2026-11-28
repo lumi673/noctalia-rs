@@ -12,7 +12,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use crate::clock::ClockBudget;
+use super::ClockBudget;
 
 /// Payload used to stop a body whose driver is gone.
 struct Stopped;

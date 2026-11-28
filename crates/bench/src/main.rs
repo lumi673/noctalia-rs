@@ -534,7 +534,7 @@ fn context(
     payload: Value,
 ) -> noctalia_rs::Context {
     noctalia_rs::Context::new(
-        noctalia_rs::Parts {
+        noctalia_rs::compat::Parts {
             entry: names.0.to_owned(),
             event: names.1.to_owned(),
             payload,
@@ -773,7 +773,7 @@ fn event_host() -> Value {
 
 fn event_context(data_dir: &Path) -> Context {
     Context::new(
-        noctalia_rs::Parts {
+        noctalia_rs::compat::Parts {
             entry: "entry".to_owned(),
             event: "update".to_owned(),
             payload: payload("{}"),

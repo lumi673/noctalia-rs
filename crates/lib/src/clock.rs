@@ -28,37 +28,6 @@ pub fn unix_seconds() -> i64 {
         })
 }
 
-/// A deadline measured with the same monotonic clock as `os.clock`.
-#[derive(Clone, Copy, Debug)]
-pub struct ClockBudget {
-    expires_at: f64,
-}
-
-impl ClockBudget {
-    /// Starts a budget that expires after `seconds`.
-    #[inline]
-    #[must_use]
-    pub fn new(seconds: f64) -> Self {
-        Self {
-            expires_at: os_clock() + seconds,
-        }
-    }
-
-    /// Returns whether the budget has been consumed.
-    #[inline]
-    #[must_use]
-    pub fn expired(&self) -> bool {
-        os_clock() >= self.expires_at
-    }
-
-    /// Returns seconds remaining, never negative.
-    #[inline]
-    #[must_use]
-    pub fn remaining(&self) -> f64 {
-        (self.expires_at - os_clock()).max(0.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,12 +37,5 @@ mod tests {
         let first = os_clock();
         let second = os_clock();
         assert!(second >= first);
-    }
-
-    #[test]
-    fn budget_expires() {
-        let budget = ClockBudget::new(0.0);
-        assert!(budget.expired());
-        assert_eq!(budget.remaining(), 0.0);
     }
 }

@@ -6,10 +6,8 @@ use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::io;
-use std::mem;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
@@ -20,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::Result;
 use crate::bytes::{ByteBuf, decode_json_bytes};
 use crate::clock::{os_clock, unix_seconds};
+use crate::compat::{OpSink, Parts};
 use crate::handles::{
     HttpHandle, HttpStreamHandle, RunHandle, StateWatchHandle,
 };
@@ -28,20 +27,7 @@ use crate::rng;
 use crate::timer::{IntervalHandle, TimerHandle, next_id};
 use crate::ui::{self, callback};
 
-pub struct Parts {
-    pub entry: String,
-    pub event: String,
-    pub payload: Value,
-    pub config: Value,
-    pub state: Value,
-    pub host: Value,
-    pub data_dir: PathBuf,
-}
-
-/// Writes one op to the host as soon as a native query is issued.
-pub type OpSink = Arc<dyn Fn(&Op) + Send + Sync>;
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -58,8 +44,8 @@ pub struct Context {
     pub data_dir: PathBuf,
     pub now_ms: i64,
     translations: Value,
-    op_sink: Mutex<Option<OpSink>>,
-    pending_ops: Mutex<Vec<Op>>,
+    pub(crate) op_sink: Mutex<Option<OpSink>>,
+    pub(crate) pending_ops: Mutex<Vec<Op>>,
     query_timeout: Duration,
 }
 
@@ -139,21 +125,6 @@ impl Context {
     #[must_use]
     pub fn host(&self, path: &str) -> Option<&Value> {
         lookup(&self.host, path)
-    }
-
-    /// Installs the immediate op writer used for synchronous host queries.
-    #[doc(hidden)]
-    pub fn set_op_sink(&mut self, sink: OpSink) {
-        let mut current = lock(&self.op_sink);
-        *current = Some(sink);
-    }
-
-    /// Drains ops buffered while no op sink is installed.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn take_pending_ops(&self) -> Vec<Op> {
-        let mut pending = lock(&self.pending_ops);
-        mem::take(&mut pending)
     }
 
     fn emit_op(&self, op: &Op) {
@@ -1120,6 +1091,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::cell::RefCell;
+    use std::sync::Arc;
 
     fn make_context() -> Context {
         let parts = Parts {

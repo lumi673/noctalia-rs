@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use noctalia_rs::{Context, Parts};
+use noctalia_rs::Context;
+use noctalia_rs::compat::Parts;
 use noctalia_rs_compiler::{
     EntryKind, NativeMode, Options, StrictOptions, compile,
 };

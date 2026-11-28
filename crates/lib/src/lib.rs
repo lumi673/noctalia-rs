@@ -4,8 +4,8 @@ pub mod bytes;
 pub mod cli;
 pub mod clock;
 pub mod codegen;
+pub mod compat;
 pub mod context;
-pub mod coroutine;
 pub mod handles;
 pub mod json;
 pub mod manifest;
@@ -19,11 +19,8 @@ use std::result::Result as StdResult;
 
 pub use bytes::{ByteBuf, Bytes, Utf8Text};
 pub use cli::run;
-pub use clock::{ClockBudget, os_clock, unix_seconds};
-pub use context::{Context, FileInfo, Parts};
-pub use coroutine::{
-    Coroutine, Poll as CoroutinePoll, run_budgeted, yield_now, yield_value,
-};
+pub use clock::{os_clock, unix_seconds};
+pub use context::{Context, FileInfo};
 pub use handles::{HttpHandle, HttpStreamHandle, RunHandle, StateWatchHandle};
 pub use json::{Array, Json, NullValueError, Object};
 pub use manifest::{

@@ -93,7 +93,8 @@ fn list(ctx: &Context, store: &timer::Store, ops: &mut Vec<Op>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia_rs::{Parts, Value};
+    use noctalia_rs::Value;
+    use noctalia_rs::compat::Parts;
     use serde_json::json;
     use std::env;
     use std::fs;
