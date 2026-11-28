@@ -3,6 +3,7 @@ pub mod config;
 mod emit;
 mod error;
 pub mod frontend;
+pub mod ir;
 mod program;
 pub mod strict;
 

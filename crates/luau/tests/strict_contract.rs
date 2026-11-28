@@ -1311,3 +1311,62 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "{tree}"
     );
 }
+#[test]
+fn typed_ir_fixture_emits_parseable_strict_luau() {
+    use noctalia_rs_compiler::ir::{self, Effect, HostKind};
+
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let value = ctx.config_str("theme.name");
+    let id = ui::callback("onRow");
+    Ok(vec![Op::log(value), Op::log(id)])
+}
+"#;
+    let source =
+        format!("use noctalia_rs::{{Context, Op, Result}};\n\n{handler}\n");
+    let assets: Vec<(&str, u32)> = Vec::new();
+    let options = Options {
+        handler: "handler",
+        entry: "strict",
+        state_key: "strict.state",
+        kind: EntryKind::Widget,
+        strings: &[],
+        settings: &[],
+        module: "main",
+        modules: &[],
+        native: NativeMode::Deny,
+        strict: Some(StrictOptions {
+            config: CONFIG,
+            translations: TRANSLATIONS,
+            assets: &assets,
+        }),
+    };
+    let program = ir::lower_strict(&source, &options).expect("typed IR");
+    let effects = program.effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::Host {
+                path,
+                kind: HostKind::Handler,
+            } if path == "noctalia.getConfig"
+        )
+    });
+    assert!(effects, "the typed IR must keep the host ABI marker");
+    assert!(
+        program
+            .effects
+            .iter()
+            .any(|effect| { matches!(effect, Effect::Callback { .. }) }),
+        "the typed IR must keep the callback effect"
+    );
+
+    let emitted = strict_source(handler, EntryKind::Widget);
+    assert_strict_contract(&emitted);
+    mlua::Lua::new()
+        .load(&emitted)
+        .into_function()
+        .expect("strict script parses");
+}
