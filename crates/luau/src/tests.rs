@@ -718,6 +718,69 @@ fn bridge_requests(events: &[&str]) -> Vec<Value> {
 }
 
 #[test]
+fn bridge_timers_fire_materialized_callbacks_on_the_next_event() {
+    let bridge = noctalia_rs::bridge::SOURCE
+        .replace("{{HELPER}}", "helper")
+        .replace("{{PREFIX}}", "prefix");
+    let source = format!(
+        "{BRIDGE_STUBS}\n\
+         local clock = 1000\n\
+         noctalia.nowMs = function() return clock end\n\
+         local bridge = (function()\n{bridge}\nend)()\n\
+         bridge.setup(\"service\", {{\"name\"}})\n\
+         on_line_sink('{{\"op\":\"timer_start\",\"handle\":1,\"ms\":500,\"callback\":{{\"__host_callback\":\"late\"}},\"recurring\":false}}')\n\
+         clock = 2000\n\
+         bridge.call(\"update\", {{}})\n"
+    );
+    let ctx = context(Fixture {
+        event: "update",
+        payload: json!({}),
+        config: json!({ "name": "bench" }),
+        state: json!({}),
+        host: json!({
+            "now_ms": 1_700_000_000_i64,
+            "setting": { "shell.time_format": "time" },
+            "colors": { "primary": "#fff" },
+        }),
+    });
+    let values = dispatch(&ctx, &[("entry", source.as_str())])
+        .expect("bridge timer dispatch")
+        .iter()
+        .map(|op| serde_json::to_value(op).expect("serialize op"))
+        .collect::<Vec<_>>();
+    let requests = values
+        .iter()
+        .filter(|value| value.get("op").and_then(Value::as_str) == Some("log"))
+        .filter_map(|value| value.get("message").and_then(Value::as_str))
+        .filter_map(|message| serde_json::from_str(message).ok())
+        .collect::<Vec<Value>>();
+    let callback = requests
+        .iter()
+        .find(|request| request["event"] == json!("host_callback"))
+        .expect("timer callback request");
+    assert_eq!(callback["payload"]["id"], json!("late"));
+}
+
+#[test]
+fn bridge_cancellation_uses_the_handle_from_the_native_op() {
+    let requests = bridge_requests_from(
+        "  local clock = 1000\n\
+         noctalia.nowMs = function() return clock end\n\
+         on_line_sink('{\"op\":\"timer_start\",\"handle\":11,\"ms\":0,\"callback\":{\"__host_callback\":\"one\"},\"recurring\":false}')\n\
+         on_line_sink('{\"op\":\"timer_start\",\"handle\":21,\"ms\":500,\"callback\":{\"__host_callback\":\"two\"},\"recurring\":false}')\n\
+         on_line_sink('{\"op\":\"timer_cancel\",\"handle\":11}')\n\
+         clock = 2000\n\
+         bridge.call(\"update\", {})\n",
+    );
+    let ids = requests
+        .iter()
+        .filter(|request| request["event"] == json!("host_callback"))
+        .map(|request| request["payload"]["id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, [json!("two")], "{requests:?}");
+}
+
+#[test]
 fn bridged_requests_resend_the_fixed_host_only_when_it_changes() {
     let requests = bridge_requests(&["render", "render"]);
     assert_eq!(requests.len(), 2, "{requests:?}");

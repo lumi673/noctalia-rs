@@ -110,6 +110,15 @@ fails at the handle's source position otherwise. All helpers, including these
 dispatch functions, live in the one generated entry script. Authors do not add
 a helper Luau file, and strict does not read `luau_sources`.
 
+`ctx.set_timeout` and `ctx.set_interval` return handles that can be passed to
+`ctx.cancel_timeout` or `ctx.cancel_interval`. Plugin API 57 has no one-shot
+timer member, so both modes build timers from `noctalia.nowMs()` and
+`setUpdateInterval`. A pending timer shortens the update interval while it is
+active; an `Op::set_interval` records the base rate that is restored when no
+timer is pending. Callbacks use the same `host_callback` branch as other host
+work. In `strict` the timer stores a real Luau closure; in `auto` and `off` it
+stores the callback name.
+
 `ctx.run_async_start`, `ctx.run_stream_start`, and `ctx.http_start` compile in
 `auto` when their acceptance result is dropped, because compiled Luau starts the
 call without blocking. In `strict` the real boolean result can be used in any

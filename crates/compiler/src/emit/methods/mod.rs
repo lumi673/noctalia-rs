@@ -2119,6 +2119,79 @@ impl<'a> Emitter<'a> {
                 let key = self.string_arg(args, 0, call)?;
                 Ok((format!("payload[{key}]"), Ty::VALUE))
             }
+            "set_timeout" | "set_interval" => {
+                let repeat = method == "set_interval";
+                let start = call.method.span().start();
+                let at = quote(&format!(
+                    "{}:{}:{}",
+                    self.module,
+                    start.line,
+                    start.column.saturating_add(1)
+                ));
+                let delay_expr = arg(args, 0, call)?;
+                if let Expr::Lit(ExprLit {
+                    lit: Lit::Int(value),
+                    ..
+                }) = strip_reference(delay_expr)
+                {
+                    let parsed = value.base10_parse::<u64>().map_err(|error| {
+                        Error::at(delay_expr.span(), error.to_string())
+                    })?;
+                    if parsed > 9_223_372_036_854_775_807u64 {
+                        return Err(Error::at(
+                            delay_expr.span(),
+                            format!(
+                                "timer delay `{parsed}` exceeds the exact Luau integer range"
+                            ),
+                        ));
+                    }
+                    if repeat && parsed == 0 {
+                        return Err(Error::at(
+                            delay_expr.span(),
+                            "an interval period must be greater than zero",
+                        ));
+                    }
+                }
+                let (delay, _) = self.expr(delay_expr)?;
+                let delay_local = self.temp();
+                self.line(&format!("local {delay_local} = {delay}"));
+
+                let callback_expr = arg(args, 1, call)?;
+                if is_ui_marker_call(callback_expr, "callback") {
+                    return Err(Error::at(
+                        callback_expr.span(),
+                        "pass the callback id string to `set_timeout`, not `ui::callback`",
+                    ));
+                }
+                let (id, _) = self.expr(callback_expr)?;
+                let id_local = self.temp();
+                self.line(&format!("local {id_local} = {id}"));
+                let callback = if self.strict() {
+                    self.strict_callback_local_id(&id_local, callback_expr.span())?
+                } else {
+                    if !self.has_host_callback {
+                        return Err(Error::at(
+                            callback_expr.span(),
+                            "a timer callback needs a host_callback branch",
+                        ));
+                    }
+                    id_local.clone()
+                };
+                let handle = self.temp();
+                self.line(&format!(
+                    "local {handle} = __noctalia_timer_start({delay_local}, {callback}, {repeat}, {at})"
+                ));
+                self.uses_timers = true;
+                self.emitted = true;
+                Ok((handle, Ty::INT))
+            }
+            "cancel_timeout" | "cancel_interval" => {
+                let (handle, _) = self.expr(arg(args, 0, call)?)?;
+                self.line(&format!("__noctalia_timer_cancel({handle})"));
+                self.uses_timers = true;
+                self.emitted = true;
+                Ok((String::new(), Ty::VOID))
+            }
             other => Err(Error::at(
                 call.method.span(),
                 format!(

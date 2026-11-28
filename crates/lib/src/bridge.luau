@@ -90,6 +90,76 @@ local sequence = 0
 local pending = {}
 local stream_started = false
 local handles = {}
+local timer_base_ms = 1000
+local timer_tick_ms = 1000
+local timer_last_now = nil
+local timers = {}
+local function apply_tick(ms)
+  if ms < 16 then ms = 16 end
+  if ms ~= timer_tick_ms then
+    timer_tick_ms = ms
+    noctalia.setUpdateInterval(ms)
+  end
+end
+local function schedule_timers()
+  local now = noctalia.nowMs() or 0
+  local next_ms = nil
+  for _, timer in pairs(timers) do
+    local remaining = timer.at - now
+    if remaining < 0 then remaining = 0 end
+    if next_ms == nil or remaining < next_ms then next_ms = remaining end
+  end
+  local target = timer_base_ms
+  if next_ms ~= nil and next_ms < target then target = next_ms end
+  apply_tick(target)
+end
+local function timer_tick()
+  local now = noctalia.nowMs() or 0
+  if timer_last_now == now then return end
+  timer_last_now = now
+  local due = {}
+  for handle, timer in pairs(timers) do
+    if now >= timer.at then
+      due[#due + 1] = { handle, timer.callback }
+      if timer.every and timer.every > 0 then
+        local missed = math.floor((now - timer.at) / timer.every) + 1
+        timer.at = timer.at + missed * timer.every
+      else
+        timers[handle] = nil
+      end
+    end
+  end
+  table.sort(due, function(left, right) return left[1] < right[1] end)
+  for _, item in ipairs(due) do
+    item[2]()
+  end
+  schedule_timers()
+end
+local function timer_base(ms)
+  timer_base_ms = ms
+  schedule_timers()
+end
+local function timer_start(handle, ms, callback, every)
+  if type(ms) ~= "number" or ms % 1 ~= 0 or ms < 0
+      or ms > 9223372036854775807 then
+    noctalia.log("noctalia bridge: invalid timer delay")
+    return
+  end
+  if type(callback) ~= "function" or (every and ms == 0) then
+    noctalia.log("noctalia bridge: invalid timer callback")
+    return
+  end
+  timers[handle] = {
+    at = (noctalia.nowMs() or 0) + ms,
+    every = every and ms or nil,
+    callback = callback,
+  }
+  schedule_timers()
+end
+local function timer_cancel(handle)
+  timers[handle] = nil
+  schedule_timers()
+end
 local function hexDecode(text)
   return (string.gsub(text or "", "%x%x", function(pair)
     return string.char(tonumber(pair, 16) or 0)
@@ -268,7 +338,11 @@ local handlers = {
   log = function(op) noctalia.log(op.message) end,
   notify = function(op) noctalia.notify(op.title, op.body, op.options) end,
   notify_error = function(op) noctalia.notifyError(op.title, op.body, op.options) end,
-  set_interval = function(op) noctalia.setUpdateInterval(op.ms) end,
+  set_interval = function(op) timer_base(op.ms) end,
+  timer_start = function(op)
+    timer_start(op.handle, op.ms, materialize(op.callback), op.recurring == true)
+  end,
+  timer_cancel = function(op) timer_cancel(op.handle) end,
   state_set = function(op) noctalia.state.set(op.key, op.value) end,
   toggle_panel = function(op) noctalia.togglePanel(op.id) end,
   open_settings = function(op) noctalia.openSettings() end,
@@ -431,6 +505,7 @@ local function startStream()
 end
 
 function M.call(event, payload)
+  timer_tick(false)
   if not boot then startStream() end
   table.insert(pending, {
     entry = M.entry,

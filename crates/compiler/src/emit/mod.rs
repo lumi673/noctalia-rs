@@ -37,6 +37,7 @@ mod methods;
 mod native;
 mod ops;
 mod statements;
+pub(super) mod timers;
 mod types;
 
 #[allow(unused_imports)]
@@ -110,6 +111,7 @@ impl<'a> Emitter<'a> {
             uses_unwrap: false,
             uses_host_call: false,
             uses_query: false,
+            uses_timers: false,
             uses_join: false,
             uses_bool_or: false,
             uses_replace: false,
@@ -241,7 +243,14 @@ impl<'a> Emitter<'a> {
                 "  end\n",
             ));
         }
-        source.push_str(&self.out);
+        let base_call = if self.uses_timers {
+            "__noctalia_timer_base("
+        } else {
+            "noctalia.setUpdateInterval("
+        };
+        source.push_str(
+            &self.out.replace("__noctalia_timer_base_call(", base_call),
+        );
         Body {
             source,
             events: self.events,
@@ -255,6 +264,7 @@ impl<'a> Emitter<'a> {
             uses_unwrap: self.uses_unwrap,
             uses_host_call: self.uses_host_call,
             uses_query: self.uses_query,
+            uses_timers: self.uses_timers,
             uses_join: self.uses_join,
             uses_bool_or: self.uses_bool_or,
             uses_replace: self.uses_replace,
@@ -501,6 +511,7 @@ pub(crate) struct Body {
     pub uses_unwrap: bool,
     pub uses_host_call: bool,
     pub uses_query: bool,
+    pub uses_timers: bool,
     pub uses_join: bool,
     pub uses_bool_or: bool,
     pub uses_replace: bool,
@@ -573,6 +584,7 @@ pub(crate) struct Emitter<'a> {
     uses_unwrap: bool,
     uses_host_call: bool,
     uses_query: bool,
+    uses_timers: bool,
     uses_join: bool,
     uses_bool_or: bool,
     uses_replace: bool,

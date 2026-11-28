@@ -12,6 +12,7 @@ pub mod handles;
 pub mod manifest;
 pub mod ops;
 pub mod rng;
+pub mod timer;
 pub mod ui;
 pub use bytes::ByteBuf;
 pub use callback::{Action, Callback};
@@ -37,6 +38,7 @@ pub use manifest::{
 pub use rng::LuauRng;
 use std::error::Error;
 use std::result::Result as StdResult;
+pub use timer::{IntervalHandle, TimerHandle};
 pub use ui::{NodeProps, Props};
 
 pub use noctalia_rs_macros::{entry, luau, native};
