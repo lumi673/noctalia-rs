@@ -518,6 +518,7 @@ fn compile_once(
     let uses_irem = bodies.iter().any(|slot| slot.body.uses_irem);
     let uses_unwrap = bodies.iter().any(|slot| slot.body.uses_unwrap);
     let uses_host_call = bodies.iter().any(|slot| slot.body.uses_host_call);
+    let uses_timers = bodies.iter().any(|slot| slot.body.uses_timers);
     let uses_bool_or = bodies.iter().any(|slot| slot.body.uses_bool_or);
     let uses_replace = bodies.iter().any(|slot| slot.body.uses_replace);
     let hoists = bodies
@@ -667,6 +668,9 @@ fn compile_once(
             out.push('\n');
         }
     }
+    if uses_timers {
+        out.push_str(&emit::timers::source(options.strict.is_some()));
+    }
     let mut natives = known.clone();
     for slot in &bodies {
         for item in &slot.body.native {
@@ -706,6 +710,11 @@ fn compile_once(
         out.push_str("end\n\n");
     }
 
+    let tick = if uses_timers {
+        "__noctalia_timer_tick(false); "
+    } else {
+        ""
+    };
     if let Some(slot) = update {
         let args = call_args(
             &slot.body,
@@ -716,18 +725,45 @@ fn compile_once(
             false,
             &update_event,
         );
-        let _ = writeln!(
-            out,
-            "function update() {} end",
-            invoke(
-                &slot.body,
-                &slot.name,
-                &args,
-                Some(descriptor(&update_event, Some("update"), None, false))
-            )
-        );
+        if uses_timers {
+            let _ = writeln!(
+                out,
+                "function update() {tick}{} end",
+                invoke(
+                    &slot.body,
+                    &slot.name,
+                    &args,
+                    Some(descriptor(
+                        &update_event,
+                        Some("update"),
+                        None,
+                        false
+                    ))
+                )
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "function update() {} end",
+                invoke(
+                    &slot.body,
+                    &slot.name,
+                    &args,
+                    Some(descriptor(
+                        &update_event,
+                        Some("update"),
+                        None,
+                        false
+                    ))
+                )
+            );
+        }
     } else {
-        out.push_str("function update() end\n");
+        out.push_str(if uses_timers {
+            "function update() __noctalia_timer_tick(false); end\n"
+        } else {
+            "function update() end\n"
+        });
     }
 
     if let Some(slot) = slot("host_callback").filter(|slot| !slot.body.is_empty)
@@ -862,22 +898,28 @@ fn compile_once(
             callback.payload.is_empty(),
             callback.event,
         );
+        let body = invoke(
+            &slot.body,
+            &slot.name,
+            &args,
+            Some(descriptor(
+                callback.event,
+                None,
+                dynamic,
+                callback.payload.is_empty(),
+            )),
+        );
+        let body = if uses_timers
+            && matches!(callback.function, "render" | "onFrameTick")
+        {
+            format!("{tick}{body}")
+        } else {
+            body
+        };
         let _ = writeln!(
             out,
             "function {}({}) {} end",
-            callback.function,
-            callback.params,
-            invoke(
-                &slot.body,
-                &slot.name,
-                &args,
-                Some(descriptor(
-                    callback.event,
-                    None,
-                    dynamic,
-                    callback.payload.is_empty()
-                ))
-            )
+            callback.function, callback.params, body
         );
     }
     if options.strict.is_some() {

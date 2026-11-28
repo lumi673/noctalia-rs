@@ -10,6 +10,7 @@ pub mod handles;
 pub mod manifest;
 pub mod ops;
 pub mod rng;
+pub mod timer;
 pub mod ui;
 use std::error::Error;
 use std::result::Result as StdResult;
@@ -28,6 +29,7 @@ pub use manifest::{
     NumberConfig, Plugin, Setting, SettingKind,
 };
 pub use rng::LuauRng;
+pub use timer::{IntervalHandle, TimerHandle};
 pub use ui::{NodeProps, Props};
 
 pub use noctalia_rs_macros::{entry, luau, native};

@@ -61,6 +61,16 @@ pub enum Op {
         #[serde(skip_serializing_if = "Option::is_none")]
         options: Option<Value>,
     },
+    TimerStart {
+        handle: u64,
+        ms: u64,
+        callback: Value,
+        #[serde(rename = "recurring")]
+        repeat: bool,
+    },
+    TimerCancel {
+        handle: u64,
+    },
     SetInterval {
         ms: u64,
     },
@@ -356,6 +366,32 @@ impl Op {
             body: body.to_owned(),
             options,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one op carries the full timer envelope"
+    )]
+    pub fn timer_start(
+        handle: u64,
+        ms: u64,
+        callback_id: &str,
+        repeat: bool,
+    ) -> Self {
+        Self::TimerStart {
+            handle,
+            ms,
+            callback: callback(callback_id),
+            repeat,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn timer_cancel(handle: u64) -> Self {
+        Self::TimerCancel { handle }
     }
 
     #[inline]

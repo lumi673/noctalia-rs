@@ -202,7 +202,7 @@ impl<'a> Emitter<'a> {
             }
             "SetInterval" => {
                 let ms = self.expr(field("ms")?)?.0;
-                self.line(&format!("noctalia.setUpdateInterval({ms})"));
+                self.line(&format!("__noctalia_timer_base_call({ms})"));
             }
             "StateSet" => {
                 let key = self.expr(field("key")?)?.0;
@@ -425,6 +425,21 @@ impl<'a> Emitter<'a> {
         self.uses_callback_dispatch = true;
         Ok(strict::closure(strict::CALLBACK_DISPATCH, &id))
     }
+    /// The strict callback closure for an id already held in a local.
+    pub(super) fn strict_callback_local_id(
+        &mut self,
+        id: &str,
+        span: proc_macro2::Span,
+    ) -> Result<String, Error> {
+        if !self.has_host_callback {
+            return Err(Error::at(
+                span,
+                "a callback needs a host_callback branch in strict mode",
+            ));
+        }
+        self.uses_callback_dispatch = true;
+        Ok(strict::closure(strict::CALLBACK_DISPATCH, id))
+    }
 
     /// A strict `Op::query`: the direct member call plus the response envelope.
     pub(super) fn op_query(&mut self, call: &ExprCall) -> Result<(), Error> {
@@ -582,7 +597,7 @@ impl<'a> Emitter<'a> {
             }
             "set_interval" => {
                 let ms = self.expr(arg(&args, 0, call)?)?.0;
-                self.line(&format!("noctalia.setUpdateInterval({ms})"));
+                self.line(&format!("__noctalia_timer_base_call({ms})"));
             }
             "host_call" => {
                 self.uses_host_call = true;

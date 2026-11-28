@@ -25,6 +25,7 @@ use crate::handles::{
 };
 use crate::ops::Op;
 use crate::rng;
+use crate::timer::{IntervalHandle, TimerHandle, next_id};
 use crate::ui::{self, callback};
 
 pub struct Parts {
@@ -349,6 +350,38 @@ impl Context {
             ],
         )
         .and_then(|value| value.as_f64())
+    }
+    /// Schedules one callback after `delay_ms`.
+    ///
+    /// The handle cancels the timer before it fires. The callback id is the
+    /// same stable id the `host_callback` branch receives.
+    #[must_use]
+    pub fn set_timeout(&self, delay_ms: u64, callback_id: &str) -> TimerHandle {
+        let id = next_id();
+        self.emit_op(&Op::timer_start(id, delay_ms, callback_id, false));
+        TimerHandle::from(id)
+    }
+
+    /// Schedules a callback on every `period_ms` tick.
+    #[must_use]
+    pub fn set_interval(
+        &self,
+        period_ms: u64,
+        callback_id: &str,
+    ) -> IntervalHandle {
+        let id = next_id();
+        self.emit_op(&Op::timer_start(id, period_ms, callback_id, true));
+        IntervalHandle::from(id)
+    }
+
+    /// Cancels a timeout before it fires.
+    pub fn cancel_timeout(&self, handle: TimerHandle) {
+        self.emit_op(&Op::timer_cancel(handle.get()));
+    }
+
+    /// Cancels a repeating timer.
+    pub fn cancel_interval(&self, handle: IntervalHandle) {
+        self.emit_op(&Op::timer_cancel(handle.get()));
     }
 
     /// Starts a process and returns an opaque handle for strict-generated code.
@@ -1110,6 +1143,36 @@ mod tests {
             "notify": { "title": "Timer {kind} done" }
         });
         Context::new(parts, translations)
+    }
+    #[test]
+    fn timer_methods_emit_start_and_cancel_ops() {
+        let context = make_context();
+        let timeout = context.set_timeout(1500, "finish");
+        let interval = context.set_interval(250, "tick");
+        context.cancel_timeout(timeout);
+        context.cancel_interval(interval);
+
+        let values = context
+            .take_pending_ops()
+            .iter()
+            .map(|op| serde_json::to_value(op).expect("serialize op"))
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 4);
+        assert_eq!(values[0]["op"], "timer_start");
+        assert_eq!(values[0]["ms"], 1500);
+        assert_eq!(values[0]["recurring"], false);
+        assert_eq!(
+            values[0]["callback"],
+            json!({ "__host_callback": "finish" })
+        );
+        assert_eq!(values[1]["op"], "timer_start");
+        assert_eq!(values[1]["ms"], 250);
+        assert_eq!(values[1]["recurring"], true);
+        assert_ne!(values[0]["handle"], values[1]["handle"]);
+        assert_eq!(values[2]["op"], "timer_cancel");
+        assert_eq!(values[2]["handle"], values[0]["handle"]);
+        assert_eq!(values[3]["op"], "timer_cancel");
+        assert_eq!(values[3]["handle"], values[1]["handle"]);
     }
 
     #[test]
