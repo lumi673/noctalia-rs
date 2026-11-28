@@ -1475,13 +1475,8 @@ impl<'a> Emitter<'a> {
         if matches!(method.as_str(), "stop" | "cancel" | "started" | "clone")
             && let Some(receiver) = handle_receiver
         {
-            let value = handle_method(
-                call,
-                &method,
-                &args,
-                &receiver,
-                self.strict(),
-            )?;
+            let value =
+                handle_method(call, &method, &args, &receiver, self.strict())?;
             if value.1.base != Base::Handle {
                 self.pending_class = None;
             }
@@ -1522,13 +1517,8 @@ impl<'a> Emitter<'a> {
             && !ty.optional
             && ty.base == Base::Handle
         {
-            let value = handle_method(
-                call,
-                &method,
-                &args,
-                &receiver,
-                self.strict(),
-            )?;
+            let value =
+                handle_method(call, &method, &args, &receiver, self.strict())?;
             if value.1.base != Base::Handle {
                 self.pending_class = None;
             }

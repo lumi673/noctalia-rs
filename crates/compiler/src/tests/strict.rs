@@ -930,6 +930,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(output.contains("__strict_run_handle("), "{output}");
     assert!(output.contains("\"Done\""), "{output}");
     assert!(!output.contains("__host_callback"), "{output}");
+}
 
 #[test]
 fn strict_handle_started_result_is_typed_as_a_boolean() {

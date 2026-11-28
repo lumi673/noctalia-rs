@@ -26,7 +26,7 @@ use crate::handles::{
 };
 use crate::ops::Op;
 use crate::rng;
-use crate::ui::{self, callback};
+use crate::ui::callback;
 
 pub struct Parts {
     pub entry: String,
@@ -361,11 +361,11 @@ impl Context {
     pub fn run<T>(
         &self,
         command: Value,
-        callback: Option<Callback<T>>,
+        callback: Option<&Callback<T>>,
         timeout_ms: Option<i64>,
     ) -> RunHandle {
         let mut args = match callback {
-            Some(callback) => vec![command, callback.value()],
+            Some(id) => vec![command, id.value()],
             None => vec![command, Value::Null],
         };
         args.push(
@@ -377,7 +377,11 @@ impl Context {
 
     /// Starts an HTTP request and returns an opaque handle for strict-generated code.
     #[must_use]
-    pub fn http<T>(&self, request: Value, callback: Callback<T>) -> HttpHandle {
+    pub fn http<T>(
+        &self,
+        request: Value,
+        callback: &Callback<T>,
+    ) -> HttpHandle {
         HttpHandle::new(self.query_bool(
             "noctalia",
             &["http"],
@@ -394,8 +398,8 @@ impl Context {
     pub fn http_stream<Line, Close>(
         &self,
         request: Value,
-        on_line: Callback<Line>,
-        on_close: Callback<Close>,
+        on_line: &Callback<Line>,
+        on_close: &Callback<Close>,
     ) -> HttpStreamHandle {
         let (value, _error) = self.query_pair(
             "noctalia",
@@ -412,7 +416,7 @@ impl Context {
     pub fn state_watch<T>(
         &self,
         key: &str,
-        callback: Callback<T>,
+        callback: &Callback<T>,
     ) -> StateWatchHandle {
         self.emit_op(&Op::state_watch(key, callback.id()));
         StateWatchHandle::new(key.to_owned(), callback.id().to_owned())
@@ -1364,18 +1368,18 @@ mod tests {
         let timeout = i64::MAX;
         let run = context.run(
             json!(["echo"]),
-            Some(Callback::<Value>::named("done")),
+            Some(&Callback::<Value>::named("done")),
             Some(timeout),
         );
         let http = context
-            .http(json!({ "url": "x" }), Callback::<Value>::named("response"));
+            .http(json!({ "url": "x" }), &Callback::<Value>::named("response"));
         let stream = context.http_stream(
             json!({ "url": "y" }),
-            Callback::<Value>::named("line"),
-            Callback::<Value>::named("close"),
+            &Callback::<Value>::named("line"),
+            &Callback::<Value>::named("close"),
         );
         let watch = context
-            .state_watch("wm.workspaces", Callback::<Value>::named("changed"));
+            .state_watch("wm.workspaces", &Callback::<Value>::named("changed"));
 
         assert!(run.started());
         assert!(http.started());
