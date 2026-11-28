@@ -78,6 +78,14 @@ bindings, nested `or` patterns and constant patterns compare directly, and a
 crate function passed as a callback value, such as `map(lua_text)`, is inlined
 at the call.
 
+`#[derive(State)]` names a typed host state table. `Counter::load(ctx)` reads
+`noctalia.state.get` and merges missing fields from the derived default table;
+`counter.save(&mut ops)` writes the whole table, and `Counter::watch(&mut ops, "changed")` registers a state watch. `#[state(default = ...)]` sets one field
+default and `#[state(skip)]` omits a field. `Option::None` is absent, so no JSON
+null reaches a container. Strict emits the API 57 state calls directly, while
+`auto` and `off` keep the bridge callback marker. A default whose Luau value
+cannot be proven fails the build with `file:line:column`.
+
 Host callbacks use stable names. In `auto` and `off`, `Op::run`, `Op::run_stream`,
 `Op::http`, and `Op::state_watch` emit `{ __host_callback = "name" }`, and the
 runtime delivers that name to the entry's `onHostCallback(payload)` global, so a

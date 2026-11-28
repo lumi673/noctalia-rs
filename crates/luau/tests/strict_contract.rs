@@ -755,6 +755,47 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     );
 }
 
+#[test]
+fn strict_derived_state_script_parses_and_writes_state() {
+    let handler = r#"
+#[derive(State)]
+#[state(key = "strict.counter")]
+struct Counter {
+    #[state(default = 5)]
+    count: i64,
+    #[state(default = false)]
+    enabled: bool,
+    label: Option<String>,
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let mut state = Counter::load(ctx);
+        state.count += 1;
+        let mut ops = Vec::new();
+        state.save(&mut ops);
+        return Ok(ops);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let source = strict_source(handler, EntryKind::Service);
+    assert_strict_contract(&source);
+    assert!(
+        source.contains("noctalia.state.get(\"strict.counter\")"),
+        "{source}"
+    );
+    let values = ops(&source, "update", json!({}));
+    let written = values
+        .iter()
+        .find(|value| value["op"] == json!("state_set"))
+        .expect("state_set op");
+    assert_eq!(written["key"], json!("strict.counter"));
+    assert_eq!(written["value"]["count"], json!(6));
+    assert_eq!(written["value"]["enabled"], json!(false));
+    assert!(written["value"].get("label").is_none());
+}
+
 const CROSS_ACCEPT: &str = r#"
 fn subscribe(ctx: &Context, ops: &mut Vec<Op>) {
     let streaming = ctx.run_stream_start(json!(["tail", "-f"]), "lines");

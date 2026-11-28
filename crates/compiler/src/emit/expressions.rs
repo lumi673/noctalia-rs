@@ -908,6 +908,14 @@ impl<'a> Emitter<'a> {
                     "imported constant expression cannot be lowered in the handler scope",
                 ));
             }
+            if segments.len() == 2
+                && segments.last().is_some_and(|name| name == "KEY")
+                && let Some(def) = self
+                    .program
+                    .state_def(&self.module, &segments[segments.len() - 2])
+            {
+                return Ok((quote(&def.key), Ty::STR));
+            }
             if segments.len() >= 2
                 && let Some(name) = segments.last()
                 && let Some(value) = self.program.associated_const(
