@@ -30,7 +30,7 @@ pub use manifest::{
 };
 pub use rng::LuauRng;
 pub use timer::{IntervalHandle, TimerHandle};
-pub use ui::{NodeProps, Props};
+pub use ui::{Action, CallbackId, NodeProps, Props};
 
 pub use noctalia_rs_macros::{Config, State, entry, luau, native};
 pub use ops::Op;

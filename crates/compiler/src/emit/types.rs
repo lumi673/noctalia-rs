@@ -18,6 +18,8 @@ pub(crate) enum Base {
     Value,
     List,
     Node,
+    /// A typed `Props` builder value, a plain Luau table of node properties.
+    Props,
     Table,
     /// An opaque async handle with a stop function in emitted Luau.
     Handle,
@@ -100,6 +102,7 @@ impl Ty {
     pub(crate) const LIST: Self = Self::new(Base::List);
     pub(crate) const OPT_LIST: Self = Self::opt(Base::List);
     pub(crate) const NODE: Self = Self::new(Base::Node);
+    pub(crate) const PROPS: Self = Self::new(Base::Props);
     pub(crate) const TABLE: Self = Self::new(Base::Table);
     pub(crate) const HANDLE: Self = Self::new(Base::Handle);
     pub(crate) const OPS: Self = Self::new(Base::Ops);
@@ -144,7 +147,7 @@ impl Ty {
             Base::Str | Base::Text | Base::Bytes | Base::Path => Some("\"\""),
             Base::Int | Base::Float => Some("0"),
             Base::Bool => Some("false"),
-            Base::List | Base::Table => Some("{}"),
+            Base::List | Base::Table | Base::Props => Some("{}"),
             Base::Info
             | Base::Value
             | Base::Node

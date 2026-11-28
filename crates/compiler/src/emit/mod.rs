@@ -37,6 +37,7 @@ mod macros;
 mod methods;
 mod native;
 mod ops;
+mod props;
 mod state;
 mod statements;
 pub(super) mod timers;
@@ -45,7 +46,7 @@ mod types;
 #[allow(unused_imports)]
 use {
     calls::*, config::*, expressions::*, inline::*, local::*, macros::*,
-    methods::*, native::*, ops::*, state::*, statements::*, types::*,
+    methods::*, native::*, ops::*, props::*, state::*, statements::*, types::*,
 };
 
 pub(crate) use handles::runtime as handles_runtime;

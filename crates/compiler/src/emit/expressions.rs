@@ -532,10 +532,11 @@ impl<'a> Emitter<'a> {
             return Ok(Some((format!("{{ {marker} = {value} }}"), Ty::VALUE)));
         }
         if ui_import && last == "node" && !args.is_empty() {
-            let kind = self.expr(arg(&args, 0, call)?)?.0;
+            let kind_expr = arg(&args, 0, call)?;
+            let kind = self.expr(kind_expr)?.0;
             let props = match args.get(1) {
-                Some(props) => self.expr(props)?.0,
-                None => "{}".to_owned(),
+                Some(props) => self.expr(props)?,
+                None => ("{}".to_owned(), Ty::TABLE),
             };
             let children = match args.get(2) {
                 Some(children) => {
@@ -551,12 +552,13 @@ impl<'a> Emitter<'a> {
                 }
                 None => empty_array(),
             };
-            return Ok(Some((
-                format!(
-                    "{{ kind = {kind}, props = {props}, children = {children} }}"
-                ),
-                Ty::NODE,
-            )));
+            return Ok(Some(self.dynamic_ui_node(
+                kind_expr,
+                kind,
+                props,
+                children,
+                call.span(),
+            )?));
         }
         let numeric = ["f64", "f32", "i64", "u64", "usize", "i32", "u32"];
         if (name.ends_with("::max") || name.ends_with("::min"))

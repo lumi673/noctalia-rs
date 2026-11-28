@@ -65,6 +65,7 @@ fn assert_strict_contract(source: &str) {
 fn strict_imported_ui_markers_use_action_globals() {
     let handler = r#"
 use noctalia_rs::ui::{call, callback};
+use noctalia_rs::{Action, Props};
 
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     if ctx.event == "action" {
@@ -74,7 +75,8 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         return Ok(vec![Op::log("callback")]);
     }
     let id = callback("on_click");
-    let tree = ui::row(json!({ "onClick": call("refresh") }), Vec::new());
+    let props = Props::new().action("onClick", Action::new("refresh"));
+    let tree = ui::row(props, Vec::new());
     let _ = id;
     Ok(vec![Op::BarRender { tree }])
 }
@@ -164,9 +166,11 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 fn strict_action_uses_a_global_name() {
     let source = strict_source(
         r#"
+use noctalia_rs::{Action, Props};
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     if ctx.event == "render" {
-        let tree = ui::button(json!({ "onClick": ui::call("go") }));
+        let props = Props::new().action("onClick", Action::new("go"));
+        let tree = ui::button(props);
         return Ok(vec![Op::BarRender { tree }]);
     }
     if ctx.event == "action" {
@@ -395,19 +399,22 @@ fn strict_kind(kind: MemberKind) -> &'static str {
 }
 
 const CROSS: &str = r#"
+use noctalia_rs::{Action, CallbackId, Props};
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     if ctx.event == "render" {
         let table = "shadow".to_owned();
         let id = "first".to_owned();
-        let first = ui::button(json!({ "onClick": ui::callback(&id) }));
+        let first = ui::button(
+            Props::new().callback("onClick", CallbackId::new(&id)),
+        );
         let id = "second".to_owned();
-        let second = ui::button(json!({ "onClick": ui::callback(&id) }));
+        let second = ui::button(
+            Props::new().callback("onClick", CallbackId::new(&id)),
+        );
         let focused = ctx.query_value("noctalia", &["focusedOutputName"], Vec::new());
         let _ = (table, focused);
-        let tree = ui::row(
-            json!({ "onHover": ui::call("hovered") }),
-            vec![first, second],
-        );
+        let props = Props::new().action("onHover", Action::new("hovered"));
+        let tree = ui::row(props, vec![first, second]);
         return Ok(vec![Op::BarRender { tree }]);
     }
     if ctx.event == "action" {
@@ -739,14 +746,15 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 "#,
         r#"
+use noctalia_rs::{Action, CallbackId, Props};
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     if ctx.event == "render" {
         let name = ctx.payload_str("action").unwrap_or_default();
         let id = format!("row-{name}");
-        let tree = ui::row(json!({
-            "onHover": ui::call(&name),
-            "onClick": ui::callback(&id),
-        }), Vec::new());
+        let props = Props::new()
+            .action("onHover", Action::dynamic(&name))
+            .callback("onClick", CallbackId::new(&id));
+        let tree = ui::row(props, Vec::new());
         return Ok(vec![Op::BarRender { tree }]);
     }
     if ctx.event == "action" {
@@ -939,13 +947,14 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 "#;
 
 const CROSS_OPS_IF: &str = r#"
+use noctalia_rs::Props;
 fn handler(ctx: &Context) -> Result<Vec<Op>> {
     if ctx.event == "render" {
         let vertical = ctx.bar_vertical();
         let mut ops = vec![if vertical {
-            Op::BarRender { tree: ui::column(json!({}), Vec::new()) }
+            Op::BarRender { tree: ui::column(Props::new(), Vec::new()) }
         } else {
-            Op::BarRender { tree: ui::row(json!({}), Vec::new()) }
+            Op::BarRender { tree: ui::row(Props::new(), Vec::new()) }
         }];
         ops.push(Op::BarTooltip { value: json!("tip") });
         return Ok(ops);
@@ -1243,4 +1252,62 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         .find(|op| op["op"] == json!("log"))
         .expect("log op");
     assert_eq!(log["message"], "false");
+}
+
+#[test]
+fn strict_typed_props_reach_the_host_as_a_raw_node_table() {
+    let source = strict_source(
+        r#"
+use noctalia_rs::{Action, CallbackId, Props};
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let props = Props::new()
+            .text("text", "hello")
+            .int("fontSize", 12)
+            .action("onClick", Action::new("refresh"))
+            .callback("onHover", CallbackId::new("row-1"));
+        let tree = ui::label(props);
+        return Ok(vec![Op::BarRender { tree }]);
+    }
+    if ctx.event == "action" {
+        return Ok(vec![Op::log("action")]);
+    }
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Widget,
+    );
+
+    assert_strict_contract(&source);
+    assert!(source.contains("ui.label("), "{source}");
+    mlua::Lua::new()
+        .load(&source)
+        .into_function()
+        .expect("generated strict script parses");
+
+    let rendered = ops(&source, "render", json!({}));
+    let tree = rendered
+        .iter()
+        .find(|op| op["op"] == "bar_render")
+        .expect("bar render op")["tree"]
+        .clone();
+    assert_eq!(tree["kind"], "label");
+    assert_eq!(tree["props"]["text"], "hello");
+    assert_eq!(tree["props"]["fontSize"], 12);
+    assert!(
+        tree["props"]["onClick"]
+            .as_str()
+            .is_some_and(|name| name.contains("__strict_action_refresh")),
+        "{tree}"
+    );
+    assert!(
+        tree["props"]["onHover"]["__host_callback"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("noctalia_rs_luau_")),
+        "{tree}"
+    );
 }

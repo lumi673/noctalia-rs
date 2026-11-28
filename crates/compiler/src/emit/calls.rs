@@ -163,6 +163,9 @@ impl<'a> Emitter<'a> {
                 self.tuple_expr_shapes.insert(text.clone(), shapes);
                 return Ok((text, Ty::VALUE));
             }
+            if name.ends_with("Props::new") && args.is_empty() {
+                return self.props_new();
+            }
             match name.as_str() {
                 name @ ("Some" | "Option::Some")
                     if name == "Some" || self.strict() =>
@@ -697,8 +700,8 @@ impl<'a> Emitter<'a> {
     ) -> Result<(String, Ty), Error> {
         let args = call.args.iter().collect::<Vec<_>>();
         let props = match args.first() {
-            Some(expr) => self.expr(expr)?.0,
-            None => "{}".to_owned(),
+            Some(expr) => self.expr(expr)?,
+            None => ("{}".to_owned(), Ty::TABLE),
         };
         let children = match args.get(1) {
             Some(expr) => {
@@ -718,28 +721,13 @@ impl<'a> Emitter<'a> {
             }
             None => "{}".to_owned(),
         };
-        Ok((
-            format!(
-                "{{ kind = {}, props = {props}, children = {children} }}",
-                quote(kind)
-            ),
-            Ty::NODE,
-        ))
+        self.ui_node_call(kind, props, children, call.span())
     }
 }
 
 pub(super) fn ui_constructor(name: &str) -> Option<&'static str> {
     let variant = qualified_variant(name, "ui")?;
-    match variant {
-        "column" => Some("column"),
-        "row" => Some("row"),
-        "scroll" => Some("scroll"),
-        "label" => Some("label"),
-        "button" => Some("button"),
-        "input" => Some("input"),
-        "progress" => Some("progress"),
-        _ => None,
-    }
+    strict::node_member(variant)
 }
 
 /// The marker key for `ui::call` and `ui::callback`.

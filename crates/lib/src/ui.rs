@@ -14,8 +14,9 @@ enum Prop {
     Integer(i64),
     Number(f64),
     Boolean(bool),
-    Call(&'static str),
+    Call(Cow<'static, str>),
     Json(Value),
+    HostCallback(String),
 }
 
 impl Serialize for Prop {
@@ -30,7 +31,12 @@ impl Serialize for Prop {
             Self::Boolean(value) => serializer.serialize_bool(*value),
             Self::Call(name) => {
                 let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("__call", name)?;
+                map.serialize_entry("__call", name.as_ref())?;
+                map.end()
+            }
+            Self::HostCallback(id) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("__host_callback", id)?;
                 map.end()
             }
             Self::Json(value) => value.serialize(serializer),
@@ -110,7 +116,23 @@ impl Props {
     #[inline]
     #[must_use]
     pub fn call(mut self, key: &'static str, name: &'static str) -> Self {
-        self.0.push((key, Prop::Call(name)));
+        self.0.push((key, Prop::Call(Cow::Borrowed(name))));
+        self
+    }
+
+    /// Adds a typed UI action handler.
+    #[inline]
+    #[must_use]
+    pub fn action(mut self, key: &'static str, action: Action) -> Self {
+        self.0.push((key, Prop::Call(action.0)));
+        self
+    }
+
+    /// Adds a typed host callback handle.
+    #[inline]
+    #[must_use]
+    pub fn callback(mut self, key: &'static str, id: CallbackId) -> Self {
+        self.0.push((key, Prop::HostCallback(id.0)));
         self
     }
 
@@ -120,6 +142,59 @@ impl Props {
     pub fn json(mut self, key: &'static str, value: Value) -> Self {
         self.0.push((key, Prop::Json(value)));
         self
+    }
+}
+
+/// A stable UI action name passed to a typed prop handler.
+///
+/// In strict mode the compiler gives each action its own Luau global. In auto
+/// and off modes it serializes to the same `__call` marker as [`call`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Action(Cow<'static, str>);
+
+impl Action {
+    /// Declares an action by its stable name.
+    #[inline]
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        Self(Cow::Borrowed(name))
+    }
+
+    /// Declares an action from a computed name.
+    #[inline]
+    #[must_use]
+    pub fn dynamic(name: impl Into<String>) -> Self {
+        Self(Cow::Owned(name.into()))
+    }
+
+    /// The name the host dispatches.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A host callback handle for a typed prop handler.
+///
+/// In strict mode the compiler emits a real Luau closure for it. In auto and
+/// off modes it serializes to the same `__host_callback` marker as [`callback`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallbackId(String);
+
+impl CallbackId {
+    /// Wraps a stable callback id.
+    #[inline]
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The id the host dispatches.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -302,6 +377,26 @@ mod tests {
     fn test_calls_encode_markers() {
         assert_eq!(call("save"), json!({ "__call": "save" }));
         assert_eq!(callback("done"), json!({ "__host_callback": "done" }));
+    }
+
+    #[test]
+    fn test_typed_handlers_match_the_marker_forms() {
+        let action = Props::new().action("onClick", Action::new("save"));
+        let callback_props =
+            Props::new().callback("onHover", CallbackId::new("row-1"));
+
+        assert_eq!(
+            serde_json::to_value(action).expect("serialize action"),
+            serde_json::to_value(Props::new().call("onClick", "save"))
+                .expect("serialize call")
+        );
+        assert_eq!(
+            serde_json::to_value(callback_props).expect("serialize callback"),
+            serde_json::to_value(
+                Props::new().json("onHover", callback("row-1"))
+            )
+            .expect("serialize marker")
+        );
     }
 
     #[test]
