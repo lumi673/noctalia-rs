@@ -15,16 +15,16 @@
       "updatedAt": "2026-11-23T00:53:41.071Z"
     },
     "spool_dispatch": {
-      "sha": "87b385b19cc8710e126ad523623298d63778b80e",
+      "sha": "a5308c9a2bfcd932f869fcfbc4213931ffb5bf6b",
       "method": 1,
-      "medianMs": 0.03529550000000001,
-      "worstMedianMs": 0.0412715,
-      "p95Ms": 0.059936,
-      "worstP95Ms": 0.07315700000000001,
-      "p99Ms": 0.090605,
-      "worstP99Ms": 0.11419499999999999,
+      "medianMs": 0.0936195,
+      "worstMedianMs": 0.10137399999999999,
+      "p95Ms": 0.10935399999999999,
+      "worstP95Ms": 0.140913,
+      "p99Ms": 0.16672,
+      "worstP99Ms": 0.218518,
       "budgetMs": 10,
-      "updatedAt": "2026-11-28T01:50:46.597Z"
+      "updatedAt": "2026-11-28T13:47:36.499Z"
     },
     "luau_vm_creation": {
       "sha": "346b3de85cc109f6946e99215538b3932d9c2f37",
@@ -267,16 +267,16 @@
       "updatedAt": "2026-11-28T01:50:46.597Z"
     },
     "plugin_case_convert_luau": {
-      "sha": "d87f87704b030c22884ae6d653bddb0e908600ab",
+      "sha": "a5308c9a2bfcd932f869fcfbc4213931ffb5bf6b",
       "method": 1,
-      "medianMs": 0.179755,
-      "worstMedianMs": 0.18197750000000001,
-      "p95Ms": 0.19247299999999998,
-      "worstP95Ms": 0.20328300000000002,
-      "p99Ms": 0.198327,
-      "worstP99Ms": 0.25819,
+      "medianMs": 0.2347785,
+      "worstMedianMs": 0.23635050000000002,
+      "p95Ms": 0.251018,
+      "worstP95Ms": 0.255418,
+      "p99Ms": 0.265658,
+      "worstP99Ms": 0.27553000000000005,
       "budgetMs": 2,
-      "updatedAt": "2026-11-25T20:24:08.298Z"
+      "updatedAt": "2026-11-28T13:47:36.499Z"
     },
     "plugin_case_convert_rust": {
       "sha": "d87f87704b030c22884ae6d653bddb0e908600ab",
@@ -375,16 +375,16 @@
       "updatedAt": "2026-11-27T20:00:48.892Z"
     },
     "plugin_mihomo_control_rust": {
-      "sha": "196eb07e7513b012e43e5458708d0fbeea1b09ce",
+      "sha": "a5308c9a2bfcd932f869fcfbc4213931ffb5bf6b",
       "method": 1,
-      "medianMs": 0.894148,
-      "worstMedianMs": 0.900701,
-      "p95Ms": 0.915781,
-      "worstP95Ms": 0.924631,
-      "p99Ms": 0.9302950000000001,
-      "worstP99Ms": 0.9402240000000001,
+      "medianMs": 0.9257219999999999,
+      "worstMedianMs": 0.9339000000000001,
+      "p95Ms": 0.9421170000000001,
+      "worstP95Ms": 0.975579,
+      "p99Ms": 0.9631280000000001,
+      "worstP99Ms": 1.362674,
       "budgetMs": 4,
-      "updatedAt": "2026-11-25T15:08:54.487Z"
+      "updatedAt": "2026-11-28T13:47:36.499Z"
     },
     "plugin_file_search_luau": {
       "sha": "d79b39ea5e3bedf6b733584e5e130229ddedae2c",
@@ -447,16 +447,16 @@
       "updatedAt": "2026-11-24T17:00:24.601Z"
     },
     "generated_ui_panel_compiled": {
-      "sha": "e4a6593112c61211c5a41c0c3151a15837abb3ab",
+      "sha": "a5308c9a2bfcd932f869fcfbc4213931ffb5bf6b",
       "method": 1,
-      "medianMs": 0.012882999999999999,
-      "worstMedianMs": 0.013086000000000002,
-      "p95Ms": 0.015847,
-      "worstP95Ms": 0.017,
-      "p99Ms": 0.023036,
-      "worstP99Ms": 0.024777999999999998,
+      "medianMs": 0.0142365,
+      "worstMedianMs": 0.014297,
+      "p95Ms": 0.019375999999999997,
+      "worstP95Ms": 0.021651,
+      "p99Ms": 0.025698000000000002,
+      "worstP99Ms": 0.027672,
       "budgetMs": 0.1,
-      "updatedAt": "2026-11-25T18:05:25.582Z"
+      "updatedAt": "2026-11-28T13:47:36.499Z"
     },
     "generated_event_handwritten": {
       "sha": "cd8a9771a3d9c5f3b68eb5af0b749d549b64878c",
