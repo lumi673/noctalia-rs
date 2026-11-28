@@ -678,3 +678,154 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     assert!(body.contains("__t1 = __t2"), "{body}");
     assert!(body.contains("noctalia.log(value)"), "{body}");
 }
+
+#[test]
+fn adjacent_native_calls_share_one_batch_request() {
+    let handler = r#"
+#[native]
+fn first(value: u64) -> u64 {
+    value + 1
+}
+
+#[native(cache_ms = 30_000)]
+fn second(value: u64) -> u64 {
+    value + 2
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = first(1);
+    let b = second(2);
+    Ok(vec![Op::log(format!("{a}:{b}"))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    assert_eq!(compiled.native.len(), 2, "{:?}", compiled.native);
+    assert!(
+        compiled.source.contains("__native.batch({"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled
+            .source
+            .contains("name = \"main::second\", args = { value = "),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        compiled.source.contains("cache_ms = 30000"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn dependent_native_calls_are_not_batched() {
+    let handler = r#"
+#[native]
+fn first(value: u64) -> u64 {
+    value + 1
+}
+
+#[native]
+fn second(value: u64) -> u64 {
+    value + 2
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = first(1);
+    let b = second(a);
+    Ok(vec![Op::log(format!("{a}:{b}"))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    assert!(
+        !compiled.source.contains("__native.batch({"),
+        "{}",
+        compiled.source
+    );
+    assert_eq!(
+        compiled
+            .source
+            .matches("return __native.call(\"main::")
+            .count(),
+        2,
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn a_null_argument_stays_in_the_batch_as_nil() {
+    let handler = r#"
+#[native]
+fn accept(value: Option<String>) -> u64 {
+    value.map_or(0, str::len) as u64
+}
+
+#[native]
+fn other() -> u64 {
+    2
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = accept(None);
+    let b = other();
+    Ok(vec![Op::log(format!("{a}:{b}"))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    assert!(
+        compiled.source.contains("__native.batch({"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
+fn adjacent_context_native_calls_batch_with_snapshots() {
+    let handler = r#"
+#[native]
+fn describe(ctx: &Context, value: u64) -> String {
+    format!("{}:{}", ctx.event, value)
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let a = describe(ctx, 1);
+    let b = describe(ctx, 2);
+    Ok(vec![Op::log(format!("{a}:{b}"))])
+}
+"#;
+    let compiled = compile(
+        &source(handler),
+        &native_options("handler", EntryKind::Widget),
+    )
+    .expect("compiles");
+
+    assert!(
+        compiled.source.contains("__native.batch({"),
+        "{}",
+        compiled.source
+    );
+    let batch = compiled
+        .source
+        .lines()
+        .find(|line| line.contains("__native.batch({"))
+        .expect("batch line");
+    assert_eq!(batch.matches("needs_context = true").count(), 2, "{batch}");
+}

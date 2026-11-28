@@ -26,6 +26,7 @@ use crate::{
     StrictOptions, is_context, is_identifier, is_luau_keyword, quote, sanitize,
 };
 
+mod batch;
 mod calls;
 mod constants;
 mod expressions;
@@ -39,8 +40,8 @@ mod types;
 
 #[allow(unused_imports)]
 use {
-    calls::*, expressions::*, inline::*, macros::*, methods::*, native::*,
-    ops::*, statements::*, types::*,
+    batch::*, calls::*, expressions::*, inline::*, macros::*, methods::*,
+    native::*, ops::*, statements::*, types::*,
 };
 
 pub(crate) use inline::Helper;
@@ -177,8 +178,15 @@ impl<'a> Emitter<'a> {
         let Some((last, rest)) = block.stmts.split_last() else {
             return Ok(());
         };
-        for stmt in rest {
-            self.stmt(stmt)?;
+        let mut index = 0;
+        while index < rest.len() {
+            let batched = self.native_batch(&rest[index..])?;
+            if batched > 0 {
+                index = index.saturating_add(batched);
+                continue;
+            }
+            self.stmt(&rest[index])?;
+            index = index.saturating_add(1);
         }
         if tail {
             self.tail_stmt(last)
