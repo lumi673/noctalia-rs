@@ -1,3 +1,4 @@
+mod effects;
 mod emit;
 mod error;
 pub mod ir;
@@ -362,7 +363,60 @@ pub struct Compiled {
 pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
     let program = Program::new(options.module, source, options.modules)?;
     let handler = program.handler(options.module, options.handler)?;
+    let (findings, boundaries) = effects::classify_program(
+        &program,
+        &handler.module,
+        handler.function,
+        options.strict.is_some() || options.native == NativeMode::Deny,
+    );
+    if let Some((module, finding)) = findings.first() {
+        let mut error = Error::at(finding.span, finding.reason.clone());
+        if module != &handler.module {
+            error = error.with_file(module);
+        }
+        return Err(error);
+    }
     let mut known: BTreeMap<String, NativeFn> = BTreeMap::new();
+    if !boundaries.is_empty() {
+        let emitter = Emitter::new(
+            context_name(handler.function)?,
+            None,
+            options.strings,
+            &[],
+            &program,
+            &handler.module,
+            options.native,
+            &known,
+            options.strict,
+            true,
+            true,
+        );
+        let mut candidates = emitter;
+        let mut items = Vec::new();
+        for boundary in boundaries {
+            if emit::forced_native(&boundary.function)?.is_some() {
+                continue;
+            }
+            let helper = emit::Helper {
+                module: boundary.module.clone(),
+                function: boundary.function.clone(),
+                name: boundary.function.sig.ident.to_string(),
+                class: None,
+            };
+            let item = candidates.register_native(
+                &helper,
+                0,
+                false,
+                &boundary.reason,
+                boundary.function.sig.ident.span(),
+            )?;
+            items.push(item);
+        }
+        drop(candidates);
+        for item in items {
+            known.insert(item.name.clone(), item);
+        }
+    }
     loop {
         let (compiled, found) = compile_once(
             &program,

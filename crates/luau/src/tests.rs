@@ -1274,3 +1274,75 @@ assert(noctalia.readFile("/sys/led") == nil)
         .expect("write query");
     assert_eq!(query["path"], json!(["writeFile"]));
 }
+
+#[test]
+fn effect_classified_scripts_parse_in_the_luau_vm() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let text = std::fs::read_to_string("x")?;
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(vec![Op::log(text)])
+}
+"#;
+    let source =
+        format!("use noctalia_rs::{{Context, Op, Result}};\n{handler}\n");
+    let strict = noctalia_rs_compiler::compile(
+        &source,
+        &noctalia_rs_compiler::Options {
+            handler: "handler",
+            entry: "entry",
+            state_key: "entry.state",
+            kind: noctalia_rs_compiler::EntryKind::Widget,
+            strings: &[],
+            settings: &[],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Deny,
+            strict: Some(noctalia_rs_compiler::StrictOptions {
+                config: "local CONFIG = {}\n",
+                translations: "local LANGUAGES = {}\nlocal TRANSLATIONS = {}\n",
+                assets: &[],
+            }),
+        },
+    )
+    .expect("strict effect script compiles");
+    let lua = mlua::Lua::new();
+    lua.load(&strict.source)
+        .into_function()
+        .expect("strict effect script parses");
+
+    let helper = r#"
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(1));
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    tick();
+    Ok(vec![Op::log("ok")])
+}
+"#;
+    let source =
+        format!("use noctalia_rs::{{Context, Op, Result}};\n{helper}\n");
+    let auto = noctalia_rs_compiler::compile(
+        &source,
+        &noctalia_rs_compiler::Options {
+            handler: "handler",
+            entry: "entry",
+            state_key: "entry.state",
+            kind: noctalia_rs_compiler::EntryKind::Widget,
+            strings: &[],
+            settings: &[],
+            module: "main",
+            modules: &[],
+            native: noctalia_rs_compiler::NativeMode::Allow,
+            strict: None,
+        },
+    )
+    .expect("auto boundary script compiles");
+    assert_eq!(auto.native.len(), 1);
+    lua.load(&auto.source)
+        .into_function()
+        .expect("auto boundary script parses");
+}
