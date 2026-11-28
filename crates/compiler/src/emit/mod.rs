@@ -43,7 +43,8 @@ use {
     ops::*, statements::*, types::*,
 };
 
-pub(crate) use native::{native_runtime, stub_source};
+pub(crate) use inline::Helper;
+pub(crate) use native::{forced_native, native_runtime, stub_source};
 
 impl<'a> Emitter<'a> {
     pub(crate) fn new(

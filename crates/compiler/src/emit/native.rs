@@ -3,7 +3,7 @@ use super::*;
 impl<'a> Emitter<'a> {
     /// Records `helper` as a native function and validates that its signature
     /// can cross the JSON boundary.
-    pub(super) fn register_native(
+    pub(crate) fn register_native(
         &mut self,
         helper: &Helper,
         cache_ms: u64,
@@ -615,7 +615,7 @@ fn lua_list(values: &[&str]) -> String {
 }
 
 /// Parses `#[native]` and `#[native(cache_ms = 30_000)]`.
-pub(super) fn forced_native(function: &ItemFn) -> Result<Option<u64>, Error> {
+pub(crate) fn forced_native(function: &ItemFn) -> Result<Option<u64>, Error> {
     for attr in &function.attrs {
         if !attr.path().is_ident("native") {
             continue;

@@ -1,6 +1,7 @@
 use crate::{EntryKind, Module, NativeMode, Options, compile};
 mod calls;
 mod constants;
+mod effects;
 mod expressions;
 mod files;
 mod inline;

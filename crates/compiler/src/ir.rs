@@ -1850,18 +1850,43 @@ fn pure_method(name: &str) -> bool {
 }
 
 fn host_path(path: &str) -> Option<(&'static str, strict::MemberKind)> {
-    match path {
-        "std::env::var" | "env::var" => {
-            Some(("noctalia.getenv", strict::MemberKind::Value))
+    use strict::MemberKind::{Handler, Pair, Value};
+    let mapped = match path {
+        "std::fs::read_to_string" | "std::fs::read" => {
+            Some(("noctalia.readFile", Value))
+        }
+        "std::fs::write" => Some(("noctalia.writeFile", Pair)),
+        "std::fs::create_dir_all" => Some(("noctalia.mkdirAll", Pair)),
+        "std::fs::remove_file" => Some(("noctalia.removeFile", Pair)),
+        "std::fs::rename" => Some(("noctalia.renameFile", Pair)),
+        "std::fs::read_dir" => Some(("noctalia.listDir", Pair)),
+        "std::fs::metadata" => Some(("noctalia.fileInfo", Value)),
+        "fs::read_to_string" | "fs::read" => Some(("noctalia.readFile", Value)),
+        "fs::write" => Some(("noctalia.writeFile", Pair)),
+        "fs::create_dir_all" => Some(("noctalia.mkdirAll", Pair)),
+        "fs::remove_file" => Some(("noctalia.removeFile", Pair)),
+        "fs::rename" => Some(("noctalia.renameFile", Pair)),
+        "fs::read_dir" => Some(("noctalia.listDir", Pair)),
+        "fs::metadata" => Some(("noctalia.fileInfo", Value)),
+        "std::env::var" | "std::env::var_os" | "env::var" | "env::var_os" => {
+            Some(("noctalia.getenv", Value))
         }
         "std::time::SystemTime::now" | "SystemTime::now" => {
-            Some(("noctalia.nowMs", strict::MemberKind::Handler))
+            Some(("noctalia.nowMs", Handler))
         }
+        "serde_json::from_str" | "serde_json::from_value" => {
+            Some(("noctalia.json.decode", Handler))
+        }
+        "serde_json::to_string" => Some(("noctalia.json.encode", Handler)),
         _ => None,
-    }
+    };
+    mapped
 }
 
 fn native_path(path: &str) -> bool {
+    if host_path(path).is_some() {
+        return false;
+    }
     path.starts_with("std::fs::")
         || path.starts_with("std::net::")
         || path.starts_with("std::process::")
@@ -1869,6 +1894,7 @@ fn native_path(path: &str) -> bool {
         || path.starts_with("std::env::")
         || path.starts_with("libc::")
         || path.starts_with("Command::")
+        || path == "serde_json::to_string_pretty"
 }
 
 fn context_member(name: &str) -> Option<(&'static str, HostKind)> {
@@ -2044,10 +2070,29 @@ mod tests {
     }
 
     #[test]
-    fn native_effects_fail_closed_in_strict() {
+    fn mapped_file_effects_stay_host_in_strict() {
         let source = source(
             r#"fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let _ = std::fs::read("/a");
+    Ok(vec![])
+}"#,
+        );
+        let program =
+            lower_strict(&source, &options()).expect("mapped file effect");
+        assert!(has_effect(
+            &program,
+            &Effect::Host {
+                path: "noctalia.readFile".to_owned(),
+                kind: HostKind::Value,
+            }
+        ));
+    }
+
+    #[test]
+    fn native_effects_fail_closed_in_strict() {
+        let source = source(
+            r#"fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let _ = std::fs::read_link("/a");
     Ok(vec![])
 }"#,
         );
@@ -2056,7 +2101,7 @@ mod tests {
         assert!(error.message.contains("native effect"), "{error}");
         assert_eq!(
             error.render("widget.rs"),
-            "main:5:13: native effect in strict mode: call to `std::fs::read` needs native code"
+            "main:5:13: native effect in strict mode: call to `std::fs::read_link` needs native code"
         );
     }
 
@@ -2064,7 +2109,7 @@ mod tests {
     fn auto_allows_native_effects() {
         let program = lower_handler(
             r#"fn handler(_ctx: &Context) -> Result<Vec<Op>> {
-    let _ = std::fs::read("/a");
+    let _ = std::fs::read_link("/a");
     Ok(vec![])
 }"#,
         );
