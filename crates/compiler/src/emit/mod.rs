@@ -268,7 +268,9 @@ impl<'a> Emitter<'a> {
                 .local_defs
                 .replace("__noctalia_timer_base_call(", base_call),
         );
-        source.push_str(&self.out.replace("__noctalia_timer_base_call(", base_call));
+        source.push_str(
+            &self.out.replace("__noctalia_timer_base_call(", base_call),
+        );
         Body {
             source,
             events: self.events,
