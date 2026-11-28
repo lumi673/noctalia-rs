@@ -4,6 +4,7 @@ mod emit;
 mod error;
 pub mod frontend;
 pub mod ir;
+mod luau_ast;
 mod program;
 pub mod strict;
 
@@ -392,6 +393,24 @@ pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
             return Ok(compiled);
         }
     }
+}
+
+/// Lowers a handler and its typed IR into a printable Luau script.
+///
+/// The result contains the lowered functions and helper functions. The full
+/// entry wrappers are still assembled by `compile`; this API exposes the
+/// typed-IR to AST path for callers that need the generated body source.
+pub fn compile_ir(
+    source: &str,
+    options: &Options<'_>,
+) -> Result<String, Error> {
+    let program = ir::lower_strict(source, options)?;
+    let script = luau_ast::lower_ir(&program)?;
+    let script = luau_ast::fold_constants(&script);
+    let script = luau_ast::remove_dead_code(&script);
+    let script = luau_ast::prune_callbacks(&script);
+    let script = luau_ast::specialize_tables(&script);
+    Ok(luau_ast::print_script(&script))
 }
 
 type CompiledOnce = (Compiled, BTreeMap<String, NativeFn>);
@@ -1064,12 +1083,27 @@ fn compile_once(
 
     Ok((
         Compiled {
-            source: out,
+            source: if options.strict.is_some() {
+                optimize_strict_source(&out)
+            } else {
+                out
+            },
             events: positive,
             native: natives.values().cloned().collect(),
         },
         natives,
     ))
+}
+
+/// Lowers the assembled strict script through the Luau AST and runs the
+/// semantic passes. Auto and off keep the string emitter's output unchanged.
+fn optimize_strict_source(source: &str) -> String {
+    let script = luau_ast::parse_script(source, "generated.luau");
+    let script = luau_ast::fold_constants(&script);
+    let script = luau_ast::prune_callbacks(&script);
+    let script = luau_ast::remove_dead_code(&script);
+    let script = luau_ast::specialize_tables(&script);
+    luau_ast::print_script(&script)
 }
 
 /// Calls a body directly, or through the native coroutine driver when the body
