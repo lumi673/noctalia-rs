@@ -12,5 +12,12 @@ quote.workspace = true
 syn.workspace = true
 
 [lints.clippy]
-excessive_nesting = "allow"
-too_many_arguments = "allow"
+collapsible_if        = "allow"
+excessive_nesting     = "allow"
+large_enum_variant    = "allow"
+let_and_return        = "allow"
+manual_range_contains = "allow"
+needless_return       = "allow"
+redundant_closure     = "allow"
+too_many_arguments    = "allow"
+while_let_loop        = "allow"
