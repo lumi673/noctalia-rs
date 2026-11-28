@@ -930,4 +930,18 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(output.contains("__strict_run_handle("), "{output}");
     assert!(output.contains("\"Done\""), "{output}");
     assert!(!output.contains("__host_callback"), "{output}");
+
+#[test]
+fn strict_handle_started_result_is_typed_as_a_boolean() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let started = ctx.run(json!(["echo"]), Some("done"), None).started();
+    return Ok(vec![Op::log(format!("{started:?}"))]);
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("noctalia.log("), "{output}");
 }

@@ -1475,13 +1475,17 @@ impl<'a> Emitter<'a> {
         if matches!(method.as_str(), "stop" | "cancel" | "started" | "clone")
             && let Some(receiver) = handle_receiver
         {
-            return handle_method(
+            let value = handle_method(
                 call,
                 &method,
                 &args,
                 &receiver,
                 self.strict(),
-            );
+            )?;
+            if value.1.base != Base::Handle {
+                self.pending_class = None;
+            }
+            return Ok(value);
         }
         if self.is_ctx_expr(&call.receiver) {
             return self.context_method(call, &method, &args);
@@ -1518,13 +1522,17 @@ impl<'a> Emitter<'a> {
             && !ty.optional
             && ty.base == Base::Handle
         {
-            return handle_method(
+            let value = handle_method(
                 call,
                 &method,
                 &args,
                 &receiver,
                 self.strict(),
-            );
+            )?;
+            if value.1.base != Base::Handle {
+                self.pending_class = None;
+            }
+            return Ok(value);
         }
         if let Some(value) =
             self.combinator(call, &method, &args, &receiver, ty)?

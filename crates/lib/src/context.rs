@@ -383,6 +383,7 @@ impl Context {
             &["http"],
             vec![request, callback.value()],
         ))
+    }
 
     /// Starts an HTTP stream and returns an opaque handle for strict-generated code.
     #[must_use]
@@ -404,6 +405,7 @@ impl Context {
         HttpStreamHandle::new(
             value.and_then(|item| item.as_str().map(str::to_owned)),
         )
+    }
 
     /// Registers a state watch and returns an opaque handle for strict-generated code.
     #[must_use]
@@ -414,6 +416,7 @@ impl Context {
     ) -> StateWatchHandle {
         self.emit_op(&Op::state_watch(key, callback.id()));
         StateWatchHandle::new(key.to_owned(), callback.id().to_owned())
+    }
 
     /// Starts a process and returns Luau's `runAsync` acceptance boolean.
     #[must_use]
@@ -1364,19 +1367,15 @@ mod tests {
             Some(Callback::<Value>::named("done")),
             Some(timeout),
         );
-        let http = context.http(
-            json!({ "url": "x" }),
-            Callback::<Value>::named("response"),
-        );
+        let http = context
+            .http(json!({ "url": "x" }), Callback::<Value>::named("response"));
         let stream = context.http_stream(
             json!({ "url": "y" }),
             Callback::<Value>::named("line"),
             Callback::<Value>::named("close"),
         );
-        let watch = context.state_watch(
-            "wm.workspaces",
-            Callback::<Value>::named("changed"),
-        );
+        let watch = context
+            .state_watch("wm.workspaces", Callback::<Value>::named("changed"));
 
         assert!(run.started());
         assert!(http.started());
