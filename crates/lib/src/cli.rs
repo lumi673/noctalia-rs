@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -57,8 +58,21 @@ struct Request {
     host: Value,
     #[serde(default)]
     host_fixed: Value,
+    #[serde(default)]
+    calls: Vec<NativeCall>,
 }
 
+#[derive(Debug, Deserialize)]
+struct NativeCall {
+    id: String,
+    name: String,
+    #[serde(default)]
+    args: Value,
+    #[serde(default)]
+    cache_ms: u64,
+    #[serde(default)]
+    context: Value,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Processed {
     Entry,
@@ -158,8 +172,7 @@ impl<W: Write> Serve<'_, W> {
             .into());
         }
         if request.kind.as_deref() == Some("native") {
-            self.process_native(request, path)?;
-            return Ok(Processed::Native);
+            return self.process_native_request(request, path);
         }
 
         if request.host_fixed.is_object() {
@@ -191,54 +204,144 @@ impl<W: Write> Serve<'_, W> {
 
     fn process_native(&mut self, request: Request, path: &Path) -> Result<()> {
         let id = request.id.clone().unwrap_or_else(|| request_name(path));
-        let context = self.native_context(&request);
-        let Some(name) = request.name.clone() else {
-            return self.emit_native_error(&id, "missing native function name");
-        };
-        if name.is_empty() {
-            return self.emit_native_error(&id, "missing native function name");
+        let name = request.name.as_deref().unwrap_or_default();
+        match self.native_value(
+            &request.entry,
+            name,
+            request.args,
+            request.cache_ms.unwrap_or(0),
+            &request.context,
+        ) {
+            Ok(value) => self.emit_native_value(&id, &value),
+            Err(error) => self.emit_native_error(&id, error.as_str()),
         }
-        let args = request.args;
-        let cache_ms = request.cache_ms.unwrap_or(0);
+    }
+
+    fn process_native_request(
+        &mut self,
+        request: Request,
+        path: &Path,
+    ) -> Result<Processed> {
+        if request.calls.is_empty() {
+            self.process_native(request, path)?;
+        } else {
+            self.process_native_batch(&request)?;
+        }
+        Ok(Processed::Native)
+    }
+
+    fn process_native_batch(&mut self, request: &Request) -> Result<()> {
+        let id = request.id.clone().unwrap_or_default();
+        let mut results = Vec::with_capacity(request.calls.len());
+        let mut failed = false;
+        for call in &request.calls {
+            let (entry, next) = self.native_batch_entry(request, call, failed);
+            failed = next;
+            results.push(entry);
+        }
+        self.emit_json(&json!({
+            "control": "native_batch_result",
+            "id": id,
+            "results": results,
+        }))
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one batch entry needs the request, call and failure state"
+    )]
+    fn native_batch_entry(
+        &mut self,
+        request: &Request,
+        call: &NativeCall,
+        failed: bool,
+    ) -> (Value, bool) {
+        if failed {
+            return (
+                json!({
+                    "id": call.id,
+                    "value": Value::Null,
+                    "error": "skipped after an earlier native failure",
+                }),
+                true,
+            );
+        }
+        match self.native_value(
+            &request.entry,
+            &call.name,
+            call.args.clone(),
+            call.cache_ms,
+            &call.context,
+        ) {
+            Ok(value) => (
+                json!({
+                    "id": call.id,
+                    "value": value,
+                    "error": Value::Null,
+                }),
+                false,
+            ),
+            Err(error) => (
+                json!({
+                    "id": call.id,
+                    "value": Value::Null,
+                    "error": error,
+                }),
+                true,
+            ),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a native request carries the entry, name, args and cache policy"
+    )]
+    fn native_value(
+        &mut self,
+        entry: &str,
+        name: &str,
+        args: Value,
+        cache_ms: u64,
+        context_value: &Value,
+    ) -> StdResult<Value, String> {
+        if name.is_empty() {
+            return Err("missing native function name".to_owned());
+        }
+        let context = self.native_context(entry, context_value);
         let key = if context.is_some() {
             format!(
                 "{}\0{}",
-                native_key(&name, &args),
-                canonical_json(&stable_context(&request.context))
+                native_key(name, &args),
+                canonical_json(&stable_context(context_value))
             )
         } else {
-            native_key(&name, &args)
+            native_key(name, &args)
         };
         let cached = if cache_ms > 0 {
             self.cached_native(&key, cache_ms)
         } else {
             None
         };
-        let result = match cached {
-            Some(value) => Ok(value),
-            None => self.plugin.native(&name, args, context.as_ref()),
-        };
-        let value = match result {
-            Ok(value) => value,
-            Err(error) => return self.emit_native_error(&id, &error),
+        let value = match cached {
+            Some(value) => value,
+            None => self.plugin.native(name, args, context.as_ref())?,
         };
         if cache_ms > 0 {
             self.remember_native(&key, value.clone());
         }
-        self.emit_native_value(&id, &value)
+        Ok(value)
     }
 
     /// Rebuilds the invocation context a `&Context` native parameter sees.
-    fn native_context(&self, request: &Request) -> Option<Context> {
-        if !request.context.is_object() {
+    fn native_context(&self, entry: &str, context: &Value) -> Option<Context> {
+        if !context.is_object() {
             return None;
         }
-        let field = |key: &str| {
-            request.context.get(key).cloned().unwrap_or(Value::Null)
-        };
+        let field =
+            |key: &str| context.get(key).cloned().unwrap_or(Value::Null);
         Some(Context::new(
             Parts {
-                entry: request.entry.clone(),
+                entry: entry.to_owned(),
                 event: field("event")
                     .as_str()
                     .map_or_else(String::new, str::to_owned),
@@ -1557,5 +1660,133 @@ mod tests {
         assert_eq!(results[0]["value"]["now_ms"], 1_700_000_000_i64);
         assert_eq!(results[1]["value"]["event"], "render");
         assert_eq!(results[2]["value"]["now_ms"], 1_700_000_000_i64);
+    }
+
+    #[test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "test dispatch has three cases"
+    )]
+    fn test_serve_answers_a_native_batch_in_one_line() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn dispatch(
+            name: &str,
+            _args: Value,
+            _context: Option<&crate::Context>,
+        ) -> StdResult<Value, String> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            if name == "missing" {
+                return Err("unknown native function".to_owned());
+            }
+            Ok(json!({ "rows": 1 }))
+        }
+
+        CALLS.store(0, Ordering::Relaxed);
+        let spool = TestSpool::new("serve-native-batch");
+        let args = json!({ "value": 7 });
+        spool.write(
+            "000000000001.json",
+            &json!({
+                "boot": "boot-native-batch",
+                "kind": "native",
+                "entry": "service",
+                "id": "batch-1",
+                "calls": [
+                    { "id": "1", "name": "rows", "args": args, "cache_ms": 1000 },
+                    { "id": "2", "name": "rows", "args": { "value": 7 }, "cache_ms": 1000 },
+                    { "id": "3", "name": "missing", "args": {}, "cache_ms": 0 },
+                    { "id": "4", "name": "rows", "args": {}, "cache_ms": 0 },
+                ],
+            }),
+        );
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .with_native(dispatch);
+        let writer = Capture {
+            plugin: &plugin,
+            data: &spool.data,
+            spool: &spool.spool,
+            boot: "boot-native-batch",
+            stale: BTreeSet::new(),
+            stop_after: 2,
+        }
+        .run();
+        let lines = writer.lines();
+        spool.cleanup();
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let value: Value = serde_json::from_str(&lines[1]).expect("batch line");
+        assert_eq!(value["control"], "native_batch_result");
+        assert_eq!(value["id"], "batch-1");
+        assert_eq!(value["results"][0]["value"], json!({ "rows": 1 }));
+        assert_eq!(value["results"][1]["value"], json!({ "rows": 1 }));
+        assert_eq!(value["results"][2]["error"], "unknown native function");
+        assert_eq!(
+            value["results"][3]["error"],
+            "skipped after an earlier native failure"
+        );
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_native_cache_honors_ttl() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        #[expect(clippy::unnecessary_wraps)]
+        fn dispatch(
+            _name: &str,
+            _args: Value,
+            _context: Option<&crate::Context>,
+        ) -> StdResult<Value, String> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({ "value": 1 }))
+        }
+
+        CALLS.store(0, Ordering::Relaxed);
+        let spool = TestSpool::new("serve-native-ttl");
+        let plugin = Plugin::new(Meta::new("me/hello", "Hello", "0.1.0"))
+            .with_native(dispatch);
+        let translations = Value::Null;
+        let mut out = CaptureWriter::new(10);
+        let mut server = Serve {
+            plugin: &plugin,
+            data_dir: &spool.data,
+            spool_dir: &spool.spool,
+            boot: "boot-native-ttl",
+            stale: BTreeSet::new(),
+            native_cache: BTreeMap::new(),
+            native_cache_order: VecDeque::new(),
+            host_fixed: Value::Object(Map::new()),
+            translations: &translations,
+            out: &mut out,
+        };
+        let args = json!({ "key": 1 });
+        let key = native_key("rows", &args);
+        let first = server.native_value(
+            "service",
+            "rows",
+            args.clone(),
+            60_000,
+            &Value::Null,
+        );
+        let second = server.native_value(
+            "service",
+            "rows",
+            args.clone(),
+            60_000,
+            &Value::Null,
+        );
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(60_001))
+            .unwrap_or_else(Instant::now);
+        server
+            .native_cache
+            .insert(key, (expired, json!({ "value": 1 })));
+        let third =
+            server.native_value("service", "rows", args, 60_000, &Value::Null);
+        spool.cleanup();
+
+        assert_eq!(first.expect("first"), json!({ "value": 1 }));
+        assert_eq!(second.expect("second"), json!({ "value": 1 }));
+        assert_eq!(third.expect("third"), json!({ "value": 1 }));
+        assert_eq!(CALLS.load(Ordering::Relaxed), 2);
     }
 }

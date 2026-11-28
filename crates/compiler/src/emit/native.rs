@@ -499,18 +499,28 @@ pub(crate) fn native_runtime(
     }
   end
 
+  local function cache_key(name, args, context, cache_ms)
+    if cache_ms == nil or cache_ms <= 0 then return nil end
+    local encoded = name .. string.char(0) .. noctalia.json.encode(args)
+    if context ~= nil then
+      encoded = encoded .. string.char(0) .. noctalia.json.encode(stable(context))
+    end
+    return encoded
+  end
+
+  local function cached_value(encoded, cache_ms)
+    if encoded == nil then return nil, false end
+    local hit = cache[encoded]
+    if hit and noctalia.nowMs() - hit.at < cache_ms then return hit.value, true end
+    return nil, false
+  end
+
   function M.call(name, args, cache_ms, needs_context, as_result)
     local context = nil
     if needs_context then context = snapshot(current) end
-    local encoded = nil
-    if cache_ms and cache_ms > 0 then
-      encoded = name .. string.char(0) .. noctalia.json.encode(args)
-      if context ~= nil then
-        encoded = encoded .. string.char(0) .. noctalia.json.encode(stable(context))
-      end
-      local hit = cache[encoded]
-      if hit and noctalia.nowMs() - hit.at < cache_ms then return hit.value end
-    end
+    local encoded = cache_key(name, args, context, cache_ms)
+    local hit, found = cached_value(encoded, cache_ms)
+    if found then return hit end
     local value, failure = coroutine.yield({
       kind = "native",
       name = name,
@@ -527,6 +537,45 @@ pub(crate) fn native_runtime(
     return value
   end
 
+  function M.batch(descriptors)
+    local values, calls, encodings = {}, {}, {}
+    for index, descriptor in ipairs(descriptors) do
+      local context = nil
+      if descriptor.needs_context then context = snapshot(current) end
+      local encoded = cache_key(descriptor.name, descriptor.args, context, descriptor.cache_ms)
+      local hit, found = cached_value(encoded, descriptor.cache_ms)
+      if found then
+        values[index] = { value = hit }
+      else
+        encodings[index] = encoded
+        calls[#calls + 1] = {
+          id = tostring(index),
+          name = descriptor.name,
+          args = descriptor.args,
+          cache_ms = descriptor.cache_ms or 0,
+          context = context,
+        }
+      end
+    end
+    if #calls > 0 then
+      local results = coroutine.yield({ kind = "native", calls = calls })
+      for _, result in ipairs(results) do
+        local index = tonumber(result.id)
+        if index == nil then error("native batch result has no index", 0) end
+        if result.error ~= nil then error(tostring(result.error), 0) end
+        local encoded = encodings[index]
+        if encoded ~= nil then remember(encoded, result.value) end
+        values[index] = { value = result.value }
+      end
+    end
+    for index, descriptor in ipairs(descriptors) do
+      if values[index] == nil then
+        error("native batch result missing for " .. descriptor.name, 0)
+      end
+    end
+    return values
+  end
+
   local function park(co, request)
     active = { co = co, request = request, context = current }
     M.send(request)
@@ -539,7 +588,7 @@ pub(crate) fn native_runtime(
       local co = coroutine.create(job.fn)
       local ok, yielded = coroutine.resume(co, table.unpack(job.args))
       if not ok then error(yielded, 0) end
-      if type(yielded) == "table" and yielded.kind == "native" then park(co, yielded) end
+      if type(yielded) == "table" and (yielded.kind == "native" or yielded.kind == "native_batch") then park(co, yielded) end
     end
   end
 
@@ -570,10 +619,13 @@ pub(crate) fn native_runtime(
       end
       return
     end
-    if line.control ~= "native_result" or active == nil then return end
+    if active == nil
+        or (line.control ~= "native_result"
+          and line.control ~= "native_batch_result") then return
+    end
     if active.request ~= nil
-      and active.request.id ~= nil
-      and line.id ~= active.request.id then
+        and active.request.id ~= nil
+        and line.id ~= active.request.id then
       noctalia.log(
         "noctalia native: stale result " .. tostring(line.id)
         .. " for " .. tostring(active.request.id)
@@ -583,9 +635,15 @@ pub(crate) fn native_runtime(
     local co = active.co
     current = active.context
     active = nil
-    local ok, yielded = coroutine.resume(co, line.value, line.error)
+    local ok, yielded
+    if line.control == "native_batch_result" then
+      ok, yielded = coroutine.resume(co, line.results)
+    else
+      ok, yielded = coroutine.resume(co, line.value, line.error)
+    end
     if not ok then error(yielded, 0) end
-    if type(yielded) == "table" and yielded.kind == "native" then
+    if type(yielded) == "table"
+        and (yielded.kind == "native" or yielded.kind == "native_batch") then
       park(co, yielded)
       return
     end

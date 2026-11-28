@@ -404,3 +404,113 @@ fn a_native_function_that_takes_the_context_resumes() {
         "{resumed:?}"
     );
 }
+
+const TWO_PLAIN_CALLS: &str = r#"
+#[native]
+fn first(value: u64) -> u64 {
+    value + 1
+}
+
+#[native(cache_ms = 60_000)]
+fn second(value: u64) -> u64 {
+    value + 2
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let a = first(1);
+    let b = second(2);
+    Ok(vec![Op::BarText { text: format!("{a}:{b}") }])
+}
+"#;
+
+#[test]
+fn adjacent_native_calls_resume_from_one_batch_result() {
+    let source = compile("batch", TWO_PLAIN_CALLS);
+    assert!(source.contains("__native.batch({"), "{source}");
+    assert!(
+        source.contains("kind = \"native\", calls = calls"),
+        "{source}"
+    );
+
+    let parked = dispatch("batch", &source, "render", json!({}));
+    assert!(bar_text(&parked).is_none(), "{parked:?}");
+    let stream = stream_id(&parked);
+
+    let ready = dispatch(
+        "batch",
+        &source,
+        "host_callback",
+        line(
+            &stream,
+            json!({ "control": "ready", "boot": "b1", "spool": "/tmp/x" }),
+        ),
+    );
+    assert_eq!(spool_writes(&ready), 1, "{ready:?}");
+
+    let resumed = dispatch(
+        "batch",
+        &source,
+        "host_callback",
+        line(
+            &stream,
+            json!({
+                "control": "native_batch_result",
+                "id": "000000000001",
+                "results": [
+                    { "id": "1", "value": 11, "error": null },
+                    { "id": "2", "value": 22, "error": null },
+                ],
+            }),
+        ),
+    );
+    assert_eq!(bar_text(&resumed).as_deref(), Some("11:22"), "{resumed:?}");
+}
+
+const TWO_NULL_CALLS: &str = r#"
+#[native]
+fn missing() -> Option<String> {
+    None
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let first = missing();
+    let second = missing();
+    let _ = (first, second);
+    Ok(vec![Op::BarText { text: "ok".to_owned() }])
+}
+"#;
+
+#[test]
+fn a_batch_keeps_null_native_values() {
+    let source = compile("nullbatch", TWO_NULL_CALLS);
+    assert!(source.contains("__native.batch({"), "{source}");
+
+    let parked = dispatch("nullbatch", &source, "render", json!({}));
+    let stream = stream_id(&parked);
+    dispatch(
+        "nullbatch",
+        &source,
+        "host_callback",
+        line(
+            &stream,
+            json!({ "control": "ready", "boot": "b1", "spool": "/tmp/x" }),
+        ),
+    );
+    let resumed = dispatch(
+        "nullbatch",
+        &source,
+        "host_callback",
+        line(
+            &stream,
+            json!({
+                "control": "native_batch_result",
+                "id": "000000000001",
+                "results": [
+                    { "id": "1", "value": null, "error": null },
+                    { "id": "2", "value": null, "error": null },
+                ],
+            }),
+        ),
+    );
+    assert_eq!(bar_text(&resumed).as_deref(), Some("ok"), "{resumed:?}");
+}

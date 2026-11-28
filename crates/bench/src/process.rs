@@ -113,6 +113,89 @@ impl Spool {
         std::hint::black_box(start.elapsed());
         Ok(())
     }
+
+    fn write_native_request(&mut self, mut request: Value) -> Result<String> {
+        self.sequence += 1;
+        let file = format!("{:012}.json", self.sequence);
+        let id = format!("native-{}", self.sequence);
+        let object = request
+            .as_object_mut()
+            .ok_or("native request is not an object")?;
+        object.insert("boot".to_owned(), json!(self.boot));
+        object.insert("entry".to_owned(), json!("service"));
+        object.insert("id".to_owned(), json!(id));
+        fs::write(self.spool_dir.join(file), serde_json::to_string(&request)?)?;
+        Ok(id)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a native call carries its cache policy"
+    )]
+    pub fn native(
+        &mut self,
+        name: &str,
+        args: Value,
+        cache_ms: u64,
+    ) -> Result<Value> {
+        let id = self.write_native_request(json!({
+            "kind": "native",
+            "name": name,
+            "args": args,
+            "cache_ms": cache_ms,
+        }))?;
+        let line = wait_line(&self.lines, |value| {
+            value.get("control").and_then(Value::as_str)
+                == Some("native_result")
+                && value.get("id").and_then(Value::as_str) == Some(id.as_str())
+        })?;
+        if !matches!(line.get("error"), None | Some(Value::Null)) {
+            return Err(format!("native result error: {line}").into());
+        }
+        let value = line
+            .get("value")
+            .cloned()
+            .ok_or("native result has no value")?;
+        std::hint::black_box(&value);
+        Ok(value)
+    }
+
+    pub fn native_batch(
+        &mut self,
+        calls: &[(&str, Value, u64)],
+    ) -> Result<Vec<Value>> {
+        let entries = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (name, args, cache_ms))| {
+                json!({
+                    "id": index.to_string(),
+                    "name": name,
+                    "args": args,
+                    "cache_ms": cache_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        let id = self.write_native_request(json!({
+            "kind": "native",
+            "calls": entries,
+        }))?;
+        let line = wait_line(&self.lines, |value| {
+            value.get("control").and_then(Value::as_str)
+                == Some("native_batch_result")
+                && value.get("id").and_then(Value::as_str) == Some(id.as_str())
+        })?;
+        let results = line
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or("native batch result has no results")?;
+        let mut values = Vec::with_capacity(results.len());
+        for result in results {
+            let value = batch_value(result)?;
+            values.push(value);
+        }
+        Ok(values)
+    }
 }
 
 impl Drop for Spool {
@@ -120,6 +203,18 @@ impl Drop for Spool {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn batch_value(result: &Value) -> Result<Value> {
+    if !matches!(result.get("error"), None | Some(Value::Null)) {
+        return Err(format!("native batch result error: {result}").into());
+    }
+    let value = result
+        .get("value")
+        .cloned()
+        .ok_or("native batch result has no value")?;
+    std::hint::black_box(&value);
+    Ok(value)
 }
 
 fn wait_line<F>(lines: &Receiver<String>, accept: F) -> Result<Value>

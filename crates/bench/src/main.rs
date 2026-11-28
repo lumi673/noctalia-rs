@@ -1,5 +1,6 @@
 mod generated;
 mod metadata;
+mod native;
 mod plugins;
 mod process;
 mod stats;
@@ -203,6 +204,33 @@ impl Pair {
     }
 }
 
+#[derive(Debug, Serialize)]
+struct NativePair {
+    workload: &'static str,
+    baseline: Summary,
+    candidate: Summary,
+    speedup_median: f64,
+    speedup_p95: f64,
+    speedup_p99: f64,
+}
+
+impl NativePair {
+    fn new(
+        workload: &'static str,
+        baseline: Summary,
+        candidate: Summary,
+    ) -> Self {
+        Self {
+            workload,
+            speedup_median: ratio(candidate.median_us, baseline.median_us),
+            speedup_p95: ratio(candidate.p95_us, baseline.p95_us),
+            speedup_p99: ratio(candidate.p99_us, baseline.p99_us),
+            baseline,
+            candidate,
+        }
+    }
+}
+
 fn ratio(rust_us: f64, luau_us: f64) -> f64 {
     if rust_us > 0.0 {
         luau_us / rust_us
@@ -218,6 +246,7 @@ struct Report {
     pairs: Vec<Pair>,
     #[serde(rename = "boundary")]
     generated: Vec<generated::GeneratedSource>,
+    native_pairs: Vec<NativePair>,
 }
 
 fn main() -> ExitCode {
@@ -248,6 +277,15 @@ fn run() -> Result<()> {
     }
 
     let scratch = Scratch::new(&workspace)?;
+    let native_helper =
+        native::NativeHelper::build(&workspace, scratch.path())?;
+    if !native_helper.path().is_file() {
+        return Err(format!(
+            "native helper binary missing: {}",
+            native_helper.path().display()
+        )
+        .into());
+    }
     let metadata = Metadata::collect(&workspace, &helper, options.plan());
     let mut results = Vec::new();
 
@@ -261,6 +299,57 @@ fn run() -> Result<()> {
         spool.request()
     })?);
     drop(spool);
+
+    let mut native_spool =
+        process::Spool::start(native_helper.path(), scratch.path())?;
+    let cached_args = json!({ "value": 11 });
+    let mut native_pairs = Vec::new();
+    native_spool.native("main::bench_cached", cached_args.clone(), 60_000)?;
+    let cache_miss =
+        measure(options.phase("native_cache_miss", false), || {
+            native_spool.native(
+                "main::bench_cached",
+                cached_args.clone(),
+                0,
+            )?;
+            Ok(())
+        })?;
+    let cache_hit = measure(options.phase("native_cache_hit", false), || {
+        native_spool.native(
+            "main::bench_cached",
+            cached_args.clone(),
+            60_000,
+        )?;
+        Ok(())
+    })?;
+    results.push(cache_miss);
+    results.push(cache_hit);
+    native_pairs.push(NativePair::new("native_cache", cache_miss, cache_hit));
+
+    let batch_calls = [
+        ("main::bench_work", json!({ "value": 1 }), 0),
+        ("main::bench_work", json!({ "value": 2 }), 0),
+    ];
+    let batch_sequential =
+        measure(options.phase("native_batch_sequential", false), || {
+            for (name, args, cache_ms) in &batch_calls {
+                native_spool.native(name, args.clone(), *cache_ms)?;
+            }
+            Ok(())
+        })?;
+    let batch_candidate =
+        measure(options.phase("native_batch_batched", false), || {
+            native_spool.native_batch(&batch_calls)?;
+            Ok(())
+        })?;
+    results.push(batch_sequential);
+    results.push(batch_candidate);
+    native_pairs.push(NativePair::new(
+        "native_batch",
+        batch_sequential,
+        batch_candidate,
+    ));
+    drop(native_spool);
 
     let mut vm_counter = 0usize;
     results.push(measure(options.phase("luau_vm_creation", false), || {
@@ -504,6 +593,7 @@ fn run() -> Result<()> {
         metadata,
         results,
         pairs,
+        native_pairs,
         generated: generated.sources,
     };
     print_report(&report);
@@ -1193,6 +1283,27 @@ fn print_report(report: &Report) {
         }
         println!(
             "compiled/hand are medians in microseconds; speedup = hand / compiled. Target: compiled Luau >= hand-written Luau (parity). Both sides pay the same ~2 us dispatch floor, so the 3x target applies to spool_dispatch, not to this comparison."
+        );
+    }
+    print_native_pairs(&report.native_pairs);
+}
+
+fn print_native_pairs(pairs: &[NativePair]) {
+    println!();
+    println!("Native helper round trips (speedup = baseline / candidate)");
+    println!(
+        "{:<20} {:>12} {:>12} {:>12} {:>12} {:>10}",
+        "workload", "base_med", "cand_med", "base_p95", "cand_p95", "speedup"
+    );
+    for pair in pairs {
+        println!(
+            "{:<20} {:>12.3} {:>12.3} {:>12.3} {:>12.3} {:>10.2}",
+            pair.workload,
+            pair.baseline.median_us,
+            pair.candidate.median_us,
+            pair.baseline.p95_us,
+            pair.candidate.p95_us,
+            pair.speedup_median
         );
     }
 }

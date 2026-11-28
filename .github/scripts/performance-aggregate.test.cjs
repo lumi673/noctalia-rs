@@ -92,3 +92,19 @@ test('boundary metrics travel through the gate report', () => {
     /boundary metrics/
   )
 })
+
+test('native helper surfaces have criteria and budgets', () => {
+  for (const surface of [
+    'native_cache_miss',
+    'native_cache_hit',
+    'native_batch_sequential',
+    'native_batch_batched',
+  ]) {
+    const sample = raw(1000)
+    sample.results[0].surface = surface
+    const gate = toGateReport(sample)
+    assert.equal(gate.results[0].name, surface)
+    assert.ok(gate.results[0].criterion.length > 0)
+    assert.equal(gate.results[0].budgetMs, 20)
+  }
+})
