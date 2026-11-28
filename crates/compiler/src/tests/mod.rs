@@ -11,6 +11,7 @@ mod native;
 mod ops;
 mod statements;
 mod strict;
+mod timers;
 mod types;
 
 fn options<'a>(handler: &'a str, kind: EntryKind) -> Options<'a> {
