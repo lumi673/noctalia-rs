@@ -425,6 +425,12 @@ impl<'a> Emitter<'a> {
         let text = if let Some(id) =
             self.typed_callback_id_checked(inner, inner.span())?
         {
+            if !matches!(inner, Expr::Call(_) | Expr::Path(_)) {
+                return Err(Error::at(
+                    inner.span(),
+                    "a typed callback expression with effects is not supported by strict handles",
+                ));
+            }
             crate::quote(&id)
         } else {
             self.expr(inner)?.0

@@ -946,3 +946,34 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let output = compile_strict(handler, &[]).expect("compile");
     assert!(output.contains("noctalia.log("), "{output}");
 }
+
+#[test]
+fn strict_handle_rejects_an_effectful_typed_callback_expression() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct Done;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let handle = ctx.run(
+        json!(["echo"]),
+        Some({
+            let _ = 1;
+            Callback::<Done>::new()
+        }),
+        None,
+    );
+    handle.stop();
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("effectful callback");
+    assert!(
+        error.contains("typed callback expression with effects"),
+        "{error}"
+    );
+    assert!(error.contains("widget.rs:"), "{error}");
+}
