@@ -169,6 +169,21 @@ fn cache_key(ctx: &Context, name: &str, source: &str, strict: bool) -> String {
         source.len()
     )
 }
+/// Compiles a Luau chunk without running it.
+///
+/// Reports only syntax and compile-time errors. Host calls and entry bodies
+/// stay unexecuted, so this is safe to use on generated reports in CI.
+pub fn parse_source(
+    name: &str,
+    source: &str,
+) -> std::result::Result<(), String> {
+    mlua::Lua::new()
+        .load(source)
+        .set_name(name)
+        .into_function()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
 
 fn traceback(lua: &Lua, error: &mlua::Error) -> String {
     let message = error.to_string();

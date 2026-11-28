@@ -121,6 +121,7 @@ impl<'a> Emitter<'a> {
             native_mode,
             known_native,
             native_found: BTreeMap::new(),
+            native_calls: 0,
             uses_native: false,
             uses_native_context: false,
             deferred: 0,
@@ -261,6 +262,7 @@ impl<'a> Emitter<'a> {
                 .collect(),
             is_empty: !self.emitted,
             uses_native: self.uses_native,
+            native_calls: self.native_calls,
             uses_native_context: self.uses_native_context,
             native: self.native_found.into_values().collect(),
             statics: self
@@ -496,6 +498,8 @@ pub(crate) struct Body {
     pub uses_source: bool,
     pub params: Vec<&'static str>,
     pub is_empty: bool,
+    /// Native helper call sites in this body.
+    pub native_calls: usize,
     pub uses_native: bool,
     pub uses_native_context: bool,
     pub native: Vec<NativeFn>,
@@ -572,6 +576,7 @@ pub(crate) struct Emitter<'a> {
     native_mode: NativeMode,
     known_native: &'a BTreeMap<String, NativeFn>,
     native_found: BTreeMap<String, NativeFn>,
+    native_calls: usize,
     uses_native: bool,
     uses_native_context: bool,
     deferred: usize,

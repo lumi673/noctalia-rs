@@ -486,3 +486,46 @@ test('a ceiling only moves from its same-session anchor and matching floor SHA',
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+const BOUNDARY = [{
+  workload: 'generated_hello_bar',
+  compiled_functions: 2,
+  native_functions: 0,
+  helper_calls_per_event: { render: 0, click: 0 },
+  compiled_bytes: 1200,
+  handwritten_bytes: 900,
+  parse: { ok: true },
+}]
+
+test('boundary metrics are validated and shown in the audit', () => {
+  const head = { ...artifact([metric('spool_dispatch')]), boundary: BOUNDARY }
+  const base = artifact([metric('spool_dispatch')])
+  const compared = perf.compare({ meta: meta(), floor: perf.emptyFloor(), head, base })
+  assert.equal(compared.failed, false)
+  const body = perf.markdown(compared)
+  assert.match(body, /### Boundary metrics/)
+  assert.match(body, /generated_hello_bar.*2.*0.*render:0, click:0.*1200.*ok/)
+  assert.throws(
+    () => perf.validateBoundary([{ ...BOUNDARY[0], compiled_functions: -1 }], 'boundary'),
+    /compiled_functions must be a non-negative integer/
+  )
+})
+
+test('a generated script that does not parse fails the audit', () => {
+  const broken = {
+    ...BOUNDARY[0],
+    parse: { ok: false, error: 'unexpected token' },
+  }
+  const head = {
+    ...artifact([metric('spool_dispatch')]),
+    boundary: [broken],
+  }
+  const compared = perf.compare({
+    meta: meta(),
+    floor: perf.emptyFloor(),
+    head,
+    base: artifact([metric('spool_dispatch')]),
+  })
+  assert.equal(compared.failed, true)
+  assert.match(perf.markdown(compared), /fail: unexpected token/)
+})

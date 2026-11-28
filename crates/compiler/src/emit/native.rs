@@ -201,6 +201,7 @@ impl<'a> Emitter<'a> {
         let call =
             format!("{}({})", native_local(&item.name), values.join(", "));
         self.uses_native = true;
+        self.native_calls = self.native_calls.saturating_add(1);
         let ty = if item.result {
             Ty::result(value_ty.base)
         } else {

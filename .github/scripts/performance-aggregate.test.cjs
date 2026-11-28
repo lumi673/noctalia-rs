@@ -63,3 +63,32 @@ test('an unknown workload has no silent budget', () => {
   report.results[0].surface = 'unknown'
   assert.throws(() => toGateReport(report), /no criterion or budget/)
 })
+
+test('boundary metrics travel through the gate report', () => {
+  const boundary = [{
+    workload: 'generated_hello_bar',
+    compiled_functions: 2,
+    native_functions: 0,
+    helper_calls_per_event: { render: 0 },
+    compiled_bytes: 1200,
+    handwritten_bytes: 900,
+    parse: { ok: true },
+  }]
+  const first = { ...raw(1500), boundary }
+  const second = { ...raw(1200), boundary }
+  assert.deepEqual(toGateReport(first).boundary, boundary)
+  const combined = combine([
+    toGateReport(first),
+    toGateReport(second),
+    toGateReport({ ...raw(1800), boundary }),
+  ])
+  assert.deepEqual(combined.boundary, boundary)
+
+  assert.throws(
+    () => combine([
+      toGateReport(first),
+      toGateReport({ ...raw(1200), boundary: [] }),
+    ]),
+    /boundary metrics/
+  )
+})

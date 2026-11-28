@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use noctalia_rs_compiler as compiler;
 use toml::Value;
 
+mod report;
 pub mod strict;
 
 type BoxError = Box<dyn Error>;
@@ -74,6 +75,8 @@ struct CompileContext<'a> {
     plugin_settings: &'a [String],
     constants: &'a mut String,
     warnings: &'a mut Vec<String>,
+    report: &'a mut report::BuildReport,
+    write_report: bool,
     natives: &'a mut std::collections::BTreeMap<String, compiler::NativeFn>,
 }
 
@@ -119,23 +122,40 @@ pub fn generate() -> Result<(), BoxError> {
     let out = std::env::var("OUT_DIR")?;
     println!("cargo:rerun-if-changed=noctalia.toml");
     println!("cargo:rerun-if-env-changed=NOCTALIA_RS_COMPILE");
+    println!("cargo:rerun-if-env-changed=NOCTALIA_RS_BOUNDARY_REPORT");
     watch_tree(Path::new("."))?;
     generate_to(manifest, Path::new(&out))
 }
 
 pub fn generate_to(manifest: &Path, out_dir: &Path) -> Result<(), BoxError> {
     let env_override = std::env::var("NOCTALIA_RS_COMPILE").ok();
-    let warnings = generate_with(manifest, out_dir, env_override.as_deref())?;
+    let report = std::env::var_os("NOCTALIA_RS_BOUNDARY_REPORT").is_some();
+    let warnings = generate_with_report(
+        manifest,
+        out_dir,
+        env_override.as_deref(),
+        report,
+    )?;
     for warning in warnings {
         println!("cargo:warning={warning}");
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn generate_with(
     manifest: &Path,
     out_dir: &Path,
     env_override: Option<&str>,
+) -> Result<Vec<String>, BoxError> {
+    generate_with_report(manifest, out_dir, env_override, false)
+}
+
+fn generate_with_report(
+    manifest: &Path,
+    out_dir: &Path,
+    env_override: Option<&str>,
+    write_report: bool,
 ) -> Result<Vec<String>, BoxError> {
     let text = fs::read_to_string(manifest)?;
     let value: Value = toml::from_str(&text)?;
@@ -146,6 +166,11 @@ fn generate_with(
         .unwrap_or_else(|| Path::new("."));
     let mode = compile_mode(root, env_override)?;
     let mut warnings = Vec::new();
+    let mut boundary = report::BuildReport::new(match mode {
+        CompileMode::Auto => "auto",
+        CompileMode::Strict => "strict",
+        CompileMode::Off => "off",
+    });
 
     let mut generated = Generated::default();
     write_meta(&mut generated.body, root)
@@ -172,6 +197,8 @@ fn generate_with(
             constants: &mut constants,
             warnings: &mut warnings,
             natives: &mut natives,
+            report: &mut boundary,
+            write_report,
         },
     )
     .map_err(|error| format!("entries: {error}"))?;
@@ -244,6 +271,9 @@ fn generate_with(
     let out = qualify_types(&out);
     let target = out_dir.join("generated.rs");
     fs::write(target, out)?;
+    if write_report {
+        boundary.write(out_dir)?;
+    }
     Ok(warnings)
 }
 
@@ -991,6 +1021,10 @@ fn entry_expression(
         compile_entry(row, id, script, kind, handler_name, context)?
     {
         let _ = write!(expression, ".with_luau({constant})");
+    } else {
+        if context.write_report {
+            context.report.push_uncompiled(id, context.source, script)?;
+        }
     }
     Ok(expression)
 }
@@ -1500,6 +1534,9 @@ fn compile_entry(
     }
     fs::write(target, compiled.source)?;
 
+    if context.write_report {
+        context.report.push_compiled(id, &compiled.report);
+    }
     for item in compiled.native {
         let line = format!(
             "entry {id}: native `{}` (cache {} ms): {}",
@@ -2147,14 +2184,41 @@ mod tests {
         Ok((dir.join("noctalia.toml"), dir))
     }
 
+    fn boundary_report(dir: &Path) -> Result<serde_json::Value, BoxError> {
+        let path = dir.join("noctalia-boundary-report.json");
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+
+    fn first_entry(report: &serde_json::Value) -> &serde_json::Value {
+        report
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|entries| entries.first())
+            .expect("one entry")
+    }
+    #[test]
+    fn generate_without_report_opt_in_skips_the_file() -> Result<(), BoxError> {
+        let (manifest, dir) = compile_fixture(
+            "no-report",
+            DISCOVERED_MANIFEST,
+            COMPILED_HANDLER,
+        )?;
+        generate_with(&manifest, &dir, None)?;
+        let exists = dir.join("noctalia-boundary-report.json").exists();
+        fs::remove_dir_all(&dir)?;
+        assert!(!exists);
+        Ok(())
+    }
+
     #[test]
     fn generate_with_auto_compiles_discovered_handler() -> Result<(), BoxError>
     {
         let (manifest, dir) =
             compile_fixture("auto", DISCOVERED_MANIFEST, COMPILED_HANDLER)?;
-        let warnings = generate_with(&manifest, &dir, None)?;
+        let warnings = generate_with_report(&manifest, &dir, None, true)?;
         let generated = fs::read_to_string(dir.join("generated.rs"))?;
         let script = fs::read_to_string(dir.join("luau/widget.luau"))?;
+        let report = boundary_report(&dir)?;
         fs::remove_dir_all(&dir)?;
 
         assert!(generated.contains(".with_luau(LUAU_WIDGET)"));
@@ -2162,6 +2226,20 @@ mod tests {
         assert!(warnings.is_empty());
         assert!(!generated.contains("compile ="));
         assert!(!generated.contains("luau ="));
+        assert_eq!(report.get("mode"), Some(&serde_json::json!("auto")));
+        let entry = first_entry(&report);
+        assert_eq!(entry.get("id"), Some(&serde_json::json!("widget")));
+        assert_eq!(entry.get("compiled"), Some(&serde_json::json!(true)));
+        assert!(
+            entry
+                .get("compiled_functions")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|value| value > 0)
+        );
+        assert_eq!(
+            entry.get("generated_bytes"),
+            Some(&serde_json::json!(script.len()))
+        );
         Ok(())
     }
 
@@ -2172,8 +2250,9 @@ mod tests {
             DISCOVERED_MANIFEST,
             UNTRANSLATABLE_HANDLER,
         )?;
-        let warnings = generate_with(&manifest, &dir, None)?;
+        let warnings = generate_with_report(&manifest, &dir, None, true)?;
         let generated = fs::read_to_string(dir.join("generated.rs"))?;
+        let report = boundary_report(&dir)?;
         fs::remove_dir_all(&dir)?;
 
         assert!(generated.contains("Entry::configured"));
@@ -2185,6 +2264,10 @@ mod tests {
             warnings[0].contains("op `Nope` is not supported"),
             "{}",
             warnings[0]
+        );
+        assert_eq!(
+            first_entry(&report).get("compiled"),
+            Some(&serde_json::json!(false))
         );
         Ok(())
     }
@@ -2231,14 +2314,20 @@ mod tests {
         let manifest_text = format!("compile = \"off\"\n{DISCOVERED_MANIFEST}");
         let (manifest, dir) =
             compile_fixture("off", &manifest_text, COMPILED_HANDLER)?;
-        let warnings = generate_with(&manifest, &dir, None)?;
+        let warnings = generate_with_report(&manifest, &dir, None, true)?;
         let generated = fs::read_to_string(dir.join("generated.rs"))?;
         let script = dir.join("luau/widget.luau").exists();
+        let report = boundary_report(&dir)?;
         fs::remove_dir_all(&dir)?;
 
         assert!(!generated.contains(".with_luau("));
         assert!(!script);
         assert!(warnings.is_empty());
+        assert_eq!(report.get("mode"), Some(&serde_json::json!("off")));
+        assert_eq!(
+            first_entry(&report).get("compiled"),
+            Some(&serde_json::json!(false))
+        );
         Ok(())
     }
 
@@ -2384,10 +2473,11 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             DISCOVERED_MANIFEST,
             NATIVE_RESULT_SOURCE,
         )?;
-        let warnings = generate_with(&manifest, &dir, None)?;
+        let warnings = generate_with_report(&manifest, &dir, None, true)?;
         let script = fs::read_to_string(dir.join("luau/widget.luau"))?;
         let native = fs::read_to_string(dir.join("native.rs"))?;
         let generated = fs::read_to_string(dir.join("generated.rs"))?;
+        let report = boundary_report(&dir)?;
         fs::remove_dir_all(&dir)?;
 
         assert!(script.contains("__native.call("), "{script}");
@@ -2414,6 +2504,15 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
             ),
             "{}",
             warnings[0]
+        );
+        let entry = first_entry(&report);
+        assert_eq!(entry.get("native_functions"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            entry
+                .get("helper_calls_per_event")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|calls| calls.get("render")),
+            Some(&serde_json::json!(1))
         );
         Ok(())
     }

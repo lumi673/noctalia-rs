@@ -14,10 +14,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use noctalia_rs::{Context, Op, Result as HandlerResult, ui};
-use noctalia_rs_compiler::{EntryKind, Options as CompileOptions, compile};
+use noctalia_rs_compiler::{
+    BoundaryReport, EntryKind, Options as CompileOptions, compile,
+};
 
 use super::plugins::canonical;
 use super::{Options, Pair, Result, Summary, context, measure};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -201,6 +204,7 @@ impl Plan {
 struct Fixture {
     plan: Plan,
     source: String,
+    report: BoundaryReport,
     handwritten: &'static str,
     native: Native,
     payload: Value,
@@ -273,11 +277,35 @@ impl Run<'_> {
     }
 }
 
+/// Result of compiling the generated script in the Luau VM.
+#[derive(Debug, Serialize)]
+pub struct ParseResult {
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+fn parse_source(name: &str, source: &str) -> ParseResult {
+    match noctalia_rs_luau::parse_source(name, source) {
+        Ok(()) => ParseResult {
+            ok: true,
+            error: None,
+        },
+        Err(error) => ParseResult {
+            ok: false,
+            error: Some(error),
+        },
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct GeneratedSource {
     pub workload: &'static str,
     pub compiled_bytes: usize,
     pub handwritten_bytes: usize,
+    pub compiled_functions: usize,
+    pub native_functions: usize,
+    pub helper_calls_per_event: BTreeMap<String, usize>,
+    pub parse: ParseResult,
 }
 
 pub struct Generated {
@@ -330,6 +358,13 @@ pub fn run(options: &Options, scratch: &Path) -> Result<Generated> {
             workload: fixture.workload(),
             compiled_bytes: fixture.source.len(),
             handwritten_bytes: fixture.handwritten.len(),
+            compiled_functions: fixture.report.compiled_functions,
+            native_functions: fixture.report.native_functions,
+            helper_calls_per_event: fixture
+                .report
+                .helper_calls_per_event
+                .clone(),
+            parse: parse_source(compiled_entry, fixture.source(Side::Compiled)),
         });
         generated.results.push(handwritten);
         generated.results.push(compiled);
@@ -353,10 +388,11 @@ fn fixtures() -> Result<Vec<Fixture>> {
 fn hello_bar_fixture() -> Result<Fixture> {
     let plan =
         Plan::new("generated_hello_bar", EntryKind::Widget, "hello.state");
-    let source = compile_fixture(&plan, HELLO_BAR_SOURCE)?;
+    let compiled = compile_fixture(&plan, HELLO_BAR_SOURCE)?;
     Ok(Fixture {
         plan,
-        source,
+        source: compiled.source,
+        report: compiled.report,
         handwritten: HELLO_BAR_HANDWRITTEN,
         native: hello_bar,
         payload: json!({}),
@@ -366,10 +402,11 @@ fn hello_bar_fixture() -> Result<Fixture> {
 
 fn ui_panel_fixture() -> Result<Fixture> {
     let plan = Plan::new("generated_ui_panel", EntryKind::Panel, "panel.state");
-    let source = compile_fixture(&plan, UI_PANEL_SOURCE)?;
+    let compiled = compile_fixture(&plan, UI_PANEL_SOURCE)?;
     Ok(Fixture {
         plan,
-        source,
+        source: compiled.source,
+        report: compiled.report,
         handwritten: UI_PANEL_HANDWRITTEN,
         native: ui_panel,
         payload: json!({}),
@@ -380,10 +417,11 @@ fn ui_panel_fixture() -> Result<Fixture> {
 fn event_fixture() -> Result<Fixture> {
     let plan =
         Plan::new("generated_event", EntryKind::Service, "service.state");
-    let source = compile_fixture(&plan, EVENT_SOURCE)?;
+    let compiled = compile_fixture(&plan, EVENT_SOURCE)?;
     Ok(Fixture {
         plan,
-        source,
+        source: compiled.source,
+        report: compiled.report,
         handwritten: EVENT_HANDWRITTEN,
         native: service_event,
         payload: json!({ "id": "save" }),
@@ -391,7 +429,12 @@ fn event_fixture() -> Result<Fixture> {
     })
 }
 
-fn compile_fixture(plan: &Plan, handler: &str) -> Result<String> {
+struct CompiledFixture {
+    source: String,
+    report: BoundaryReport,
+}
+
+fn compile_fixture(plan: &Plan, handler: &str) -> Result<CompiledFixture> {
     let compiled = compile(
         handler,
         &CompileOptions {
@@ -408,7 +451,10 @@ fn compile_fixture(plan: &Plan, handler: &str) -> Result<String> {
         },
     )
     .map_err(|error| format!("{}: {error}", plan.workload))?;
-    Ok(compiled.source)
+    Ok(CompiledFixture {
+        source: compiled.source,
+        report: compiled.report,
+    })
 }
 
 /// Entry, cache and surface names are `&'static str`, so each fixture is named
@@ -543,4 +589,22 @@ fn service_event(ctx: &Context) -> HandlerResult<Vec<Op>> {
         Op::log(status.clone()),
         Op::BarText { text: status },
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_metrics_are_collected_and_the_script_parses() {
+        let plan =
+            Plan::new("boundary_probe", EntryKind::Widget, "probe.state");
+        let compiled =
+            compile_fixture(&plan, HELLO_BAR_SOURCE).expect("fixture compiles");
+        assert!(compiled.report.compiled_functions > 0);
+        assert_eq!(compiled.report.native_functions, 0);
+        assert_eq!(compiled.report.generated_bytes, compiled.source.len());
+        let parsed = parse_source(plan.entry(Side::Compiled), &compiled.source);
+        assert!(parsed.ok, "{:?}", parsed.error);
+    }
 }

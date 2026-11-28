@@ -100,6 +100,7 @@ function merge(input, output) {
       os: baseline.os,
       cpu: baseline.cpu,
       results: [...results.values()].sort((left, right) => left.name.localeCompare(right.name)),
+      boundary: baseline.boundary ?? [],
     }
     validateReport(merged, sha)
     fs.writeFileSync(path.join(output, `${sha}.json`), JSON.stringify(merged))

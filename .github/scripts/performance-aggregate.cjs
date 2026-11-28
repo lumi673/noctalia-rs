@@ -3,7 +3,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 
-const { METHOD } = require('./performance.cjs')
+const { METHOD, validateBoundary } = require('./performance.cjs')
 
 const RUN = /^([0-9a-f]{40})-(\d+)\.json$/u
 
@@ -83,12 +83,16 @@ function toGateReport(raw) {
       worstP99Ms: microsToMs(result.p99_us),
     }
   })
+  const boundary = raw.boundary === undefined
+    ? []
+    : validateBoundary(raw.boundary, 'benchmark report.boundary')
   return {
     method: METHOD,
     runtime: raw.metadata.rustc,
     os: raw.metadata.os,
     cpu: raw.metadata.cpu_model,
     results,
+    boundary,
   }
 }
 
@@ -100,6 +104,10 @@ function combine(reports) {
     if (names.length !== expected.length || names.some((name, index) => name !== expected[index]))
       fail('benchmark runs do not share the same workloads')
   }
+  const boundary = first.boundary ?? []
+  for (const report of reports)
+    if (JSON.stringify(report.boundary ?? []) !== JSON.stringify(boundary))
+      fail('benchmark runs disagree on boundary metrics')
   const results = first.results.map((result) => {
     const values = reports.map((report) => {
       const value = report.results.find((entry) => entry.name === result.name)
@@ -123,7 +131,7 @@ function combine(reports) {
       noisePercent: (worst / best - 1) * 100,
     }
   })
-  return { method: first.method, runtime: first.runtime, os: first.os, cpu: first.cpu, results }
+  return { method: first.method, runtime: first.runtime, os: first.os, cpu: first.cpu, results, boundary }
 }
 
 function main() {
