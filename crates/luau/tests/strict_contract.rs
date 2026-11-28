@@ -879,6 +879,34 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(written["value"].get("label").is_none());
 }
 
+fn strict_local_helpers_run_recursion_and_ops_in_expression_position() {
+    let handler = r#"
+fn fib(n: i64) -> i64 {
+    if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn build(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(ctx.event.as_str())])
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = fib(8);
+    let ops = build(ctx)?;
+    let _ = ops;
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let source = strict_source(handler, EntryKind::Widget);
+    assert!(source.contains("__noctalia_helper_main__fib"), "{source}");
+    assert!(source.contains("__noctalia_helper_main__build"), "{source}");
+    let produced = ops(&source, "render", json!({}));
+    let messages = produced
+        .iter()
+        .filter_map(|op| op.get("message").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(messages.starts_with(&["render", "21"]), "{produced:?}");
+}
+
 const CROSS_ACCEPT: &str = r#"
 fn subscribe(ctx: &Context, ops: &mut Vec<Op>) {
     let streaming = ctx.run_stream_start(json!(["tail", "-f"]), "lines");

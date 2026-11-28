@@ -460,7 +460,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
-fn strict_reuses_an_inlined_acceptance_result() {
+fn strict_calls_a_local_helper_for_acceptance_result() {
     let handler = r#"
 fn start(ctx: &Context) -> bool {
     ctx.run_stream_start(json!(["tail", "-f"]), "stream")
@@ -478,8 +478,15 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 "#;
     let output = compile_strict(handler, &[]).expect("compile");
-    assert!(output.contains("local streaming = __t"), "{output}");
-    assert!(!output.contains("local streaming = \n"), "{output}");
+    assert!(
+        output.contains("local streaming = __noctalia_helper_"),
+        "{output}"
+    );
+    assert!(
+        output.contains("__noctalia_helper_")
+            && output.contains(" = function(__arg0)"),
+        "{output}"
+    );
     assert!(output.contains("= noctalia.runStream("), "{output}");
 }
 
@@ -987,4 +994,157 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 "#;
     let output = strict_source(source).expect("local helper");
     assert!(output.contains("noctalia.log"), "{output}");
+
+#[test]
+fn strict_emits_recursive_helpers_as_local_functions() {
+    let handler = r#"
+fn count(n: i64) -> i64 {
+    if n <= 0 { 0 } else { count(n - 1) + 1 }
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = count(12);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let output =
+        compile_strict(handler, &[]).expect("recursive helper compiles");
+    assert!(
+        output.contains("__noctalia_helper_main__count")
+            && output.contains(" = function(__arg0)"),
+        "{output}"
+    );
+    assert!(!output.contains("recursive helper"), "{output}");
+}
+
+#[test]
+fn strict_emits_mutually_recursive_helpers_with_forward_declarations() {
+    let handler = r#"
+fn even(n: i64) -> bool {
+    if n == 0 { true } else { odd(n - 1) }
+}
+fn odd(n: i64) -> bool {
+    if n == 0 { false } else { even(n - 1) }
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = even(10);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let output =
+        compile_strict(handler, &[]).expect("mutual recursion compiles");
+    assert!(
+        output.contains("local __noctalia_helper_main__even"),
+        "{output}"
+    );
+    assert!(
+        output.contains("local __noctalia_helper_main__odd"),
+        "{output}"
+    );
+    assert!(
+        output.matches(" = function(__arg0)").count() >= 2,
+        "{output}"
+    );
+}
+
+#[test]
+fn strict_helpers_ignore_inline_depth_and_call_limits() {
+    let mut handler = String::new();
+    for index in 0..12 {
+        handler.push_str(&format!(
+            "fn h{index}(ctx: &Context) -> i64 {{ h{}(ctx) }}\n",
+            index + 1
+        ));
+    }
+    handler.push_str("fn h12(_ctx: &Context) -> i64 { 1 }\n");
+    handler.push_str(
+        "fn handler(ctx: &Context) -> Result<Vec<Op>> {\n    let value = h0(ctx);\n",
+    );
+    for _ in 0..320 {
+        handler.push_str("    let _ = h12(ctx);\n");
+    }
+    handler.push_str("    Ok(vec![Op::log(value.to_string())])\n}\n");
+    let output =
+        compile_strict(&handler, &[]).expect("deep helper chain compiles");
+    assert!(!output.contains("depth limit"), "{output}");
+    assert!(!output.contains("calls per body"), "{output}");
+}
+
+#[test]
+fn strict_vec_ops_helper_works_in_expression_position() {
+    let handler = r#"
+fn build(ctx: &Context) -> Vec<Op> {
+    let mut ops = Vec::new();
+    ops.push(Op::log(ctx.event.as_str()));
+    ops
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let ops = build(ctx);
+    Ok(ops)
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("Vec<Op> helper compiles");
+    assert!(
+        output.contains("local ops = __noctalia_helper_main__build_"),
+        "{output}"
+    );
+    assert!(output.contains("noctalia.log(event)"), "{output}");
+}
+
+#[test]
+fn strict_result_vec_ops_helper_works_in_expression_position() {
+    let handler = r#"
+fn build(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log(ctx.event.as_str())])
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let ops = build(ctx)?;
+    Ok(ops)
+}
+"#;
+    let output =
+        compile_strict(handler, &[]).expect("Result<Vec<Op>> helper compiles");
+    assert!(output.contains("local __t"), "{output}");
+    assert!(
+        output.contains("__noctalia_helper_main__build_"),
+        "{output}"
+    );
+    assert!(output.contains("noctalia.log(event)"), "{output}");
+}
+
+#[test]
+fn strict_result_value_helper_uses_a_two_value_return() {
+    let handler = r#"
+fn value(ctx: &Context) -> Result<i64> {
+    Ok(ctx.now_ms)
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let now = value(ctx)?;
+    Ok(vec![Op::log(now.to_string())])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("Result helper compiles");
+    assert!(output.contains(", nil"), "{output}");
+    assert!(output.contains("return noctalia.nowMs(), nil"), "{output}");
+}
+
+#[test]
+fn strict_helper_reference_is_a_lua_function() {
+    let handler = r#"
+fn label() -> String { "label".to_owned() }
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = label();
+    Ok(vec![Op::log(value)])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("helper compiles");
+    assert!(
+        output.contains("local value = __noctalia_helper_main__label_"),
+        "{output}"
+    );
 }

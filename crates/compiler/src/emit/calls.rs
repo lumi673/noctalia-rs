@@ -49,20 +49,15 @@ impl<'a> Emitter<'a> {
                 function,
                 class: Some(class.clone()),
             };
-            let returns = return_kind(&helper.function)?;
-            let check = self.check_inline(
-                &helper,
+            let value = self.inline_resolved(
+                helper,
                 Inline::Value,
-                returns,
-                &expr.span(),
-            )?;
-            let (text, _) = self.inline(
-                &helper,
+                expr.span(),
                 Vec::new(),
-                Inline::Value,
-                returns,
-                check,
             )?;
+            let (text, _) = value.ok_or_else(|| {
+                Error::at(expr.span(), "helper did not produce a value")
+            })?;
             return Ok(Some((text, Ty::VALUE)));
         }
         let ty: Type = syn::parse_str(&class).map_err(|error| {
@@ -98,6 +93,9 @@ impl<'a> Emitter<'a> {
             function: resolved.function.clone(),
             class: None,
         };
+        if let Some(name) = self.local_helper_name(&helper) {
+            return Ok(Some((name, Ty::VALUE)));
+        }
         let params = typed_args(&helper.function);
         if params.len() != values.len() {
             return Err(Error::at(
@@ -293,20 +291,15 @@ impl<'a> Emitter<'a> {
                         function: function.clone(),
                         class: Some(class.to_owned()),
                     };
-                    let returns = return_kind(&helper.function)?;
-                    let check = self.check_inline(
-                        &helper,
+                    let value = self.inline_resolved(
+                        helper,
                         Inline::Value,
-                        returns,
-                        &call.span(),
-                    )?;
-                    return self.inline(
-                        &helper,
+                        call.span(),
                         Vec::new(),
-                        Inline::Value,
-                        returns,
-                        check,
-                    );
+                    )?;
+                    return value.ok_or_else(|| {
+                        Error::at(call.span(), "helper did not produce a value")
+                    });
                 }
                 return Ok((default_value(self, &ty, call.span())?, Ty::VALUE));
             }

@@ -268,6 +268,12 @@ impl<'a> Emitter<'a> {
         span: proc_macro2::Span,
         bindings: Vec<Binding>,
     ) -> Result<Inlined, Error> {
+        if self.strict()
+            && let Some(value) =
+                self.local_call(&helper, mode, span, bindings.clone())?
+        {
+            return Ok(Some(value));
+        }
         let returns = return_kind(&helper.function)?;
         let key = native_key(&helper);
         if let Some(known) = self.known_native.get(&key).cloned() {
@@ -334,7 +340,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn ops_body(&mut self, block: &syn::Block) -> Result<(), Error> {
+    pub(super) fn ops_body(&mut self, block: &syn::Block) -> Result<(), Error> {
         let Some((last, rest)) = block.stmts.split_last() else {
             return Ok(());
         };
@@ -927,6 +933,7 @@ pub(crate) enum Inline {
     Ops,
 }
 
+#[derive(Clone)]
 pub(crate) struct Helper {
     pub(crate) module: String,
     pub(crate) function: ItemFn,

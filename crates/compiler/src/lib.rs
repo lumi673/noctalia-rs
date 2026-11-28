@@ -416,6 +416,7 @@ fn compile_once(
         true,
         true,
     );
+    discovery.emit_local_helpers(&function.block)?;
     discovery.constants();
     discovery.block(&function.block)?;
     let discovery_body = discovery.finish();
@@ -459,6 +460,7 @@ fn compile_once(
             has_action,
             has_host_callback,
         );
+        emitter.emit_local_helpers(&function.block)?;
         emitter.constants();
         emitter.block(&function.block)?;
         let body = emitter.finish();
