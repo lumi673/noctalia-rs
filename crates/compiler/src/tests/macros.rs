@@ -157,6 +157,19 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn auto_mode_still_rejects_absent_json_keys() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let _ = json!({ "a": None });
+    Ok(Vec::new())
+}
+"#;
+    let error =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect_err("auto path keeps null semantics");
+    assert!(error.message.contains("json null"), "{error}");
+}
+#[test]
 fn compiles_format_escapes_named_arguments_and_radix() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

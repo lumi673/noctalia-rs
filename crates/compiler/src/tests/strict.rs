@@ -600,3 +600,135 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(output.contains(".stop()"), "{output}");
     assert!(output.contains("__strict_run_handle("), "{output}");
 }
+
+#[test]
+fn strict_json_object_omits_absent_keys() {
+    let handler = r#"
+use serde_json::{Value, json};
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let maybe: Option<i64> = None;
+    let value = json!({ "present": Some(7), "missing": None, "maybe": maybe });
+    Ok(vec![Op::log(serde_json::to_string(&value)?)])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(!output.contains("[\"missing\"]"), "{output}");
+    assert!(output.contains("~= nil then"), "{output}");
+    assert!(output.contains("[\"maybe\"]"), "{output}");
+}
+
+#[test]
+fn strict_json_arrays_reject_absent_slots() {
+    let handler = r#"
+use serde_json::json;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let maybe: Option<i64> = Some(1);
+    let value = json!([maybe]);
+    Ok(vec![Op::log(serde_json::to_string(&value)?)])
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("absent slot");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(
+        error.contains("a missing value cannot be stored"),
+        "{error}"
+    );
+}
+
+#[test]
+fn strict_json_containers_reject_computed_null() {
+    for handler in [
+        r#"
+use serde_json::{Value, json};
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let empty = Value::Null;
+    let value = json!({ "a": empty });
+    Ok(vec![Op::log(serde_json::to_string(&value)?)])
+}
+"#,
+        r#"
+use serde_json::{Value, json};
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let empty = Value::Null;
+    let value = json!([empty]);
+    Ok(vec![Op::log(serde_json::to_string(&value)?)])
+}
+"#,
+    ] {
+        let error = compile_strict(handler, &[]).expect_err("computed null");
+        assert!(error.contains("widget.rs:"), "{error}");
+        assert!(error.contains("json null"), "{error}");
+    }
+}
+
+#[test]
+fn strict_json_model_lowers_object_and_array() {
+    let handler = r#"
+use noctalia_rs::json::{Array, Object};
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let mut object = Object::new();
+    object.insert("present", Some(7));
+    object.insert("missing", None::<i64>);
+    let mut array = Array::new();
+    array.push(1);
+    let text = serde_json::to_string(&object)?;
+    let list = serde_json::to_string(&array)?;
+    Ok(vec![Op::log(format!("{text} {list}"))])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("table.insert"), "{output}");
+    assert!(!output.contains("[\"missing\"]"), "{output}");
+    assert!(output.contains("setmetatable"), "{output}");
+}
+
+#[test]
+fn strict_json_model_rejects_absent_array_push() {
+    let handler = r#"
+use noctalia_rs::json::Array;
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let maybe: Option<i64> = Some(1);
+    let mut array = Array::new();
+    array.push(maybe);
+    Ok(vec![Op::log(serde_json::to_string(&array)?)])
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("absent push");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(
+        error.contains("a missing value cannot be stored"),
+        "{error}"
+    );
+}
+
+#[test]
+fn strict_json_arrays_reject_optional_if_expressions() {
+    let handler = r#"
+use serde_json::json;
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let maybe: Option<i64> = Some(1);
+    let value = json!([if ctx.now_ms > 0 { 2 } else { maybe }]);
+    Ok(vec![Op::log(serde_json::to_string(&value)?)])
+}
+"#;
+    let error =
+        compile_strict(handler, &[]).expect_err("optional branch in array");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(
+        error.contains("a missing value cannot be stored"),
+        "{error}"
+    );
+}
+
+#[test]
+fn strict_json_handles_qualified_option_variants() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = json!({ "present": Option::Some(1), "missing": Option::None });
+    Ok(vec![Op::log(serde_json::to_string(&value)?)])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(!output.contains("[\"missing\"]"), "{output}");
+    assert!(output.contains("~= nil then"), "{output}");
+}

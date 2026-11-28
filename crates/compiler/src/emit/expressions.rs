@@ -14,7 +14,13 @@ impl<'a> Emitter<'a> {
             if text.is_empty() {
                 continue;
             }
-            reject_null(&text, item_ty, item.span(), "a list literal")?;
+            reject_null(
+                &text,
+                item_ty,
+                item.span(),
+                "a list literal",
+                self.strict(),
+            )?;
             values.push(text);
         }
         Ok((format!("{{ {} }}", values.join(", ")), Ty::LIST))
@@ -277,6 +283,8 @@ impl<'a> Emitter<'a> {
                         then_types = None;
                     }
                     result.null = then_ty.null || else_ty.null;
+                    result.absent = then_ty.absent && else_ty.absent;
+                    result.optional = then_ty.optional || else_ty.optional;
                     if !value.is_empty() && else_ty.base != Base::Void {
                         self.line(&format!("{name} = {value}"));
                     } else {
@@ -301,7 +309,14 @@ impl<'a> Emitter<'a> {
             Expr::Array(array) => {
                 let mut values = Vec::new();
                 for item in &array.elems {
-                    let (text, _) = self.expr(item)?;
+                    let (text, item_ty) = self.expr(item)?;
+                    reject_null(
+                        &text,
+                        item_ty,
+                        item.span(),
+                        "an array literal",
+                        self.strict(),
+                    )?;
                     if !text.is_empty() {
                         values.push(text);
                     }
@@ -909,6 +924,23 @@ impl<'a> Emitter<'a> {
                 return Ok((text, Ty::VALUE));
             }
         }
+        let segments = &path.path.segments;
+        let bare_none = segments.len() == 1
+            && segments
+                .first()
+                .is_some_and(|segment| segment.ident == "None");
+        let qualified_none = self.strict()
+            && segments.len() == 2
+            && segments
+                .first()
+                .is_some_and(|segment| segment.ident == "Option")
+            && segments
+                .last()
+                .is_some_and(|segment| segment.ident == "None");
+        if bare_none || qualified_none {
+            let ty = if self.strict() { Ty::ABSENT } else { Ty::NULL };
+            return Ok(("nil".to_owned(), ty));
+        }
         let Some(name) = path.path.get_ident() else {
             return Err(Error::at(expr.span(), "unsupported path expression"));
         };
@@ -917,7 +949,8 @@ impl<'a> Emitter<'a> {
             return Ok((name, Ty::BOOL));
         }
         if name == "None" {
-            return Ok(("nil".to_owned(), Ty::NULL));
+            let ty = if self.strict() { Ty::ABSENT } else { Ty::NULL };
+            return Ok(("nil".to_owned(), ty));
         }
         if name == self.ctx {
             return Err(Error::at(
@@ -1706,6 +1739,8 @@ pub(super) fn wider(left: Ty, right: Ty) -> Ty {
         Ty::VALUE
     };
     ty.null = null;
+    ty.absent = left.absent && right.absent;
+    ty.optional = left.optional || right.optional;
     ty
 }
 

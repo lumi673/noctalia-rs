@@ -1,6 +1,80 @@
 use super::*;
 
 impl<'a> Emitter<'a> {
+    pub(super) fn json_object_method(
+        &mut self,
+        call: &ExprMethodCall,
+        method: &str,
+        args: &[&Expr],
+        receiver: &str,
+    ) -> Result<OptionalValue, Error> {
+        match method {
+            "insert" => {
+                let key_expr = arg(args, 0, call)?;
+                let (key, _) = self.expr(key_expr)?;
+                let key = if key.starts_with('"') && key.ends_with('"') {
+                    key
+                } else {
+                    let slot = self.temp();
+                    self.line(&format!("local {slot} = {key}"));
+                    slot
+                };
+                let value_expr = arg(args, 1, call)?;
+                let (value, ty) = self.expr(value_expr)?;
+                if ty.null {
+                    return Err(Error::at(
+                        value_expr.span(),
+                        "json null cannot be stored by Object::insert; use None to omit the key",
+                    ));
+                }
+                if value == "nil" && !ty.absent {
+                    return Err(Error::at(
+                        value_expr.span(),
+                        "a missing value cannot be stored by Object::insert",
+                    ));
+                }
+                if value != "nil" && (ty.optional || ty.absent) {
+                    let slot = self.temp();
+                    self.line(&format!("local {slot} = {value}"));
+                    self.line(&format!(
+                        "if {slot} ~= nil then {receiver}[{key}] = {slot} end"
+                    ));
+                } else if value != "nil" {
+                    self.line(&format!("{receiver}[{key}] = {value}"));
+                }
+                Ok(Some((receiver.to_owned(), Ty::VALUE)))
+            }
+            "get" => {
+                let (key, _) = self.expr(arg(args, 0, call)?)?;
+                Ok(Some((format!("{receiver}[{key}]"), Ty::OPT_VALUE)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn json_array_method(
+        &mut self,
+        call: &ExprMethodCall,
+        method: &str,
+        args: &[&Expr],
+        receiver: &str,
+    ) -> Result<OptionalValue, Error> {
+        match method {
+            "push" => {
+                let value = arg(args, 0, call)?;
+                let (text, ty) = self.expr(value)?;
+                reject_null(&text, ty, value.span(), "Array::push", true)?;
+                self.line(&format!("table.insert({receiver}, {text})"));
+                Ok(Some((receiver.to_owned(), Ty::LIST)))
+            }
+            "get" => {
+                let (index, _) = self.expr(arg(args, 0, call)?)?;
+                Ok(Some((format!("{receiver}[({index}) + 1]"), Ty::OPT_VALUE)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(super) fn range_contains(
         &mut self,
         call: &ExprMethodCall,
@@ -67,13 +141,25 @@ impl<'a> Emitter<'a> {
             "push_back" => {
                 let item = arg(args, 0, call)?;
                 let (text, value_ty) = self.expr(item)?;
-                reject_null(&text, value_ty, item.span(), "push_back")?;
+                reject_null(
+                    &text,
+                    value_ty,
+                    item.span(),
+                    "push_back",
+                    self.strict(),
+                )?;
                 Ok((format!("table.insert({receiver}, {text})"), Ty::VOID))
             }
             "push" if args.len() == 1 && ty.base != Base::Ops => {
                 let item = arg(args, 0, call)?;
                 let (text, value_ty) = self.expr(item)?;
-                reject_null(&text, value_ty, item.span(), "push")?;
+                reject_null(
+                    &text,
+                    value_ty,
+                    item.span(),
+                    "push",
+                    self.strict(),
+                )?;
                 Ok((format!("table.insert({receiver}, {text})"), Ty::VOID))
             }
             "flatten" if ty.optional || ty.base == Base::List => {
@@ -472,7 +558,13 @@ impl<'a> Emitter<'a> {
                 let key = self.expr(arg(args, 0, call)?)?.0;
                 let item = arg(args, 1, call)?;
                 let (value, value_ty) = self.expr(item)?;
-                reject_null(&value, value_ty, item.span(), "insert")?;
+                reject_null(
+                    &value,
+                    value_ty,
+                    item.span(),
+                    "insert",
+                    self.strict(),
+                )?;
                 if ty.base != Base::Table
                     && key.chars().all(|character| character.is_ascii_digit())
                 {
@@ -744,7 +836,13 @@ impl<'a> Emitter<'a> {
                     self.op_expr(value)?;
                 } else {
                     let (text, value_ty) = self.expr(value)?;
-                    reject_null(&text, value_ty, value.span(), "push")?;
+                    reject_null(
+                        &text,
+                        value_ty,
+                        value.span(),
+                        "push",
+                        self.strict(),
+                    )?;
                     self.line(&format!("table.insert({receiver}, {text})"));
                 }
                 Ok((String::new(), Ty::VOID))

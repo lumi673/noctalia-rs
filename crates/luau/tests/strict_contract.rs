@@ -609,11 +609,69 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     Ok(Vec::new())
 }
 "#,
+        r#"
+use noctalia_rs::json::{Array, Object};
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let absent: Option<i64> = None;
+        let object = json!({ "absent": absent, "present": Some(1) });
+        let mut model = Object::new();
+        model.insert("absent", None::<i64>);
+        let mut array = Array::new();
+        array.push(object);
+        return Ok(vec![Op::log(serde_json::to_string(&array)?)]);
+    }
+    Ok(Vec::new())
+}
+"#,
     ];
     for handler in fixtures {
         let source = strict_source(handler, EntryKind::Widget);
         let _ = ops(&source, "update", json!({}));
     }
+}
+
+#[test]
+fn strict_json_model_omits_absent_keys_at_runtime() {
+    let source = strict_source(
+        r#"
+use noctalia_rs::json::{Array, Object};
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let maybe: Option<i64> = None;
+        let from_macro = json!({ "present": Some(7), "missing": None, "maybe": maybe });
+        let mut object = Object::new();
+        object.insert("present", Some(8));
+        object.insert("missing", None::<i64>);
+        let mut array = Array::new();
+        array.push(9);
+        let text = format!(
+            "{}|{}|{}",
+            serde_json::to_string(&from_macro)?,
+            serde_json::to_string(&object)?,
+            serde_json::to_string(&array)?
+        );
+        return Ok(vec![Op::log(text)]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Widget,
+    );
+    assert_strict_contract(&source);
+    let values = ops(&source, "render", json!({}));
+    let messages = values
+        .iter()
+        .filter(|op| op["op"] == json!("log"))
+        .map(|op| op["message"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(!messages.is_empty(), "{source}");
+    assert!(
+        messages
+            .iter()
+            .all(|message| *message == r#"{"present":7}|{"present":8}|[9]"#),
+        "{messages:?}\n{source}"
+    );
 }
 
 const CROSS_ACCEPT: &str = r#"
