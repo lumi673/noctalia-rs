@@ -12,6 +12,7 @@ pub(crate) struct Resolved<'a> {
 #[derive(Clone)]
 pub(crate) struct StructDef {
     pub fields: Vec<(String, Type)>,
+    pub config: Option<Vec<crate::config::ConfigField>>,
     pub derives_default: bool,
     pub derives_serialize: bool,
     pub derives_deserialize: bool,
@@ -69,7 +70,7 @@ impl Program {
         };
         let file = syn::parse_file(source)
             .map_err(|error| Error::from(error).with_file(&module))?;
-        program.insert(&module, &file);
+        program.insert(&module, &file)?;
         for item in extra {
             let path = normalize(item.path);
             if program.units.contains_key(&path) {
@@ -77,7 +78,7 @@ impl Program {
             }
             let file = syn::parse_file(item.source)
                 .map_err(|error| Error::from(error).with_file(&path))?;
-            program.insert(&path, &file);
+            program.insert(&path, &file)?;
         }
         program.root = if program.units.contains_key("main") {
             "main".to_owned()
@@ -91,12 +92,13 @@ impl Program {
         &self.root
     }
 
-    fn insert(&mut self, module: &str, file: &syn::File) {
+    fn insert(&mut self, module: &str, file: &syn::File) -> Result<(), Error> {
         let mut units = Vec::new();
-        collect(&mut units, module, true, &file.items);
+        collect(&mut units, module, true, &file.items)?;
         for (path, unit) in units {
             self.units.insert(path, unit);
         }
+        Ok(())
     }
 
     /// Resolves the handler, following `use` aliases in its module.
@@ -476,7 +478,7 @@ fn collect(
     module: &str,
     is_root: bool,
     items: &[Item],
-) {
+) -> Result<(), Error> {
     let mut unit = Unit::new();
     let mut nested = Vec::new();
     for item in items {
@@ -502,7 +504,7 @@ fn collect(
                     } else {
                         format!("{module}::{name}")
                     };
-                    collect(&mut nested, &path, false, inner);
+                    collect(&mut nested, &path, false, inner)?;
                 }
             }
             Item::Static(item_static) => {
@@ -511,6 +513,9 @@ fn collect(
             }
             Item::Struct(item_struct) => {
                 if let syn::Fields::Named(fields) = &item_struct.fields {
+                    let config = crate::config::parse_struct(item_struct)
+                        .map(|def| def.map(|def| def.fields))
+                        .map_err(Error::from)?;
                     let derives = derives(&item_struct.attrs);
                     let derives_default = derives.contains("Default");
                     let derives_serialize = derives.contains("Serialize");
@@ -528,6 +533,7 @@ fn collect(
                         item_struct.ident.to_string(),
                         StructDef {
                             fields,
+                            config,
                             derives_default,
                             derives_serialize,
                             derives_deserialize,
@@ -588,6 +594,7 @@ fn collect(
     }
     units.push((module.to_owned(), unit));
     units.append(&mut nested);
+    Ok(())
 }
 
 fn derives(attrs: &[syn::Attribute]) -> BTreeSet<String> {
@@ -693,6 +700,15 @@ impl Program {
             }
         }
         found
+    }
+
+    /// Config fields for a struct that derives `Config`.
+    pub(crate) fn config_fields(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Option<&[crate::config::ConfigField]> {
+        self.struct_def(module, name)?.config.as_deref()
     }
 
     /// Resolves an associated constant such as `State::EMPTY`.

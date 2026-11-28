@@ -1245,6 +1245,13 @@ impl<'a> Emitter<'a> {
         }
         let (key, key_ty) = self.expr(&index.index)?;
         if is_config_expr(&index.expr) {
+            if self.strict() {
+                strict_config_key(&index.index)?;
+            }
+            if self.strict() {
+                self.uses_config_table = true;
+                return Ok((format!("CONFIG[{key}]"), Ty::OPT_VALUE));
+            }
             return Ok((
                 self.coerced_string(format!("noctalia.getConfig({key})"), true),
                 Ty::OPT_VALUE,
@@ -1654,6 +1661,15 @@ pub(super) fn default_value(
                 format!("type `{name}` has no default in a compilable handler"),
             )
         })?;
+    if let Some(config) = &def.config {
+        let fields = config
+            .iter()
+            .map(|field| {
+                format!("{} = {}", lua_key(&field.name), field.default.lua())
+            })
+            .collect::<Vec<_>>();
+        return Ok(format!("{{ {} }}", fields.join(", ")));
+    }
     if !def.derives_default {
         return Err(Error::at(
             span,

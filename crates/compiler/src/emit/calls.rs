@@ -133,8 +133,11 @@ impl<'a> Emitter<'a> {
         &mut self,
         call: &ExprCall,
     ) -> Result<(String, Ty), Error> {
+        let args = call.args.iter().collect::<Vec<_>>();
+        if let Some(value) = self.config_from_ctx(call, &args)? {
+            return Ok(value);
+        }
         if let Some(name) = path_last_name(&call.func) {
-            let args = call.args.iter().collect::<Vec<_>>();
             if !name.contains("::")
                 && self.lookup(&name).is_some()
                 && !self.is_ctx_expr(&call.func)

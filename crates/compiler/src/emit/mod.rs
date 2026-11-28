@@ -27,6 +27,7 @@ use crate::{
 };
 
 mod calls;
+mod config;
 mod constants;
 mod expressions;
 mod handles;
@@ -41,8 +42,8 @@ mod types;
 
 #[allow(unused_imports)]
 use {
-    calls::*, expressions::*, inline::*, macros::*, methods::*, native::*,
-    ops::*, statements::*, types::*,
+    calls::*, config::*, expressions::*, inline::*, macros::*, methods::*,
+    native::*, ops::*, statements::*, types::*,
 };
 
 pub(crate) use handles::runtime as handles_runtime;

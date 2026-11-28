@@ -1471,6 +1471,13 @@ impl<'a> Emitter<'a> {
         }
         if is_config_expr(&call.receiver) && method == "get" {
             let (key, _) = self.expr(arg(&args, 0, call)?)?;
+            if self.strict() {
+                strict_config_key(arg(&args, 0, call)?)?;
+            }
+            if self.strict() {
+                self.uses_config_table = true;
+                return Ok((format!("CONFIG[{key}]"), Ty::OPT_VALUE));
+            }
             return Ok((
                 self.coerced_string(format!("noctalia.getConfig({key})"), true),
                 Ty::OPT_VALUE,
@@ -1573,6 +1580,17 @@ impl<'a> Emitter<'a> {
             "config_str" => {
                 let key = self.string_arg(args, 0, call)?;
                 let raw = key.trim_matches('"');
+                if self.strict() {
+                    self.uses_config_table = true;
+                    let source = format!("CONFIG[{key}]");
+                    if self.strings.iter().any(|item| item == raw) {
+                        return Ok((source, Ty::OPT_STR));
+                    }
+                    return Ok((
+                        self.coerced_string(source, true),
+                        Ty::OPT_STR,
+                    ));
+                }
                 if self.strings.iter().any(|item| item == raw) {
                     return Ok((
                         format!("noctalia.getConfig({key})"),
@@ -1589,11 +1607,19 @@ impl<'a> Emitter<'a> {
             }
             "config_bool" => {
                 self.uses_bool_or = true;
+                if self.strict() {
+                    self.uses_config_table = true;
+                }
                 let key = self.string_arg(args, 0, call)?;
                 let (default, _) = self.expr(arg(args, 1, call)?)?;
                 Ok((
                     format!(
-                        "bool_or(noctalia.getConfig({key}), {default})"
+                        "bool_or({}, {default})",
+                        if self.strict() {
+                            format!("CONFIG[{key}]")
+                        } else {
+                            format!("noctalia.getConfig({key})")
+                        }
                     ),
                     Ty::BOOL,
                 ))

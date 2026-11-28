@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use noctalia_rs_compiler as compiler;
 use toml::Value;
 
+pub mod config;
 pub mod strict;
 
 type BoxError = Box<dyn Error>;
@@ -145,6 +146,8 @@ fn generate_with(
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mode = compile_mode(root, env_override)?;
+    config::validate(root, source)
+        .map_err(|error| format!("config: {error}"))?;
     let mut warnings = Vec::new();
 
     let mut generated = Generated::default();
@@ -1070,7 +1073,7 @@ fn state_key(root: &toml::Table) -> Result<String, BoxError> {
     Ok(format!("{last}.state"))
 }
 
-struct ModuleFile {
+pub(crate) struct ModuleFile {
     module: String,
     file: PathBuf,
     source: String,
@@ -1263,7 +1266,7 @@ fn source_relative(file: &Path, root: &Path) -> PathBuf {
     file.strip_prefix(root).unwrap_or(file).to_path_buf()
 }
 
-fn walk_all(root: &Path) -> Result<Vec<ModuleFile>, BoxError> {
+pub(crate) fn walk_all(root: &Path) -> Result<Vec<ModuleFile>, BoxError> {
     let mut files = Vec::new();
     walk_sources(root, &root.join("src"), &mut files)?;
     Ok(files)
@@ -2223,6 +2226,36 @@ mod tests {
             message.contains("noctalia.toml:1:1: no handler to compile"),
             "{message}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn generate_with_strict_uses_the_config_table_for_derived_fields()
+    -> Result<(), BoxError> {
+        let manifest = "id = \"me/test\"\nname = \"Test\"\n\n[[setting]]\nkey = \"message\"\ntype = \"string\"\nlabel_key = \"settings.message.label\"\ndefault = \"Hello\"\n\n[[widget]]\nid = \"widget\"\nentry = \"widget.luau\"\nhandler = \"handler\"\n";
+        let source = r#"
+use noctalia_rs::{Config, Context, Op, Result};
+
+#[derive(Config)]
+struct Settings {
+    #[config(key = "message", default = "Hello")]
+    message: String,
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let settings = Settings::from_ctx(ctx);
+    Ok(vec![Op::log(settings.message)])
+}
+"#;
+        let (manifest, dir) =
+            compile_fixture("strict-derived-config", manifest, source)?;
+        let _warnings = generate_with(&manifest, &dir, Some("strict"))?;
+        let script = fs::read_to_string(dir.join("luau/widget.luau"))?;
+        fs::remove_dir_all(&dir)?;
+
+        assert!(script.contains("local CONFIG = {"), "{script}");
+        assert!(script.contains("CONFIG[\"message\"]"), "{script}");
+        assert!(script.contains("message = \"Hello\""), "{script}");
         Ok(())
     }
 

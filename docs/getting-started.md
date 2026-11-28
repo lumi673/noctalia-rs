@@ -49,6 +49,12 @@ type = "string"
 label_key = "settings.message.label"
 default = "Hello"
 
+[[setting]]
+key = "refresh_ms"
+type = "int"
+label_key = "settings.refresh_ms.label"
+default = 1000
+
 [[service]]
 id = "service"
 entry = "service.luau"
@@ -90,6 +96,35 @@ fn main() -> ExitCode {
     noctalia_rs::run(&plugin())
 }
 ```
+
+## Typed config
+
+Declare a struct with `#[derive(Config)]` to read settings by field instead of by
+key. Each field needs a literal default that matches the `[[setting]]` default in
+`noctalia.toml`. The build checks the key, setting type, and default before it
+compiles the plugin.
+Declare those settings at plugin level so every strict entry receives them.
+
+```rust
+use noctalia_rs::{Config, Context, Op, Result};
+
+#[derive(Config)]
+struct Settings {
+    #[config(key = "message", default = "Hello")]
+    message: String,
+    #[config(key = "refresh_ms", default = 1000)]
+    refresh_ms: u32,
+}
+
+fn service(ctx: &Context) -> Result<Vec<Op>> {
+    let settings = Settings::from_ctx(ctx);
+    Ok(vec![Op::set_interval(1000), Op::log(format!("{} {}", settings.message, settings.refresh_ms))])
+}
+```
+
+Supported field types are `String`, `bool`, `i32`, `u32`, and `f64`. Strict
+builds read the generated `CONFIG` table directly. Auto and off builds keep the
+host config path.
 
 ## Build and install
 

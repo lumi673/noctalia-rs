@@ -1,3 +1,4 @@
+pub mod config;
 mod emit;
 mod error;
 mod program;

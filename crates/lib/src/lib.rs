@@ -34,7 +34,7 @@ pub use rng::LuauRng;
 pub use timer::{IntervalHandle, TimerHandle};
 pub use ui::{NodeProps, Props};
 
-pub use noctalia_rs_macros::{entry, luau, native};
+pub use noctalia_rs_macros::{Config, entry, luau, native};
 pub use ops::Op;
 pub use serde_json::Value;
 

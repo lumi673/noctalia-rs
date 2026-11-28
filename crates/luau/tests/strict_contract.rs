@@ -558,6 +558,87 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(messages.contains(&"written"), "{messages:?}");
     assert!(messages.contains(&"true"), "{messages:?}");
 }
+#[test]
+fn strict_typed_config_reads_the_injected_table() {
+    let handler = r#"
+#[derive(noctalia_rs::Config)]
+struct Settings {
+    #[config(key = "message", default = "fallback")]
+    message: String,
+    #[config(key = "enabled", default = false)]
+    enabled: bool,
+    #[config(key = "count", default = 2)]
+    count: u32,
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let settings = Settings::from_ctx(ctx);
+    Ok(vec![Op::log(format!("{}:{}:{}", settings.message, settings.enabled, settings.count))])
+}
+"#;
+    let compile_typed = |config: &'static str| {
+        let source =
+            format!("use noctalia_rs::{{Context, Op, Result}};\n{handler}\n");
+        let assets = Vec::new();
+        let keys = ["message", "enabled", "count"];
+        compile(
+            &source,
+            &Options {
+                handler: "handler",
+                entry: "strict",
+                state_key: "strict.state",
+                kind: EntryKind::Widget,
+                strings: &keys,
+                settings: &keys,
+                module: "main",
+                modules: &[],
+                native: NativeMode::Deny,
+                strict: Some(StrictOptions {
+                    config,
+                    translations: TRANSLATIONS,
+                    assets: &assets,
+                }),
+            },
+        )
+        .expect("compile typed config")
+        .source
+    };
+
+    let populated = compile_typed(
+        "local CONFIG = { [\"message\"] = \"from host\", [\"enabled\"] = false, [\"count\"] = 9 }\n",
+    );
+    assert_strict_contract(&populated);
+    assert!(!populated.contains("noctalia.getConfig"), "{populated}");
+    let messages = ops(&populated, "render", json!({}));
+    let log = messages
+        .iter()
+        .find(|op| op["op"] == "log")
+        .expect("log op");
+    let message = log["message"].as_str().expect("message");
+    assert!(message.contains("from host"), "{message}");
+    assert!(message.contains("false:9"), "{message}");
+
+    let defaults = compile_typed("local CONFIG = { [\"enabled\"] = false }\n");
+    let messages = ops(&defaults, "render", json!({}));
+    let log = messages
+        .iter()
+        .find(|op| op["op"] == "log")
+        .expect("log op");
+    let message = log["message"].as_str().expect("message");
+    assert!(message.contains("fallback"), "{message}");
+    assert!(message.contains("false:2"), "{message}");
+
+    let wrong_type = compile_typed(
+        "local CONFIG = { [\"enabled\"] = \"true\", [\"count\"] = 9 }\n",
+    );
+    let messages = ops(&wrong_type, "render", json!({}));
+    let log = messages
+        .iter()
+        .find(|op| op["op"] == "log")
+        .expect("log op");
+    let message = log["message"].as_str().expect("message");
+    assert!(message.contains("false:9"), "{message}");
+}
 
 #[test]
 fn strict_emit_matrix_parses() {
