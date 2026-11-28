@@ -2,6 +2,7 @@ mod compat;
 pub mod config;
 mod emit;
 mod error;
+pub mod frontend;
 mod program;
 pub mod strict;
 
