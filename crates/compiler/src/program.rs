@@ -1,7 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::{Error, Module};
-use syn::{Expr, Item, ItemFn, ItemStatic, Pat, Type, UseTree};
+use proc_macro2::Span;
+use syn::spanned::Spanned;
+use syn::{
+    Attribute, Expr, ExprLit, Ident, Item, ItemFn, ItemStatic, Lit, Meta, Pat,
+    Token, Type, UseTree, punctuated::Punctuated,
+};
 
 /// A module path and the function found at that path.
 pub(crate) struct Resolved<'a> {
@@ -18,6 +23,26 @@ pub(crate) struct StructDef {
     pub derives_deserialize: bool,
 }
 
+/// One field of a `#[derive(State)]` struct, as seen in the source text.
+#[derive(Clone)]
+pub(crate) struct StateFieldDef {
+    pub name: String,
+    pub ty: Type,
+    pub default: Option<Expr>,
+    pub skip: bool,
+    pub span: Span,
+}
+
+/// The schema the compiler synthesizes helpers from. Proc macros are not
+/// expanded in the source the compiler reads, so helper attributes are parsed
+/// directly.
+#[derive(Clone)]
+pub(crate) struct StateDef {
+    pub key: String,
+    pub fields: Vec<StateFieldDef>,
+    pub error: Option<(Span, String)>,
+}
+
 struct Unit {
     functions: HashMap<String, ItemFn>,
     statics: HashMap<String, ItemStatic>,
@@ -25,6 +50,7 @@ struct Unit {
     newtypes: BTreeSet<String>,
     tuple_structs: HashMap<String, usize>,
     structs: HashMap<String, StructDef>,
+    states: HashMap<String, StateDef>,
     impls: HashMap<String, HashMap<String, ItemFn>>,
     constants: HashMap<String, Expr>,
     associated: HashMap<String, HashMap<String, Expr>>,
@@ -41,6 +67,7 @@ impl Unit {
             newtypes: BTreeSet::new(),
             tuple_structs: HashMap::new(),
             structs: HashMap::new(),
+            states: HashMap::new(),
             impls: HashMap::new(),
             constants: HashMap::new(),
             associated: HashMap::new(),
@@ -539,6 +566,14 @@ fn collect(
                             derives_deserialize,
                         },
                     );
+                    if derives.contains("State") {
+                        let def = state_def(
+                            &item_struct.attrs,
+                            &item_struct.ident,
+                            &item_struct.fields,
+                        );
+                        unit.states.insert(item_struct.ident.to_string(), def);
+                    }
                 } else if let syn::Fields::Unnamed(fields) = &item_struct.fields
                     && fields.unnamed.len() == 1
                 {
@@ -615,6 +650,127 @@ fn derives(attrs: &[syn::Attribute]) -> BTreeSet<String> {
         }
     }
     names
+}
+
+fn state_def(
+    attrs: &[Attribute],
+    name: &Ident,
+    fields: &syn::Fields,
+) -> StateDef {
+    parse_state_def(attrs, name, fields).unwrap_or_else(|error| StateDef {
+        key: String::new(),
+        fields: Vec::new(),
+        error: Some((error.span(), error.to_string())),
+    })
+}
+
+fn parse_state_def(
+    attrs: &[Attribute],
+    name: &Ident,
+    fields: &syn::Fields,
+) -> Result<StateDef, syn::Error> {
+    let mut key = snake_case(&name.to_string());
+    for attr in state_attrs(attrs) {
+        for meta in state_metas(attr)? {
+            if let Meta::NameValue(value) = &meta
+                && value.path.is_ident("key")
+            {
+                match &value.value {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(text),
+                        ..
+                    }) => key = text.value(),
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "state key must be a string literal",
+                        ));
+                    }
+                }
+            } else {
+                return Err(syn::Error::new_spanned(
+                    meta,
+                    "unknown state struct option",
+                ));
+            }
+        }
+    }
+    let syn::Fields::Named(named) = fields else {
+        return Err(syn::Error::new(
+            fields.span(),
+            "State requires named fields",
+        ));
+    };
+    let mut parsed = Vec::new();
+    for field in &named.named {
+        let ident = field.ident.clone().ok_or_else(|| {
+            syn::Error::new(field.span(), "State requires a named field")
+        })?;
+        let mut default = None;
+        let mut skip = false;
+        for attr in state_attrs(&field.attrs) {
+            for meta in state_metas(attr)? {
+                match meta {
+                    Meta::Path(path) if path.is_ident("skip") => skip = true,
+                    Meta::NameValue(value)
+                        if value.path.is_ident("default") =>
+                    {
+                        default = Some(value.value);
+                    }
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            other,
+                            "unknown state field option",
+                        ));
+                    }
+                }
+            }
+        }
+        parsed.push(StateFieldDef {
+            name: ident.to_string(),
+            ty: field.ty.clone(),
+            default,
+            skip,
+            span: field.span(),
+        });
+    }
+    Ok(StateDef {
+        key,
+        fields: parsed,
+        error: None,
+    })
+}
+
+fn state_attrs(attrs: &[Attribute]) -> impl Iterator<Item = &Attribute> {
+    attrs.iter().filter(|attr| attr.path().is_ident("state"))
+}
+
+fn state_metas(attr: &Attribute) -> Result<Vec<Meta>, syn::Error> {
+    Ok(attr
+        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?
+        .into_iter()
+        .collect())
+}
+
+fn snake_case(name: &str) -> String {
+    let mut out = String::new();
+    let chars = name.chars().collect::<Vec<_>>();
+    for (index, character) in chars.iter().enumerate() {
+        if character.is_ascii_uppercase() {
+            let previous_lower =
+                index > 0 && chars[index - 1].is_ascii_lowercase();
+            let next_lower = chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_lowercase());
+            if index > 0 && (previous_lower || next_lower) {
+                out.push('_');
+            }
+            out.push(character.to_ascii_lowercase());
+        } else {
+            out.push(*character);
+        }
+    }
+    out
 }
 
 fn collect_use(unit: &mut Unit, tree: &UseTree, prefix: &mut Vec<String>) {
@@ -709,6 +865,27 @@ impl Program {
         name: &str,
     ) -> Option<&[crate::config::ConfigField]> {
         self.struct_def(module, name)?.config.as_deref()
+    }
+
+    /// Finds the schema of a `#[derive(State)]` struct by type name.
+    pub(crate) fn state_def(
+        &self,
+        module: &str,
+        name: &str,
+    ) -> Option<&StateDef> {
+        if let Some(def) = self.units.get(module)?.states.get(name) {
+            return Some(def);
+        }
+        let mut found = None;
+        for unit in self.units.values() {
+            if let Some(def) = unit.states.get(name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(def);
+            }
+        }
+        found
     }
 
     /// Resolves an associated constant such as `State::EMPTY`.

@@ -1486,6 +1486,9 @@ impl<'a> Emitter<'a> {
         if let Some((lua, kind)) = self.static_receiver(&call.receiver)? {
             return self.static_method(&lua, kind, call, &args);
         }
+        if let Some(value) = self.derived_state_method(call)? {
+            return Ok(value);
+        }
         if let Some(class) = self.class_of_receiver(&call.receiver) {
             let receiver = self.expr(&call.receiver)?.0;
             if self.strict()
@@ -2630,6 +2633,9 @@ impl<'a> Emitter<'a> {
         };
         if segments.len() < 2 {
             return Ok(None);
+        }
+        if let Some(value) = self.derived_state_call(call, args)? {
+            return Ok(Some(value));
         }
         let method = segments.last().map_or("", String::as_str);
         let class = segments[segments.len() - 2].as_str();

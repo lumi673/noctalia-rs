@@ -9,6 +9,7 @@ mod macros;
 mod methods;
 mod native;
 mod ops;
+mod state;
 mod statements;
 mod strict;
 mod timers;
