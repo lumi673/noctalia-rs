@@ -163,7 +163,16 @@ impl<'a> Emitter<'a> {
                 return Ok((text, Ty::VALUE));
             }
             match name.as_str() {
-                "Some" => return self.expr(arg(&args, 0, call)?),
+                name @ ("Some" | "Option::Some")
+                    if name == "Some" || self.strict() =>
+                {
+                    let (text, mut ty) = self.expr(arg(&args, 0, call)?)?;
+                    if self.strict() {
+                        ty.optional = true;
+                        ty.absent = false;
+                    }
+                    return Ok((text, ty));
+                }
                 "drop" => {
                     let _ = self.expr(arg(&args, 0, call)?)?;
                     return Ok((String::new(), Ty::VOID));

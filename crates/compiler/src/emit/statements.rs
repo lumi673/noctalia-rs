@@ -328,6 +328,12 @@ impl<'a> Emitter<'a> {
         self.value_needed = saved_value;
         let lua = self.bind_name(&name);
         let (text, mut ty) = result?;
+        if self.strict()
+            && hint.is_some_and(|hint| type_hint(hint).optional)
+            && !ty.absent
+        {
+            ty.optional = true;
+        }
         if let Expr::Tuple(items) = strip_reference(&init.expr) {
             let element_types = self.tuple_shapes(
                 &items.elems.iter().cloned().collect::<Vec<_>>(),
@@ -441,7 +447,7 @@ impl<'a> Emitter<'a> {
         if let Some(nulls) = self.pending_null_fields.take() {
             self.null_fields.insert(name.clone(), nulls);
         }
-        if text == "nil" {
+        if text == "nil" && !ty.absent {
             ty.null = true;
         }
         self.push(&name, ty);
@@ -1424,8 +1430,10 @@ impl<'a> Emitter<'a> {
                         // Option's own nullness describes None, not the inner
                         // value. A nested `Null` pattern reintroduces null.
                         let mut present = outer;
-                        if present.optional {
+                        if present.optional || present.absent {
                             present.null = false;
+                            present.absent = false;
+                            present.optional = false;
                         }
                         present
                     }
@@ -2107,7 +2115,13 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         if matches!(strip_reference(left), Expr::Index(_)) {
-            reject_null(&text, ty, right.span(), "an index assignment")?;
+            reject_null(
+                &text,
+                ty,
+                right.span(),
+                "an index assignment",
+                self.strict(),
+            )?;
         }
         let call_shape = if matches!(strip_reference(right), Expr::Call(_)) {
             self.last_tuple_shape

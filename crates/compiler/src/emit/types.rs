@@ -29,6 +29,9 @@ pub(crate) struct Ty {
     pub(crate) result: bool,
     /// The expression is a JSON null, which a Luau container cannot hold.
     pub(crate) null: bool,
+    /// The expression is `None`, so an object key is omitted and an array slot
+    /// cannot hold it.
+    pub(crate) absent: bool,
     /// Element type of a list that is known, used by `next()`.
     pub(crate) element: Option<Base>,
 }
@@ -40,6 +43,7 @@ impl Ty {
             optional: false,
             result: false,
             null: false,
+            absent: false,
             element: None,
         }
     }
@@ -50,6 +54,7 @@ impl Ty {
             optional: true,
             result: false,
             null: false,
+            absent: false,
             element: None,
         }
     }
@@ -60,6 +65,7 @@ impl Ty {
             optional: false,
             result: true,
             null: false,
+            absent: false,
             element: None,
         }
     }
@@ -77,6 +83,14 @@ impl Ty {
     pub(crate) const OPT_BOOL: Self = Self::opt(Base::Bool);
     pub(crate) const VALUE: Self = Self::new(Base::Value);
     pub(crate) const OPT_VALUE: Self = Self::opt(Base::Value);
+    pub(crate) const ABSENT: Self = Self {
+        base: Base::Value,
+        optional: true,
+        result: false,
+        null: false,
+        absent: true,
+        element: None,
+    };
     pub(crate) const LIST: Self = Self::new(Base::List);
     pub(crate) const OPT_LIST: Self = Self::opt(Base::List);
     pub(crate) const NODE: Self = Self::new(Base::Node);
@@ -90,6 +104,7 @@ impl Ty {
         optional: false,
         result: false,
         null: true,
+        absent: false,
         element: None,
     };
     pub(crate) const LIST_OF_KEYS: Self = Self {
@@ -97,6 +112,7 @@ impl Ty {
         optional: false,
         result: false,
         null: false,
+        absent: false,
         element: Some(Base::Str),
     };
     pub(crate) const STRING_LIST: Self = Self {
@@ -104,6 +120,7 @@ impl Ty {
         optional: false,
         result: false,
         null: false,
+        absent: false,
         element: Some(Base::Str),
     };
 

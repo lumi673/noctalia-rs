@@ -1481,6 +1481,20 @@ impl<'a> Emitter<'a> {
         }
         if let Some(class) = self.class_of_receiver(&call.receiver) {
             let receiver = self.expr(&call.receiver)?.0;
+            if self.strict()
+                && class == "Object"
+                && let Some(value) =
+                    self.json_object_method(call, &method, &args, &receiver)?
+            {
+                return Ok(value);
+            }
+            if self.strict()
+                && class == "Array"
+                && let Some(value) =
+                    self.json_array_method(call, &method, &args, &receiver)?
+            {
+                return Ok(value);
+            }
             if let Some(value) = self.method_call(call, &receiver, &class)? {
                 return Ok(value);
             }
@@ -2521,6 +2535,22 @@ impl<'a> Emitter<'a> {
             parts.last().copied().unwrap_or("")
         };
         match variant {
+            "Object"
+                if self.strict()
+                    && name.ends_with("::new")
+                    && args.is_empty() =>
+            {
+                self.pending_class = Some("Object".to_owned());
+                Ok(Some(("{}".to_owned(), Ty::VALUE)))
+            }
+            "Array"
+                if self.strict()
+                    && name.ends_with("::new")
+                    && args.is_empty() =>
+            {
+                self.pending_class = Some("Array".to_owned());
+                Ok(Some((empty_array(), Ty::LIST)))
+            }
             "HashMap" | "BTreeMap" | "Map" => {
                 Ok(Some(("{}".to_owned(), Ty::TABLE)))
             }
@@ -2702,23 +2732,26 @@ fn integer_check(receiver: &str, ty: Ty, range: (&str, &str)) -> String {
     }
 }
 
-/// A JSON null has no representation inside a Luau container: writing nil
-/// removes the slot, so a computed `Value::Null` would silently disappear.
 pub(super) fn reject_null(
     text: &str,
     ty: Ty,
     span: proc_macro2::Span,
     construct: &str,
+    strict: bool,
 ) -> Result<(), Error> {
-    if text != "nil" && !ty.null {
+    if text != "nil" && !ty.null && !(strict && (ty.absent || ty.optional)) {
         return Ok(());
     }
-    Err(Error::at(
-        span,
+    let reason = if ty.null || text == "nil" {
         format!(
             "json null cannot be stored by {construct}: a Luau table has no null, so the key or slot would disappear; omit the key or guard the value with is_null()"
-        ),
-    ))
+        )
+    } else {
+        format!(
+            "a missing value cannot be stored by {construct}: a Luau table has no null, so the slot would disappear; unwrap the value or use an object key"
+        )
+    };
+    Err(Error::at(span, reason))
 }
 
 /// `Value::as_object` as a Luau expression. A list is never an object and a

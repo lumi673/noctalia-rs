@@ -186,23 +186,85 @@ impl<'a> Emitter<'a> {
     fn json_node(&mut self, node: &JsonNode) -> Result<(String, Ty), Error> {
         match node {
             JsonNode::Object(entries) => {
-                let mut parts = Vec::new();
+                let mut slots: Vec<(String, String, bool)> = Vec::new();
                 for (key, value) in entries {
-                    let (text, _) = self.json_node(value)?;
+                    let (text, ty) = self.json_node(value)?;
+                    if ty.null {
+                        return Err(Error::at(
+                            value.span(),
+                            "json null inside an object is not supported; omit the key instead",
+                        ));
+                    }
+                    if self.strict() && text == "nil" && ty.absent {
+                        continue;
+                    }
                     if text == "nil" {
                         return Err(Error::at(
                             value.span(),
                             "json null inside an object is not supported; omit the key instead",
                         ));
                     }
-                    parts.push(format!("{} = {text}", lua_key(key)));
+                    slots.push((
+                        key.clone(),
+                        text,
+                        self.strict() && (ty.optional || ty.absent),
+                    ));
                 }
-                Ok((format!("{{ {} }}", parts.join(", ")), Ty::VALUE))
+                if !slots.iter().any(|(_, _, optional)| *optional) {
+                    let parts = slots
+                        .iter()
+                        .map(|(key, text, _)| {
+                            format!("{} = {text}", lua_key(key))
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok((
+                        format!("{{ {} }}", parts.join(", ")),
+                        Ty::VALUE,
+                    ));
+                }
+                let saved_out = std::mem::take(&mut self.out);
+                let saved_indent = self.indent;
+                self.indent = 0;
+                let object = self.temp();
+                self.line(&format!("local {object} = {{}}"));
+                for (key, text, optional) in slots {
+                    if optional {
+                        let value = self.temp();
+                        self.line(&format!("local {value} = {text}"));
+                        self.line(&format!(
+                            "if {value} ~= nil then {object}[{}] = {value} end",
+                            quote(&key)
+                        ));
+                    } else {
+                        self.line(&format!(
+                            "{object}[{}] = {text}",
+                            quote(&key)
+                        ));
+                    }
+                }
+                self.line(&format!("return {object}"));
+                let body = std::mem::replace(&mut self.out, saved_out);
+                self.indent = saved_indent;
+                Ok((format!("(function()\n{body}end)()"), Ty::VALUE))
             }
             JsonNode::Array(values) => {
                 let mut parts = Vec::new();
                 for value in values {
-                    let (text, _) = self.json_node(value)?;
+                    let (text, ty) = self.json_node(value)?;
+                    if ty.null {
+                        return Err(Error::at(
+                            value.span(),
+                            "json null inside an array is not supported",
+                        ));
+                    }
+                    if self.strict()
+                        && (text == "nil" || ty.optional || ty.absent)
+                    {
+                        return Err(Error::at(
+                            value.span(),
+                            "a missing value cannot be stored in a json array; unwrap the value or use an object key",
+                        ));
+                    }
                     if text == "nil" {
                         return Err(Error::at(
                             value.span(),
@@ -226,7 +288,8 @@ impl<'a> Emitter<'a> {
                 if ty.is_numeric() {
                     return Ok((text, ty));
                 }
-                Ok((text, Ty::VALUE))
+                let ty = if self.strict() { ty } else { Ty::VALUE };
+                Ok((text, ty))
             }
         }
     }
