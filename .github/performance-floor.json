@@ -243,16 +243,16 @@
       "updatedAt": "2026-11-23T21:12:02.373Z"
     },
     "service_update_luau": {
-      "sha": "87b385b19cc8710e126ad523623298d63778b80e",
+      "sha": "8895e9be9e1eda1b0c6f0a91efeb3e575711f405",
       "method": 1,
-      "medianMs": 0.012133000000000001,
-      "worstMedianMs": 0.0121975,
-      "p95Ms": 0.015819,
-      "worstP95Ms": 0.01621,
-      "p99Ms": 0.017914000000000003,
-      "worstP99Ms": 0.027552,
+      "medianMs": 0.012183,
+      "worstMedianMs": 0.012423499999999999,
+      "p95Ms": 0.015599,
+      "worstP95Ms": 0.016511,
+      "p99Ms": 0.022642,
+      "worstP99Ms": 0.044483,
       "budgetMs": 10,
-      "updatedAt": "2026-11-28T01:50:46.597Z"
+      "updatedAt": "2026-11-28T02:52:18.498Z"
     },
     "service_update_rust": {
       "sha": "87b385b19cc8710e126ad523623298d63778b80e",
