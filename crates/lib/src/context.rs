@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Result;
 use crate::bytes::{ByteBuf, decode_json_bytes};
+use crate::callback::Callback;
 use crate::clock::{os_clock, unix_seconds};
 use crate::handles::{
     HttpHandle, HttpStreamHandle, RunHandle, StateWatchHandle,
@@ -357,14 +358,14 @@ impl Context {
         clippy::too_many_arguments,
         reason = "the strict run handle API keeps command, callback and timeout explicit"
     )]
-    pub fn run(
+    pub fn run<T>(
         &self,
         command: Value,
-        callback_id: Option<&str>,
+        callback: Option<Callback<T>>,
         timeout_ms: Option<i64>,
     ) -> RunHandle {
-        let mut args = match callback_id {
-            Some(id) => vec![command, callback(id)],
+        let mut args = match callback {
+            Some(callback) => vec![command, callback.value()],
             None => vec![command, Value::Null],
         };
         args.push(
@@ -376,9 +377,12 @@ impl Context {
 
     /// Starts an HTTP request and returns an opaque handle for strict-generated code.
     #[must_use]
-    pub fn http(&self, request: Value, callback_id: &str) -> HttpHandle {
-        HttpHandle::new(self.http_start(request, callback_id))
-    }
+    pub fn http<T>(&self, request: Value, callback: Callback<T>) -> HttpHandle {
+        HttpHandle::new(self.query_bool(
+            "noctalia",
+            &["http"],
+            vec![request, callback.value()],
+        ))
 
     /// Starts an HTTP stream and returns an opaque handle for strict-generated code.
     #[must_use]
@@ -386,32 +390,30 @@ impl Context {
         clippy::too_many_arguments,
         reason = "the strict stream handle API keeps both callback ids explicit"
     )]
-    pub fn http_stream(
+    pub fn http_stream<Line, Close>(
         &self,
         request: Value,
-        on_line_id: &str,
-        on_close_id: &str,
+        on_line: Callback<Line>,
+        on_close: Callback<Close>,
     ) -> HttpStreamHandle {
         let (value, _error) = self.query_pair(
             "noctalia",
             &["httpStream"],
-            vec![request, ui::callback(on_line_id), ui::callback(on_close_id)],
+            vec![request, on_line.value(), on_close.value()],
         );
         HttpStreamHandle::new(
             value.and_then(|item| item.as_str().map(str::to_owned)),
         )
-    }
 
     /// Registers a state watch and returns an opaque handle for strict-generated code.
     #[must_use]
-    pub fn state_watch(
+    pub fn state_watch<T>(
         &self,
         key: &str,
-        callback_id: &str,
+        callback: Callback<T>,
     ) -> StateWatchHandle {
-        self.emit_op(&Op::state_watch(key, callback_id));
-        StateWatchHandle::new(key.to_owned(), callback_id.to_owned())
-    }
+        self.emit_op(&Op::state_watch(key, callback.id()));
+        StateWatchHandle::new(key.to_owned(), callback.id().to_owned())
 
     /// Starts a process and returns Luau's `runAsync` acceptance boolean.
     #[must_use]
@@ -1357,11 +1359,24 @@ mod tests {
         }));
 
         let timeout = i64::MAX;
-        let run = context.run(json!(["echo"]), Some("done"), Some(timeout));
-        let http = context.http(json!({ "url": "x" }), "response");
-        let stream =
-            context.http_stream(json!({ "url": "y" }), "line", "close");
-        let watch = context.state_watch("wm.workspaces", "changed");
+        let run = context.run(
+            json!(["echo"]),
+            Some(Callback::<Value>::named("done")),
+            Some(timeout),
+        );
+        let http = context.http(
+            json!({ "url": "x" }),
+            Callback::<Value>::named("response"),
+        );
+        let stream = context.http_stream(
+            json!({ "url": "y" }),
+            Callback::<Value>::named("line"),
+            Callback::<Value>::named("close"),
+        );
+        let watch = context.state_watch(
+            "wm.workspaces",
+            Callback::<Value>::named("changed"),
+        );
 
         assert!(run.started());
         assert!(http.started());

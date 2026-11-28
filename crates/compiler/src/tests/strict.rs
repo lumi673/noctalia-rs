@@ -908,3 +908,26 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     assert!(error.contains("method `stop` is not supported"), "{error}");
     assert!(error.contains("widget.rs:"), "{error}");
 }
+
+#[test]
+fn strict_handle_accepts_a_typed_callback() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct Done;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let callback = Callback::<Done>::new();
+    let handle = ctx.run(json!(["echo"]), Some(callback), None);
+    handle.stop();
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("__strict_run_handle("), "{output}");
+    assert!(output.contains("\"Done\""), "{output}");
+    assert!(!output.contains("__host_callback"), "{output}");
+}

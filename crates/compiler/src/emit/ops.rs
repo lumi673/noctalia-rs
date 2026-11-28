@@ -422,7 +422,14 @@ impl<'a> Emitter<'a> {
                 "a handle callback needs a host_callback branch in strict mode",
             ));
         }
-        Ok(Some(self.expr(inner)?.0))
+        let text = if let Some(id) =
+            self.typed_callback_id_checked(inner, inner.span())?
+        {
+            crate::quote(&id)
+        } else {
+            self.expr(inner)?.0
+        };
+        Ok(Some(text))
     }
     /// Records a notify action global that the host will call by name.
     fn notify_action(&mut self, options: &Expr) -> Result<(), Error> {
