@@ -335,6 +335,37 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn strict_json_macro_rejects_nested_bytes() {
+    let handler = r#"
+use noctalia_rs::Bytes;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = json!({ "body": Bytes::new(vec![255u8]) });
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("nested bytes");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(error.contains("cannot be placed in json!"), "{error}");
+    assert!(!error.contains("__noctalia_rs_bytes"), "{error}");
+}
+
+#[test]
+fn strict_utf8_text_supports_exact_string_searches() {
+    let handler = r#"
+use noctalia_rs::Utf8Text;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = Utf8Text::new("hi");
+    let at = text.find("h").unwrap_or_default();
+    Ok(vec![Op::log(at.to_string())])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("string.find("), "{output}");
+}
+
+#[test]
 fn strict_acceptance_methods_report_booleans() {
     let handler = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {

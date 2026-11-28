@@ -285,6 +285,12 @@ impl<'a> Emitter<'a> {
                     return Ok(("nil".to_owned(), Ty::NULL));
                 }
                 let (text, ty) = self.expr(expr)?;
+                if ty.base == Base::Bytes {
+                    return Err(Error::at(
+                        expr.span(),
+                        "Bytes cannot be placed in json!; convert to Utf8Text first",
+                    ));
+                }
                 if ty.is_numeric() {
                     return Ok((text, ty));
                 }
