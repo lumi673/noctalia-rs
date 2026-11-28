@@ -1,6 +1,6 @@
 use crate::{EntryKind, StrictOptions, compile};
 
-use super::{options, source, strict_options};
+use super::{native_options, options, source, strict_options};
 
 /// The metatable a `json!`/`Vec::new` empty array carries, so the runtime can
 /// tell it from an empty object.
@@ -808,6 +808,98 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     }
 }
 
+fn strict_source(source: &str) -> Result<String, String> {
+    compile(
+        source,
+        &strict_options(
+            "handler",
+            EntryKind::Widget,
+            StrictOptions {
+                config: "local CONFIG = {}\n",
+                translations: "local LANGUAGES = {}\nlocal TRANSLATIONS = {}\n",
+                assets: &[],
+            },
+        ),
+    )
+    .map(|compiled| compiled.source)
+    .map_err(|error| error.render("widget.rs"))
+}
+
+#[test]
+fn strict_rejects_compat_imports_with_a_source_position() {
+    let source = r#"use noctalia_rs::compat::Parts;
+use noctalia_rs::{Context, Op, Result};
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    Ok(vec![Op::log("ok")])
+}
+"#;
+    let error = strict_source(source).expect_err("compat import");
+    assert!(error.contains("widget.rs:1:"), "{error}");
+    assert!(error.contains("noctalia_rs::compat"), "{error}");
+
+    let auto = compile(source, &native_options("handler", EntryKind::Widget));
+    assert!(auto.is_ok(), "{:?}", auto.err());
+}
+
+#[test]
+fn strict_rejects_helper_op_sink_methods() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    Ok(ctx.take_pending_ops())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("compat method");
+    assert!(error.contains("take_pending_ops"), "{error}");
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_rejects_coroutine_yields() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    use noctalia_rs::compat::yield_now;
+    yield_now();
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("yield");
+    assert!(error.contains("yield_now"), "{error}");
+    assert!(error.contains("helper runtime"), "{error}");
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_rejects_raw_pointer_stashes() {
+    let handler = r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let pointer: *const u8 = core::ptr::null();
+    let _ = pointer;
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("raw pointer");
+    assert!(error.contains("raw pointer"), "{error}");
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_rejects_compat_aliases_and_old_module_paths() {
+    let cases = [
+        "use noctalia_rs::compat as c;\nuse noctalia_rs::{Context, Op, Result};\nfn handler(_ctx: &Context) -> Result<Vec<Op>> { let _ = c::Parts; Ok(vec![Op::log(\"ok\")]) }\n",
+        "use noctalia_rs as rs;\nuse noctalia_rs::{Context, Op, Result};\nfn handler(_ctx: &Context) -> Result<Vec<Op>> { let _ = rs::compat::Parts; Ok(vec![Op::log(\"ok\")]) }\n",
+        "use noctalia_rs::context::Parts;\nuse noctalia_rs::{Context, Op, Result};\nfn handler(_ctx: &Context) -> Result<Vec<Op>> { let _: Option<Parts> = None; Ok(vec![Op::log(\"ok\")]) }\n",
+        "use noctalia_rs::clock::ClockBudget;\nuse noctalia_rs::{Context, Op, Result};\nfn handler(_ctx: &Context) -> Result<Vec<Op>> { let _: Option<ClockBudget> = None; Ok(vec![Op::log(\"ok\")]) }\n",
+        "use noctalia_rs::CoroutinePoll;\nuse noctalia_rs::{Context, Op, Result};\nfn handler(_ctx: &Context) -> Result<Vec<Op>> { let _: Option<CoroutinePoll> = None; Ok(vec![Op::log(\"ok\")]) }\n",
+        "use noctalia_rs::yield_now;\nuse noctalia_rs::{Context, Op, Result};\nfn handler(_ctx: &Context) -> Result<Vec<Op>> { yield_now(); Ok(vec![Op::log(\"ok\")]) }\n",
+        "use std::thread as t;\nuse noctalia_rs::{Context, Op, Result};\nfn handler(_ctx: &Context) -> Result<Vec<Op>> { t::yield_now(); Ok(vec![Op::log(\"ok\")]) }\n",
+    ];
+    for case in cases {
+        let error = strict_source(case).expect_err("compat alias or old path");
+        assert!(error.contains("helper runtime"), "{case}\n{error}");
+    }
+}
+
 #[test]
 fn strict_json_model_lowers_object_and_array() {
     let handler = r#"
@@ -878,4 +970,21 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let output = compile_strict(handler, &[]).expect("compile");
     assert!(!output.contains("[\"missing\"]"), "{output}");
     assert!(output.contains("~= nil then"), "{output}");
+}
+
+#[test]
+fn strict_allows_a_local_helper_named_yield_now() {
+    let source = r#"use noctalia_rs::{Context, Op, Result};
+
+fn yield_now(value: i64) -> i64 {
+    value + 1
+}
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let value = yield_now(1);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let output = strict_source(source).expect("local helper");
+    assert!(output.contains("noctalia.log"), "{output}");
 }

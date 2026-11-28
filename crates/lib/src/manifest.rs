@@ -1230,7 +1230,7 @@ fn insert_translation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Parts;
+    use crate::compat::Parts;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

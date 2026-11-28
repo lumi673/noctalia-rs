@@ -6,7 +6,8 @@ use crate::callback::{callback_args, callback_for_event};
 use crate::dispatch;
 use crate::dispatch_strict;
 use crate::host::Host;
-use noctalia_rs::{Context, Parts, api};
+use noctalia_rs::compat::Parts;
+use noctalia_rs::{Context, api};
 use serde_json::{Value, json};
 
 struct Fixture<'a> {

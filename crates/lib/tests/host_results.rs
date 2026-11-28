@@ -6,7 +6,8 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use noctalia_rs::{ByteBuf, Context, Op, Parts, Value};
+use noctalia_rs::compat::Parts;
+use noctalia_rs::{ByteBuf, Context, Op, Value};
 use serde_json::json;
 
 type TestResult = StdResult<(), Box<dyn Error>>;

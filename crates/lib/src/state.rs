@@ -100,7 +100,7 @@ pub fn insert<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Parts;
+    use crate::compat::Parts;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;

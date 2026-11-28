@@ -260,7 +260,8 @@ fn controls_row(ctx: &Context, draft: &str) -> ui::UiNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia_rs::{Parts, Value};
+    use noctalia_rs::Value;
+    use noctalia_rs::compat::Parts;
     use std::env;
     use std::fs;
     use std::process;

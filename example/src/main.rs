@@ -306,7 +306,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia_rs::{Parts, Value};
+    use noctalia_rs::Value;
+    use noctalia_rs::compat::Parts;
     use std::path::PathBuf;
 
     fn context() -> Context {

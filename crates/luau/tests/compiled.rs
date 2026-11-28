@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use noctalia_rs::{Context, Op, Parts};
+use noctalia_rs::compat::Parts;
+use noctalia_rs::{Context, Op};
 use noctalia_rs_compiler::{EntryKind, Options, compile};
 use serde_json::{Value, json};
 

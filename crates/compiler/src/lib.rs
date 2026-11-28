@@ -1,3 +1,4 @@
+mod compat;
 pub mod config;
 mod emit;
 mod error;
@@ -359,6 +360,12 @@ pub struct Compiled {
 /// `Result<Vec<Op>>`. Constructs outside the supported subset are reported as
 /// errors with their source position instead of being translated silently.
 pub fn compile(source: &str, options: &Options<'_>) -> Result<Compiled, Error> {
+    if options.strict.is_some() {
+        compat::reject(source, options.module, true)?;
+        for module in options.modules {
+            compat::reject(module.source, module.path, false)?;
+        }
+    }
     let program = Program::new(options.module, source, options.modules)?;
     let handler = program.handler(options.module, options.handler)?;
     let mut known: BTreeMap<String, NativeFn> = BTreeMap::new();

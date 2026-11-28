@@ -16,7 +16,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::Result;
-use crate::context::{Context, Parts};
+use crate::compat::Parts;
+use crate::context::Context;
 use crate::manifest::Plugin;
 use crate::ops::Op;
 

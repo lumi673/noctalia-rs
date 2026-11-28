@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_roundtrip() {
-        use noctalia_rs::Parts;
+        use noctalia_rs::compat::Parts;
         use serde_json::json;
         use std::env;
         use std::fs;

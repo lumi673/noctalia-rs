@@ -9,7 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use noctalia_rs::{Context, Parts};
+use noctalia_rs::Context;
+use noctalia_rs::compat::Parts;
 use noctalia_rs_compiler::{
     EntryKind, NativeMode, Options, compile as compile_rust,
 };

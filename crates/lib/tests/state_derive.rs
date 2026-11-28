@@ -1,4 +1,5 @@
-use noctalia_rs::{Context, Op, Parts, State, Value};
+use noctalia_rs::compat::Parts;
+use noctalia_rs::{Context, Op, State, Value};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;

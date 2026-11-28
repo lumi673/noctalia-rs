@@ -201,7 +201,8 @@ fn temporary_path(ctx: &Context) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noctalia_rs::{Parts, Value};
+    use noctalia_rs::Value;
+    use noctalia_rs::compat::Parts;
     use serde_json::json;
     use std::env;
     use std::fs;
