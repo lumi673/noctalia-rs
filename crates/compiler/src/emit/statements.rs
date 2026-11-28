@@ -413,6 +413,11 @@ impl<'a> Emitter<'a> {
         {
             self.newtype_types.insert(name.clone(), ty);
         }
+        if let Some(id) = self.typed_callback_id(&init.expr)
+            && let Some(scope) = self.callback_ids.last_mut()
+        {
+            scope.insert(name.clone(), id);
+        }
         if ty.result
             && let Some(hint) = hint
         {
@@ -2353,6 +2358,23 @@ impl<'a> Emitter<'a> {
             None
         };
         self.line(&format!("{target} {op} {text}"));
+        if is_local
+            && op == "="
+            && let Some(name) = path_ident(strip_reference(left))
+        {
+            let owned = self
+                .callback_ids
+                .iter()
+                .rev()
+                .any(|scope| scope.contains_key(&name));
+            let id = match self.typed_callback_id(right) {
+                Some(_) if owned => {
+                    Some(super::ops::UNRESOLVED_CALLBACK_ID.to_owned())
+                }
+                other => other,
+            };
+            self.set_callback_id(&name, id);
+        }
         if is_local && let Some(name) = path_ident(strip_reference(left)) {
             self.tuple_types.remove(&name);
             self.tuple_expr_text.remove(&name);

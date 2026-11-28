@@ -379,3 +379,258 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         .expect_err("prefix is not the asset");
     assert!(error.contains("not a declared asset"), "{error}");
 }
+
+#[test]
+fn strict_typed_callback_emits_a_stable_closure() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct RowClicked;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    if ctx.event == "render" {
+        let callback = Callback::<RowClicked>::new();
+        return Ok(vec![Op::http_callback(json!({"url": "x"}), &callback)]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(
+        output.contains("(function(__captured) return function(...) __strict_callback(__captured, ...) end end)(\"RowClicked\")"),
+        "{output}"
+    );
+    assert!(
+        output.contains("function __strict_callback(id, ...)"),
+        "{output}"
+    );
+    assert!(!output.contains("__host_callback"), "{output}");
+}
+
+#[test]
+fn strict_typed_action_emits_a_named_plugin_global() {
+    let handler = r#"
+use noctalia_rs::Action;
+
+struct Refresh;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "action" {
+        return Ok(vec![Op::log("action")]);
+    }
+    if ctx.event == "render" {
+        let tree = ui::button(json!({ "onClick": Action::<Refresh>::new() }));
+        return Ok(vec![Op::BarRender { tree }]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    let global =
+        format!("onClick = \"{}\"", crate::strict::action_global("Refresh"));
+    assert!(output.contains(&global), "{output}");
+    assert!(
+        output.contains(&format!(
+            "function {}(...)",
+            crate::strict::action_global("Refresh")
+        )),
+        "{output}"
+    );
+    assert!(!output.contains("__call ="), "{output}");
+}
+
+#[test]
+fn strict_typed_callback_without_a_branch_fails_at_its_span() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct RowClicked;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "render" {
+        let _ = Callback::<RowClicked>::new();
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error =
+        compile_strict(handler, &[]).expect_err("no host_callback branch");
+    assert!(
+        error.contains("typed callback needs a host_callback branch"),
+        "{error}"
+    );
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_named_handles_keep_their_kinds() {
+    let handler = r#"
+use noctalia_rs::{Action, Callback};
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    if ctx.event == "action" {
+        return Ok(vec![Op::log("action")]);
+    }
+    if ctx.event == "render" {
+        let callback = Callback::named("row");
+        let tree = ui::button(json!({ "onClick": Action::named("reloadNow") }));
+        return Ok(vec![
+            Op::http_callback(json!({}), &callback),
+            Op::BarRender { tree },
+        ]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(
+        output.contains("(function(__captured) return function(...) __strict_callback(__captured, ...) end end)(\"row\")"),
+        "{output}"
+    );
+    let global = crate::strict::action_global("reloadNow");
+    assert!(output.contains(&format!("\"{global}\"")), "{output}");
+    assert!(
+        output.contains(&format!("function {global}(...)")),
+        "{output}"
+    );
+}
+
+#[test]
+fn strict_typed_callback_reassignment_fails_closed() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct First;
+struct Second;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    if ctx.event == "render" {
+        let mut callback = Callback::<First>::new();
+        callback = Callback::<Second>::new();
+        return Ok(vec![Op::http_callback(json!({}), &callback)]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("reassigned id");
+    assert!(
+        error.contains("typed callback id must resolve to one id"),
+        "{error}"
+    );
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_typed_callback_with_two_possible_ids_fails_closed() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct First;
+struct Second;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    if ctx.event == "render" {
+        let callback = if ctx.payload_str("flag").unwrap_or_default() == "on" {
+            Callback::<First>::new()
+        } else {
+            Callback::<Second>::new()
+        };
+        return Ok(vec![Op::http_callback(json!({}), &callback)]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("two different ids");
+    assert!(
+        error.contains("typed callback id must resolve to one id"),
+        "{error}"
+    );
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_typed_callback_reassignment_in_a_loop_fails_closed() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct First;
+struct Second;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    if ctx.event == "render" {
+        let mut callback = Callback::<First>::new();
+        for index in 0..2 {
+            let _ = index;
+            callback = Callback::<Second>::new();
+        }
+        return Ok(vec![Op::http_callback(json!({}), &callback)]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("loop reassignment");
+    assert!(
+        error.contains("typed callback id must resolve to one id"),
+        "{error}"
+    );
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_typed_callback_uses_the_library_spelling_for_references() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    if ctx.event == "render" {
+        let callback = Callback::<&str>::new();
+        return Ok(vec![Op::http_callback(json!({}), &callback)]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("end end)(\"&str\")"), "{output}");
+}
+
+#[test]
+fn strict_typed_callback_rejects_an_unproven_type_alias() {
+    let handler = r#"
+use noctalia_rs::Callback;
+
+struct RowClicked;
+type Clicked = RowClicked;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    if ctx.event == "render" {
+        let callback = Callback::<Clicked>::new();
+        return Ok(vec![Op::http_callback(json!({}), &callback)]);
+    }
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("alias");
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(error.contains("Callback"), "{error}");
+}

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use crate::callback::{Action, action as typed_action};
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
@@ -14,7 +15,7 @@ enum Prop {
     Integer(i64),
     Number(f64),
     Boolean(bool),
-    Call(&'static str),
+    Call(Cow<'static, str>),
     Json(Value),
 }
 
@@ -110,7 +111,16 @@ impl Props {
     #[inline]
     #[must_use]
     pub fn call(mut self, key: &'static str, name: &'static str) -> Self {
-        self.0.push((key, Prop::Call(name)));
+        self.0.push((key, Prop::Call(Cow::Borrowed(name))));
+        self
+    }
+
+    /// Adds a typed UI action, derived from `T`.
+    #[inline]
+    #[must_use]
+    pub fn action<T>(mut self, key: &'static str, action: &Action<T>) -> Self {
+        self.0
+            .push((key, Prop::Call(Cow::Owned(action.name().to_owned()))));
         self
     }
 
@@ -265,6 +275,13 @@ pub fn call(name: &str) -> Value {
 #[must_use]
 pub fn callback(id: &str) -> Value {
     json!({ "__host_callback": id })
+}
+
+/// A typed UI action marker for `T`.
+#[inline]
+#[must_use]
+pub fn action<T>() -> Value {
+    typed_action::<T>().value()
 }
 
 #[cfg(test)]

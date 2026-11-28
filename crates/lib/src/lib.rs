@@ -1,6 +1,7 @@
 pub mod api;
 pub mod bridge;
 pub mod bytes;
+pub mod callback;
 pub mod cli;
 pub mod clock;
 pub mod codegen;
@@ -11,10 +12,8 @@ pub mod manifest;
 pub mod ops;
 pub mod rng;
 pub mod ui;
-use std::error::Error;
-use std::result::Result as StdResult;
-
 pub use bytes::ByteBuf;
+pub use callback::{Action, Callback};
 pub use cli::run;
 pub use clock::{ClockBudget, os_clock, unix_seconds};
 pub use context::{Context, FileInfo, Parts};
@@ -34,6 +33,8 @@ pub use manifest::{
     NumberConfig, Plugin, Setting, SettingKind,
 };
 pub use rng::LuauRng;
+use std::error::Error;
+use std::result::Result as StdResult;
 pub use ui::{NodeProps, Props};
 
 pub use noctalia_rs_macros::{entry, luau, native};

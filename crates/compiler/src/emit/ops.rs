@@ -1,5 +1,7 @@
 use super::*;
 
+/// Marker for a typed callback whose id differs by branch or was overwritten.
+pub(super) const UNRESOLVED_CALLBACK_ID: &str = "__unresolved_callback_id";
 impl<'a> Emitter<'a> {
     pub(super) fn record_pattern_events(&mut self, expr: &Expr, pattern: &Pat) {
         if let Some(method) = self.typed_event_method(expr) {
@@ -375,7 +377,13 @@ impl<'a> Emitter<'a> {
         if self.strict() {
             return Ok(Some(self.strict_callback(inner, inner.span())?));
         }
-        let (text, _) = self.expr(inner)?;
+        let text = if let Some(id) =
+            self.typed_callback_id_checked(inner, inner.span())?
+        {
+            crate::quote(&id)
+        } else {
+            self.expr(inner)?.0
+        };
         Ok(Some(format!("{{ __host_callback = {text} }}")))
     }
 
@@ -431,9 +439,119 @@ impl<'a> Emitter<'a> {
         if is_ui_marker_call(inner, "callback") {
             return Ok(self.expr(inner)?.0);
         }
-        let id = self.expr(inner)?.0;
+        let id = if let Some(id) =
+            self.typed_callback_id_checked(inner, inner.span())?
+        {
+            crate::quote(&id)
+        } else {
+            self.expr(inner)?.0
+        };
         self.uses_callback_dispatch = true;
         Ok(strict::closure(strict::CALLBACK_DISPATCH, &id))
+    }
+
+    /// The stable id of a typed callback, at the call site or in a local.
+    pub(super) fn typed_callback_id(&self, expr: &Expr) -> Option<String> {
+        let expr = strip_reference(expr);
+        if let Some(id) = typed_handle_expr(
+            expr,
+            TypedHandle::Callback,
+            self.program,
+            &self.module,
+        ) {
+            return Some(id);
+        }
+        match expr {
+            Expr::Path(path) => {
+                let name = path.path.get_ident()?.to_string();
+                self.callback_ids
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(&name).cloned())
+            }
+            Expr::Block(block) => {
+                block
+                    .block
+                    .stmts
+                    .last()
+                    .and_then(|statement| match statement {
+                        Stmt::Expr(expr, _) => self.typed_callback_id(expr),
+                        _ => None,
+                    })
+            }
+            Expr::If(item) => {
+                let then =
+                    item.then_branch.stmts.last().and_then(|statement| {
+                        match statement {
+                            Stmt::Expr(expr, _) => self.typed_callback_id(expr),
+                            _ => None,
+                        }
+                    });
+                let otherwise =
+                    item.else_branch.as_ref().and_then(|(_, branch)| {
+                        match &**branch {
+                            Expr::Block(block) => {
+                                block.block.stmts.last().and_then(|statement| {
+                                    match statement {
+                                        Stmt::Expr(expr, _) => {
+                                            self.typed_callback_id(expr)
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                            }
+                            other => self.typed_callback_id(other),
+                        }
+                    });
+                match (then, otherwise) {
+                    (Some(left), Some(right)) if left == right => Some(left),
+                    _ => Some(UNRESOLVED_CALLBACK_ID.to_owned()),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Updates the scope that owns a callback binding.
+    ///
+    /// A reassignment cannot keep a compile-time id, because a later branch
+    /// may take a different path through the assignment.
+    pub(super) fn set_callback_id(&mut self, name: &str, id: Option<String>) {
+        for scope in self.callback_ids.iter_mut().rev() {
+            if scope.contains_key(name) {
+                match id {
+                    Some(id) => {
+                        scope.insert(name.to_owned(), id);
+                    }
+                    None => {
+                        scope.remove(name);
+                    }
+                }
+                return;
+            }
+        }
+        if let (Some(id), Some(scope)) = (id, self.callback_ids.last_mut()) {
+            scope.insert(name.to_owned(), id);
+        }
+    }
+
+    /// Reads a typed callback id, failing closed when one branch or a later
+    /// assignment left it unknown.
+    pub(super) fn typed_callback_id_checked(
+        &self,
+        expr: &Expr,
+        span: proc_macro2::Span,
+    ) -> Result<Option<String>, Error> {
+        let Some(id) = self.typed_callback_id(expr) else {
+            return Ok(None);
+        };
+        if id == UNRESOLVED_CALLBACK_ID {
+            return Err(Error::at(
+                span,
+                "a typed callback id must resolve to one id at compile time",
+            ));
+        }
+        Ok(Some(id))
     }
 
     /// A strict `Op::query`: the direct member call plus the response envelope.
@@ -529,20 +647,27 @@ impl<'a> Emitter<'a> {
                 let value = self.expr(arg(&args, 1, call)?)?.0;
                 self.line(&format!("state.set({key}, {value})"));
             }
-            "state_watch" => {
+            "state_watch" | "state_watch_callback" => {
                 let key = self.expr(arg(&args, 0, call)?)?.0;
+                let id_expr = arg(&args, 1, call)?;
                 if self.strict() {
-                    let id = arg(&args, 1, call)?;
-                    let callback = self.strict_callback(id, id.span())?;
+                    let callback =
+                        self.strict_callback(id_expr, id_expr.span())?;
                     self.line(&format!("state.watch({key}, {callback})"));
                 } else {
-                    let id = self.expr(arg(&args, 1, call)?)?.0;
+                    let id = if let Some(id) =
+                        self.typed_callback_id_checked(id_expr, id_expr.span())?
+                    {
+                        crate::quote(&id)
+                    } else {
+                        self.expr(id_expr)?.0
+                    };
                     self.line(&format!(
                         "state.watch({key}, {{ __host_callback = {id} }})"
                     ));
                 }
             }
-            "run" => {
+            "run" | "run_callback" => {
                 let command = self.expr(arg(&args, 0, call)?)?.0;
                 let callback = self.callback_marker(&args, 1)?;
                 let line = match callback {
@@ -553,7 +678,7 @@ impl<'a> Emitter<'a> {
                 };
                 self.line(&line);
             }
-            "run_with_timeout" => {
+            "run_with_timeout" | "run_callback_with_timeout" => {
                 let command = self.expr(arg(&args, 0, call)?)?.0;
                 let callback = self
                     .callback_marker(&args, 1)?
@@ -566,7 +691,7 @@ impl<'a> Emitter<'a> {
                     "noctalia.runAsync({command}, {callback}, {timeout})"
                 ));
             }
-            "run_stream" => {
+            "run_stream" | "run_stream_callback" => {
                 let command = self.expr(arg(&args, 0, call)?)?.0;
                 let callback =
                     self.callback_marker(&args, 1)?.ok_or_else(|| {
@@ -579,7 +704,7 @@ impl<'a> Emitter<'a> {
                     "noctalia.runStream({command}, {callback})"
                 ));
             }
-            "http" => {
+            "http" | "http_callback" => {
                 let request = self.expr(arg(&args, 0, call)?)?.0;
                 let callback = self.callback_marker(&args, 1)?;
                 let line = match callback {
@@ -739,6 +864,11 @@ pub(super) fn op_constructor(name: &str) -> Option<String> {
         "write_file_bytes",
         "http_bytes",
         "query",
+        "state_watch_callback",
+        "run_callback",
+        "run_callback_with_timeout",
+        "run_stream_callback",
+        "http_callback",
     ];
     supported.contains(&variant).then(|| variant.to_owned())
 }
@@ -816,4 +946,135 @@ pub(super) fn literal_path(expr: &Expr) -> Result<Vec<String>, Error> {
         result.push(value);
     }
     Ok(result)
+}
+
+/// Which typed handle a constructor builds.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum TypedHandle {
+    Callback,
+    Action,
+}
+
+/// The id of a typed handle constructor.
+///
+/// `Callback::<Row>::new()`, `callback::<Row>()`, `Callback::named("row")`
+/// and their `Action` counterparts are recognized. The id comes from the
+/// outer type name, which is the same spelling the library reads with
+/// `type_name::<T>()`.
+pub(super) fn typed_handle_call(
+    call: &syn::ExprCall,
+    kind: TypedHandle,
+    program: &Program,
+    module: &str,
+) -> Option<String> {
+    let Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    let segments = path.path.segments.iter().collect::<Vec<_>>();
+    let last = segments.last()?.ident.to_string();
+    let root = if kind == TypedHandle::Callback {
+        "Callback"
+    } else {
+        "Action"
+    };
+    if last == "named" {
+        if segments.get(segments.len().saturating_sub(2))?.ident != root {
+            return None;
+        }
+        let argument =
+            arg(&call.args.iter().collect::<Vec<_>>(), 0, call).ok()?;
+        let Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) = strip_reference(argument)
+        else {
+            return None;
+        };
+        return Some(value.value());
+    }
+    let (name, segment) = if last == "new" {
+        let name = segments.get(segments.len().saturating_sub(2))?;
+        (name, name)
+    } else {
+        (segments.last()?, segments.last()?)
+    };
+    let matches = name.ident == root
+        || (kind == TypedHandle::Callback && name.ident == "callback")
+        || (kind == TypedHandle::Action && name.ident == "action");
+    if !matches {
+        return None;
+    }
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    let syn::GenericArgument::Type(ty) = arguments.args.first()? else {
+        return None;
+    };
+    let id = type_ident(ty)?;
+    if !is_known_id(&id) && !program.has_type(module, &id) {
+        return None;
+    }
+    Some(id)
+}
+
+/// The id of a typed handle expression.
+pub(super) fn typed_handle_expr(
+    expr: &Expr,
+    kind: TypedHandle,
+    program: &Program,
+    module: &str,
+) -> Option<String> {
+    let Expr::Call(call) = strip_reference(expr) else {
+        return None;
+    };
+    typed_handle_call(call, kind, program, module)
+}
+
+fn type_ident(ty: &syn::Type) -> Option<String> {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        syn::Type::Reference(reference) => {
+            type_ident(&reference.elem).map(|id| format!("&{id}"))
+        }
+        syn::Type::Paren(paren) => type_ident(&paren.elem),
+        syn::Type::Group(group) => type_ident(&group.elem),
+        syn::Type::Tuple(_) => None,
+        _ => None,
+    }
+}
+
+/// Type names whose `type_name` tail is the same as their source spelling.
+fn is_known_id(id: &str) -> bool {
+    matches!(
+        id,
+        "Value"
+            | "String"
+            | "str"
+            | "&str"
+            | "bool"
+            | "char"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+            | "Option"
+            | "Result"
+            | "Vec"
+            | "Box"
+            | "Cow"
+    )
 }

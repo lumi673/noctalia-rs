@@ -133,6 +133,51 @@ impl<'a> Emitter<'a> {
         &mut self,
         call: &ExprCall,
     ) -> Result<(String, Ty), Error> {
+        if let Some(id) = typed_handle_call(
+            call,
+            TypedHandle::Callback,
+            self.program,
+            &self.module,
+        ) {
+            let quoted = crate::quote(&id);
+            if self.strict() {
+                if !self.has_host_callback {
+                    return Err(Error::at(
+                        call.span(),
+                        "a typed callback needs a host_callback branch in strict mode",
+                    ));
+                }
+                self.uses_callback_dispatch = true;
+                return Ok((
+                    strict::closure(strict::CALLBACK_DISPATCH, &quoted),
+                    Ty::VALUE,
+                ));
+            }
+            return Ok((
+                format!("{{ __host_callback = {quoted} }}"),
+                Ty::VALUE,
+            ));
+        }
+        if let Some(name) = typed_handle_call(
+            call,
+            TypedHandle::Action,
+            self.program,
+            &self.module,
+        ) {
+            let quoted = crate::quote(&name);
+            if self.strict() {
+                if !self.has_action {
+                    return Err(Error::at(
+                        call.span(),
+                        "a typed action needs an action branch in strict mode",
+                    ));
+                }
+                let global = strict::action_global(&name);
+                self.actions.insert(name);
+                return Ok((format!("\"{global}\""), Ty::VALUE));
+            }
+            return Ok((format!("{{ __call = {quoted} }}"), Ty::VALUE));
+        }
         if let Some(name) = path_last_name(&call.func) {
             let args = call.args.iter().collect::<Vec<_>>();
             if !name.contains("::")
