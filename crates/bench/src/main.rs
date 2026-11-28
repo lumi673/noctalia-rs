@@ -216,6 +216,7 @@ struct Report {
     metadata: Metadata,
     results: Vec<Summary>,
     pairs: Vec<Pair>,
+    #[serde(rename = "boundary")]
     generated: Vec<generated::GeneratedSource>,
 }
 
@@ -1173,6 +1174,21 @@ fn print_report(report: &Report) {
                 speedup,
                 item.compiled_bytes,
                 item.handwritten_bytes
+            );
+        }
+        println!(
+            "{:<24} {:>7} {:>7} {:>10} {:>6}",
+            "workload", " luau_fns", " natives", " helpers", " parse"
+        );
+        for item in &report.generated {
+            let helpers = item.helper_calls_per_event.values().sum::<usize>();
+            println!(
+                "{:<24} {:>7} {:>7} {:>10} {:>6}",
+                item.workload,
+                item.compiled_functions,
+                item.native_functions,
+                helpers,
+                if item.parse.ok { "ok" } else { "fail" }
             );
         }
         println!(

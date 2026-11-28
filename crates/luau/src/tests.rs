@@ -1346,3 +1346,11 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
         .into_function()
         .expect("auto boundary script parses");
 }
+
+#[test]
+fn parse_source_only_compiles_the_chunk() {
+    assert!(crate::parse_source("ok", "function update() end").is_ok());
+    let error =
+        crate::parse_source("broken", "function update( end").unwrap_err();
+    assert!(error.contains("broken"), "{error}");
+}

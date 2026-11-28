@@ -5,6 +5,7 @@ pub mod ir;
 mod luau_ast;
 mod program;
 mod pure;
+mod report;
 pub mod strict;
 
 use std::collections::BTreeMap;
@@ -14,6 +15,7 @@ use syn::spanned::Spanned;
 use syn::{FnArg, Pat, Type};
 
 pub use error::Error;
+pub use report::BoundaryReport;
 pub use strict::StrictOptions;
 
 use emit::Emitter;
@@ -352,6 +354,8 @@ pub struct NativeFn {
 pub struct Compiled {
     pub source: String,
     pub events: Vec<String>,
+    /// Boundary metrics for the generated entry.
+    pub report: BoundaryReport,
     /// Functions that cross into the helper process.
     pub native: Vec<NativeFn>,
 }
@@ -1082,6 +1086,27 @@ fn compile_once(
             )
         );
     }
+    let helper_calls_per_event = names
+        .iter()
+        .map(|(event, name)| {
+            let calls = bodies
+                .iter()
+                .find(|slot| &slot.name == name)
+                .map_or(0, |slot| slot.body.native_calls);
+            (event.clone(), calls)
+        })
+        .collect();
+    let compiled_functions: usize = bodies
+        .iter()
+        .filter(|slot| !slot.body.is_empty)
+        .map(|slot| 1 + slot.body.source.matches("local function ").count())
+        .sum();
+    let boundary = report::BoundaryReport::new(
+        compiled_functions,
+        natives.len(),
+        helper_calls_per_event,
+        out.len(),
+    );
 
     Ok((
         Compiled {
@@ -1091,6 +1116,7 @@ fn compile_once(
                 out
             },
             events: positive,
+            report: boundary,
             native: natives.values().cloned().collect(),
         },
         natives,

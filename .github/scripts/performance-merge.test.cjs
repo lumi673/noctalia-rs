@@ -182,3 +182,36 @@ test('a workload missing from the base is still reported as new', () => {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('boundary metrics survive the shard merge into the PR report', () => {
+  const root = tempDir()
+  const out = path.join(root, 'performance')
+  const boundary = [{
+    workload: 'generated_hello_bar',
+    compiled_functions: 2,
+    native_functions: 0,
+    helper_calls_per_event: { render: 0, click: 0 },
+    compiled_bytes: 1200,
+    handwritten_bytes: 900,
+    parse: { ok: true },
+  }]
+  try {
+    const [first, second] = shards(root)
+    const headMetrics = [
+      metric('a_ceiling', 1), metric('b_ceiling', 1), metric('c_base', 1),
+    ]
+    write(path.join(first, `${HEAD}.json`), { ...report(headMetrics), boundary })
+    write(path.join(second, `${HEAD}.json`), { ...report(headMetrics), boundary })
+    write(path.join(first, `${BASE}.json`), report([metric('c_base', 1)]))
+    write(path.join(first, `${CEILING}.json`), report([metric('a_ceiling', 1)]))
+    write(path.join(second, `${OTHER}.json`), report([metric('b_ceiling', 1)]))
+
+    assert.equal(merge(root, out), 4)
+    const merged = JSON.parse(fs.readFileSync(path.join(out, `${HEAD}.json`), 'utf8'))
+    assert.deepEqual(merged.boundary, boundary)
+    perf.report({ dir: out, floor: path.join(out, 'floor.json'), out: path.join(out, 'comment.md'), result: path.join(out, 'result.txt') })
+    assert.match(fs.readFileSync(path.join(out, 'comment.md'), 'utf8'), /### Boundary metrics/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
