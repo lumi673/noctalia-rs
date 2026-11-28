@@ -247,6 +247,9 @@ impl<'a> Emitter<'a> {
                     Ty::OPT_FLOAT,
                 ));
             }
+            if self.strict() && crate::pure::call(&name).is_some() {
+                return self.pure_call(call, &name, &args);
+            }
             if let Some(class) = name.strip_suffix("::default")
                 && class != "Default"
             {
@@ -429,6 +432,14 @@ impl<'a> Emitter<'a> {
             return Ok(value);
         }
         let label = path_last_name(&call.func).unwrap_or_default();
+        if self.strict() && crate::pure::allowlisted(&label) {
+            return Err(Error::at(
+                call.span(),
+                format!(
+                    "call to `{label}` is not in the strict pure-crate allowlist; only calls with an exact Luau lowering can run without a helper"
+                ),
+            ));
+        }
         Err(Error::at(
             call.span(),
             format!(
@@ -585,6 +596,82 @@ impl<'a> Emitter<'a> {
         let list = self.list(&items)?.0;
         self.uses_unpack = true;
         Ok((format!("string.char(__unpack({list}))"), Ty::STR))
+    }
+    /// Lowers one allowlisted pure crate call into the strict script.
+    fn pure_call(
+        &mut self,
+        call: &ExprCall,
+        name: &str,
+        args: &[&Expr],
+    ) -> Result<(String, Ty), Error> {
+        let pure = crate::pure::call(name).ok_or_else(|| {
+            Error::at(
+                call.span(),
+                format!("`{name}` is not an allowed pure call"),
+            )
+        })?;
+        if args.len() != pure.arity {
+            return Err(Error::at(
+                call.span(),
+                format!("`{name}` takes {} argument(s)", pure.arity),
+            ));
+        }
+        match pure.lowering {
+            crate::pure::Lowering::EmptyMap => Ok(("{}".to_owned(), Ty::TABLE)),
+            crate::pure::Lowering::JsonEncode => {
+                let value = self.expr(args[0])?.0;
+                Ok((
+                    format!("noctalia.json.encode({value})"),
+                    Ty::result(Base::Str),
+                ))
+            }
+            crate::pure::Lowering::JsonDecode => {
+                let text = self.expr(args[0])?.0;
+                let base = json_parse_base(call)?;
+                Ok((format!("noctalia.json.decode({text})"), Ty::result(base)))
+            }
+            crate::pure::Lowering::Identity => {
+                let (text, ty) = self.expr(args[0])?;
+                if ty.null || ty.optional {
+                    return Err(Error::at(
+                        call.span(),
+                        format!(
+                            "`{name}` cannot carry a JSON null or optional value into strict Luau; omit the key instead"
+                        ),
+                    ));
+                }
+                if !matches!(
+                    ty.base,
+                    Base::Str
+                        | Base::Path
+                        | Base::Int
+                        | Base::Float
+                        | Base::Bool
+                ) {
+                    return Err(Error::at(
+                        call.span(),
+                        format!(
+                            "`{name}` needs a JSON-shaped scalar; a container can hide a JSON null"
+                        ),
+                    ));
+                }
+                Ok((text, Ty::result(Base::Value)))
+            }
+            crate::pure::Lowering::Helper(helper) => {
+                let mut values = Vec::new();
+                for argument in args {
+                    let value = self.expr(argument)?.0;
+                    let temp = self.temp();
+                    self.line(&format!("local {temp} = {value}"));
+                    values.push(temp);
+                }
+                self.uses_pure.insert(helper);
+                Ok((
+                    format!("{}({})", helper.name(), values.join(", ")),
+                    Ty::STR,
+                ))
+            }
+        }
     }
 
     /// A real callback value for strict emit.

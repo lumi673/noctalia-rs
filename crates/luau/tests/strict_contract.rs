@@ -490,6 +490,37 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         let _ = ops(&source, "update", json!({}));
     }
 }
+#[test]
+fn strict_pure_hex_calls_match_the_library() {
+    let source = strict_source(
+        r#"
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let bytes = ByteBuf::new(vec![0u8, 16, 127, 255]);
+    let text = noctalia_rs::bytes::encode_hex(&bytes);
+    let back = noctalia_rs::bytes::decode_hex(&text);
+    let odd = noctalia_rs::bytes::decode_hex("0g1F2");
+    Ok(vec![
+        Op::log(format!("{text}:{}", back.len())),
+        Op::log(noctalia_rs::bytes::encode_hex(&odd)),
+    ])
+}
+"#,
+        EntryKind::Widget,
+    );
+    let messages = ops(&source, "update", json!({}))
+        .iter()
+        .map(|op| op["message"].as_str().unwrap_or_default().to_owned())
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>();
+    assert!(!messages.is_empty());
+    assert!(
+        messages
+            .iter()
+            .all(|message| { message == "00107fff:4" || message == "1f" })
+    );
+    assert!(messages.contains(&"00107fff:4".to_owned()));
+    assert!(messages.contains(&"1f".to_owned()));
+}
 
 const CROSS_ACCEPT: &str = r#"
 fn subscribe(ctx: &Context, ops: &mut Vec<Op>) {
