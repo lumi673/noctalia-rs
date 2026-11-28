@@ -20,6 +20,7 @@ use syn::{
     ItemFn, Lit, Member, Pat, PathArguments, Stmt, Token, Type, UnOp,
 };
 
+use crate::events;
 use crate::program::{Program, typed_args};
 use crate::{
     Error, NativeFn, NativeMode, NativeParam, NativeParamKind, NativePass,

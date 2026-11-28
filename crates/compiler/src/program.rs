@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
+use crate::events;
 use crate::{Error, Module};
 use syn::{Expr, Item, ItemFn, ItemStatic, Pat, Type, UseTree};
 
@@ -55,6 +56,29 @@ pub(crate) struct Program {
     units: HashMap<String, Unit>,
     root: String,
 }
+fn insert_payload_structs(program: &mut Program, module: &str) {
+    let Some(unit) = program.units.get_mut(module) else {
+        return;
+    };
+    for (name, fields) in events::PAYLOAD_STRUCTS {
+        let fields = fields
+            .iter()
+            .map(|(field, kind)| {
+                let ty = syn::parse_str(kind)
+                    .unwrap_or_else(|_| syn::parse_quote!(serde_json::Value));
+                ((*field).to_owned(), ty)
+            })
+            .collect();
+        unit.structs
+            .entry((*name).to_owned())
+            .or_insert_with(|| StructDef {
+                fields,
+                derives_default: false,
+                derives_serialize: false,
+                derives_deserialize: false,
+            });
+    }
+}
 
 impl Program {
     pub(crate) fn new(
@@ -70,6 +94,7 @@ impl Program {
         let file = syn::parse_file(source)
             .map_err(|error| Error::from(error).with_file(&module))?;
         program.insert(&module, &file);
+        insert_payload_structs(&mut program, &module);
         for item in extra {
             let path = normalize(item.path);
             if program.units.contains_key(&path) {

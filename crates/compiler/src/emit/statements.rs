@@ -882,15 +882,19 @@ impl<'a> Emitter<'a> {
                 }
                 let left = self.const_literal(&binary.left);
                 let right = self.const_literal(&binary.right);
+                let left_variant = self.typed_variant_label(&binary.left);
+                let right_variant = self.typed_variant_label(&binary.right);
                 let value = match (
                     self.is_event_expr(&binary.left),
                     self.is_event_expr(&binary.right),
                 ) {
                     (true, false) => {
-                        self.bound_event.as_deref()? == right?.as_str()
+                        let label = right.as_deref().or(right_variant)?;
+                        self.bound_event.as_deref()? == label
                     }
                     (false, true) => {
-                        self.bound_event.as_deref()? == left?.as_str()
+                        let label = left.as_deref().or(left_variant)?;
+                        self.bound_event.as_deref()? == label
                     }
                     (false, false) => left? == right?,
                     (true, true) => return None,
@@ -1016,6 +1020,9 @@ impl<'a> Emitter<'a> {
         item: &syn::ExprMatch,
         tail: bool,
     ) -> Result<(), Error> {
+        if let Some(method) = self.typed_event_method(&item.expr) {
+            return self.typed_event_match(item, method, tail);
+        }
         let guarded =
             item.arms.iter().any(|arm| matches!(arm.pat, Pat::Guard(_)));
         if !guarded
@@ -1073,7 +1080,236 @@ impl<'a> Emitter<'a> {
         )?;
         Ok(())
     }
+}
 
+pub(super) struct TypedPattern {
+    pub(super) label: Option<String>,
+    pub(super) bindings: Vec<String>,
+    pub(super) wild: bool,
+    pub(super) unknown: bool,
+    pub(super) unknown_binding: Option<String>,
+}
+
+impl TypedPattern {
+    pub(super) fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
+
+pub(super) fn typed_patterns(
+    pattern: &Pat,
+) -> Result<Vec<TypedPattern>, Error> {
+    match pattern {
+        Pat::Paren(paren) => typed_patterns(&paren.pat),
+        Pat::Or(or) => {
+            let mut result = Vec::new();
+            for case in &or.cases {
+                result.extend(typed_patterns(case)?);
+            }
+            Ok(result)
+        }
+        Pat::Wild(_) => Ok(vec![TypedPattern {
+            label: None,
+            bindings: Vec::new(),
+            wild: true,
+            unknown: false,
+            unknown_binding: None,
+        }]),
+        Pat::Path(path) => {
+            let name = path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default();
+            if name == "Unknown" {
+                return Ok(vec![TypedPattern {
+                    label: None,
+                    bindings: Vec::new(),
+                    wild: false,
+                    unknown: true,
+                    unknown_binding: None,
+                }]);
+            }
+            let label = events::variant_label(&name).ok_or_else(|| {
+                Error::at(
+                    path.span(),
+                    format!("typed event variant `{name}` is not recognized"),
+                )
+            })?;
+            Ok(vec![TypedPattern {
+                label: Some(label.to_owned()),
+                bindings: Vec::new(),
+                wild: false,
+                unknown: false,
+                unknown_binding: None,
+            }])
+        }
+        Pat::TupleStruct(item) => {
+            let name = item
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default();
+            if name == "Unknown" {
+                let unknown_binding =
+                    item.elems.first().and_then(|element| match element {
+                        Pat::Ident(ident) => Some(ident.ident.to_string()),
+                        _ => None,
+                    });
+                return Ok(vec![TypedPattern {
+                    label: None,
+                    bindings: Vec::new(),
+                    wild: false,
+                    unknown: true,
+                    unknown_binding,
+                }]);
+            }
+            let label = events::variant_label(&name).ok_or_else(|| {
+                Error::at(
+                    item.span(),
+                    format!("typed event variant `{name}` is not recognized"),
+                )
+            })?;
+            let mut bindings = Vec::new();
+            for element in &item.elems {
+                match element {
+                    Pat::Ident(ident) => {
+                        bindings.push(ident.ident.to_string());
+                    }
+                    Pat::Wild(_) => {}
+                    other => {
+                        return Err(Error::at(
+                            other.span(),
+                            "typed event payload must bind a plain name",
+                        ));
+                    }
+                }
+            }
+            Ok(vec![TypedPattern {
+                label: Some(label.to_owned()),
+                bindings,
+                wild: false,
+                unknown: false,
+                unknown_binding: None,
+            }])
+        }
+        other => Err(Error::at(
+            other.span(),
+            "typed event match only supports enum variants and wildcards",
+        )),
+    }
+}
+
+impl<'a> Emitter<'a> {
+    fn typed_event_match(
+        &mut self,
+        item: &syn::ExprMatch,
+        method: &str,
+        tail: bool,
+    ) -> Result<(), Error> {
+        let patterns = item
+            .arms
+            .iter()
+            .map(|arm| {
+                let (pattern, guard) = split_guard(&arm.pat);
+                if guard.is_some() {
+                    return Err(Error::at(
+                        arm.pat.span(),
+                        "guards are not supported in typed event matches",
+                    ));
+                }
+                Ok((arm, typed_patterns(pattern)?))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        if self.bound_event.is_none() {
+            let unknown = patterns
+                .iter()
+                .flat_map(|(_, cases)| cases)
+                .any(|case| case.unknown);
+            for (_, cases) in &patterns {
+                for case in cases {
+                    if let Some(label) = &case.label {
+                        self.events.insert(label.clone());
+                    }
+                }
+            }
+            if unknown {
+                for label in events::known_labels(method) {
+                    self.events.insert((*label).to_owned());
+                }
+            }
+            return Ok(());
+        }
+        let bound = self.bound_event.clone().unwrap_or_default();
+        for (arm, cases) in patterns {
+            for case in cases {
+                let unknown = case.unknown
+                    && !events::known_labels(method).contains(&bound.as_str());
+                if case.label.as_deref() == Some(bound.as_str())
+                    || (case.wild && case.label.is_none())
+                    || unknown
+                {
+                    return self.inline_typed_arm(
+                        arm,
+                        case.label.as_deref(),
+                        case.bindings,
+                        case.unknown_binding.as_deref(),
+                        &bound,
+                        tail,
+                    );
+                }
+            }
+        }
+        Err(Error::at(
+            item.span(),
+            format!("typed event match has no arm for `{bound}`"),
+        ))
+    }
+
+    fn inline_typed_arm(
+        &mut self,
+        arm: &syn::Arm,
+        label: Option<&str>,
+        bindings: Vec<String>,
+        unknown_binding: Option<&str>,
+        event: &str,
+        tail: bool,
+    ) -> Result<(), Error> {
+        if bindings.is_empty() && unknown_binding.is_none() {
+            return self.inline_arm(&arm.body, tail);
+        }
+        self.push_scope();
+        if let Some(name) = unknown_binding {
+            let lua = self.bind_name(name);
+            self.line(&format!("local {lua} = {}", quote(event)));
+            self.push(name, Ty::STR);
+        }
+        let class = label.and_then(events::payload_struct);
+        for name in bindings {
+            self.uses_payload = true;
+            self.payload_escapes = true;
+            let lua = self.bind_name(&name);
+            self.line(&format!("local {lua} = payload"));
+            if matches!(class, Some("ActionPayload" | "HostCallbackPayload")) {
+                self.line(&format!(
+                    "{lua}.args = payload.args or {}",
+                    empty_array()
+                ));
+            }
+            if let Some(class) = class {
+                self.classes.insert(lua.clone(), class.to_owned());
+            }
+            self.push(&name, Ty::VALUE);
+        }
+        let result = self.inline_arm(&arm.body, tail);
+        self.pop_scope();
+        result
+    }
+}
+
+impl<'a> Emitter<'a> {
     fn binding_name(&self, pattern: &syn::PatIdent) -> Result<String, Error> {
         let name = pattern.ident.to_string();
         Ok(name)

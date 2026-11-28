@@ -1,11 +1,11 @@
 use noctalia_rs::entry;
-use noctalia_rs::{Context, Op, Result};
+use noctalia_rs::{Context, Op, Result, ShortcutEvent};
 use serde_json::json;
 
 #[entry(kind = "shortcut", id = "shortcut")]
 pub fn update(ctx: &Context) -> Result<Vec<Op>> {
     let _ = serde_json::to_value(&ctx.entry)?;
-    if ctx.event != "click" {
+    if ctx.shortcut_event() != ShortcutEvent::Click {
         return Ok(Vec::new());
     }
 

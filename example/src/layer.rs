@@ -1,11 +1,11 @@
 use noctalia_rs::entry;
-use noctalia_rs::{Context, Op, Result, ui};
+use noctalia_rs::{Context, LayerEvent, Op, Result, ui};
 use serde_json::json;
 
 #[entry(kind = "layer", id = "layer")]
 pub fn update(ctx: &Context) -> Result<Vec<Op>> {
     let _ = serde_json::to_value(&ctx.entry)?;
-    if ctx.event == "click" {
+    if ctx.layer_event() == LayerEvent::Click {
         return Ok(vec![Op::LayerHide {
             id: "layer".to_owned(),
         }]);

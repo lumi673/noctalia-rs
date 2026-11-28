@@ -2519,3 +2519,97 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let native = duplicated(vec![Op::log("2 2 3".to_owned())]);
     assert_eq!(luau, native);
 }
+
+fn typed_widget_handler(ctx: &Context) -> noctalia_rs::Result<Vec<Op>> {
+    use noctalia_rs::WidgetEvent;
+    match ctx.widget_event() {
+        WidgetEvent::Click => Ok(vec![Op::log("clicked".to_owned())]),
+        WidgetEvent::Scroll(scroll) => {
+            let axis = scroll.axis.unwrap_or_default();
+            let steps = scroll.steps.unwrap_or_default();
+            let gesture = scroll.starts_gesture.unwrap_or_default();
+            Ok(vec![Op::log(format!("{axis}|{steps}|{gesture}"))])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+#[test]
+fn typed_events_match_the_native_handler() {
+    let handler = r#"
+use noctalia_rs::{Context, Op, Result, WidgetEvent};
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    match ctx.widget_event() {
+        WidgetEvent::Click => Ok(vec![Op::log("clicked".to_owned())]),
+        WidgetEvent::Scroll(scroll) => {
+            let axis = scroll.axis.unwrap_or_default();
+            let steps = scroll.steps.unwrap_or_default();
+            let gesture = scroll.starts_gesture.unwrap_or_default();
+            Ok(vec![Op::log(format!("{axis}|{steps}|{gesture}"))])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+"#;
+    let source = compiled_source("typed_events", handler, EntryKind::Widget);
+    for (event, payload) in [
+        ("render", json!({ "source": "update" })),
+        ("click", json!({})),
+        (
+            "scroll",
+            json!({ "axis": "y", "steps": -3, "starts_gesture": true }),
+        ),
+        ("scroll", json!({ "axis": null, "steps": 1 })),
+    ] {
+        let ctx = context("typed_events", event, payload, json!({}));
+        assert_eq!(
+            ops("typed_events", &source, &ctx),
+            rust_ops(typed_widget_handler(&ctx).expect("native ops")),
+            "event {event}"
+        );
+    }
+}
+
+fn typed_callback_handler(ctx: &Context) -> noctalia_rs::Result<Vec<Op>> {
+    use noctalia_rs::ServiceEvent;
+    match ctx.service_event() {
+        ServiceEvent::HostCallback(callback) => {
+            let id = callback.id.unwrap_or_default();
+            let count = callback.args.len();
+            Ok(vec![Op::log(format!("{id}:{count}"))])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+#[test]
+fn typed_callback_payload_defaults_missing_args_to_an_empty_list() {
+    let handler = r#"
+use noctalia_rs::{Context, Op, Result, ServiceEvent};
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    match ctx.service_event() {
+        ServiceEvent::HostCallback(callback) => {
+            let id = callback.id.unwrap_or_default();
+            let count = callback.args.len();
+            Ok(vec![Op::log(format!("{id}:{count}"))])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+"#;
+    let source =
+        compiled_source("typed_callbacks", handler, EntryKind::Service);
+    for payload in [
+        json!({ "id": "cb" }),
+        json!({ "id": "cb", "args": [1, 2, 3] }),
+    ] {
+        let ctx =
+            context("typed_callbacks", "host_callback", payload, json!({}));
+        assert_eq!(
+            ops("typed_callbacks", &source, &ctx),
+            rust_ops(typed_callback_handler(&ctx).expect("native ops")),
+            "payload {:?}",
+            ctx.payload
+        );
+    }
+}

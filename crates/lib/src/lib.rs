@@ -6,6 +6,7 @@ pub mod clock;
 pub mod codegen;
 pub mod context;
 pub mod coroutine;
+pub mod events;
 pub mod manifest;
 pub mod ops;
 pub mod rng;
@@ -19,6 +20,13 @@ pub use clock::{ClockBudget, os_clock, unix_seconds};
 pub use context::{Context, FileInfo, Parts};
 pub use coroutine::{
     Coroutine, Poll as CoroutinePoll, run_budgeted, yield_now, yield_value,
+};
+pub use events::{
+    ActionPayload, ActivatePayload, AudioSpectrumPayload, DesktopWidgetEvent,
+    ExitPayload, FramePayload, HostCallbackPayload, HoverPayload, IpcPayload,
+    KeyPayload, LauncherEvent, LayerEvent, OpenPayload, PanelEvent,
+    ScrollPayload, SearchPayload, ServiceEvent, ShortcutEvent, SourcePayload,
+    WidgetEvent,
 };
 pub use manifest::{
     Entry, EntryConfig, EntryKind, ExclusiveZone, LauncherCategory,
