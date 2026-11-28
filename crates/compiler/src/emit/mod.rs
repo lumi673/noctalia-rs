@@ -32,6 +32,7 @@ mod constants;
 mod expressions;
 mod handles;
 mod inline;
+mod local;
 mod macros;
 mod methods;
 mod native;
@@ -43,8 +44,8 @@ mod types;
 
 #[allow(unused_imports)]
 use {
-    calls::*, config::*, expressions::*, inline::*, macros::*, methods::*,
-    native::*, ops::*, state::*, statements::*, types::*,
+    calls::*, config::*, expressions::*, inline::*, local::*, macros::*,
+    methods::*, native::*, ops::*, state::*, statements::*, types::*,
 };
 
 pub(crate) use handles::runtime as handles_runtime;
@@ -83,6 +84,10 @@ impl<'a> Emitter<'a> {
             home: module.to_owned(),
             inline_stack: Vec::new(),
             inline_budget: MAX_INLINE_CALLS,
+            local_helpers: BTreeMap::new(),
+            local_defs: String::new(),
+            helper_result: false,
+            helper_pair: false,
             statics: BTreeMap::new(),
             local_statics: Vec::new(),
             classes: HashMap::new(),
@@ -258,6 +263,11 @@ impl<'a> Emitter<'a> {
         } else {
             "noctalia.setUpdateInterval("
         };
+        source.push_str(
+            &self
+                .local_defs
+                .replace("__noctalia_timer_base_call(", base_call),
+        );
         source.push_str(
             &self.out.replace("__noctalia_timer_base_call(", base_call),
         );
@@ -563,6 +573,10 @@ pub(crate) struct Emitter<'a> {
     home: String,
     inline_stack: Vec<String>,
     inline_budget: usize,
+    local_helpers: BTreeMap<String, String>,
+    local_defs: String,
+    helper_result: bool,
+    helper_pair: bool,
     statics: BTreeMap<String, StaticDef>,
     local_statics: LocalStatics,
     classes: HashMap<String, String>,

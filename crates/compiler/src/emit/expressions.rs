@@ -1289,13 +1289,26 @@ impl<'a> Emitter<'a> {
         if ty.result {
             let error = self.temp();
             self.line(&format!("local {name}, {error} = {text}"));
-            self.line(&format!(
-                "if {error} ~= nil then error(tostring({error})) end"
-            ));
+            if self.helper_result {
+                self.line(&format!(
+                    "if {error} ~= nil then return nil, {error} end"
+                ));
+            } else {
+                self.line(&format!(
+                    "if {error} ~= nil then error(tostring({error})) end"
+                ));
+            }
         } else {
             self.line(&format!("local {name} = {text}"));
             if ty.optional {
-                self.line(&format!("if {name} == nil then return end"));
+                let bare = if self.helper_pair {
+                    "return nil, nil"
+                } else if self.helper_result {
+                    "return nil"
+                } else {
+                    "return"
+                };
+                self.line(&format!("if {name} == nil then {bare} end"));
             }
         }
         Ok((
@@ -1316,6 +1329,10 @@ impl<'a> Emitter<'a> {
         let saved_indent = self.indent;
         let saved_target = self.tail_target.clone();
         let saved_deferred = self.deferred;
+        let saved_result = self.helper_result;
+        let saved_pair = self.helper_pair;
+        self.helper_result = false;
+        self.helper_pair = false;
         self.deferred = self.deferred.saturating_add(1);
         self.indent = 0;
         self.tail_target = None;
@@ -1341,6 +1358,8 @@ impl<'a> Emitter<'a> {
                     self.indent = saved_indent;
                     self.tail_target = saved_target;
                     self.deferred = saved_deferred;
+                    self.helper_result = saved_result;
+                    self.helper_pair = saved_pair;
                     return Err(Error::at(
                         other.span(),
                         "closure parameters must be plain identifiers",
@@ -1363,6 +1382,8 @@ impl<'a> Emitter<'a> {
         self.indent = saved_indent;
         self.tail_target = saved_target;
         self.deferred = saved_deferred;
+        self.helper_result = saved_result;
+        self.helper_pair = saved_pair;
         result?;
         Ok((text, Ty::VALUE))
     }

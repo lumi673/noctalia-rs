@@ -65,10 +65,11 @@ impl<'a> Emitter<'a> {
                         Error::at(call.span(), "Ok() needs a value")
                     })?;
                     let (text, _) = self.expr(value)?;
+                    let suffix = if self.helper_pair { ", nil" } else { "" };
                     if let Some(target) = self.tail_target.clone() {
-                        self.line(&format!("{target} = {text}"));
+                        self.line(&format!("{target} = {text}{suffix}"));
                     } else {
-                        self.line(&format!("return {text}"));
+                        self.line(&format!("return {text}{suffix}"));
                     }
                     Ok(())
                 } else {
@@ -602,10 +603,17 @@ impl<'a> Emitter<'a> {
 
     pub(super) fn ret(&mut self, expr: Option<&Expr>) -> Result<(), Error> {
         let Some(expr) = expr else {
+            let bare = if self.helper_pair {
+                "return nil, nil"
+            } else if self.helper_result {
+                "return nil"
+            } else {
+                "return"
+            };
             if let Some(target) = self.tail_target.clone() {
                 self.line(&format!("{target} = nil"));
             } else {
-                self.line("return");
+                self.line(bare);
             }
             return Ok(());
         };
@@ -618,7 +626,11 @@ impl<'a> Emitter<'a> {
                     self.expr(call.args.first().ok_or_else(|| {
                         Error::at(call.span(), "Err() needs a value")
                     })?)?;
-                self.line(&format!("error({text})"));
+                if self.helper_result {
+                    self.line(&format!("return nil, {text}"));
+                } else {
+                    self.line(&format!("error({text})"));
+                }
                 return Ok(());
             }
         }
@@ -631,7 +643,7 @@ impl<'a> Emitter<'a> {
                     self.op_expr(item)?;
                 }
                 if self.tail_target.is_none() {
-                    self.line("return");
+                    self.helper_return();
                 }
                 return Ok(());
             }
@@ -640,7 +652,8 @@ impl<'a> Emitter<'a> {
         if let Some(target) = self.tail_target.clone() {
             self.line(&format!("{target} = {text}"));
         } else {
-            self.line(&format!("return {text}"));
+            let suffix = if self.helper_pair { ", nil" } else { "" };
+            self.line(&format!("return {text}{suffix}"));
         }
         Ok(())
     }
@@ -658,6 +671,13 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), Error> {
         self.ok_impl(args, false)
     }
+    pub(super) fn helper_return(&mut self) {
+        if self.helper_pair {
+            self.line("return nil");
+        } else {
+            self.line("return");
+        }
+    }
 
     fn ok_impl(
         &mut self,
@@ -669,7 +689,7 @@ impl<'a> Emitter<'a> {
         })?;
         if matches!(value, Expr::Tuple(tuple) if tuple.elems.is_empty()) {
             if emit_return {
-                self.line("return");
+                self.helper_return();
             }
             return Ok(());
         }
@@ -677,22 +697,10 @@ impl<'a> Emitter<'a> {
             && let Some(helper) = self.helper(call)
             && matches!(return_kind(&helper.function)?, Returns::VecOps)
         {
-            let check = self.check_inline(
-                &helper,
-                Inline::Ops,
-                Returns::VecOps,
-                &call.span(),
-            )?;
             let bindings = self.bindings(&helper, call)?;
-            self.inline(
-                &helper,
-                bindings,
-                Inline::Ops,
-                Returns::VecOps,
-                check,
-            )?;
+            self.inline_resolved(helper, Inline::Ops, call.span(), bindings)?;
             if emit_return {
-                self.line("return");
+                self.helper_return();
             }
             return Ok(());
         }
@@ -700,7 +708,7 @@ impl<'a> Emitter<'a> {
             && is_vec_new(call)
         {
             if emit_return {
-                self.line("return");
+                self.helper_return();
             }
             return Ok(());
         }
@@ -711,7 +719,7 @@ impl<'a> Emitter<'a> {
                 self.op_expr(&item)?;
             }
             if emit_return {
-                self.line("return");
+                self.helper_return();
             }
             return Ok(());
         }
@@ -722,7 +730,7 @@ impl<'a> Emitter<'a> {
                 .is_some_and(|ty| matches!(ty.base, Base::Ops | Base::List))
         {
             if emit_return {
-                self.line("return");
+                self.helper_return();
             }
             return Ok(());
         }
