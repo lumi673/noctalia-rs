@@ -139,6 +139,14 @@ impl Runtime<'_> {
                 )));
             }
         }
+        if let LuaValue::String(_) =
+            table.raw_get::<LuaValue>(noctalia_rs::bytes::BYTES_KEY)?
+        {
+            return Err(mlua::Error::runtime(format!(
+                "plugin API 57 takes a Luau byte string; strict emit passed the `{}` marker table",
+                noctalia_rs::bytes::BYTES_KEY
+            )));
+        }
         for pair in table.clone().pairs::<LuaValue, LuaValue>() {
             let (_, item) = pair?;
             self.reject_markers(&item, depth + 1)?;
@@ -717,6 +725,16 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
     set_fn!(lua, &table, "copyToClipboard", |lua, args: Args| {
         let host = host(lua)?;
         let values = args.to_vec();
+        if host.strict()
+            && let Some(LuaValue::Table(table)) = values.first()
+            && let LuaValue::String(_) =
+                table.raw_get::<LuaValue>(noctalia_rs::bytes::BYTES_KEY)?
+        {
+            return Err(mlua::Error::runtime(format!(
+                "plugin API 57 takes a Luau byte string; strict emit passed the `{}` marker table",
+                noctalia_rs::bytes::BYTES_KEY
+            )));
+        }
         let mime = string_arg(lua, &values, 1);
         let mime = if mime.is_empty() {
             "text/plain".to_owned()

@@ -23,6 +23,9 @@ impl<'a> Emitter<'a> {
         ty: Ty,
     ) -> Result<OptionalValue, Error> {
         let value: Result<(String, Ty), Error> = match method {
+            "as_bytes" | "into_bytes" if ty.base == Base::Text => {
+                Ok((receiver.to_owned(), Ty::BYTES))
+            }
             "push_str" => {
                 let value = self.expr(arg(args, 0, call)?)?.0;
                 self.line(&format!("{receiver} = {receiver} .. ({value})"));

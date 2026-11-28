@@ -223,6 +223,118 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn strict_bytes_and_utf8_text_are_raw_luau_strings() {
+    let handler = r#"
+use noctalia_rs::{Bytes, Utf8Text};
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let raw = Bytes::new(vec![0u8, 255u8]);
+    let text = Utf8Text::from_bytes(Bytes::new(vec![104u8]))?;
+    let mut ops = Vec::new();
+    ops.push(Op::copy_bytes(raw, "application/octet-stream"));
+    ops.push(Op::log(text.as_str()));
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(ops)
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("string.char(0, 255)"), "{output}");
+    assert!(output.contains("string.char(104)"), "{output}");
+    assert!(output.contains("__check_utf8("), "{output}");
+    assert!(
+        output.contains("local function __check_utf8(value)"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("__noctalia_rs_bytes"),
+        "a marker crossed the strict ABI: {output}"
+    );
+}
+
+#[test]
+fn strict_rejects_an_out_of_range_byte_literal_at_its_span() {
+    let handler = r#"
+use noctalia_rs::Bytes;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let raw = Bytes::new(vec![256u8]);
+    Ok(vec![Op::log(raw.len().to_string())])
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("range");
+    let span = error.strip_prefix("widget.rs:").expect("file:line:column");
+    let mut numbers = span.split(':');
+    let line = numbers
+        .next()
+        .expect("line")
+        .parse::<usize>()
+        .expect("number");
+    let column = numbers
+        .next()
+        .expect("column")
+        .parse::<usize>()
+        .expect("number");
+    assert!(line > 0 && column > 0, "{error}");
+    assert!(error.contains("outside 0..=255"), "{error}");
+    assert!(!error.contains("string.char(256)"), "{error}");
+}
+
+#[test]
+fn strict_bytes_reject_json_encoding_and_validate_as_str() {
+    let encode = r#"
+use noctalia_rs::Bytes;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let raw = Bytes::new(vec![255u8]);
+    Ok(vec![Op::log(serde_json::to_string(&raw)?)])
+}
+"#;
+    let error = compile_strict(encode, &[]).expect_err("no byte JSON");
+    assert!(
+        error.contains("UTF-8 validation"),
+        "missing file:line:column: {error}"
+    );
+    assert!(error.contains("widget.rs:"), "{error}");
+    assert!(!error.contains("__noctalia_rs_bytes"), "{error}");
+
+    let checked = r#"
+use noctalia_rs::Bytes;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let raw = Bytes::new(vec![255u8]);
+    Ok(vec![Op::log(raw.as_str().unwrap_or("fallback"))])
+}
+"#;
+    let output = compile_strict(checked, &[]).expect("compile");
+    assert!(output.contains("__check_utf8("), "{output}");
+    assert!(
+        output.contains("if __error ~= nil then return nil end"),
+        "{output}"
+    );
+}
+
+#[test]
+fn strict_utf8_text_accepts_byte_array_literals() {
+    let handler = r#"
+use noctalia_rs::Utf8Text;
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let text = Utf8Text::try_from(&[104u8]).unwrap();
+    Ok(vec![Op::log(text.as_str())])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("string.char(104)"), "{output}");
+    assert!(output.contains("__check_utf8("), "{output}");
+    assert!(
+        !output.contains("__check_utf8({ 104 })"),
+        "a byte array became a table: {output}"
+    );
+}
+
+#[test]
 fn strict_acceptance_methods_report_booleans() {
     let handler = r#"
 fn handler(ctx: &Context) -> Result<Vec<Op>> {

@@ -568,6 +568,33 @@ fn handler(_ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn auto_mode_keeps_byte_and_text_strings_without_markers() {
+    let handler = r#"
+use noctalia_rs::{Bytes, Utf8Text};
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let raw = Bytes::new(vec![104u8]);
+    let text = Utf8Text::new("hi");
+    let _ = raw;
+    Ok(vec![Op::log(text.as_str())])
+}
+"#;
+    let compiled =
+        compile(&source(handler), &options("handler", EntryKind::Service))
+            .expect("auto compile");
+    assert!(
+        compiled.source.contains("string.char(104)"),
+        "{}",
+        compiled.source
+    );
+    assert!(
+        !compiled.source.contains("__noctalia_rs_bytes"),
+        "{}",
+        compiled.source
+    );
+}
+
+#[test]
 fn rejects_let_chain_binding_shadowing() {
     let handler = r#"
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {

@@ -357,7 +357,8 @@ fn format_specifier(
     }
     format.push_str(rest);
     let conversion = match ty.base {
-        Base::Str | Base::Path => 's',
+        Base::Str | Base::Text | Base::Path => 's',
+        Base::Bytes => return Err(unsupported()),
         Base::Int => 'd',
         Base::Float => {
             if rest.contains('.') {
@@ -373,7 +374,7 @@ fn format_specifier(
     };
     format.push(conversion);
     let value = match ty.base {
-        Base::Str | Base::Path | Base::Int | Base::Float => value,
+        Base::Str | Base::Text | Base::Path | Base::Int | Base::Float => value,
         _ => format!("tostring({value})"),
     };
     Ok(format!("string.format({}, {value})", quote(&format)))

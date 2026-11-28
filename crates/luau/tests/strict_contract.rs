@@ -641,6 +641,88 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
 }
 
 #[test]
+fn strict_rejects_a_byte_marker_table() {
+    let source = r#"
+noctalia.writeFile("/tmp/x", { __noctalia_rs_bytes = "ff00" })
+"#;
+    let error = noctalia_rs_luau::dispatch_strict(
+        &context("update", json!({})),
+        &[("strict", source)],
+    )
+    .expect_err("byte marker");
+    assert!(error.to_string().contains("__noctalia_rs_bytes"), "{error}");
+}
+
+#[test]
+fn strict_utf8_text_conversion_validates_at_runtime() {
+    let handler = |bytes: &str| {
+        format!(
+            r#"
+use noctalia_rs::{{Bytes, Utf8Text}};
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {{
+    let text = Utf8Text::from_bytes(Bytes::new(vec![{bytes}]))?;
+    Ok(vec![Op::log(text.as_str())])
+}}
+"#
+        )
+    };
+    let valid = strict_source(&handler("104u8"), EntryKind::Service);
+    assert_strict_contract(&valid);
+    mlua::Lua::new()
+        .load(&valid)
+        .into_function()
+        .expect("generated script parses");
+    let values = ops(&valid, "update", json!({}));
+    let messages = values
+        .into_iter()
+        .filter(|op| op["op"] == json!("log"))
+        .map(|op| op["message"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        !messages.is_empty() && messages.iter().all(|item| item == "h"),
+        "{messages:?}"
+    );
+
+    let invalid = strict_source(&handler("255u8"), EntryKind::Service);
+    let error = noctalia_rs_luau::dispatch_strict(
+        &context("update", json!({})),
+        &[("strict", &invalid)],
+    )
+    .expect_err("invalid UTF-8");
+    assert!(error.to_string().contains("invalid UTF-8"), "{error}");
+}
+
+#[test]
+fn strict_byte_as_str_falls_back_and_byte_arrays_validate_as_text() {
+    let source = strict_source(
+        r#"
+use noctalia_rs::{Bytes, Utf8Text};
+
+fn handler(_ctx: &Context) -> Result<Vec<Op>> {
+    let raw = Bytes::new(vec![255u8]);
+    let fallback = raw.as_str().unwrap_or("fallback");
+    let text = Utf8Text::try_from(&[104u8]).unwrap();
+    Ok(vec![Op::log(fallback), Op::log(text.as_str())])
+}
+"#,
+        EntryKind::Service,
+    );
+    assert_strict_contract(&source);
+    let values = ops(&source, "update", json!({}));
+    let messages = values
+        .into_iter()
+        .filter(|op| op["op"] == json!("log"))
+        .map(|op| op["message"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        messages.iter().any(|item| item == "fallback"),
+        "{messages:?}"
+    );
+    assert!(messages.iter().any(|item| item == "h"), "{messages:?}");
+}
+
+#[test]
 fn strict_emit_matrix_parses() {
     let fixtures = [
         r#"

@@ -1,16 +1,21 @@
-//! Raw byte transport across the JSON bridge.
+//! Byte and text transport.
 //!
-//! Luau strings can hold arbitrary bytes while JSON strings cannot. Byte
-//! buffers are carried through spool files as a tagged hex string and turned
-//! back into Luau strings by the generated bridge.
+//! `Bytes` and `Utf8Text` are the strict-mode types. Both map to a Luau byte
+//! string. `Bytes` carries arbitrary bytes; `Utf8Text` is validated UTF-8.
+//! Neither uses a marker when it crosses a JSON boundary: invalid bytes are
+//! rejected instead.
+//!
+//! `ByteBuf` and the `__noctalia_rs_bytes` marker remain for the auto/off
+//! bridge, where JSON strings cannot carry arbitrary bytes.
 
+use std::fmt;
 use std::ops::Deref;
+use std::str::{Utf8Error, from_utf8};
 
-use serde::de::Deserializer;
-use serde::ser::Serializer;
+use serde::de::{Deserializer, Error as DeError};
+use serde::ser::{Error as SerError, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
-
 /// Marker key used by Rust and generated Luau to identify byte buffers.
 pub const BYTES_KEY: &str = "__noctalia_rs_bytes";
 
@@ -67,6 +72,245 @@ impl Deref for ByteBuf {
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// Arbitrary bytes that map to a Luau byte string.
+///
+/// Unlike [`ByteBuf`], this type never emits a bridge marker. A JSON boundary
+/// is only valid while the bytes are UTF-8 text.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Bytes(Vec<u8>);
+
+impl Bytes {
+    /// Wraps an existing byte vector.
+    #[inline]
+    #[must_use]
+    pub const fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the raw bytes.
+    #[inline]
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consumes the value and returns the raw bytes.
+    #[inline]
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+
+    /// Returns the bytes as text when they are valid UTF-8.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        from_utf8(&self.0).ok()
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    #[inline]
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&[u8]> for Bytes {
+    #[inline]
+    fn from(value: &[u8]) -> Self {
+        Self(value.to_vec())
+    }
+}
+
+impl From<Utf8Text> for Bytes {
+    #[inline]
+    fn from(value: Utf8Text) -> Self {
+        Self(value.0.into_bytes())
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Deref for Bytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Serialize for Bytes {
+    #[inline]
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let text = from_utf8(&self.0).map_err(|error| {
+            <S::Error as SerError>::custom(format!(
+                "Bytes cannot cross a JSON boundary as invalid UTF-8: {error}"
+            ))
+        })?;
+        serializer.serialize_str(text)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bytes {
+    #[inline]
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let value = Json::deserialize(deserializer)?;
+        value.as_str().map_or_else(
+            || {
+                Err(<D::Error as DeError>::custom(
+                    "Bytes expects a JSON string; byte markers are not part of the strict JSON model",
+                ))
+            },
+            |text| Ok(Self(text.as_bytes().to_vec())),
+        )
+    }
+}
+
+/// Validated UTF-8 text that maps to a Luau byte string.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Utf8Text(String);
+
+impl Utf8Text {
+    /// Wraps text that is already valid UTF-8.
+    #[inline]
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// Validates a byte buffer as UTF-8.
+    #[inline]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the byte buffer is the validated input"
+    )]
+    pub fn from_bytes(bytes: Bytes) -> Result<Self, Utf8Error> {
+        let text = from_utf8(&bytes.0)?;
+        Ok(Self(text.to_owned()))
+    }
+
+    /// Returns the text.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the encoded bytes.
+    #[inline]
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    /// Consumes the value and returns the text.
+    #[inline]
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<Bytes> for Utf8Text {
+    type Error = Utf8Error;
+
+    #[inline]
+    fn try_from(value: Bytes) -> Result<Self, Self::Error> {
+        Self::from_bytes(value)
+    }
+}
+
+impl TryFrom<&[u8]> for Utf8Text {
+    type Error = Utf8Error;
+
+    #[inline]
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_bytes(Bytes::from(value))
+    }
+}
+
+impl From<&str> for Utf8Text {
+    #[inline]
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for Utf8Text {
+    #[inline]
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Deref for Utf8Text {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Utf8Text {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Utf8Text {
+    #[inline]
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for Utf8Text {
+    #[inline]
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Utf8Text {
+    #[inline]
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+impl From<Bytes> for ByteBuf {
+    #[inline]
+    fn from(value: Bytes) -> Self {
+        Self::new(value.0)
+    }
+}
+
+impl From<ByteBuf> for Bytes {
+    #[inline]
+    fn from(value: ByteBuf) -> Self {
+        Self(value.0)
     }
 }
 
@@ -197,5 +441,49 @@ mod tests {
                 .expect("deserialize marker");
         assert_eq!(text.as_bytes(), b"hello");
         assert_eq!(marked.as_bytes(), &[0, 255]);
+    }
+
+    #[test]
+    fn bytes_serialize_as_text_and_reject_invalid_utf8() {
+        let text = Bytes::from(b"hello".as_slice());
+        assert_eq!(
+            serde_json::to_value(&text).expect("serialize text"),
+            json!("hello")
+        );
+
+        let binary = Bytes::new(vec![0xff, 0x00]);
+        let error = serde_json::to_value(&binary).expect_err("reject bytes");
+        assert!(error.to_string().contains("invalid UTF-8"), "{error}");
+        assert!(
+            !error.to_string().contains(BYTES_KEY),
+            "a marker must not cross the JSON boundary: {error}"
+        );
+    }
+
+    #[test]
+    fn bytes_reject_a_bridge_marker() {
+        let error = serde_json::from_value::<Bytes>(json!({
+            "__noctalia_rs_bytes": "00ff"
+        }))
+        .expect_err("reject marker");
+        assert!(error.to_string().contains("byte markers"), "{error}");
+    }
+
+    #[test]
+    fn utf8_text_validates_and_round_trips() {
+        let valid =
+            Utf8Text::from_bytes(Bytes::from("é".as_bytes())).expect("text");
+        assert_eq!(valid.as_str(), "é");
+        assert_eq!(Bytes::from(valid.clone()).as_bytes(), "é".as_bytes());
+
+        let error = Utf8Text::try_from(&[0xff][..]).expect_err("invalid");
+        assert_eq!(error.valid_up_to(), 0);
+        assert_eq!(
+            serde_json::to_value(&valid).expect("serialize"),
+            json!("é")
+        );
+        let decoded: Utf8Text =
+            serde_json::from_value(json!("ok")).expect("deserialize");
+        assert_eq!(decoded.as_str(), "ok");
     }
 }
