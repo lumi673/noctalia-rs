@@ -40,16 +40,13 @@ fn is_mut_other(ty: &Type) -> bool {
     matches!(ty, Type::Reference(reference) if reference.mutability.is_some() && !is_ops_vec(&reference.elem))
 }
 
-fn note_call(
+fn note_path(
     program: &Program,
     module: &str,
-    call: &ExprCall,
+    path: &syn::Path,
     out: &mut BTreeMap<String, Helper>,
 ) {
-    let Expr::Path(path) = &*call.func else {
-        return;
-    };
-    let Some(segments) = path_segments(&path.path) else {
+    let Some(segments) = path_segments(path) else {
         return;
     };
     let Some(resolved) = program.resolve(module, &segments) else {
@@ -68,6 +65,18 @@ fn note_call(
             class: None,
         },
     );
+}
+
+fn note_call(
+    program: &Program,
+    module: &str,
+    call: &ExprCall,
+    out: &mut BTreeMap<String, Helper>,
+) {
+    let Expr::Path(path) = &*call.func else {
+        return;
+    };
+    note_path(program, module, &path.path, out);
 }
 
 fn walk_expr(
@@ -106,6 +115,7 @@ fn walk_expr(
             walk_block(program, module, &item.body, out);
         }
         Expr::Group(item) => walk_expr(program, module, &item.expr, out),
+        Expr::Path(item) => note_path(program, module, &item.path, out),
         Expr::If(item) => {
             walk_expr(program, module, &item.cond, out);
             walk_block(program, module, &item.then_branch, out);
@@ -267,7 +277,6 @@ impl<'a> Emitter<'a> {
             .map(|key| (key.clone(), helper_name(key)))
             .collect::<BTreeMap<_, _>>();
         self.local_helpers = names.clone();
-        self.emitted = true;
         let owned_strings = self.strings.clone();
         let strings =
             owned_strings.iter().map(String::as_str).collect::<Vec<_>>();
@@ -303,9 +312,9 @@ impl<'a> Emitter<'a> {
                 Error::at(helper.function.span(), "missing helper name")
             })?;
             emitter.emit_helper_definition(&helper, name)?;
-            let body = emitter.finish();
+            let body = emitter.clone().finish();
             self.merge_helper_body(&body);
-            defs.push_str(&body.source);
+            defs.push_str(&emitter.out);
         }
         self.local_defs = defs;
         Ok(())
@@ -435,6 +444,17 @@ impl<'a> Emitter<'a> {
         }
         self.emitted |= !body.is_empty;
     }
+    fn call_error_check(&mut self, error: &str) {
+        if self.helper_result {
+            self.line(&format!(
+                "if {error} ~= nil then return nil, {error} end"
+            ));
+        } else {
+            self.line(&format!(
+                "if {error} ~= nil then error(tostring({error})) end"
+            ));
+        }
+    }
 
     pub(super) fn local_call(
         &mut self,
@@ -447,6 +467,7 @@ impl<'a> Emitter<'a> {
         let Some(name) = self.local_helpers.get(&key).cloned() else {
             return Ok(None);
         };
+
         let returns = return_kind(&helper.function)?;
         let mut args = Vec::new();
         for binding in bindings {
@@ -492,18 +513,14 @@ impl<'a> Emitter<'a> {
                         let value = self.temp();
                         let error = self.temp();
                         self.line(&format!("local {value}, {error} = {call}"));
-                        self.line(&format!(
-                            "if {error} ~= nil then error(tostring({error})) end"
-                        ));
+                        self.call_error_check(&error);
                         self.line("return");
                     }
                     Returns::Value(ty) if ty.result => {
                         let value = self.temp();
                         let error = self.temp();
                         self.line(&format!("local {value}, {error} = {call}"));
-                        self.line(&format!(
-                            "if {error} ~= nil then error(tostring({error})) end"
-                        ));
+                        self.call_error_check(&error);
                         self.line(&format!("return {value}"));
                     }
                     Returns::Value(_) => self.line(&format!("return {call}")),
@@ -519,9 +536,7 @@ impl<'a> Emitter<'a> {
                     let value = self.temp();
                     let error = self.temp();
                     self.line(&format!("local {value}, {error} = {call}"));
-                    self.line(&format!(
-                        "if {error} ~= nil then error(tostring({error})) end"
-                    ));
+                    self.call_error_check(&error);
                 } else {
                     self.line(&call);
                 }

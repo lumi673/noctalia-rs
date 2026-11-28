@@ -1148,3 +1148,82 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         "{output}"
     );
 }
+
+#[test]
+fn strict_helper_bodies_share_the_outer_state_table() {
+    let handler = r#"
+fn state_count(ctx: &Context) -> i64 {
+    ctx.state_value::<i64>("count").unwrap_or(0)
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = state_count(ctx);
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("state helper compiles");
+    let body_render = output
+        .split("local function body_render()")
+        .nth(1)
+        .expect("render body")
+        .split("\nend\n\nlocal function")
+        .next()
+        .expect("body end");
+    assert_eq!(
+        body_render.matches("local plugin_state =").count(),
+        1,
+        "{body_render}"
+    );
+    assert!(body_render.contains("plugin_state["), "{body_render}");
+}
+
+#[test]
+fn strict_nested_result_ops_helper_propagates_its_error() {
+    let handler = r#"
+fn inner(_ctx: &Context) -> Result<Vec<Op>> {
+    return Err("boom".to_owned());
+}
+
+fn outer(ctx: &Context) -> Result<Vec<Op>> {
+    inner(ctx)
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let ops = outer(ctx)?;
+    let _ = ops;
+    Ok(vec![Op::log("done")])
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("nested helper compiles");
+    assert!(output.contains("__noctalia_helper_main__outer"), "{output}");
+    let outer = output
+        .split("__noctalia_helper_main__outer_")
+        .nth(1)
+        .expect("outer definition")
+        .split("\n  end")
+        .next()
+        .expect("outer body");
+    assert!(outer.contains("return nil, "), "{outer}");
+    assert!(!outer.contains("error(tostring("), "{outer}");
+}
+
+#[test]
+fn strict_recursive_helper_used_as_a_callback_value_is_local() {
+    let handler = r#"
+fn count(n: i64) -> i64 {
+    if n <= 0 { 0 } else { count(n - 1) + 1 }
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let value = Some(4).map(count).unwrap_or_default();
+    Ok(vec![Op::log(value.to_string())])
+}
+"#;
+    let output =
+        compile_strict(handler, &[]).expect("callback helper compiles");
+    assert!(
+        output.contains("__noctalia_helper_main__count_"),
+        "{output}"
+    );
+    assert!(!output.contains("recursive helper"), "{output}");
+}
