@@ -1197,7 +1197,7 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let output = compile_strict(handler, &[]).expect("nested helper compiles");
     assert!(output.contains("__noctalia_helper_main__outer"), "{output}");
     let outer = output
-        .split("__noctalia_helper_main__outer_")
+        .split("\n  __noctalia_helper_main__outer_")
         .nth(1)
         .expect("outer definition")
         .split("\n  end")
