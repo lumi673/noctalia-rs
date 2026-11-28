@@ -1516,6 +1516,15 @@ impl<'a> Emitter<'a> {
         method: &str,
         args: &[&Expr],
     ) -> Result<(String, Ty), Error> {
+        if args.is_empty() && events::TYPED_EVENT_METHODS.contains(&method) {
+            return Ok(match &self.bound_event {
+                Some(event) => (quote(event), Ty::STR),
+                None => {
+                    self.uses_event = true;
+                    ("event".to_owned(), Ty::STR)
+                }
+            });
+        }
         match method {
             "config_str" => {
                 let key = self.string_arg(args, 0, call)?;

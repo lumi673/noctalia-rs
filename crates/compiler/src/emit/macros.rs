@@ -147,6 +147,39 @@ impl<'a> Emitter<'a> {
     ) -> Result<(String, Ty), Error> {
         let parsed: MatchesArgs = syn::parse2(mac.mac.tokens.clone())?;
         self.record_pattern_events(&parsed.expr, &parsed.pat);
+        if let Some(method) = self.typed_event_method(&parsed.expr) {
+            if parsed.guard.is_some() {
+                return Err(Error::at(
+                    mac.span(),
+                    "guards are not supported in typed event matches",
+                ));
+            }
+            let (expr, _) = self.expr(&parsed.expr)?;
+            let bound = self.bound_event.clone().unwrap_or_default();
+            let mut conditions = Vec::new();
+            for case in typed_patterns(&parsed.pat)? {
+                if case.wild {
+                    conditions.push("true".to_owned());
+                } else if case.unknown {
+                    if !events::known_labels(method).contains(&bound.as_str()) {
+                        conditions.push("true".to_owned());
+                    }
+                } else {
+                    if !case.bindings.is_empty() {
+                        return Err(Error::at(
+                            mac.span(),
+                            "typed payload bindings are not supported in matches!",
+                        ));
+                    }
+                    let label = case.label.unwrap_or_default();
+                    conditions.push(format!("({expr} == {})", quote(&label)));
+                }
+            }
+            if conditions.is_empty() {
+                conditions.push("false".to_owned());
+            }
+            return Ok((format!("({})", conditions.join(" or ")), Ty::BOOL));
+        }
         let (expr, ty) = self.expr(&parsed.expr)?;
         let Some(guard) = parsed.guard else {
             let (condition, _) =

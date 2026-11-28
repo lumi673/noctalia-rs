@@ -71,6 +71,19 @@ and the compiler covers config, payload, state, settings, `tr`, host reads,
 common ops, and constants. Errors name the module when they sit in an inlined
 helper.
 
+Each entry kind has a typed event enum in `noctalia_rs::events`: `ServiceEvent`,
+`WidgetEvent`, `ShortcutEvent`, `LauncherEvent`, `PanelEvent`, `LayerEvent`, and
+`DesktopWidgetEvent`. Read it with the matching `Context` method, such as
+`ctx.widget_event()`, and match its variants instead of comparing
+`ctx.event.as_str()` to strings. A variant with a payload binds the decoded
+payload table, so `WidgetEvent::Scroll(scroll)` gives access to the same fields
+`ctx.payload_str("axis")` reads. The compiler folds the match into the existing
+per-event Luau branches in `strict` and `auto`; `off` decodes it in the native
+handler. Unknown host events stay
+in the `Unknown(String)` variant. A typed match without an arm for a delivered
+event, an unrecognized variant, or a guard fails the build with
+`file:line:column`.
+
 JSON parsing and `serde_json::Value`, nested assignments, common iterators,
 string and numeric methods, format specifiers, character-set trimming, string
 slices, blocks and loops are translated. Match guards read their pattern

@@ -979,8 +979,22 @@ impl<'a> Emitter<'a> {
             self.record_event(&binary.left, &binary.right, negated);
             self.record_event(&binary.right, &binary.left, negated);
         }
-        let (left, left_ty) = self.expr(&binary.left)?;
-        let (right, right_ty) = self.expr(&binary.right)?;
+        let left_event = self.is_event_expr(&binary.left);
+        let right_event = self.is_event_expr(&binary.right);
+        let left_variant = (!left_event && right_event)
+            .then(|| self.typed_variant_label(&binary.left))
+            .flatten();
+        let right_variant = (left_event && !right_event)
+            .then(|| self.typed_variant_label(&binary.right))
+            .flatten();
+        let (left, left_ty) = match left_variant {
+            Some(label) => (quote(label), Ty::STR),
+            None => self.expr(&binary.left)?,
+        };
+        let (right, right_ty) = match right_variant {
+            Some(label) => (quote(label), Ty::STR),
+            None => self.expr(&binary.right)?,
+        };
         if let Some(operator) = compare_operator(&binary.op) {
             if let Some(ordering) = path_ordering(&binary.op)
                 && (left_ty.base == Base::Path || right_ty.base == Base::Path)

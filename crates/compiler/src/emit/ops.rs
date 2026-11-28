@@ -2,6 +2,22 @@ use super::*;
 
 impl<'a> Emitter<'a> {
     pub(super) fn record_pattern_events(&mut self, expr: &Expr, pattern: &Pat) {
+        if let Some(method) = self.typed_event_method(expr) {
+            if let Ok(cases) = typed_patterns(pattern) {
+                let unknown = cases.iter().any(|case| case.unknown);
+                for case in cases {
+                    if let Some(label) = case.label() {
+                        self.events.insert(label.to_owned());
+                    }
+                }
+                if unknown {
+                    for label in events::known_labels(method) {
+                        self.events.insert((*label).to_owned());
+                    }
+                }
+            }
+            return;
+        }
         match pattern {
             Pat::Lit(literal) => {
                 self.record_event(expr, &Expr::Lit(literal.clone()), false)
@@ -25,15 +41,18 @@ impl<'a> Emitter<'a> {
         if !self.is_event_expr(event) {
             return;
         }
-        if let Expr::Lit(ExprLit {
-            lit: Lit::Str(value),
-            ..
-        }) = literal
-        {
+        let label = match literal {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) => Some(value.value()),
+            other => self.typed_variant_label(other).map(str::to_owned),
+        };
+        if let Some(label) = label {
             if negated {
-                self.negative_events.insert(value.value());
+                self.negative_events.insert(label);
             } else {
-                self.events.insert(value.value());
+                self.events.insert(label);
             }
         }
     }
@@ -55,12 +74,40 @@ impl<'a> Emitter<'a> {
                     && matches!(&field.member, Member::Named(name) if name == "event")
             }
             Expr::MethodCall(call) => {
-                self.is_event_expr(&call.receiver) && call.method == "as_str"
+                (self.is_event_expr(&call.receiver) && call.method == "as_str")
+                    || self.typed_event_method(expr).is_some()
             }
             Expr::Paren(paren) => self.is_event_expr(&paren.expr),
             Expr::Group(group) => self.is_event_expr(&group.expr),
             _ => false,
         }
+    }
+
+    pub(super) fn typed_event_method(
+        &self,
+        expr: &Expr,
+    ) -> Option<&'static str> {
+        let Expr::MethodCall(call) = expr else {
+            return None;
+        };
+        if !self.is_ctx_expr(&call.receiver) || !call.args.is_empty() {
+            return None;
+        }
+        events::TYPED_EVENT_METHODS
+            .iter()
+            .copied()
+            .find(|name| call.method == *name)
+    }
+
+    pub(super) fn typed_variant_label(
+        &self,
+        expr: &Expr,
+    ) -> Option<&'static str> {
+        let Expr::Path(path) = expr else {
+            return None;
+        };
+        let name = path.path.segments.last()?.ident.to_string();
+        events::variant_label(&name)
     }
 
     pub(super) fn op_expr(&mut self, expr: &Expr) -> Result<(), Error> {

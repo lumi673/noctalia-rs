@@ -484,6 +484,18 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     Ok(Vec::new())
 }
 "#,
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    match ctx.widget_event() {
+        WidgetEvent::Click => Ok(vec![Op::log("click")]),
+        WidgetEvent::Scroll(scroll) => {
+            let _ = scroll;
+            Ok(vec![Op::log("scroll")])
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+"#,
     ];
     for handler in fixtures {
         let source = strict_source(handler, EntryKind::Widget);
