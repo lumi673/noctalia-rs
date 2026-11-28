@@ -3,6 +3,10 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Base {
     Str,
+    /// Validated UTF-8 text backed by a Luau byte string.
+    Text,
+    /// Arbitrary bytes backed by a Luau byte string.
+    Bytes,
     /// A filesystem path. The value is a Luau string, and the base only selects
     /// component-wise path semantics over string ones.
     Path,
@@ -71,6 +75,8 @@ impl Ty {
     }
 
     pub(crate) const STR: Self = Self::new(Base::Str);
+    pub(crate) const TEXT: Self = Self::new(Base::Text);
+    pub(crate) const BYTES: Self = Self::new(Base::Bytes);
     pub(crate) const PATH: Self = Self::new(Base::Path);
     pub(crate) const OPT_PATH: Self = Self::opt(Base::Path);
     pub(crate) const INFO: Self = Self::new(Base::Info);
@@ -130,12 +136,12 @@ impl Ty {
 
     /// Whether the value prints and behaves as text, which includes a path.
     pub(super) fn is_string(self) -> bool {
-        matches!(self.base, Base::Str | Base::Path)
+        matches!(self.base, Base::Str | Base::Text | Base::Path)
     }
 
     pub(crate) const fn default_literal(self) -> Option<&'static str> {
         match self.base {
-            Base::Str | Base::Path => Some("\"\""),
+            Base::Str | Base::Text | Base::Bytes | Base::Path => Some("\"\""),
             Base::Int | Base::Float => Some("0"),
             Base::Bool => Some("false"),
             Base::List | Base::Table => Some("{}"),
@@ -181,6 +187,8 @@ pub(super) fn json_base_for_type(ty: &Type) -> Result<Base, Error> {
     let base = match name.as_str() {
         "Value" => Base::Value,
         "String" | "str" => Base::Str,
+        "Utf8Text" => Base::Text,
+        "Bytes" | "ByteBuf" => Base::Bytes,
         "bool" => Base::Bool,
         "i64" | "u64" | "usize" | "u32" | "i32" => Base::Int,
         "f64" | "f32" => Base::Float,
@@ -443,7 +451,11 @@ pub(super) fn type_hint(ty: &Type) -> Ty {
     if is_generic(ty, "Result") {
         return generic_arg(ty).map_or(Ty::VALUE, type_hint);
     }
-    if text.contains("String") || text == "str" {
+    if text == "Utf8Text" {
+        Ty::TEXT
+    } else if matches!(text.as_str(), "Bytes" | "ByteBuf") {
+        Ty::BYTES
+    } else if text.contains("String") || text == "str" {
         Ty::STR
     } else if matches!(text.as_str(), "Path" | "PathBuf" | "OsStr" | "OsString")
     {

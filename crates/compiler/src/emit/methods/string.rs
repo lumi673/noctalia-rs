@@ -23,6 +23,9 @@ impl<'a> Emitter<'a> {
         ty: Ty,
     ) -> Result<OptionalValue, Error> {
         let value: Result<(String, Ty), Error> = match method {
+            "as_bytes" | "into_bytes" if ty.base == Base::Text => {
+                Ok((receiver.to_owned(), Ty::BYTES))
+            }
             "push_str" => {
                 let value = self.expr(arg(args, 0, call)?)?.0;
                 self.line(&format!("{receiver} = {receiver} .. ({value})"));
@@ -30,7 +33,7 @@ impl<'a> Emitter<'a> {
             }
             "find" if !matches!(args.first(), Some(Expr::Closure(_))) => {
                 let needle = self.expr(arg(args, 0, call)?)?.0;
-                if ty.base != Base::Str {
+                if !matches!(ty.base, Base::Str | Base::Text) {
                     return Err(Error::at(
                         call.method.span(),
                         "find() needs a string receiver",
@@ -49,7 +52,7 @@ impl<'a> Emitter<'a> {
             )),
             "rfind" => {
                 let needle = self.expr(arg(args, 0, call)?)?.0;
-                if ty.base != Base::Str {
+                if !matches!(ty.base, Base::Str | Base::Text) {
                     return Err(Error::at(
                         call.method.span(),
                         "rfind() needs a string receiver",
@@ -64,7 +67,7 @@ impl<'a> Emitter<'a> {
             }
             "split_once" => {
                 let separator = self.expr(arg(args, 0, call)?)?.0;
-                if ty.base != Base::Str {
+                if !matches!(ty.base, Base::Str | Base::Text) {
                     return Err(Error::at(
                         call.method.span(),
                         "split_once() needs a string receiver",
@@ -79,7 +82,7 @@ impl<'a> Emitter<'a> {
             }
             "rsplit" => {
                 let separator = self.expr(arg(args, 0, call)?)?.0;
-                if ty.base != Base::Str {
+                if !matches!(ty.base, Base::Str | Base::Text) {
                     return Err(Error::at(
                         call.method.span(),
                         "rsplit() needs a string receiver",

@@ -285,6 +285,12 @@ impl<'a> Emitter<'a> {
                     return Ok(("nil".to_owned(), Ty::NULL));
                 }
                 let (text, ty) = self.expr(expr)?;
+                if ty.base == Base::Bytes {
+                    return Err(Error::at(
+                        expr.span(),
+                        "Bytes cannot be placed in json!; convert to Utf8Text first",
+                    ));
+                }
                 if ty.is_numeric() {
                     return Ok((text, ty));
                 }
@@ -357,7 +363,8 @@ fn format_specifier(
     }
     format.push_str(rest);
     let conversion = match ty.base {
-        Base::Str | Base::Path => 's',
+        Base::Str | Base::Text | Base::Path => 's',
+        Base::Bytes => return Err(unsupported()),
         Base::Int => 'd',
         Base::Float => {
             if rest.contains('.') {
@@ -373,7 +380,7 @@ fn format_specifier(
     };
     format.push(conversion);
     let value = match ty.base {
-        Base::Str | Base::Path | Base::Int | Base::Float => value,
+        Base::Str | Base::Text | Base::Path | Base::Int | Base::Float => value,
         _ => format!("tostring({value})"),
     };
     Ok(format!("string.format({}, {value})", quote(&format)))

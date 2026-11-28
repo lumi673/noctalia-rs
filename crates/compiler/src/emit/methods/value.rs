@@ -24,6 +24,18 @@ impl<'a> Emitter<'a> {
                 call.method.span(),
                 "the entry API is only supported as entry(key).or_insert(value), entry(key).or_insert_with(f) or entry(key).and_modify(f).or_insert(value)",
             )),
+            "as_str" if ty.base == Base::Text => {
+                Ok((receiver.to_owned(), Ty::TEXT))
+            }
+            "as_str" if ty.base == Base::Bytes => {
+                self.uses_utf8_check = true;
+                Ok((
+                    format!(
+                        "(function() local __value, __error = __check_utf8({receiver}); if __error ~= nil then return nil end; return __value end)()"
+                    ),
+                    Ty::opt(Base::Text),
+                ))
+            }
             "as_str" => Ok((string_check(receiver, ty), Ty::OPT_STR)),
             "as_i64" => {
                 Ok((integer_check(receiver, ty, I64_RANGE), Ty::OPT_INT))

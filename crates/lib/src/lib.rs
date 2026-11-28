@@ -17,7 +17,7 @@ pub mod ui;
 use std::error::Error;
 use std::result::Result as StdResult;
 
-pub use bytes::ByteBuf;
+pub use bytes::{ByteBuf, Bytes, Utf8Text};
 pub use cli::run;
 pub use clock::{ClockBudget, os_clock, unix_seconds};
 pub use context::{Context, FileInfo, Parts};

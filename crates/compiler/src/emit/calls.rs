@@ -217,6 +217,17 @@ impl<'a> Emitter<'a> {
                 {
                     return self.byte_string(arg(&args, 0, call)?);
                 }
+                "Bytes::new" | "Bytes::from" if args.len() == 1 => {
+                    return self.byte_string(arg(&args, 0, call)?);
+                }
+                "Utf8Text::new" | "Utf8Text::from" if args.len() == 1 => {
+                    return self.utf8_text(arg(&args, 0, call)?, call, false);
+                }
+                "Utf8Text::from_bytes" | "Utf8Text::try_from"
+                    if args.len() == 1 =>
+                {
+                    return self.utf8_text(arg(&args, 0, call)?, call, true);
+                }
                 _ => {}
             }
             if args.len() == 1
@@ -305,7 +316,13 @@ impl<'a> Emitter<'a> {
                 return Ok((format!("json.decode({text})"), Ty::result(base)));
             }
             if name == "serde_json::to_string" {
-                let text = self.expr(arg(&args, 0, call)?)?.0;
+                let (text, value_ty) = self.expr(arg(&args, 0, call)?)?;
+                if value_ty.base == Base::Bytes {
+                    return Err(Error::at(
+                        call.span(),
+                        "Bytes cannot be JSON encoded without UTF-8 validation; convert to Utf8Text first",
+                    ));
+                }
                 return Ok((format!("(json.encode({text}))"), Ty::STR));
             }
             if matches!(name.rsplit("::").next(), Some("from_iter"))
@@ -565,7 +582,8 @@ impl<'a> Emitter<'a> {
     ///
     /// A byte array becomes `string.char(...)` so it stays a Lua string. Any
     /// other expression (a `String`, `&str`, or a value already carrying
-    /// bytes) is used as is.
+    /// bytes) is used as is. Literal elements outside `0..=255` fail here
+    /// instead of producing an invalid Luau string.
     fn byte_string(&mut self, expr: &Expr) -> Result<(String, Ty), Error> {
         let inner = strip_reference(expr);
         let items = match inner {
@@ -573,30 +591,66 @@ impl<'a> Emitter<'a> {
             Expr::Array(array) => {
                 array.elems.iter().cloned().collect::<Vec<_>>()
             }
-            _ => return self.expr(expr),
+            _ => {
+                let (text, _) = self.expr(expr)?;
+                return Ok((text, Ty::BYTES));
+            }
         };
         let mut values = Vec::new();
-        let mut all_literals = true;
         for item in &items {
             let Expr::Lit(ExprLit {
                 lit: Lit::Int(value),
                 ..
             }) = strip_reference(item)
             else {
-                all_literals = false;
-                break;
+                return Err(Error::at(
+                    item.span(),
+                    "byte array elements must be integer literals in 0..=255 for an exact Luau string",
+                ));
             };
-            values.push(value.base10_parse::<u32>()?.to_string());
+            let byte = value.base10_parse::<u32>()?;
+            if byte > u32::from(u8::MAX) {
+                return Err(Error::at(
+                    item.span(),
+                    format!("byte literal {byte} is outside 0..=255"),
+                ));
+            }
+            values.push(byte.to_string());
         }
-        if all_literals {
-            return Ok((
-                format!("string.char({})", values.join(", ")),
-                Ty::STR,
+        Ok((format!("string.char({})", values.join(", ")), Ty::BYTES))
+    }
+
+    /// Emits `Utf8Text` as a Luau string. A value already known to be text is
+    /// used as is. Bytes are checked by a generated local function that
+    /// returns `(text, error)` for Rust's `Result` lowering.
+    fn utf8_text(
+        &mut self,
+        expr: &Expr,
+        call: &ExprCall,
+        result: bool,
+    ) -> Result<(String, Ty), Error> {
+        let inner = strip_reference(expr);
+        let (text, ty) = if matches!(inner, Expr::Array(_))
+            || matches!(inner, Expr::Macro(mac) if macro_name(mac) == "vec")
+        {
+            self.byte_string(expr)?
+        } else {
+            self.expr(expr)?
+        };
+        if matches!(ty.base, Base::Text | Base::Str | Base::Path) {
+            if result {
+                return Ok((format!("({text}, nil)"), Ty::result(Base::Text)));
+            }
+            return Ok((text, Ty::TEXT));
+        }
+        if !result {
+            return Err(Error::at(
+                call.span(),
+                "Utf8Text::new needs text; use Utf8Text::from_bytes for validation",
             ));
         }
-        let list = self.list(&items)?.0;
-        self.uses_unpack = true;
-        Ok((format!("string.char(__unpack({list}))"), Ty::STR))
+        self.uses_utf8_check = true;
+        Ok((format!("__check_utf8({text})"), Ty::result(Base::Text)))
     }
 
     /// A real callback value for strict emit.

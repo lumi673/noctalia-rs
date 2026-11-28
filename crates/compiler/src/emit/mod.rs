@@ -136,6 +136,7 @@ impl<'a> Emitter<'a> {
             uses_config_table: false,
             uses_translations_table: false,
             uses_unpack: false,
+            uses_utf8_check: false,
             uses_pcall: false,
             uses_action_dispatch: false,
             uses_callback_dispatch: false,
@@ -240,6 +241,15 @@ impl<'a> Emitter<'a> {
                 "    local copy = setmetatable({}, getmetatable(value))\n",
                 "    for key, item in pairs(value) do copy[key] = deep_clone(item) end\n",
                 "    return copy\n",
+                "  end\n",
+            ));
+        }
+        if self.uses_utf8_check {
+            source.push_str(concat!(
+                "  local function __check_utf8(value)\n",
+                "    local ok, length = pcall(utf8.len, value)\n",
+                "    if not ok or length == nil then return nil, \"invalid UTF-8\" end\n",
+                "    return value\n",
                 "  end\n",
             ));
         }
@@ -606,6 +616,7 @@ pub(crate) struct Emitter<'a> {
     uses_config_table: bool,
     uses_translations_table: bool,
     uses_unpack: bool,
+    uses_utf8_check: bool,
     uses_pcall: bool,
     uses_action_dispatch: bool,
     uses_callback_dispatch: bool,
