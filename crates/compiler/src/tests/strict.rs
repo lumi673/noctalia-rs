@@ -358,11 +358,15 @@ use noctalia_rs::Utf8Text;
 fn handler(_ctx: &Context) -> Result<Vec<Op>> {
     let text = Utf8Text::new("hi");
     let at = text.find("h").unwrap_or_default();
-    Ok(vec![Op::log(at.to_string())])
+    let last = text.rfind("i").unwrap_or_default();
+    let _ = text.split_once("i");
+    let _ = text.rsplit("i");
+    Ok(vec![Op::log(format!("{at}{last}"))])
 }
 "#;
     let output = compile_strict(handler, &[]).expect("compile");
     assert!(output.contains("string.find("), "{output}");
+    assert!(output.contains("string.sub("), "{output}");
 }
 
 #[test]
