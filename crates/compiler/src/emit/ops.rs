@@ -387,6 +387,56 @@ impl<'a> Emitter<'a> {
         Ok(Some(format!("{{ __host_callback = {text} }}")))
     }
 
+    /// The raw callback id for a strict handle helper, or `None` when the
+    /// argument is `None`. The helper captures the id once and wraps it in a
+    /// closure, so the host still sees a real API 57 function.
+    pub(super) fn strict_callback_id(
+        &mut self,
+        args: &[&Expr],
+        index: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(argument) = args.get(index) else {
+            return Ok(None);
+        };
+        let argument = strip_reference(argument);
+        if let Expr::Path(path) = argument
+            && path
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "None")
+        {
+            return Ok(None);
+        }
+        let inner = match argument {
+            Expr::Call(inner)
+                if path_last_name(&inner.func).as_deref() == Some("Some") =>
+            {
+                arg(&inner.args.iter().collect::<Vec<_>>(), 0, inner)?
+            }
+            other => other,
+        };
+        if !self.has_host_callback {
+            return Err(Error::at(
+                inner.span(),
+                "a handle callback needs a host_callback branch in strict mode",
+            ));
+        }
+        let text = if let Some(id) =
+            self.typed_callback_id_checked(inner, inner.span())?
+        {
+            if !matches!(inner, Expr::Call(_) | Expr::Path(_)) {
+                return Err(Error::at(
+                    inner.span(),
+                    "a typed callback expression with effects is not supported by strict handles",
+                ));
+            }
+            crate::quote(&id)
+        } else {
+            self.expr(inner)?.0
+        };
+        Ok(Some(text))
+    }
     /// Records a notify action global that the host will call by name.
     fn notify_action(&mut self, options: &Expr) -> Result<(), Error> {
         let Some(name) = json_action_name(options) else {

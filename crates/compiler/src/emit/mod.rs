@@ -30,6 +30,7 @@ use crate::{
 mod calls;
 mod constants;
 mod expressions;
+mod handles;
 mod inline;
 mod macros;
 mod methods;
@@ -44,6 +45,7 @@ use {
     ops::*, statements::*, types::*,
 };
 
+pub(crate) use handles::runtime as handles_runtime;
 pub(crate) use native::{native_runtime, stub_source};
 
 impl<'a> Emitter<'a> {
@@ -135,6 +137,10 @@ impl<'a> Emitter<'a> {
             uses_pcall: false,
             uses_action_dispatch: false,
             uses_callback_dispatch: false,
+            uses_run_handle: false,
+            uses_http_handle: false,
+            uses_stream_handle: false,
+            uses_watch_handle: false,
             has_action,
             has_host_callback,
         };
@@ -275,6 +281,10 @@ impl<'a> Emitter<'a> {
             uses_translations_table: self.uses_translations_table,
             uses_unpack: self.uses_unpack,
             uses_pcall: self.uses_pcall,
+            uses_run_handle: self.uses_run_handle,
+            uses_http_handle: self.uses_http_handle,
+            uses_stream_handle: self.uses_stream_handle,
+            uses_watch_handle: self.uses_watch_handle,
         }
     }
 
@@ -508,6 +518,10 @@ pub(crate) struct Body {
     pub uses_translations_table: bool,
     pub uses_unpack: bool,
     pub uses_pcall: bool,
+    pub uses_run_handle: bool,
+    pub uses_http_handle: bool,
+    pub uses_stream_handle: bool,
+    pub uses_watch_handle: bool,
 }
 
 #[derive(Clone)]
@@ -586,6 +600,10 @@ pub(crate) struct Emitter<'a> {
     uses_pcall: bool,
     uses_action_dispatch: bool,
     uses_callback_dispatch: bool,
+    uses_run_handle: bool,
+    uses_http_handle: bool,
+    uses_stream_handle: bool,
+    uses_watch_handle: bool,
     has_action: bool,
     has_host_callback: bool,
 }

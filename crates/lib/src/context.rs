@@ -19,7 +19,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::Result;
 use crate::bytes::{ByteBuf, decode_json_bytes};
+use crate::callback::Callback;
 use crate::clock::{os_clock, unix_seconds};
+use crate::handles::{
+    HttpHandle, HttpStreamHandle, RunHandle, StateWatchHandle,
+};
 use crate::ops::Op;
 use crate::rng;
 use crate::ui::callback;
@@ -346,6 +350,76 @@ impl Context {
             ],
         )
         .and_then(|value| value.as_f64())
+    }
+
+    /// Starts a process and returns an opaque handle for strict-generated code.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the strict run handle API keeps command, callback and timeout explicit"
+    )]
+    pub fn run<T>(
+        &self,
+        command: Value,
+        callback: Option<&Callback<T>>,
+        timeout_ms: Option<i64>,
+    ) -> RunHandle {
+        let mut args = match callback {
+            Some(id) => vec![command, id.value()],
+            None => vec![command, Value::Null],
+        };
+        args.push(
+            timeout_ms
+                .map_or(Value::Null, |ms| Value::Number(Number::from(ms))),
+        );
+        RunHandle::new(self.query_bool("noctalia", &["runAsync"], args))
+    }
+
+    /// Starts an HTTP request and returns an opaque handle for strict-generated code.
+    #[must_use]
+    pub fn http<T>(
+        &self,
+        request: Value,
+        callback: &Callback<T>,
+    ) -> HttpHandle {
+        HttpHandle::new(self.query_bool(
+            "noctalia",
+            &["http"],
+            vec![request, callback.value()],
+        ))
+    }
+
+    /// Starts an HTTP stream and returns an opaque handle for strict-generated code.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the strict stream handle API keeps both callback ids explicit"
+    )]
+    pub fn http_stream<Line, Close>(
+        &self,
+        request: Value,
+        on_line: &Callback<Line>,
+        on_close: &Callback<Close>,
+    ) -> HttpStreamHandle {
+        let (value, _error) = self.query_pair(
+            "noctalia",
+            &["httpStream"],
+            vec![request, on_line.value(), on_close.value()],
+        );
+        HttpStreamHandle::new(
+            value.and_then(|item| item.as_str().map(str::to_owned)),
+        )
+    }
+
+    /// Registers a state watch and returns an opaque handle for strict-generated code.
+    #[must_use]
+    pub fn state_watch<T>(
+        &self,
+        key: &str,
+        callback: &Callback<T>,
+    ) -> StateWatchHandle {
+        self.emit_op(&Op::state_watch(key, callback.id()));
+        StateWatchHandle::new(key.to_owned(), callback.id().to_owned())
     }
 
     /// Starts a process and returns Luau's `runAsync` acceptance boolean.
@@ -1263,5 +1337,84 @@ mod tests {
         assert!(!info.is_dir);
         assert!(info.mtime > 0);
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    #[expect(
+        clippy::excessive_nesting,
+        reason = "the op sink records a response and the emitted op in one place"
+    )]
+    fn test_async_handle_methods_emit_expected_host_work() {
+        let mut context = make_context();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        context.set_op_sink(Arc::new(move |op| {
+            let value = serde_json::to_value(op).unwrap_or(Value::Null);
+            let body = if value.get("path") == Some(&json!(["httpStream"])) {
+                r#"{"value":"stream-token"}"#
+            } else {
+                r#"{"value":true}"#
+            };
+            if let Some(response) =
+                value.get("response").and_then(Value::as_str)
+            {
+                let _ = fs::write(response, body);
+            }
+            if let Ok(mut ops) = recorded.lock() {
+                ops.push(value);
+            }
+        }));
+
+        let timeout = i64::MAX;
+        let run = context.run(
+            json!(["echo"]),
+            Some(&Callback::<Value>::named("done")),
+            Some(timeout),
+        );
+        let http = context
+            .http(json!({ "url": "x" }), &Callback::<Value>::named("response"));
+        let stream = context.http_stream(
+            json!({ "url": "y" }),
+            &Callback::<Value>::named("line"),
+            &Callback::<Value>::named("close"),
+        );
+        let watch = context
+            .state_watch("wm.workspaces", &Callback::<Value>::named("changed"));
+
+        assert!(run.started());
+        assert!(http.started());
+        assert!(stream.started());
+        assert!(watch.started());
+
+        let ops = lock(&seen);
+        assert_eq!(ops.len(), 4);
+        assert_eq!(
+            ops.first().and_then(|op| op.get("path")),
+            Some(&json!(["runAsync"]))
+        );
+        assert_eq!(
+            ops.first().and_then(|op| op.get("args")),
+            Some(&json!([
+                ["echo"],
+                { "__host_callback": "done" },
+                timeout,
+            ]))
+        );
+        assert_eq!(
+            ops.get(1).and_then(|op| op.get("path")),
+            Some(&json!(["http"]))
+        );
+        assert_eq!(
+            ops.get(2).and_then(|op| op.get("args")),
+            Some(&json!([
+                { "url": "y" },
+                { "__host_callback": "line" },
+                { "__host_callback": "close" },
+            ]))
+        );
+        assert_eq!(
+            ops.get(3).and_then(|op| op.get("path")),
+            Some(&json!(["state", "watch"]))
+        );
     }
 }

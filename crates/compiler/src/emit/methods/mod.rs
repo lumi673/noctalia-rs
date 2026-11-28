@@ -15,6 +15,36 @@ pub(super) fn reset_iter_done() {
     ITER_DONE.with(|slot| slot.borrow_mut().clear());
 }
 
+fn handle_method(
+    call: &ExprMethodCall,
+    method: &str,
+    args: &[&Expr],
+    receiver: &str,
+    strict: bool,
+) -> Result<(String, Ty), Error> {
+    if !strict {
+        return Err(Error::at(
+            call.method.span(),
+            format!("handle method `{method}` needs strict mode"),
+        ));
+    }
+    if !args.is_empty() {
+        return Err(Error::at(
+            call.span(),
+            format!("handle method `{method}` takes no arguments"),
+        ));
+    }
+    match method {
+        "stop" | "cancel" => Ok((format!("{receiver}.stop()"), Ty::VOID)),
+        "started" => Ok((format!("{receiver}.started()"), Ty::BOOL)),
+        "clone" => Ok((receiver.to_owned(), Ty::HANDLE)),
+        _ => Err(Error::at(
+            call.method.span(),
+            format!("handle method `{method}` is not supported"),
+        )),
+    }
+}
+
 thread_local! {
     static ITER_DONE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
@@ -1427,6 +1457,31 @@ impl<'a> Emitter<'a> {
         {
             return self.range_contains(call, &args, range);
         }
+        let handle_receiver =
+            if let Expr::Path(path) = strip_reference(&call.receiver) {
+                path.path.get_ident().and_then(|name| {
+                    let name = name.to_string();
+                    let by_class = self
+                        .class_of_receiver(&call.receiver)
+                        .is_some_and(|class| handles::is_class(&class));
+                    let by_type = self.lookup(&name).is_some_and(|ty| {
+                        !ty.optional && ty.base == Base::Handle
+                    });
+                    (by_class || by_type).then(|| self.local_name(&name))
+                })
+            } else {
+                None
+            };
+        if matches!(method.as_str(), "stop" | "cancel" | "started" | "clone")
+            && let Some(receiver) = handle_receiver
+        {
+            let value =
+                handle_method(call, &method, &args, &receiver, self.strict())?;
+            if value.1.base != Base::Handle {
+                self.pending_class = None;
+            }
+            return Ok(value);
+        }
         if self.is_ctx_expr(&call.receiver) {
             return self.context_method(call, &method, &args);
         }
@@ -1458,6 +1513,17 @@ impl<'a> Emitter<'a> {
         } else {
             receiver
         };
+        if matches!(method.as_str(), "stop" | "cancel" | "started" | "clone")
+            && !ty.optional
+            && ty.base == Base::Handle
+        {
+            let value =
+                handle_method(call, &method, &args, &receiver, self.strict())?;
+            if value.1.base != Base::Handle {
+                self.pending_class = None;
+            }
+            return Ok(value);
+        }
         if let Some(value) =
             self.combinator(call, &method, &args, &receiver, ty)?
         {
@@ -1884,6 +1950,67 @@ impl<'a> Emitter<'a> {
             "file_info" => {
                 let path = self.path_arg(args, 0, call)?;
                 Ok((format!("noctalia.fileInfo({path})"), Ty::INFO))
+            }
+            "run" | "http" | "http_stream" | "state_watch" => {
+                if !self.strict() {
+                    return Err(Error::at(
+                        call.method.span(),
+                        format!("context method `{method}` needs strict mode"),
+                    ));
+                }
+                let (helper, class) = match method {
+                    "run" => ("__strict_run_handle", handles::RUN),
+                    "http" => ("__strict_http_handle", handles::HTTP),
+                    "http_stream" => {
+                        ("__strict_http_stream_handle", handles::STREAM)
+                    }
+                    _ => ("__strict_state_watch_handle", handles::WATCH),
+                };
+                let request = self.expr(arg(args, 0, call)?)?.0;
+                let arguments = match method {
+                    "run" => {
+                        self.uses_run_handle = true;
+                        let callback = self
+                            .strict_callback_id(args, 1)?
+                            .unwrap_or_else(|| "nil".to_owned());
+                        let timeout = match args.get(2) {
+                            Some(timeout) => self.option_value(timeout)?,
+                            None => "nil".to_owned(),
+                        };
+                        format!("{request}, {callback}, {timeout}")
+                    }
+                    "http" => {
+                        self.uses_http_handle = true;
+                        let callback = self.strict_callback_id(args, 1)?.ok_or_else(|| {
+                            Error::at(call.span(), "op `http` needs a callback id")
+                        })?;
+                        format!("{request}, {callback}")
+                    }
+                    "http_stream" => {
+                        self.uses_stream_handle = true;
+                        let line = self.strict_callback_id(args, 1)?.ok_or_else(|| {
+                            Error::at(call.span(), "op `http_stream` needs a line callback id")
+                        })?;
+                        let close = self.strict_callback_id(args, 2)?.ok_or_else(|| {
+                            Error::at(call.span(), "op `http_stream` needs a close callback id")
+                        })?;
+                        format!("{request}, {line}, {close}")
+                    }
+                    _ => {
+                        self.uses_watch_handle = true;
+                        let callback = self.strict_callback_id(args, 1)?.ok_or_else(|| {
+                            Error::at(call.span(), "op `state_watch` needs a callback id")
+                        })?;
+                        format!("{request}, {callback}")
+                    }
+                };
+                let value = self.temp();
+                self.line(&format!(
+                    "local {value} = {helper}({arguments})"
+                ));
+                self.emitted = true;
+                self.pending_class = Some(class.to_owned());
+                Ok((format!("({value})"), Ty::HANDLE))
             }
             "run_async_start" | "run_stream_start" | "http_start"
                 if self.strict() =>

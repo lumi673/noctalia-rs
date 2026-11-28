@@ -15,6 +15,8 @@ pub(crate) enum Base {
     List,
     Node,
     Table,
+    /// An opaque async handle with a stop function in emitted Luau.
+    Handle,
     Ops,
     Context,
     Void,
@@ -79,6 +81,7 @@ impl Ty {
     pub(crate) const OPT_LIST: Self = Self::opt(Base::List);
     pub(crate) const NODE: Self = Self::new(Base::Node);
     pub(crate) const TABLE: Self = Self::new(Base::Table);
+    pub(crate) const HANDLE: Self = Self::new(Base::Handle);
     pub(crate) const OPS: Self = Self::new(Base::Ops);
     pub(crate) const CONTEXT: Self = Self::new(Base::Context);
     pub(crate) const VOID: Self = Self::new(Base::Void);
@@ -122,6 +125,7 @@ impl Ty {
             Base::Info
             | Base::Value
             | Base::Node
+            | Base::Handle
             | Base::Ops
             | Base::Context
             | Base::Void => None,
@@ -440,6 +444,11 @@ pub(super) fn type_hint(ty: &Type) -> Ty {
         Ty::INT
     } else if matches!(text.as_str(), "f64" | "f32") {
         Ty::FLOAT
+    } else if matches!(
+        text.as_str(),
+        "RunHandle" | "HttpHandle" | "HttpStreamHandle" | "StateWatchHandle"
+    ) {
+        Ty::HANDLE
     } else if text == "Op" {
         Ty::OPS
     } else {

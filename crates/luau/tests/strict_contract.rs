@@ -51,6 +51,7 @@ fn assert_strict_contract(source: &str) {
         "onHostCallback",
         "bridge.luau",
         "lib/bridge",
+        "__noctalia_rs",
     ] {
         assert!(
             !source.contains(forbidden),
@@ -827,4 +828,260 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
         }),
     );
     assert!(actions.iter().any(|op| op["message"] == json!("AB")));
+}
+
+#[test]
+fn strict_handles_emit_parseable_direct_api_calls() {
+    let source = strict_source(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let run = ctx.run(json!(["echo"]), Some("run"), Some(250i64));
+        let http = ctx.http(json!({ "url": "x" }), "http");
+        let stream = ctx.http_stream(json!({ "url": "x" }), "line", "close");
+        let watch = ctx.state_watch("watched", "watch");
+        run.stop();
+        http.stop();
+        stream.stop();
+        watch.stop();
+    }
+    if ctx.event == "host_callback" {
+        let id = ctx.payload_str("id").unwrap_or_default();
+        return Ok(vec![Op::log(id)]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Service,
+    );
+    assert_strict_contract(&source);
+    assert!(
+        source.contains("local function __strict_run_handle"),
+        "{source}"
+    );
+    assert!(source.contains("noctalia.httpStream("), "{source}");
+    assert!(source.contains("state.watch("), "{source}");
+    let update = ops(&source, "update", json!({}));
+    assert!(update.iter().any(|op| op["path"] == json!(["runAsync"])));
+    assert!(update.iter().any(|op| op["path"] == json!(["http"])));
+    assert!(
+        update
+            .iter()
+            .any(|op| op["path"] == json!(["state", "watch"])),
+        "{update:?}"
+    );
+}
+
+#[test]
+fn strict_stop_suppresses_only_the_named_handle_callback() {
+    let source = strict_source(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let stopped = ctx.run(json!(["echo"]), Some("stopped"), None);
+        let live = ctx.run(json!(["echo"]), Some("live"), None);
+        stopped.stop();
+    }
+    if ctx.event == "host_callback" {
+        let id = ctx.payload_str("id").unwrap_or_default();
+        return Ok(vec![Op::log(id)]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Service,
+    );
+    assert_strict_contract(&source);
+    let update = ops(&source, "update", json!({}));
+    let runs = update
+        .iter()
+        .filter(|op| op["path"] == json!(["runAsync"]))
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    let stopped = runs[0]["args"][1]["__host_callback"]
+        .as_str()
+        .expect("stopped id")
+        .to_owned();
+    let live = runs[1]["args"][1]["__host_callback"]
+        .as_str()
+        .expect("live id")
+        .to_owned();
+    let suppressed = ops(
+        &source,
+        "host_callback",
+        json!({ "id": stopped, "args": [] }),
+    );
+    assert!(
+        suppressed.iter().all(|op| op["op"] != json!("log")),
+        "{suppressed:?}"
+    );
+    let delivered =
+        ops(&source, "host_callback", json!({ "id": live, "args": [] }));
+    assert!(
+        delivered
+            .iter()
+            .any(|op| op["op"] == json!("log") && op["message"] == "live"),
+        "{delivered:?}"
+    );
+}
+
+#[test]
+fn strict_stream_stop_sends_no_internal_host_call() {
+    let source = strict_source(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let stream = ctx.http_stream(json!({ "url": "x" }), "line", "close");
+        stream.stop();
+    }
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Service,
+    );
+    assert_strict_contract(&source);
+    assert!(
+        source.contains("if handle then handle.stop() end"),
+        "{source}"
+    );
+    let update = ops(&source, "update", json!({}));
+    assert!(
+        update.iter().all(|op| op["root"] != json!("__noctalia_rs")),
+        "{update:?}"
+    );
+}
+
+#[test]
+fn strict_run_without_a_callback_sends_nil() {
+    let source = strict_source(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let handle = ctx.run(json!(["echo"]), None, None);
+        handle.stop();
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Service,
+    );
+    assert!(!source.contains("function __strict_callback"), "{source}");
+    let update = ops(&source, "update", json!({}));
+    let run = update
+        .iter()
+        .find(|op| op["path"] == json!(["runAsync"]))
+        .expect("run op");
+    assert_eq!(run["args"][1], serde_json::Value::Null);
+}
+
+#[test]
+fn strict_handle_keyword_binding_parses() {
+    let source = strict_source(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let end = ctx.run(json!(["echo"]), Some("done"), None);
+        end.stop();
+    }
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Service,
+    );
+    assert_strict_contract(&source);
+    assert!(source.contains("__kw_end.stop()"), "{source}");
+    let update = ops(&source, "update", json!({}));
+    assert!(update.iter().any(|op| op["path"] == json!(["runAsync"])));
+}
+
+#[test]
+fn strict_watch_handle_started_checks_registration_arguments() {
+    let source = strict_source(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let empty_key = ctx.state_watch("", "cb");
+        let empty_callback = ctx.state_watch("key", "");
+        let started = empty_key.started() || empty_callback.started();
+        return Ok(vec![Op::log(started.to_string())]);
+    }
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Service,
+    );
+    assert_strict_contract(&source);
+    assert!(
+        source.contains("__key ~= \"\" and __callback ~= \"\""),
+        "{source}"
+    );
+    let update = ops(&source, "update", json!({}));
+    let log = update
+        .iter()
+        .find(|op| op["op"] == json!("log"))
+        .expect("log op");
+    assert_eq!(log["message"], "false");
+}
+
+#[test]
+fn strict_cloned_handle_stop_suppresses_the_original_callback() {
+    let source = strict_source(
+        r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "update" {
+        let stopped = ctx.run(json!(["echo"]), Some("stopped"), None);
+        let saved = stopped.clone();
+        saved.stop();
+        let live = ctx.run(json!(["echo"]), Some("live"), None);
+    }
+    if ctx.event == "host_callback" {
+        let id = ctx.payload_str("id").unwrap_or_default();
+        return Ok(vec![Op::log(id)]);
+    }
+    Ok(Vec::new())
+}
+"#,
+        EntryKind::Service,
+    );
+    assert_strict_contract(&source);
+    let update = ops(&source, "update", json!({}));
+    let runs = update
+        .iter()
+        .filter(|op| op["path"] == json!(["runAsync"]))
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 2);
+    let stopped = runs[0]["args"][1]["__host_callback"]
+        .as_str()
+        .expect("stopped id")
+        .to_owned();
+    let live = runs[1]["args"][1]["__host_callback"]
+        .as_str()
+        .expect("live id")
+        .to_owned();
+    let suppressed = ops(
+        &source,
+        "host_callback",
+        json!({ "id": stopped, "args": [] }),
+    );
+    assert!(
+        suppressed.iter().all(|op| op["op"] != json!("log")),
+        "{suppressed:?}"
+    );
+    let delivered =
+        ops(&source, "host_callback", json!({ "id": live, "args": [] }));
+    assert!(
+        delivered
+            .iter()
+            .any(|op| op["op"] == json!("log") && op["message"] == "live"),
+        "{delivered:?}"
+    );
 }

@@ -337,7 +337,7 @@ fn format_specifier(
             }
         }
         Base::Bool | Base::Value | Base::List | Base::Table | Base::Node => 's',
-        Base::Info | Base::Ops | Base::Context | Base::Void => {
+        Base::Info | Base::Ops | Base::Context | Base::Void | Base::Handle => {
             return Err(unsupported());
         }
     };
