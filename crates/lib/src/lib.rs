@@ -6,6 +6,7 @@ pub mod clock;
 pub mod codegen;
 pub mod context;
 pub mod coroutine;
+pub mod handles;
 pub mod manifest;
 pub mod ops;
 pub mod rng;
@@ -20,6 +21,7 @@ pub use context::{Context, FileInfo, Parts};
 pub use coroutine::{
     Coroutine, Poll as CoroutinePoll, run_budgeted, yield_now, yield_value,
 };
+pub use handles::{HttpHandle, HttpStreamHandle, RunHandle, StateWatchHandle};
 pub use manifest::{
     Entry, EntryConfig, EntryKind, ExclusiveZone, LauncherCategory,
     LayerConfig, Meta, MetaBuilder, MetaReady, NeedId, NeedName, NeedVersion,
