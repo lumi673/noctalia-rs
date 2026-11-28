@@ -646,6 +646,13 @@ fn compile_once(
         if bodies.iter().any(|slot| slot.body.uses_pcall) {
             out.push_str("local __pcall = pcall\n");
         }
+        let handle_runtime = emit::handles_runtime(
+            bodies.iter().any(|slot| slot.body.uses_run_handle),
+            bodies.iter().any(|slot| slot.body.uses_http_handle),
+            bodies.iter().any(|slot| slot.body.uses_stream_handle),
+            bodies.iter().any(|slot| slot.body.uses_watch_handle),
+        );
+        out.push_str(&handle_runtime);
     }
     if let Some(strict) = &options.strict {
         let uses_config = bodies.iter().any(|slot| slot.body.uses_config_table);

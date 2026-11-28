@@ -8,6 +8,7 @@ pub mod codegen;
 pub mod context;
 pub mod coroutine;
 pub mod events;
+pub mod handles;
 pub mod manifest;
 pub mod ops;
 pub mod rng;
@@ -27,6 +28,7 @@ pub use events::{
     ScrollPayload, SearchPayload, ServiceEvent, ShortcutEvent, SourcePayload,
     WidgetEvent,
 };
+pub use handles::{HttpHandle, HttpStreamHandle, RunHandle, StateWatchHandle};
 pub use manifest::{
     Entry, EntryConfig, EntryKind, ExclusiveZone, LauncherCategory,
     LayerConfig, Meta, MetaBuilder, MetaReady, NeedId, NeedName, NeedVersion,

@@ -1,6 +1,6 @@
 use crate::{EntryKind, StrictOptions, compile};
 
-use super::{source, strict_options};
+use super::{options, source, strict_options};
 
 /// The metatable a `json!`/`Vec::new` empty array carries, so the runtime can
 /// tell it from an empty object.
@@ -633,4 +633,278 @@ fn handler(ctx: &Context) -> Result<Vec<Op>> {
     let error = compile_strict(handler, &[]).expect_err("alias");
     assert!(error.contains("widget.rs:"), "{error}");
     assert!(error.contains("Callback"), "{error}");
+}
+
+fn compile_auto(handler: &str) -> Result<String, String> {
+    compile(&source(handler), &options("handler", EntryKind::Widget))
+        .map(|compiled| compiled.source)
+        .map_err(|error| error.render("widget.rs"))
+}
+
+#[test]
+fn strict_run_handle_uses_api57_and_stops_the_callback() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let handle = ctx.run(json!(["echo", "hi"]), Some("done"), Some(250i64));
+    if handle.started() {
+        handle.stop();
+    }
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("__strict_run_handle"), "{output}");
+    assert!(output.contains("noctalia.runAsync("), "{output}");
+    assert!(output.contains("handle.started()"), "{output}");
+    assert!(output.contains("handle.stop()"), "{output}");
+    assert!(output.contains("250"), "{output}");
+    assert!(!output.contains("__host_callback"), "{output}");
+    assert!(!output.contains("__noctalia_rs"), "{output}");
+    assert!(!output.contains("onHostCallback"), "{output}");
+}
+
+#[test]
+fn strict_handles_lower_every_async_start_directly() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let run = ctx.run(json!(["echo"]), Some("run"), None);
+    let http = ctx.http(json!({ "url": "x" }), "http");
+    let stream = ctx.http_stream(json!({ "url": "x" }), "line", "close");
+    let watch = ctx.state_watch("watched", "changed");
+    run.stop();
+    http.stop();
+    stream.stop();
+    watch.stop();
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    for helper in [
+        "__strict_run_handle",
+        "__strict_http_handle",
+        "__strict_http_stream_handle",
+        "__strict_state_watch_handle",
+    ] {
+        assert!(output.contains(helper), "{helper} missing: {output}");
+    }
+    for member in [
+        "noctalia.runAsync(",
+        "noctalia.http(",
+        "noctalia.httpStream(",
+        "state.watch(",
+    ] {
+        assert!(output.contains(member), "{member} missing: {output}");
+    }
+    assert!(!output.contains("__noctalia_rs"), "{output}");
+    assert!(!output.contains("__host_callback"), "{output}");
+}
+
+#[test]
+fn strict_handle_timeout_keeps_the_exact_integer_and_none() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let wide = ctx.run(json!(["echo"]), Some("wide"), Some(9223372036854775807i64));
+    let none = ctx.run(json!(["echo"]), Some("none"), None);
+    wide.stop();
+    none.stop();
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(
+        output.contains("\"wide\", 9223372036854775807)"),
+        "{output}"
+    );
+    assert!(output.contains("\"none\", nil)"), "{output}");
+}
+
+#[test]
+fn strict_handle_callback_needs_a_host_branch() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let _handle = ctx.http(json!({ "url": "x" }), "response");
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("missing branch");
+    assert!(error.contains("host_callback branch"), "{error}");
+    assert!(error.contains("widget.rs:"), "{error}");
+    let line = error
+        .split("widget.rs:")
+        .nth(1)
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("line");
+    let column = error
+        .split("widget.rs:")
+        .nth(1)
+        .and_then(|rest| rest.split(':').nth(1))
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("column");
+    assert!(line > 0 && column > 0, "{error}");
+}
+
+#[test]
+fn strict_handle_rejects_an_unknown_method() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let handle = ctx.state_watch("watched", "changed");
+    handle.restart();
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("unknown method");
+    assert!(
+        error.contains("method `restart` is not supported"),
+        "{error}"
+    );
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_handle_preserves_evaluation_order() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let mut ops = Vec::new();
+    ops.push(Op::log("before"));
+    let handle = ctx.run(json!(["echo"]), Some("done"), None);
+    ops.push(Op::log("after"));
+    handle.stop();
+    Ok(ops)
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    let body = output
+        .split("local function body_render()")
+        .nth(1)
+        .expect("body")
+        .split("\nend")
+        .next()
+        .expect("body end");
+    let before = body.find("noctalia.log(\"before\")").expect("before");
+    let start = body.find("__strict_run_handle(").expect("start");
+    let after = body.find("noctalia.log(\"after\")").expect("after");
+    assert!(before < start && start < after, "{body}");
+}
+
+#[test]
+fn auto_mode_rejects_strict_handles() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    let _handle = ctx.state_watch("watched", "changed");
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_auto(handler).expect_err("auto mode");
+    assert!(error.contains("needs strict mode"), "{error}");
+    assert!(error.contains("widget.rs:"), "{error}");
+}
+
+#[test]
+fn strict_handle_methods_use_the_bound_luau_name() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let end = ctx.run(json!(["echo"]), Some("done"), None);
+    end.stop();
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("local __kw_end = "), "{output}");
+    assert!(output.contains("__kw_end.stop()"), "{output}");
+    assert!(!output.contains("\n  end.stop()"), "{output}");
+}
+
+#[test]
+fn strict_handle_methods_work_on_helper_parameters() {
+    let handler = r#"
+use noctalia_rs::RunHandle;
+
+fn stop_it(handle: RunHandle) {
+    handle.stop();
+}
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let handle = ctx.run(json!(["echo"]), Some("done"), None);
+    stop_it(handle);
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains(".stop()"), "{output}");
+    assert!(output.contains("__strict_run_handle("), "{output}");
+}
+
+#[test]
+fn strict_handle_methods_accept_evaluated_receivers() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    ctx.run(json!(["echo"]), Some("done"), None).stop();
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains(").stop()"), "{output}");
+}
+
+#[test]
+fn strict_handle_clone_keeps_the_same_handle() {
+    let handler = r#"
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let handle = ctx.run(json!(["echo"]), Some("done"), None);
+    let saved = handle.clone();
+    saved.stop();
+    Ok(Vec::new())
+}
+"#;
+    let output = compile_strict(handler, &[]).expect("compile");
+    assert!(output.contains("local saved = handle"), "{output}");
+    assert!(output.contains("saved.stop()"), "{output}");
+}
+
+#[test]
+fn strict_optional_handles_keep_optional_combinators_and_fail_closed() {
+    let handler = r#"
+use noctalia_rs::RunHandle;
+
+fn handler(ctx: &Context) -> Result<Vec<Op>> {
+    if ctx.event == "host_callback" {
+        return Ok(vec![Op::log("callback")]);
+    }
+    let handle = ctx.run(json!(["echo"]), Some("done"), None);
+    let maybe: Option<RunHandle> = Some(handle);
+    let _ = maybe.map(|h| h.stop());
+    Ok(Vec::new())
+}
+"#;
+    let error = compile_strict(handler, &[]).expect_err("typed closure");
+    assert!(error.contains("method `stop` is not supported"), "{error}");
+    assert!(error.contains("widget.rs:"), "{error}");
 }

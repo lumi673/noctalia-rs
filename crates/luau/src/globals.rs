@@ -788,7 +788,9 @@ fn make_noctalia_table(lua: &Lua) -> LuaResult<Table> {
             return Ok(LuaValue::Nil);
         }
         let table = lua.create_table()?;
-        let stop = {
+        let stop = if host.strict() {
+            function(lua, move |_: &Lua, _: Args| Ok(LuaValue::Nil))?
+        } else {
             let handle = handle.clone();
             let host = Arc::clone(&host);
             function(lua, move |lua, _: Args| {
