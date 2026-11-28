@@ -1759,23 +1759,29 @@ mod tests {
             out: &mut out,
         };
         let args = json!({ "key": 1 });
+        let key = native_key("rows", &args);
         let first = server.native_value(
             "service",
             "rows",
             args.clone(),
-            5,
+            60_000,
             &Value::Null,
         );
         let second = server.native_value(
             "service",
             "rows",
             args.clone(),
-            5,
+            60_000,
             &Value::Null,
         );
-        thread::sleep(Duration::from_millis(20));
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(60_001))
+            .unwrap_or_else(Instant::now);
+        server
+            .native_cache
+            .insert(key, (expired, json!({ "value": 1 })));
         let third =
-            server.native_value("service", "rows", args, 5, &Value::Null);
+            server.native_value("service", "rows", args, 60_000, &Value::Null);
         spool.cleanup();
 
         assert_eq!(first.expect("first"), json!({ "value": 1 }));
