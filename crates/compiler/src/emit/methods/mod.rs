@@ -15,6 +15,36 @@ pub(super) fn reset_iter_done() {
     ITER_DONE.with(|slot| slot.borrow_mut().clear());
 }
 
+fn handle_method(
+    call: &ExprMethodCall,
+    method: &str,
+    args: &[&Expr],
+    receiver: &str,
+    strict: bool,
+) -> Result<(String, Ty), Error> {
+    if !strict {
+        return Err(Error::at(
+            call.method.span(),
+            format!("handle method `{method}` needs strict mode"),
+        ));
+    }
+    if !args.is_empty() {
+        return Err(Error::at(
+            call.span(),
+            format!("handle method `{method}` takes no arguments"),
+        ));
+    }
+    match method {
+        "stop" | "cancel" => Ok((format!("{receiver}.stop()"), Ty::VOID)),
+        "started" => Ok((format!("{receiver}.started()"), Ty::BOOL)),
+        "clone" => Ok((receiver.to_owned(), Ty::HANDLE)),
+        _ => Err(Error::at(
+            call.method.span(),
+            format!("handle method `{method}` is not supported"),
+        )),
+    }
+}
+
 thread_local! {
     static ITER_DONE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
@@ -1434,37 +1464,24 @@ impl<'a> Emitter<'a> {
                     let by_class = self
                         .class_of_receiver(&call.receiver)
                         .is_some_and(|class| handles::is_class(&class));
-                    let by_type = self
-                        .lookup(&name)
-                        .is_some_and(|ty| ty.base == Base::Handle);
+                    let by_type = self.lookup(&name).is_some_and(|ty| {
+                        !ty.optional && ty.base == Base::Handle
+                    });
                     (by_class || by_type).then(|| self.local_name(&name))
                 })
             } else {
                 None
             };
-        if let Some(receiver) = handle_receiver {
-            if !self.strict() {
-                return Err(Error::at(
-                    call.method.span(),
-                    format!("handle method `{method}` needs strict mode"),
-                ));
-            }
-            if !args.is_empty() {
-                return Err(Error::at(
-                    call.span(),
-                    format!("handle method `{method}` takes no arguments"),
-                ));
-            }
-            return match method.as_str() {
-                "stop" | "cancel" => {
-                    Ok((format!("{receiver}.stop()"), Ty::VOID))
-                }
-                "started" => Ok((format!("{receiver}.started()"), Ty::BOOL)),
-                _ => Err(Error::at(
-                    call.method.span(),
-                    format!("handle method `{method}` is not supported"),
-                )),
-            };
+        if matches!(method.as_str(), "stop" | "cancel" | "started" | "clone")
+            && let Some(receiver) = handle_receiver
+        {
+            return handle_method(
+                call,
+                &method,
+                &args,
+                &receiver,
+                self.strict(),
+            );
         }
         if self.is_ctx_expr(&call.receiver) {
             return self.context_method(call, &method, &args);
@@ -1497,6 +1514,18 @@ impl<'a> Emitter<'a> {
         } else {
             receiver
         };
+        if matches!(method.as_str(), "stop" | "cancel" | "started" | "clone")
+            && !ty.optional
+            && ty.base == Base::Handle
+        {
+            return handle_method(
+                call,
+                &method,
+                &args,
+                &receiver,
+                self.strict(),
+            );
+        }
         if let Some(value) =
             self.combinator(call, &method, &args, &receiver, ty)?
         {
